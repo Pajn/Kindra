@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use git2::{BranchType, Repository};
 use inquire::MultiSelect;
@@ -24,6 +24,9 @@ enum Commands {
     Split,
     /// Pushes all branches with upstreams (atomic, force-with-lease)
     Push,
+    /// Interactive branch checkout
+    #[command(alias = "co")]
+    Checkout,
 }
 
 struct CommitInfo {
@@ -37,14 +40,77 @@ fn main() -> Result<()> {
     match &cli.command {
         Commands::Split => split()?,
         Commands::Push => push()?,
+        Commands::Checkout => checkout()?,
+    }
+
+    Ok(())
+}
+
+fn checkout() -> Result<()> {
+    let repo = Repository::open(".").context("Failed to open git repository.")?;
+
+    let upstream_name = find_upstream(&repo)?;
+    let upstream_obj = repo.revparse_single(&upstream_name)?;
+    let upstream_id = upstream_obj.id();
+    let head_id = repo.head()?.peel_to_commit()?.id();
+
+    let mut stack_branches = Vec::new();
+    let local_branches = repo.branches(Some(BranchType::Local))?;
+
+    for res in local_branches {
+        let (branch, _) = res?;
+        let name = branch
+            .name()?
+            .ok_or_else(|| anyhow!("Branch has no name"))?
+            .to_string();
+
+        if name == upstream_name {
+            continue;
+        }
+
+        if let Some(target_id) = branch.get().target() {
+            // A branch is in the "stack" if:
+            // 1. It is an ancestor of HEAD OR HEAD is an ancestor of it (linearity)
+            // 2. It is not already merged into upstream (optional but usually desired for "active" stack)
+
+            let is_linear = repo.graph_descendant_of(head_id, target_id)? // target is ancestor of head (below)
+                || repo.graph_descendant_of(target_id, head_id)? // head is ancestor of target (ahead)
+                || head_id == target_id;
+
+            let is_merged = repo.graph_descendant_of(upstream_id, target_id)?;
+
+            if is_linear && !is_merged {
+                stack_branches.push(name);
+            }
+        }
+    }
+
+    if stack_branches.is_empty() {
+        println!(
+            "No branches found in the current stack (excluding {}).",
+            upstream_name
+        );
+        return Ok(());
+    }
+
+    stack_branches.sort();
+
+    let selected = inquire::Select::new("Select branch to checkout:", stack_branches).prompt()?;
+
+    let status = Command::new("git")
+        .arg("checkout")
+        .arg(&selected)
+        .status()?;
+
+    if !status.success() {
+        return Err(anyhow!("git checkout failed"));
     }
 
     Ok(())
 }
 
 fn push() -> Result<()> {
-    let repo = Repository::open(".")
-        .context("Failed to open git repository.")?;
+    let repo = Repository::open(".").context("Failed to open git repository.")?;
 
     // Check remotes first to avoid hanging on interactive prompt if it will fail anyway
     let remote_name = resolve_remote(&repo)?;
@@ -55,15 +121,24 @@ fn push() -> Result<()> {
     let local_branches = repo.branches(Some(BranchType::Local))?;
     for res in local_branches {
         let (branch, _) = res?;
-        let name = branch.name()?.ok_or_else(|| anyhow!("Branch has no name"))?.to_string();
-        
+        let name = branch
+            .name()?
+            .ok_or_else(|| anyhow!("Branch has no name"))?
+            .to_string();
+
         match branch.upstream() {
             Ok(upstream) => {
                 let upstream_name = upstream.name()?.unwrap_or("unknown").to_string();
-                branches_to_push.push(BranchStatus { name, upstream: Some(upstream_name) });
+                branches_to_push.push(BranchStatus {
+                    name,
+                    upstream: Some(upstream_name),
+                });
             }
             Err(_) => {
-                branches_without_upstream.push(BranchStatus { name, upstream: None });
+                branches_without_upstream.push(BranchStatus {
+                    name,
+                    upstream: None,
+                });
             }
         }
     }
@@ -76,20 +151,22 @@ fn push() -> Result<()> {
         all_branches.extend(branches_without_upstream.clone());
         all_branches.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let options = all_branches.iter()
+        let options = all_branches
+            .iter()
             .filter(|b| b.upstream.is_none())
             .cloned()
             .collect::<Vec<_>>();
 
         if options.is_empty() {
-             perform_push(&repo, branches_to_push)?;
-             return Ok(());
+            perform_push(&repo, branches_to_push)?;
+            return Ok(());
         }
 
         let selected = MultiSelect::new(
             "Select branches to set upstream and push (Space to toggle, Enter to confirm):",
             options,
-        ).prompt()?;
+        )
+        .prompt()?;
 
         if selected.is_empty() && branches_to_push.is_empty() {
             println!("No branches selected to push.");
@@ -100,9 +177,10 @@ fn push() -> Result<()> {
         for mut branch_status in selected {
             let mut branch = repo.find_branch(&branch_status.name, BranchType::Local)?;
             let upstream_ref = format!("refs/remotes/{}/{}", remote_name, branch_status.name);
-            branch.set_upstream(Some(&upstream_ref))
+            branch
+                .set_upstream(Some(&upstream_ref))
                 .context(format!("Failed to set upstream for {}", branch_status.name))?;
-            
+
             branch_status.upstream = Some(upstream_ref);
             branches_to_push.push(branch_status);
         }
@@ -139,7 +217,9 @@ fn resolve_remote(repo: &Repository) -> Result<String> {
     } else if remote_list.is_empty() {
         Err(anyhow!("No remotes configured."))
     } else {
-        Err(anyhow!("'origin' remote not found and multiple remotes exist. Please specify a remote or rename one to 'origin'."))
+        Err(anyhow!(
+            "'origin' remote not found and multiple remotes exist. Please specify a remote or rename one to 'origin'."
+        ))
     }
 }
 
@@ -149,14 +229,17 @@ fn perform_push(_repo: &Repository, branches: Vec<BranchStatus>) -> Result<()> {
         return Ok(());
     }
 
-    // Identify which remotes we are pushing to. 
+    // Identify which remotes we are pushing to.
     // Atomic push only works for a single remote at a time.
     let mut remote_to_refs: HashMap<String, Vec<String>> = HashMap::new();
     for b in branches {
         if let Some(upstream) = b.upstream {
             let parts: Vec<&str> = upstream.splitn(2, '/').collect();
             if parts.len() == 2 {
-                remote_to_refs.entry(parts[0].to_string()).or_default().push(b.name);
+                remote_to_refs
+                    .entry(parts[0].to_string())
+                    .or_default()
+                    .push(b.name);
             }
         }
     }
@@ -165,10 +248,10 @@ fn perform_push(_repo: &Repository, branches: Vec<BranchStatus>) -> Result<()> {
         println!("Pushing {} branches to {}...", refs.len(), remote);
         let mut cmd = Command::new("git");
         cmd.arg("push")
-           .arg("--atomic")
-           .arg("--force-with-lease")
-           .arg(&remote);
-        
+            .arg("--atomic")
+            .arg("--force-with-lease")
+            .arg(&remote);
+
         for r in refs {
             cmd.arg(format!("{}:{}", r, r));
         }
@@ -183,17 +266,39 @@ fn perform_push(_repo: &Repository, branches: Vec<BranchStatus>) -> Result<()> {
 }
 
 fn split() -> Result<()> {
-    let repo = Repository::open(".")
-        .context("Failed to open git repository. Are you in a git repo?")?;
+    let repo =
+        Repository::open(".").context("Failed to open git repository. Are you in a git repo?")?;
 
     let upstream_name = find_upstream(&repo)?;
     let upstream_obj = repo.revparse_single(&upstream_name)?;
     let head_obj = repo.revparse_single("HEAD")?;
+    let head_id = head_obj.id();
 
-    let merge_base = repo.merge_base(upstream_obj.id(), head_obj.id())?;
+    let merge_base = repo.merge_base(upstream_obj.id(), head_id)?;
+
+    // Identify all branches in the linear stack (including those ahead of HEAD)
+    let mut stack_branch_targets = Vec::new();
+    let local_branches = repo.branches(Some(BranchType::Local))?;
+    for res in local_branches {
+        let (branch, _) = res?;
+        if let Some(target_id) = branch.get().target() {
+            let is_linear = repo.graph_descendant_of(head_id, target_id)?
+                || repo.graph_descendant_of(target_id, head_id)?
+                || head_id == target_id;
+
+            let is_merged = repo.graph_descendant_of(upstream_obj.id(), target_id)?;
+
+            if is_linear && !is_merged {
+                stack_branch_targets.push(target_id);
+            }
+        }
+    }
 
     let mut revwalk = repo.revwalk()?;
-    revwalk.push(head_obj.id())?;
+    revwalk.push(head_id)?;
+    for target in stack_branch_targets {
+        revwalk.push(target)?;
+    }
     revwalk.hide(merge_base)?;
     revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
 
@@ -228,7 +333,10 @@ fn split() -> Result<()> {
             if let Some(target) = branch.get().target() {
                 let target_str = target.to_string();
                 if commit_ids.contains(&target_str) {
-                    commit_to_branches.entry(target_str).or_default().push(name.to_string());
+                    commit_to_branches
+                        .entry(target_str)
+                        .or_default()
+                        .push(name.to_string());
                 }
             }
         }
@@ -286,11 +394,16 @@ fn split() -> Result<()> {
             if let Some(id) = &last_commit_id {
                 new_branch_map.push((branch_name, id.clone()));
             } else {
-                return Err(anyhow!("Branch '{}' must follow a commit line", branch_name));
+                return Err(anyhow!(
+                    "Branch '{}' must follow a commit line",
+                    branch_name
+                ));
             }
         } else {
             let parts: Vec<&str> = line.splitn(2, ' ').collect();
-            if parts.is_empty() { continue; }
+            if parts.is_empty() {
+                continue;
+            }
             let id = parts[0].to_string();
             new_commits_short.push(id.clone());
             last_commit_id = Some(id);
@@ -299,12 +412,17 @@ fn split() -> Result<()> {
 
     // Validate commits (order and content must match exactly)
     if new_commits_short.len() != commits.len() {
-        return Err(anyhow!("Commit list was modified (count changed). gits split only supports branch management."));
+        return Err(anyhow!(
+            "Commit list was modified (count changed). gits split only supports branch management."
+        ));
     }
 
     for (original, new_short) in commits.iter().zip(new_commits_short.iter()) {
         if !original.id.starts_with(new_short) {
-            return Err(anyhow!("Commit '{}' was modified or moved. gits split only supports branch management.", new_short));
+            return Err(anyhow!(
+                "Commit '{}' was modified or moved. gits split only supports branch management.",
+                new_short
+            ));
         }
     }
 
@@ -324,7 +442,8 @@ fn split() -> Result<()> {
     let mut next_branches: HashMap<String, String> = HashMap::new();
     for (name, id_short) in new_branch_map {
         // Map short ID back to full ID
-        let full_id = commits.iter()
+        let full_id = commits
+            .iter()
             .find(|c| c.id.starts_with(&id_short))
             .map(|c| c.id.clone())
             .ok_or_else(|| anyhow!("Could not resolve commit {}", id_short))?;
@@ -335,7 +454,10 @@ fn split() -> Result<()> {
     for name in existing_managed_branches.keys() {
         if !next_branches.contains_key(name) {
             if Some(name) == current_branch.as_ref() {
-                println!("Cannot delete current branch: {}. Detaching HEAD first.", name);
+                println!(
+                    "Cannot delete current branch: {}. Detaching HEAD first.",
+                    name
+                );
                 let head_commit = repo.head()?.peel_to_commit()?;
                 repo.set_head_detached(head_commit.id())?;
             }
@@ -348,7 +470,9 @@ fn split() -> Result<()> {
     // Create or move branches
     for (name, id) in next_branches {
         let commit_obj = repo.revparse_single(&id)?;
-        let commit = commit_obj.as_commit().ok_or_else(|| anyhow!("{} is not a commit", id))?;
+        let commit = commit_obj
+            .as_commit()
+            .ok_or_else(|| anyhow!("{} is not a commit", id))?;
 
         match repo.find_branch(&name, BranchType::Local) {
             Ok(existing) => {
@@ -356,7 +480,7 @@ fn split() -> Result<()> {
                 if target.map(|t| t.to_string()) == Some(id.clone()) {
                     continue;
                 }
-                
+
                 if Some(&name) == current_branch.as_ref() {
                     println!("Detaching HEAD to move current branch: {}", name);
                     let head_commit = repo.head()?.peel_to_commit()?;

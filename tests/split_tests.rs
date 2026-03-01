@@ -21,7 +21,8 @@ fn setup_repo() -> (tempfile::TempDir, Repository) {
             "initial commit",
             &tree,
             &[],
-        ).unwrap()
+        )
+        .unwrap()
     };
 
     let first_commit_id = parent_id;
@@ -36,14 +37,16 @@ fn setup_repo() -> (tempfile::TempDir, Repository) {
         };
         let tree = repo.find_tree(tree_oid).unwrap();
         let parent = repo.find_commit(parent_id).unwrap();
-        parent_id = repo.commit(
-            None,
-            &signature,
-            &signature,
-            &format!("commit {}", i),
-            &tree,
-            &[&parent],
-        ).unwrap();
+        parent_id = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                &format!("commit {}", i),
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
     }
 
     // Detach HEAD before moving main
@@ -54,14 +57,14 @@ fn setup_repo() -> (tempfile::TempDir, Repository) {
         let first_commit = repo.find_commit(first_commit_id).unwrap();
         repo.branch("main", &first_commit, true).unwrap();
     }
-    
+
     (dir, repo)
 }
 
 #[test]
 fn test_split_move_branch() {
     let (dir, repo) = setup_repo();
-    
+
     {
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         repo.branch("feature-x", &head, false).unwrap();
@@ -69,11 +72,15 @@ fn test_split_move_branch() {
     repo.set_head("refs/heads/feature-x").unwrap();
 
     let editor_script = dir.path().join("editor.sh");
-    fs::write(&editor_script, r#"#!/bin/sh
+    fs::write(
+        &editor_script,
+        r#"#!/bin/sh
 file=$1
 sed -i '/branch feature-x/d' "$file"
 sed -i '/commit 2/a branch feature-x' "$file"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -89,7 +96,9 @@ sed -i '/commit 2/a branch feature-x' "$file"
         .assert()
         .success();
 
-    let branch = repo.find_branch("feature-x", git2::BranchType::Local).unwrap();
+    let branch = repo
+        .find_branch("feature-x", git2::BranchType::Local)
+        .unwrap();
     let target = branch.get().target().unwrap();
     let commit = repo.find_commit(target).unwrap();
     assert_eq!(commit.summary().unwrap(), "commit 2");
@@ -98,13 +107,17 @@ sed -i '/commit 2/a branch feature-x' "$file"
 #[test]
 fn test_split_create_delete_branch() {
     let (dir, repo) = setup_repo();
-    
+
     let editor_script = dir.path().join("editor.sh");
-    fs::write(&editor_script, r#"#!/bin/sh
+    fs::write(
+        &editor_script,
+        r#"#!/bin/sh
 file=$1
 sed -i '/commit 1/a branch new-feat' "$file"
 sed -i '/commit 3/a branch another-feat' "$file"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -120,13 +133,23 @@ sed -i '/commit 3/a branch another-feat' "$file"
         .assert()
         .success();
 
-    assert!(repo.find_branch("new-feat", git2::BranchType::Local).is_ok());
-    assert!(repo.find_branch("another-feat", git2::BranchType::Local).is_ok());
+    assert!(
+        repo.find_branch("new-feat", git2::BranchType::Local)
+            .is_ok()
+    );
+    assert!(
+        repo.find_branch("another-feat", git2::BranchType::Local)
+            .is_ok()
+    );
 
-    fs::write(&editor_script, r#"#!/bin/sh
+    fs::write(
+        &editor_script,
+        r#"#!/bin/sh
 file=$1
 sed -i '/branch new-feat/d' "$file"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
     cmd.arg("split")
@@ -135,19 +158,29 @@ sed -i '/branch new-feat/d' "$file"
         .assert()
         .success();
 
-    assert!(repo.find_branch("new-feat", git2::BranchType::Local).is_err());
-    assert!(repo.find_branch("another-feat", git2::BranchType::Local).is_ok());
+    assert!(
+        repo.find_branch("new-feat", git2::BranchType::Local)
+            .is_err()
+    );
+    assert!(
+        repo.find_branch("another-feat", git2::BranchType::Local)
+            .is_ok()
+    );
 }
 
 #[test]
 fn test_split_error_on_commit_mod() {
     let (dir, _repo) = setup_repo();
-    
+
     let editor_script = dir.path().join("editor.sh");
-    fs::write(&editor_script, r#"#!/bin/sh
+    fs::write(
+        &editor_script,
+        r#"#!/bin/sh
 file=$1
 sed -i 's/^[0-9a-f]\{7\}/deadbee/' "$file"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -168,7 +201,7 @@ sed -i 's/^[0-9a-f]\{7\}/deadbee/' "$file"
 #[test]
 fn test_split_detach_head_on_delete() {
     let (dir, repo) = setup_repo();
-    
+
     {
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         repo.branch("current", &head, false).unwrap();
@@ -176,10 +209,14 @@ fn test_split_detach_head_on_delete() {
     repo.set_head("refs/heads/current").unwrap();
 
     let editor_script = dir.path().join("editor.sh");
-    fs::write(&editor_script, r#"#!/bin/sh
+    fs::write(
+        &editor_script,
+        r#"#!/bin/sh
 file=$1
 sed -i '/branch current/d' "$file"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -196,13 +233,16 @@ sed -i '/branch current/d' "$file"
         .success();
 
     assert!(repo.head_detached().unwrap());
-    assert!(repo.find_branch("current", git2::BranchType::Local).is_err());
+    assert!(
+        repo.find_branch("current", git2::BranchType::Local)
+            .is_err()
+    );
 }
 
 #[test]
 fn test_push_multiple_remotes_no_origin_error() {
     let (dir, repo) = setup_repo();
-    
+
     // Setup two remotes, neither is origin
     repo.remote("remote1", "http://example.com/r1.git").unwrap();
     repo.remote("remote2", "http://example.com/r2.git").unwrap();
@@ -212,14 +252,16 @@ fn test_push_multiple_remotes_no_origin_error() {
         .current_dir(dir.path())
         .assert()
         .failure()
-        .stderr(predicates::str::contains("'origin' remote not found and multiple remotes exist"));
+        .stderr(predicates::str::contains(
+            "'origin' remote not found and multiple remotes exist",
+        ));
 }
 
 #[test]
 fn test_push_no_remotes_error() {
     let (dir, _repo) = setup_repo();
     // No remotes by default from setup_repo (except if we added any)
-    
+
     let mut cmd = Command::cargo_bin("gits").unwrap();
     cmd.arg("push")
         .current_dir(dir.path())
