@@ -88,8 +88,8 @@ fn test_split_move_branch() {
         &editor_script,
         r#"#!/bin/sh
 file=$1
-sed -i '/branch feature-x/d' "$file"
-sed -i '/commit 2/a branch feature-x' "$file"
+perl -i -pe 's/.*branch feature-x.*\n?//g' "$file"
+perl -i -pe 's/(commit 2)/$1\nbranch feature-x/' "$file"
 "#,
     )
     .unwrap();
@@ -126,8 +126,8 @@ fn test_split_create_delete_branch() {
         &editor_script,
         r#"#!/bin/sh
 file=$1
-sed -i '/commit 1/a branch new-feat' "$file"
-sed -i '/commit 3/a branch another-feat' "$file"
+perl -i -pe 's/(commit 1)/$1\nbranch new-feat/' "$file"
+perl -i -pe 's/(commit 3)/$1\nbranch another-feat/' "$file"
 "#,
     )
     .unwrap();
@@ -160,7 +160,7 @@ sed -i '/commit 3/a branch another-feat' "$file"
         &editor_script,
         r#"#!/bin/sh
 file=$1
-sed -i '/branch new-feat/d' "$file"
+perl -i -pe 's/.*branch new-feat.*\n?//g' "$file"
 "#,
     )
     .unwrap();
@@ -191,7 +191,7 @@ fn test_split_error_on_commit_mod() {
         &editor_script,
         r#"#!/bin/sh
 file=$1
-sed -i 's/^[0-9a-f]\{7\}/deadbee/' "$file"
+perl -i -pe 's/^[0-9a-f]{7}/deadbee/' "$file"
 "#,
     )
     .unwrap();
@@ -227,7 +227,7 @@ fn test_split_detach_head_on_delete() {
         &editor_script,
         r#"#!/bin/sh
 file=$1
-sed -i '/branch current/d' "$file"
+perl -i -pe 's/.*branch current.*\n?//g' "$file"
 "#,
     )
     .unwrap();
