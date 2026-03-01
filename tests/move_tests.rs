@@ -310,20 +310,11 @@ fn test_move_conflict_and_continue() {
         .assert()
         .success();
 
-    let mut cmd_git_rebase_cont = Command::new("git");
-    cmd_git_rebase_cont
-        .arg("rebase")
-        .arg("--continue")
-        .current_dir(dir.path())
-        .env("GIT_EDITOR", "true")
-        .assert()
-        .success();
-
     let mut cmd_cont = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd_cont
-        .arg("move")
         .arg("continue")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .assert()
         .success();
 
@@ -364,12 +355,11 @@ fn test_move_abort() {
 
     let mut cmd_abort = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd_abort
-        .arg("move")
         .arg("abort")
         .current_dir(dir.path())
         .assert()
         .success()
-        .stdout(predicates::str::contains("No move operation in progress"));
+        .stdout(predicates::str::contains("No operation in progress"));
 }
 
 #[test]
@@ -715,7 +705,6 @@ fn test_move_abort_cleans_up_git_rebase() {
     // 5. Abort move
     let mut cmd_abort = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd_abort
-        .arg("move")
         .arg("abort")
         .current_dir(dir.path())
         .assert()
@@ -770,8 +759,7 @@ exec {} "$@"
 
     // 4. Run gits move abort - it should fail because rebase --abort failed
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
-    cmd.arg("move")
-        .arg("abort")
+    cmd.arg("abort")
         .current_dir(dir.path())
         .env("PATH", &new_path)
         .assert()
@@ -889,38 +877,25 @@ fn test_move_conflict_and_continue_no_re_rebase() {
 
     // 2. Resolve conflict
     fs::write(dir.path().join("file.txt"), "resolved").unwrap();
-    let _ = std::process::Command::new("git")
+    let out = std::process::Command::new("git")
         .arg("add")
         .arg("file.txt")
         .current_dir(dir.path())
         .output()
         .unwrap();
-    let _ = std::process::Command::new("git")
-        .arg("rebase")
-        .arg("--continue")
-        .current_dir(dir.path())
-        .env("GIT_EDITOR", "true")
-        .output()
-        .unwrap();
-
-    // Record log size before gits move continue
-    let log_before = fs::read_to_string(&log_path).unwrap();
-    let rebase_calls_before = log_before
-        .lines()
-        .filter(|l| l.contains("rebase --no-ff --onto"))
-        .count();
-    assert_eq!(
-        rebase_calls_before, 1,
-        "Should have called rebase once for 'feature'"
+    assert!(
+        out.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 
     // 3. Continue move
     let mut cmd_cont = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd_cont
-        .arg("move")
         .arg("continue")
         .current_dir(dir.path())
         .env("PATH", &new_path)
+        .env("GIT_EDITOR", "true")
         .assert()
         .success();
 
@@ -1044,7 +1019,6 @@ exec {} "$@"
     // Continue move
     let mut cmd_cont = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd_cont
-        .arg("move")
         .arg("continue")
         .current_dir(dir.path())
         .env("PATH", &new_path)
@@ -1150,13 +1124,18 @@ fn test_move_abort_does_not_abort_manual_rebase() {
     // feature has "feature", target has "target" in file.txt
 
     // Ensure we are on feature branch and everything is clean
-    let _ = std::process::Command::new("git")
+    let out = std::process::Command::new("git")
         .arg("checkout")
         .arg("-f")
         .arg("feature")
         .current_dir(dir.path())
         .output()
         .unwrap();
+    assert!(
+        out.status.success(),
+        "git checkout failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let status = std::process::Command::new("git")
         .arg("rebase")
@@ -1179,11 +1158,7 @@ fn test_move_abort_does_not_abort_manual_rebase() {
 
     // Run gits move abort
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
-    cmd.arg("move")
-        .arg("abort")
-        .current_dir(dir.path())
-        .assert()
-        .success();
+    cmd.arg("abort").current_dir(dir.path()).assert().success();
 
     // Verify rebase is STILL in progress
     assert!(
@@ -1198,13 +1173,18 @@ fn test_move_abort_cleans_up_rebase_when_state_exists() {
     let (dir, _repo) = setup_abort_repo();
 
     // Start a manual git rebase that will conflict
-    let _ = std::process::Command::new("git")
+    let out = std::process::Command::new("git")
         .arg("checkout")
         .arg("-f")
         .arg("feature")
         .current_dir(dir.path())
         .output()
         .unwrap();
+    assert!(
+        out.status.success(),
+        "git checkout failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let _ = std::process::Command::new("git")
         .arg("rebase")
@@ -1212,6 +1192,7 @@ fn test_move_abort_cleans_up_rebase_when_state_exists() {
         .current_dir(dir.path())
         .output()
         .unwrap();
+    // This rebase is expected to fail with a conflict, so we don't assert status.success()
 
     // Manually create a gits move state file
     let state_path = dir.path().join(".git/gits_rebase_state.json");
@@ -1219,11 +1200,7 @@ fn test_move_abort_cleans_up_rebase_when_state_exists() {
 
     // Run gits move abort
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
-    cmd.arg("move")
-        .arg("abort")
-        .current_dir(dir.path())
-        .assert()
-        .success();
+    cmd.arg("abort").current_dir(dir.path()).assert().success();
 
     // Verify state file is gone
     assert!(!state_path.exists(), "State file should have been removed");

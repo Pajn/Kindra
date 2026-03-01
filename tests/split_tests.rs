@@ -312,7 +312,7 @@ fn test_checkout_up_fork() {
 
         // fork-b is a NEW commit from c1
         let tree = c2.tree().unwrap();
-        let sig = repo.signature().unwrap();
+        let sig = Signature::now("Test User", "test@example.com").unwrap();
         let fork_b_id = repo
             .commit(None, &sig, &sig, "fork-b commit", &tree, &[&c1])
             .unwrap();
@@ -359,7 +359,7 @@ fn test_checkout_top_fork() {
 
         // tip-b is a NEW commit from c1
         let tree = c2.tree().unwrap();
-        let sig = repo.signature().unwrap();
+        let sig = Signature::now("Test User", "test@example.com").unwrap();
         let tip_b_id = repo
             .commit(None, &sig, &sig, "tip-b commit", &tree, &[&c1])
             .unwrap();
@@ -402,7 +402,7 @@ fn test_split_fork_selection() {
 
         // path-b is a NEW commit from c1
         let tree = c2.tree().unwrap();
-        let sig = repo.signature().unwrap();
+        let sig = Signature::now("Test User", "test@example.com").unwrap();
         let path_b_id = repo
             .commit(None, &sig, &sig, "path-b commit", &tree, &[&c1])
             .unwrap();

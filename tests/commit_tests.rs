@@ -103,12 +103,17 @@ fn test_commit_rebases_descendants() {
     // Stage changes for new commit on feature-a
     fs::write(dir.path().join("a2.txt"), "a2").unwrap();
     let mut git_add = std::process::Command::new("git");
-    git_add
+    let out = git_add
         .arg("add")
         .arg("a2.txt")
         .current_dir(dir.path())
         .output()
         .unwrap();
+    assert!(
+        out.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Run gits commit
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
@@ -196,13 +201,17 @@ fn test_commit_amend_rebases_descendants() {
 
     // Run gits commit --amend
     fs::write(dir.path().join("a.txt"), "amended a").unwrap();
-    let mut git_add = std::process::Command::new("git");
-    git_add
+    let out = std::process::Command::new("git")
         .arg("add")
         .arg("a.txt")
         .current_dir(dir.path())
         .output()
         .unwrap();
+    assert!(
+        out.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("commit")
@@ -360,12 +369,17 @@ fn test_commit_forked_stack() {
     // Run gits commit
     fs::write(dir.path().join("a2.txt"), "a2").unwrap();
     let mut git_add = std::process::Command::new("git");
-    git_add
+    let out = git_add
         .arg("add")
         .arg("a2.txt")
         .current_dir(dir.path())
         .output()
         .unwrap();
+    assert!(
+        out.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("commit")
@@ -418,13 +432,17 @@ fn test_commit_on_main() {
 
     // Run gits commit
     fs::write(dir.path().join("main2.txt"), "main2").unwrap();
-    let mut git_add = std::process::Command::new("git");
-    git_add
+    let out = std::process::Command::new("git")
         .arg("add")
         .arg("main2.txt")
         .current_dir(dir.path())
         .output()
         .unwrap();
+    assert!(
+        out.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("commit")
@@ -496,13 +514,17 @@ fn test_commit_conflict_and_continue() {
 
     // Commit a change on feature-a that conflicts with feature-b
     fs::write(dir.path().join("shared.txt"), "conflicting change").unwrap();
-    let mut git_add = std::process::Command::new("git");
-    git_add
+    let out = std::process::Command::new("git")
         .arg("add")
         .arg("shared.txt")
         .current_dir(dir.path())
         .output()
         .unwrap();
+    assert!(
+        out.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("commit")
@@ -522,29 +544,24 @@ fn test_commit_conflict_and_continue() {
 
     // Resolve conflict
     fs::write(dir.path().join("shared.txt"), "resolved content").unwrap();
-    let mut git_add_resolved = std::process::Command::new("git");
-    git_add_resolved
+    let out = std::process::Command::new("git")
         .arg("add")
         .arg("shared.txt")
         .current_dir(dir.path())
         .output()
         .unwrap();
+    assert!(
+        out.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
-    let mut git_rebase_cont = std::process::Command::new("git");
-    git_rebase_cont
-        .arg("rebase")
-        .arg("--continue")
-        .current_dir(dir.path())
-        .env("GIT_EDITOR", "true")
-        .output()
-        .unwrap();
-
-    // Continue with gits
+    // Continue with gits (which will run git rebase --continue for us)
     let mut cmd_cont = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd_cont
-        .arg("move")
         .arg("continue")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .assert()
         .success();
 
@@ -622,13 +639,17 @@ fn test_commit_abort() {
 
     // Commit conflicting change
     fs::write(dir.path().join("shared.txt"), "conflict").unwrap();
-    let mut git_add = std::process::Command::new("git");
-    git_add
+    let out = std::process::Command::new("git")
         .arg("add")
         .arg("shared.txt")
         .current_dir(dir.path())
         .output()
         .unwrap();
+    assert!(
+        out.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("commit")
@@ -647,7 +668,6 @@ fn test_commit_abort() {
     // Abort
     let mut cmd_abort = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd_abort
-        .arg("move")
         .arg("abort")
         .current_dir(dir.path())
         .assert()
@@ -676,13 +696,17 @@ fn test_commit_on_main_rebases_descendant() {
         .unwrap();
 
     fs::write(dir.path().join("main_new.txt"), "new content").unwrap();
-    let mut cmd_add = std::process::Command::new("git");
-    cmd_add
+    let out = std::process::Command::new("git")
         .arg("add")
         .arg("main_new.txt")
         .current_dir(dir.path())
         .output()
         .unwrap();
+    assert!(
+        out.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("commit")
@@ -773,13 +797,17 @@ fn test_commit_on_main_rebases_multi_level_stack() {
 
     // 2. Run gits commit on main
     fs::write(dir.path().join("main_new_2.txt"), "new content 2").unwrap();
-    let mut cmd_add = std::process::Command::new("git");
-    cmd_add
+    let out = std::process::Command::new("git")
         .arg("add")
         .arg("main_new_2.txt")
         .current_dir(dir.path())
         .output()
         .unwrap();
+    assert!(
+        out.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("commit")

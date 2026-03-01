@@ -12,7 +12,7 @@ pub fn commit(args: &[String]) -> Result<()> {
     let path = state_path(&repo);
     if path.exists() {
         return Err(anyhow!(
-            "A move or commit operation is already in progress. Use 'gits move continue' or 'gits move abort'."
+            "A move or commit operation is already in progress. Use 'gits continue' or 'gits abort'."
         ));
     }
 
@@ -95,7 +95,7 @@ pub fn commit(args: &[String]) -> Result<()> {
     }
 
     // Sort sub_stack by topology
-    crate::stack::sort_branches_topologically(&repo, &mut sub_stack);
+    crate::stack::sort_branches_topologically(&repo, &mut sub_stack)?;
 
     let mut parent_id_map = HashMap::new();
     let mut parent_name_map = HashMap::new();
@@ -122,6 +122,7 @@ pub fn commit(args: &[String]) -> Result<()> {
         .collect();
 
     let state = RebaseState {
+        operation: crate::rebase_utils::Operation::Commit,
         original_branch: current_branch_name.clone(),
         target_branch: current_branch_name,
         remaining_branches,

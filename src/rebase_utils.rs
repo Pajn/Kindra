@@ -6,8 +6,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operation {
+    Move,
+    Commit,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct RebaseState {
+    pub operation: Operation,
     pub original_branch: String,
     pub target_branch: String,
     /// List of branches remaining to be moved
@@ -103,12 +110,12 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
                 // Persist that this branch is in progress, but do NOT remove it from remaining_branches
                 save_state(repo, &state)?;
                 return Err(anyhow!(
-                    "Rebase failed for branch {}. Resolve conflicts and run 'git rebase --continue', then 'gits move continue'.",
+                    "Rebase failed for branch {}. Resolve conflicts and run 'gits continue'.",
                     current_name
                 ));
             } else {
                 return Err(anyhow!(
-                    "Rebase failed for branch {}. It seems to have failed before starting (e.g., dirty working tree). Fix the issue and run 'gits move continue'.",
+                    "Rebase failed for branch {}. It seems to have failed before starting (e.g., dirty working tree). Fix the issue and run 'gits continue'.",
                     current_name
                 ));
             }
@@ -116,7 +123,7 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
     }
 
     println!(
-        "Move completed. Checking out original branch {}...",
+        "Operation completed. Checking out original branch {}...",
         state.original_branch
     );
     let status = Command::new("git")

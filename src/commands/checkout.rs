@@ -65,15 +65,7 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
         }
         Some(CheckoutSubcommand::Down) => {
             let mut branches = get_stack_branches(&repo, head_id, upstream_id, &upstream_name)?;
-            branches.sort_by(|a, b| {
-                if a.id == b.id {
-                    std::cmp::Ordering::Equal
-                } else if repo.graph_descendant_of(a.id, b.id).unwrap_or(false) {
-                    std::cmp::Ordering::Greater
-                } else {
-                    std::cmp::Ordering::Less
-                }
-            });
+            crate::stack::sort_branches_topologically(&repo, &mut branches)?;
 
             let current_name = current_branch_name.ok_or_else(|| anyhow!("Not on a branch"))?;
             let idx = branches

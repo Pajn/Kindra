@@ -23,7 +23,8 @@ pub fn split() -> Result<()> {
 
     let stack_branches =
         crate::stack::get_stack_branches_from_merge_base(&repo, merge_base, &upstream_name)?;
-    let tips = get_stack_tips(&repo, &stack_branches)?;
+    let mut tips = get_stack_tips(&repo, &stack_branches)?;
+    tips.sort();
 
     // If there are multiple tips, the user must choose one.
     // If there are no tips (meaning no branches on the stack), we default to HEAD.
