@@ -6,7 +6,8 @@ use crate::commands::move_cmd::{MoveArgs, move_cmd};
 use crate::commands::push::push;
 use crate::commands::split::split;
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
 
 #[derive(Parser)]
 #[command(name = "gits")]
@@ -30,6 +31,21 @@ enum Commands {
     },
     /// Move current branch stack onto another branch
     Move(MoveArgs),
+    /// Generate shell completions
+    Completions {
+        /// The shell to generate completions for
+        shell: ShellChoice,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy)]
+enum ShellChoice {
+    Bash,
+    Zsh,
+    Fish,
+    PowerShell,
+    Elvish,
+    Nu,
 }
 
 #[derive(Subcommand)]
@@ -50,6 +66,30 @@ fn main() -> Result<()> {
         Commands::Push => push()?,
         Commands::Checkout { subcommand } => checkout(subcommand)?,
         Commands::Move(args) => move_cmd(args)?,
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            match shell {
+                ShellChoice::Bash => {
+                    generate(Shell::Bash, &mut cmd, "gits", &mut std::io::stdout())
+                }
+                ShellChoice::Zsh => generate(Shell::Zsh, &mut cmd, "gits", &mut std::io::stdout()),
+                ShellChoice::Fish => {
+                    generate(Shell::Fish, &mut cmd, "gits", &mut std::io::stdout())
+                }
+                ShellChoice::PowerShell => {
+                    generate(Shell::PowerShell, &mut cmd, "gits", &mut std::io::stdout())
+                }
+                ShellChoice::Elvish => {
+                    generate(Shell::Elvish, &mut cmd, "gits", &mut std::io::stdout())
+                }
+                ShellChoice::Nu => generate(
+                    clap_complete_nushell::Nushell,
+                    &mut cmd,
+                    "gits",
+                    &mut std::io::stdout(),
+                ),
+            }
+        }
     }
 
     Ok(())
