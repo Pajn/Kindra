@@ -98,7 +98,7 @@ fn test_move_stack() {
     )
     .unwrap();
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.env("TERM", "xterm");
     cmd.arg("move")
         .arg("--onto")
@@ -177,7 +177,7 @@ exec {} "$@"
         fs::set_permissions(&git_mock, perms).unwrap();
     }
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.env("TERM", "xterm");
 
     let old_path = std::env::var_os("PATH").unwrap_or_default();
@@ -214,14 +214,16 @@ fn test_move_upstream_error() {
         .assert()
         .success();
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("move")
         .arg("--onto")
         .arg("some-branch")
         .current_dir(dir.path())
         .assert()
         .failure()
-        .stderr(predicates::str::contains("Target 'some-branch' not found."));
+        .stderr(predicates::str::contains(
+            "Branch 'main' is the upstream branch. Cannot move the upstream branch itself.",
+        ));
 }
 
 #[test]
@@ -286,7 +288,7 @@ fn test_move_conflict_and_continue() {
     )
     .unwrap();
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -317,7 +319,7 @@ fn test_move_conflict_and_continue() {
         .assert()
         .success();
 
-    let mut cmd_cont = Command::cargo_bin("gits").unwrap();
+    let mut cmd_cont = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd_cont
         .arg("move")
         .arg("continue")
@@ -352,7 +354,7 @@ fn test_move_abort() {
     )
     .unwrap();
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -360,7 +362,7 @@ fn test_move_abort() {
         .assert()
         .success();
 
-    let mut cmd_abort = Command::cargo_bin("gits").unwrap();
+    let mut cmd_abort = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd_abort
         .arg("move")
         .arg("abort")
@@ -384,7 +386,7 @@ fn test_move_all_onto_main() {
     )
     .unwrap();
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("move")
         .arg("--all")
         .arg("--onto")
@@ -422,7 +424,7 @@ fn test_move_all_from_main_error() {
         .assert()
         .success();
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("move")
         .arg("--all")
         .arg("--onto")
@@ -430,7 +432,9 @@ fn test_move_all_from_main_error() {
         .current_dir(dir.path())
         .assert()
         .failure()
-        .stderr(predicates::str::contains("Target 'feature-a' not found."));
+        .stderr(predicates::str::contains(
+            "Branch 'main' is the upstream branch. Cannot move the upstream branch itself.",
+        ));
 }
 
 #[test]
@@ -503,7 +507,7 @@ fn test_move_all_between_stacks() {
     )
     .unwrap();
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("move")
         .arg("--all")
         .arg("--onto")
@@ -594,7 +598,7 @@ fn test_move_onto_descendant() {
     )
     .unwrap();
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("move")
         .arg("--onto")
         .arg("feature-b")
@@ -690,7 +694,7 @@ fn test_move_abort_cleans_up_git_rebase() {
     .unwrap();
 
     // 4. Start move and hit conflict
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -709,7 +713,7 @@ fn test_move_abort_cleans_up_git_rebase() {
     );
 
     // 5. Abort move
-    let mut cmd_abort = Command::cargo_bin("gits").unwrap();
+    let mut cmd_abort = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd_abort
         .arg("move")
         .arg("abort")
@@ -765,7 +769,7 @@ exec {} "$@"
     new_path.push(old_path);
 
     // 4. Run gits move abort - it should fail because rebase --abort failed
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("move")
         .arg("abort")
         .current_dir(dir.path())
@@ -870,7 +874,7 @@ fn test_move_conflict_and_continue_no_re_rebase() {
     new_path.push(old_path);
 
     // 1. Start move -> should fail with conflict
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -911,7 +915,7 @@ fn test_move_conflict_and_continue_no_re_rebase() {
     );
 
     // 3. Continue move
-    let mut cmd_cont = Command::cargo_bin("gits").unwrap();
+    let mut cmd_cont = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd_cont
         .arg("move")
         .arg("continue")
@@ -941,7 +945,7 @@ fn test_move_invalid_onto() {
     repo.branch("feature", &head, false).unwrap();
     repo.set_head("refs/heads/feature").unwrap();
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("move")
         .arg("--onto")
         .arg("non-existent-branch")
@@ -953,7 +957,7 @@ fn test_move_invalid_onto() {
         ));
 
     // Verify no state file was created
-    assert!(!repo.path().join("gits_move_state.json").exists());
+    assert!(!repo.path().join("gits_rebase_state.json").exists());
 }
 
 #[test]
@@ -1010,7 +1014,7 @@ exec {} "$@"
     // Create the failure trigger file
     fs::write(dir.path().join("fail_rebase"), "").unwrap();
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -1024,7 +1028,7 @@ exec {} "$@"
         .failure();
 
     // Verify state file exists and still contains the branch in remaining_branches
-    let state_path = dir.path().join(".git/gits_move_state.json");
+    let state_path = dir.path().join(".git/gits_rebase_state.json");
     assert!(state_path.exists(), "State file should exist");
     let state_content = fs::read_to_string(&state_path).unwrap();
 
@@ -1038,7 +1042,7 @@ exec {} "$@"
     fs::remove_file(dir.path().join("fail_rebase")).unwrap();
 
     // Continue move
-    let mut cmd_cont = Command::cargo_bin("gits").unwrap();
+    let mut cmd_cont = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd_cont
         .arg("move")
         .arg("continue")
@@ -1173,7 +1177,7 @@ fn test_move_abort_does_not_abort_manual_rebase() {
     );
 
     // Run gits move abort
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("move")
         .arg("abort")
         .current_dir(dir.path())
@@ -1209,11 +1213,11 @@ fn test_move_abort_cleans_up_rebase_when_state_exists() {
         .unwrap();
 
     // Manually create a gits move state file
-    let state_path = dir.path().join(".git/gits_move_state.json");
+    let state_path = dir.path().join(".git/gits_rebase_state.json");
     fs::write(&state_path, "{}").unwrap();
 
     // Run gits move abort
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("move")
         .arg("abort")
         .current_dir(dir.path())

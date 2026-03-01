@@ -197,3 +197,85 @@ pub fn get_stack_tips(repo: &Repository, stack_branches: &[StackBranch]) -> Resu
 
     Ok(tips)
 }
+
+pub fn collect_descendants(
+    repo: &Repository,
+    root_name: &str,
+    all_branches: &[StackBranch],
+    result: &mut Vec<StackBranch>,
+) -> Result<()> {
+    let root = all_branches
+        .iter()
+        .find(|b| b.name == root_name)
+        .ok_or_else(|| {
+            anyhow!(
+                "Branch '{}' not found in stack. Cannot move the upstream branch itself.",
+                root_name
+            )
+        })?;
+
+    result.push(root.clone());
+    collect_descendants_of_id(repo, root.id, all_branches, result)
+}
+
+pub fn collect_descendants_of_id(
+    repo: &Repository,
+    root_id: Oid,
+    all_branches: &[StackBranch],
+    result: &mut Vec<StackBranch>,
+) -> Result<()> {
+    for b in all_branches {
+        if b.id != root_id
+            && repo.graph_descendant_of(b.id, root_id).unwrap_or(false)
+            && !result.iter().any(|existing| existing.name == b.name)
+        {
+            result.push(b.clone());
+        }
+    }
+    Ok(())
+}
+
+pub fn find_parent_in_stack(
+    repo: &Repository,
+    branch_name: &str,
+    all_branches: &[StackBranch],
+    merge_base: Oid,
+) -> Result<Oid> {
+    let branch = all_branches
+        .iter()
+        .find(|b| b.name == branch_name)
+        .ok_or_else(|| anyhow!("Branch '{}' not found in stack.", branch_name))?;
+
+    let mut best_parent = merge_base;
+    for b in all_branches {
+        if b.name != branch_name
+            && (repo.graph_descendant_of(branch.id, b.id).unwrap_or(false) || branch.id == b.id)
+        {
+            if b.id == branch.id {
+                continue;
+            }
+            if best_parent == merge_base
+                || repo.graph_descendant_of(b.id, best_parent).unwrap_or(false)
+            {
+                best_parent = b.id;
+            }
+        }
+    }
+    Ok(best_parent)
+}
+
+pub fn sort_branches_topologically(repo: &Repository, branches: &mut [StackBranch]) {
+    branches.sort_by(|a, b| {
+        use std::cmp::Ordering;
+        if a.id == b.id {
+            return Ordering::Equal;
+        }
+        let a_desc_b = repo.graph_descendant_of(a.id, b.id).unwrap_or(false);
+        let b_desc_a = repo.graph_descendant_of(b.id, a.id).unwrap_or(false);
+        match (a_desc_b, b_desc_a) {
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            _ => a.name.cmp(&b.name),
+        }
+    });
+}

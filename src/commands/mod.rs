@@ -1,4 +1,5 @@
 pub mod checkout;
+pub mod commit;
 pub mod move_cmd;
 pub mod push;
 pub mod split;

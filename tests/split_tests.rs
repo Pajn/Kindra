@@ -1,5 +1,4 @@
 #![allow(deprecated)]
-use assert_cmd::Command;
 use git2::{Repository, Signature};
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -109,8 +108,7 @@ perl -i -pe 's/(commit 2)/$1\nbranch feature-x/' "$file"
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
-    cmd.env("TERM", "xterm");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -148,8 +146,7 @@ perl -i -pe 's/(commit 3)/$1\nbranch another-feat/' "$file"
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
-    cmd.env("TERM", "xterm");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -175,8 +172,7 @@ perl -i -pe 's/.*branch new-feat.*\n?//g' "$file"
     )
     .unwrap();
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
-    cmd.env("TERM", "xterm");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -214,8 +210,7 @@ perl -i -pe 's/^[0-9a-f]{7}/deadbee/' "$file"
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
-    cmd.env("TERM", "xterm");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -251,8 +246,7 @@ perl -i -pe 's/.*branch current.*\n?//g' "$file"
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
-    cmd.env("TERM", "xterm");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -274,8 +268,7 @@ fn test_push_multiple_remotes_no_origin_error() {
     repo.remote("remote1", "http://example.com/r1.git").unwrap();
     repo.remote("remote2", "http://example.com/r2.git").unwrap();
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
-    cmd.env("TERM", "xterm");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("push")
         .current_dir(dir.path())
         .assert()
@@ -290,8 +283,7 @@ fn test_push_no_remotes_error() {
     let (dir, _repo) = setup_repo();
     // No remotes by default from setup_repo (except if we added any)
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
-    cmd.env("TERM", "xterm");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("push")
         .current_dir(dir.path())
         .assert()
@@ -329,10 +321,7 @@ fn test_checkout_up_fork() {
     }
     repo.set_head("refs/heads/base").unwrap();
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
-    cmd.env("TERM", "xterm");
-    // fork-a and fork-b are both descendants of c1.
-    // They should both be in successors.
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("checkout")
         .arg("up")
         .current_dir(dir.path())
@@ -365,8 +354,7 @@ fn test_checkout_top_fork() {
         .unwrap();
     }
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
-    cmd.env("TERM", "xterm");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("checkout")
         .arg("top")
         .current_dir(dir.path())
@@ -408,9 +396,7 @@ exit 0
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = Command::cargo_bin("gits").unwrap();
-    cmd.env("TERM", "xterm");
-    // Select first path
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -420,6 +406,7 @@ exit 0
 }
 
 #[test]
+#[allow(clippy::zombie_processes)]
 fn test_checkout_all_works_without_main() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
@@ -442,10 +429,8 @@ fn test_checkout_all_works_without_main() {
 
     repo.set_head("refs/heads/trunk").unwrap();
 
-    let bin_path = assert_cmd::cargo::cargo_bin("gits");
-
-    let mut child = std::process::Command::new(bin_path)
-        .arg("checkout")
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    cmd.arg("checkout")
         .arg("--all")
         .current_dir(dir.path())
         .env("TERM", "dumb")
@@ -493,6 +478,7 @@ fn test_checkout_all_works_without_main() {
 }
 
 #[test]
+#[allow(clippy::zombie_processes)]
 fn test_checkout_all_detached_no_main() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
@@ -517,10 +503,8 @@ fn test_checkout_all_detached_no_main() {
     // Detach HEAD
     repo.set_head_detached(commit_id).unwrap();
 
-    let bin_path = assert_cmd::cargo::cargo_bin("gits");
-
-    let mut child = std::process::Command::new(bin_path)
-        .arg("checkout")
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    cmd.arg("checkout")
         .arg("--all")
         .current_dir(dir.path())
         .env("TERM", "dumb")

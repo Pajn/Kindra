@@ -1,7 +1,9 @@
 mod commands;
+mod rebase_utils;
 mod stack;
 
 use crate::commands::checkout::checkout;
+use crate::commands::commit::commit;
 use crate::commands::move_cmd::{MoveArgs, move_cmd};
 use crate::commands::push::push;
 use crate::commands::split::split;
@@ -34,6 +36,12 @@ enum Commands {
     },
     /// Move current branch stack onto another branch
     Move(MoveArgs),
+    /// Commits and rebases dependent branches
+    Commit {
+        /// Arguments to pass to git commit
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Generate shell completions
     Completions {
         /// The shell to generate completions for
@@ -67,6 +75,7 @@ fn main() -> Result<()> {
     match &cli.command {
         Commands::Split => split()?,
         Commands::Push => push()?,
+        Commands::Commit { args } => commit(args)?,
         Commands::Checkout { subcommand, all } => checkout(subcommand, *all)?,
         Commands::Move(args) => move_cmd(args)?,
         Commands::Completions { shell } => {

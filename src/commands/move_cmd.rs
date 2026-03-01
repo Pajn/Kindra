@@ -1,12 +1,13 @@
 use crate::commands::find_upstream;
-use crate::stack::{StackBranch, get_all_stack_branches, visualize_stack};
+use crate::rebase_utils::{RebaseState, load_state, run_rebase_loop, save_state, state_path};
+use crate::stack::{
+    collect_descendants, find_parent_in_stack, get_all_stack_branches, visualize_stack,
+};
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Subcommand};
-use git2::{Oid, Repository};
-use serde::{Deserialize, Serialize};
+use git2::Repository;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
 
 #[derive(Args)]
@@ -31,22 +32,6 @@ pub enum MoveSubcommand {
     Status,
 }
 
-#[derive(Serialize, Deserialize)]
-struct MoveState {
-    original_branch: String,
-    target_branch: String,
-    /// List of branches remaining to be moved
-    remaining_branches: Vec<String>,
-    /// branch_name -> original_parent_id_str
-    parent_id_map: HashMap<String, String>,
-    /// branch_name -> original_parent_name (if it was a branch in the sub-stack)
-    parent_name_map: HashMap<String, String>,
-}
-
-fn state_path(repo: &Repository) -> PathBuf {
-    repo.path().join("gits_move_state.json")
-}
-
 pub fn move_cmd(args: &MoveArgs) -> Result<()> {
     let repo = Repository::open(".").context("Failed to open git repository.")?;
 
@@ -62,7 +47,7 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
     let path = state_path(repo);
     if path.exists() {
         return Err(anyhow!(
-            "A move operation is already in progress. Use 'gits move continue' or 'gits move abort'."
+            "A move or commit operation is already in progress. Use 'gits move continue' or 'gits move abort'."
         ));
     }
 
@@ -75,6 +60,14 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         None
     }
     .ok_or_else(|| anyhow!("You must be on a branch to use 'move'"))?;
+
+    let upstream_name = find_upstream(repo)?;
+    if current_branch_name == upstream_name {
+        return Err(anyhow!(
+            "Branch '{}' is the upstream branch. Cannot move the upstream branch itself.",
+            current_branch_name
+        ));
+    }
 
     // Determine target branch
     let selected_target_name = if let Some(target) = &args.onto {
@@ -89,6 +82,12 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
             }
         }
         branch_names.sort();
+
+        if branch_names.is_empty() {
+            println!("No local branches found.");
+            return Ok(());
+        }
+
         inquire::Select::new("Select target branch to move onto:", branch_names).prompt()?
     } else {
         // Only here we MUST have an upstream
@@ -146,15 +145,7 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         &mut sub_stack,
     )?;
 
-    sub_stack.sort_by(|a, b| {
-        if a.id == b.id {
-            std::cmp::Ordering::Equal
-        } else if repo.graph_descendant_of(a.id, b.id).unwrap_or(false) {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Less
-        }
-    });
+    crate::stack::sort_branches_topologically(repo, &mut sub_stack);
 
     let mut parent_id_map = HashMap::new();
     let mut parent_name_map = HashMap::new();
@@ -167,10 +158,13 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
             .find(|p| p.id == parent_id && p.name != sb.name)
         {
             parent_name_map.insert(sb.name.clone(), parent_branch.name.clone());
+        } else if sb.name == current_branch_name {
+            // The root of our move rebases onto the selected target
+            parent_name_map.insert(sb.name.clone(), selected_target_name.clone());
         }
     }
 
-    let state = MoveState {
+    let state = RebaseState {
         original_branch: current_branch_name,
         target_branch: selected_target_name.clone(),
         remaining_branches: sub_stack
@@ -178,12 +172,13 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
             .map(|sb| sb.name)
             .filter(|name| name != &selected_target_name)
             .collect(),
+        in_progress_branch: None,
         parent_id_map,
         parent_name_map,
     };
 
     save_state(repo, &state)?;
-    run_move_loop(repo, state)
+    run_rebase_loop(repo, state)
 }
 
 fn continue_move(repo: &Repository) -> Result<()> {
@@ -195,7 +190,7 @@ fn continue_move(repo: &Repository) -> Result<()> {
         ));
     }
 
-    run_move_loop(repo, state)
+    run_rebase_loop(repo, state)
 }
 
 fn abort_move(repo: &Repository) -> Result<()> {
@@ -230,149 +225,4 @@ fn show_status(repo: &Repository) -> Result<()> {
         state.remaining_branches.join(", ")
     );
     Ok(())
-}
-
-fn run_move_loop(repo: &Repository, mut state: MoveState) -> Result<()> {
-    while !state.remaining_branches.is_empty() {
-        let current_name = state.remaining_branches[0].clone();
-        let old_parent_id_str = state
-            .parent_id_map
-            .get(&current_name)
-            .ok_or_else(|| anyhow!("Parent ID not found for branch '{}'", current_name))?;
-
-        let new_base = if current_name == state.original_branch {
-            state.target_branch.clone()
-        } else {
-            match state.parent_name_map.get(&current_name) {
-                Some(name) => name.clone(),
-                None => old_parent_id_str.clone(),
-            }
-        };
-
-        println!("Rebasing {} onto {}...", current_name, new_base);
-        // Use --no-ff to ensure we always create new commits and maintain the hierarchy properly
-        // especially when reordering within the same stack.
-        let status = Command::new("git")
-            .arg("rebase")
-            .arg("--no-ff")
-            .arg("--onto")
-            .arg(&new_base)
-            .arg(old_parent_id_str)
-            .arg(&current_name)
-            .status()?;
-
-        if status.success() {
-            state.remaining_branches.remove(0);
-            save_state(repo, &state)?;
-        } else {
-            // Check if a rebase is in progress (meaning it started but hit conflicts)
-            if repo.path().join("rebase-merge").exists()
-                || repo.path().join("rebase-apply").exists()
-            {
-                state.remaining_branches.remove(0);
-                save_state(repo, &state)?;
-                return Err(anyhow!(
-                    "Rebase failed for branch {}. Resolve conflicts and run 'git rebase --continue', then 'gits move continue'.",
-                    current_name
-                ));
-            } else {
-                return Err(anyhow!(
-                    "Rebase failed for branch {}. It seems to have failed before starting (e.g., dirty working tree). Fix the issue and run 'gits move continue'.",
-                    current_name
-                ));
-            }
-        }
-    }
-
-    println!(
-        "Move completed. Checking out original branch {}...",
-        state.original_branch
-    );
-    let status = Command::new("git")
-        .arg("checkout")
-        .arg(&state.original_branch)
-        .status()?;
-
-    if status.success() {
-        fs::remove_file(state_path(repo))?;
-    } else {
-        return Err(anyhow!(
-            "Failed to checkout back to original branch '{}'. State file preserved.",
-            state.original_branch
-        ));
-    }
-
-    Ok(())
-}
-
-fn save_state(repo: &Repository, state: &MoveState) -> Result<()> {
-    let json = serde_json::to_string_pretty(state)?;
-    fs::write(state_path(repo), json)?;
-    Ok(())
-}
-
-fn load_state(repo: &Repository) -> Result<MoveState> {
-    let path = state_path(repo);
-    if !path.exists() {
-        return Err(anyhow!("No move operation in progress."));
-    }
-    let json = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&json)?)
-}
-
-fn collect_descendants(
-    repo: &Repository,
-    root_name: &str,
-    all_branches: &[StackBranch],
-    result: &mut Vec<StackBranch>,
-) -> Result<()> {
-    let root = all_branches
-        .iter()
-        .find(|b| b.name == root_name)
-        .ok_or_else(|| {
-            anyhow!(
-                "Branch '{}' not found in stack. Cannot move the upstream branch itself.",
-                root_name
-            )
-        })?;
-    result.push(root.clone());
-
-    for b in all_branches {
-        if b.name != root_name
-            && repo.graph_descendant_of(b.id, root.id).unwrap_or(false)
-            && !result.iter().any(|existing| existing.name == b.name)
-        {
-            result.push(b.clone());
-        }
-    }
-    Ok(())
-}
-
-fn find_parent_in_stack(
-    repo: &Repository,
-    branch_name: &str,
-    all_branches: &[StackBranch],
-    merge_base: Oid,
-) -> Result<Oid> {
-    let branch = all_branches
-        .iter()
-        .find(|b| b.name == branch_name)
-        .ok_or_else(|| anyhow!("Branch '{}' not found in stack.", branch_name))?;
-
-    let mut best_parent = merge_base;
-    for b in all_branches {
-        if b.name != branch_name
-            && (repo.graph_descendant_of(branch.id, b.id).unwrap_or(false) || branch.id == b.id)
-        {
-            if b.id == branch.id {
-                continue;
-            }
-            if best_parent == merge_base
-                || repo.graph_descendant_of(b.id, best_parent).unwrap_or(false)
-            {
-                best_parent = b.id;
-            }
-        }
-    }
-    Ok(best_parent)
 }
