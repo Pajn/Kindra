@@ -1,7 +1,7 @@
 use crate::commands::find_upstream;
 use crate::rebase_utils::{RebaseState, load_state, run_rebase_loop, save_state, state_path};
 use crate::stack::{
-    collect_descendants, find_parent_in_stack, get_all_stack_branches, visualize_stack,
+    collect_descendants, find_parent_in_stack, get_stack_branches_from_merge_base, visualize_stack,
 };
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Subcommand};
@@ -88,14 +88,15 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
             return Ok(());
         }
 
-        inquire::Select::new("Select target branch to move onto:", branch_names).prompt()?
+        crate::commands::prompt_select("Select target branch to move onto:", branch_names)?
     } else {
         // Only here we MUST have an upstream
         let upstream_name = find_upstream(repo)?;
         let upstream_obj = repo.revparse_single(&upstream_name)?;
         let upstream_id = upstream_obj.id();
         let merge_base = repo.merge_base(upstream_id, head_id)?;
-        let all_branches_in_stack = get_all_stack_branches(repo, merge_base, &upstream_name)?;
+        let all_branches_in_stack =
+            get_stack_branches_from_merge_base(repo, merge_base, &upstream_name)?;
 
         let visualized = visualize_stack(
             repo,
@@ -111,7 +112,7 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
 
         let options: Vec<String> = visualized.iter().map(|v| v.display_name.clone()).collect();
         let selected_display =
-            inquire::Select::new("Select target branch to move onto:", options).prompt()?;
+            crate::commands::prompt_select("Select target branch to move onto:", options)?;
 
         visualized
             .iter()
@@ -135,7 +136,8 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
     let upstream_obj = repo.revparse_single(&upstream_name)?;
     let upstream_id = upstream_obj.id();
     let merge_base = repo.merge_base(upstream_id, head_id)?;
-    let all_branches_in_stack = get_all_stack_branches(repo, merge_base, &upstream_name)?;
+    let all_branches_in_stack =
+        get_stack_branches_from_merge_base(repo, merge_base, &upstream_name)?;
 
     let mut sub_stack = Vec::new();
     collect_descendants(

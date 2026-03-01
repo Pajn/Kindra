@@ -69,7 +69,16 @@ pub enum CheckoutSubcommand {
     Top,
 }
 
+struct TerminalRestorer;
+
+impl Drop for TerminalRestorer {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
 fn main() -> Result<()> {
+    let _restorer = TerminalRestorer;
     let cli = Cli::parse();
 
     match &cli.command {

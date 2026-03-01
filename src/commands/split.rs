@@ -1,5 +1,5 @@
 use crate::commands::{CommitInfo, find_upstream};
-use crate::stack::{get_stack_branches, get_stack_tips};
+use crate::stack::get_stack_tips;
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Repository};
 use std::collections::{HashMap, HashSet};
@@ -21,7 +21,8 @@ pub fn split() -> Result<()> {
 
     let merge_base = repo.merge_base(upstream_id, head_id)?;
 
-    let stack_branches = get_stack_branches(&repo, head_id, upstream_id, &upstream_name)?;
+    let stack_branches =
+        crate::stack::get_stack_branches_from_merge_base(&repo, merge_base, &upstream_name)?;
     let tips = get_stack_tips(&repo, &stack_branches)?;
 
     // If there are multiple tips, the user must choose one.
@@ -30,11 +31,10 @@ pub fn split() -> Result<()> {
         0 => ("HEAD".to_string(), head_id),
         1 => (tips[0].clone(), repo.revparse_single(&tips[0])?.id()),
         _ => {
-            let selected = inquire::Select::new(
+            let selected = crate::commands::prompt_select(
                 "Multiple stack tips found. Which path are you splitting?",
                 tips,
-            )
-            .prompt()?;
+            )?;
             let id = repo.revparse_single(&selected)?.id();
             (selected, id)
         }

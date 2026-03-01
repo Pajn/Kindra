@@ -107,7 +107,7 @@ fn test_commit_rebases_descendants() {
         .arg("add")
         .arg("a2.txt")
         .current_dir(dir.path())
-        .status()
+        .output()
         .unwrap();
 
     // Run gits commit
@@ -201,7 +201,7 @@ fn test_commit_amend_rebases_descendants() {
         .arg("add")
         .arg("a.txt")
         .current_dir(dir.path())
-        .status()
+        .output()
         .unwrap();
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
@@ -364,7 +364,7 @@ fn test_commit_forked_stack() {
         .arg("add")
         .arg("a2.txt")
         .current_dir(dir.path())
-        .status()
+        .output()
         .unwrap();
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
@@ -423,7 +423,7 @@ fn test_commit_on_main() {
         .arg("add")
         .arg("main2.txt")
         .current_dir(dir.path())
-        .status()
+        .output()
         .unwrap();
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
@@ -501,7 +501,7 @@ fn test_commit_conflict_and_continue() {
         .arg("add")
         .arg("shared.txt")
         .current_dir(dir.path())
-        .status()
+        .output()
         .unwrap();
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
@@ -527,7 +527,7 @@ fn test_commit_conflict_and_continue() {
         .arg("add")
         .arg("shared.txt")
         .current_dir(dir.path())
-        .status()
+        .output()
         .unwrap();
 
     let mut git_rebase_cont = std::process::Command::new("git");
@@ -536,7 +536,7 @@ fn test_commit_conflict_and_continue() {
         .arg("--continue")
         .current_dir(dir.path())
         .env("GIT_EDITOR", "true")
-        .status()
+        .output()
         .unwrap();
 
     // Continue with gits
@@ -627,7 +627,7 @@ fn test_commit_abort() {
         .arg("add")
         .arg("shared.txt")
         .current_dir(dir.path())
-        .status()
+        .output()
         .unwrap();
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
@@ -681,7 +681,7 @@ fn test_commit_on_main_rebases_descendant() {
         .arg("add")
         .arg("main_new.txt")
         .current_dir(dir.path())
-        .status()
+        .output()
         .unwrap();
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
@@ -778,7 +778,7 @@ fn test_commit_on_main_rebases_multi_level_stack() {
         .arg("add")
         .arg("main_new_2.txt")
         .current_dir(dir.path())
-        .status()
+        .output()
         .unwrap();
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");

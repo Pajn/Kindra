@@ -51,7 +51,7 @@ pub fn get_stack_branches(
     Ok(stack_branches)
 }
 
-pub fn get_all_stack_branches(
+pub fn get_stack_branches_from_merge_base(
     repo: &Repository,
     merge_base: Oid,
     upstream_name: &str,
@@ -71,12 +71,12 @@ pub fn get_all_stack_branches(
         }
 
         if let Some(target_id) = branch.get().target() {
+            // A branch is part of the stack if it's a descendant of merge_base
+            // or if it IS the merge_base (but we usually want descendants).
             let is_descendant =
                 repo.graph_descendant_of(target_id, merge_base)? || target_id == merge_base;
-            let is_merged =
-                repo.graph_descendant_of(merge_base, target_id)? && target_id != merge_base;
 
-            if is_descendant && !is_merged {
+            if is_descendant {
                 stack_branches.push(StackBranch {
                     name,
                     id: target_id,

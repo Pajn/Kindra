@@ -889,18 +889,18 @@ fn test_move_conflict_and_continue_no_re_rebase() {
 
     // 2. Resolve conflict
     fs::write(dir.path().join("file.txt"), "resolved").unwrap();
-    std::process::Command::new("git")
+    let _ = std::process::Command::new("git")
         .arg("add")
         .arg("file.txt")
         .current_dir(dir.path())
-        .status()
+        .output()
         .unwrap();
-    std::process::Command::new("git")
+    let _ = std::process::Command::new("git")
         .arg("rebase")
         .arg("--continue")
         .current_dir(dir.path())
         .env("GIT_EDITOR", "true")
-        .status()
+        .output()
         .unwrap();
 
     // Record log size before gits move continue
@@ -1155,15 +1155,16 @@ fn test_move_abort_does_not_abort_manual_rebase() {
         .arg("-f")
         .arg("feature")
         .current_dir(dir.path())
-        .status()
+        .output()
         .unwrap();
 
     let status = std::process::Command::new("git")
         .arg("rebase")
         .arg("target")
         .current_dir(dir.path())
-        .status()
-        .unwrap();
+        .output()
+        .unwrap()
+        .status;
 
     assert!(
         !status.success(),
@@ -1202,14 +1203,14 @@ fn test_move_abort_cleans_up_rebase_when_state_exists() {
         .arg("-f")
         .arg("feature")
         .current_dir(dir.path())
-        .status()
+        .output()
         .unwrap();
 
     let _ = std::process::Command::new("git")
         .arg("rebase")
         .arg("target")
         .current_dir(dir.path())
-        .status()
+        .output()
         .unwrap();
 
     // Manually create a gits move state file

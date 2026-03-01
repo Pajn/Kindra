@@ -1,9 +1,6 @@
 use crate::CheckoutSubcommand;
 use crate::commands::find_upstream;
-use crate::stack::{
-    get_all_stack_branches, get_immediate_successors, get_stack_branches, get_stack_tips,
-    visualize_stack,
-};
+use crate::stack::{get_immediate_successors, get_stack_branches, get_stack_tips, visualize_stack};
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Repository};
 use std::process::Command;
@@ -28,7 +25,7 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
         }
 
         let selected_name =
-            inquire::Select::new("Select branch to checkout:", branch_names).prompt()?;
+            crate::commands::prompt_select("Select branch to checkout:", branch_names)?;
         return perform_git_checkout(&selected_name);
     }
 
@@ -46,16 +43,22 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
 
     match subcommand {
         Some(CheckoutSubcommand::Up) => {
-            let branches = get_stack_branches(&repo, head_id, upstream_id, &upstream_name)?;
+            let merge_base = repo.merge_base(upstream_id, head_id)?;
+            let branches = crate::stack::get_stack_branches_from_merge_base(
+                &repo,
+                merge_base,
+                &upstream_name,
+            )?;
             let successors = get_immediate_successors(&repo, head_id, &branches)?;
 
             match successors.len() {
                 0 => Err(anyhow!("Already at the top of the stack")),
                 1 => perform_git_checkout(&successors[0]),
                 _ => {
-                    let selected =
-                        inquire::Select::new("Multiple branches ahead. Select one:", successors)
-                            .prompt()?;
+                    let selected = crate::commands::prompt_select(
+                        "Multiple branches ahead. Select one:",
+                        successors,
+                    )?;
                     perform_git_checkout(&selected)
                 }
             }
@@ -85,22 +88,32 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
             }
         }
         Some(CheckoutSubcommand::Top) => {
-            let branches = get_stack_branches(&repo, head_id, upstream_id, &upstream_name)?;
+            let merge_base = repo.merge_base(upstream_id, head_id)?;
+            let branches = crate::stack::get_stack_branches_from_merge_base(
+                &repo,
+                merge_base,
+                &upstream_name,
+            )?;
             let tips = get_stack_tips(&repo, &branches)?;
             match tips.len() {
                 0 => Err(anyhow!("No branches in stack")),
                 1 => perform_git_checkout(&tips[0]),
                 _ => {
-                    let selected =
-                        inquire::Select::new("Multiple stack tips found. Select one:", tips)
-                            .prompt()?;
+                    let selected = crate::commands::prompt_select(
+                        "Multiple stack tips found. Select one:",
+                        tips,
+                    )?;
                     perform_git_checkout(&selected)
                 }
             }
         }
         None => {
             let merge_base = repo.merge_base(upstream_id, head_id)?;
-            let all_branches = get_all_stack_branches(&repo, merge_base, &upstream_name)?;
+            let all_branches = crate::stack::get_stack_branches_from_merge_base(
+                &repo,
+                merge_base,
+                &upstream_name,
+            )?;
 
             let visualized = visualize_stack(
                 &repo,
@@ -119,7 +132,7 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
 
             let options: Vec<String> = visualized.iter().map(|v| v.display_name.clone()).collect();
             let selected_display =
-                inquire::Select::new("Select branch to checkout:", options).prompt()?;
+                crate::commands::prompt_select("Select branch to checkout:", options)?;
 
             let selected_name = visualized
                 .iter()

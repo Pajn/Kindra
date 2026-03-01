@@ -1,8 +1,6 @@
 #![allow(deprecated)]
 use git2::{Repository, Signature};
 use std::fs;
-use std::io::{BufRead, BufReader};
-use std::process::Stdio;
 use tempfile::tempdir;
 
 fn setup_repo() -> (tempfile::TempDir, Repository) {
@@ -74,6 +72,8 @@ fn setup_repo() -> (tempfile::TempDir, Repository) {
             Some(git2::build::CheckoutBuilder::new().force()),
         )
         .unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
     }
 
     (dir, repo)
@@ -301,33 +301,41 @@ fn test_checkout_up_fork() {
     let c2_id = repo.revparse_single("HEAD~1").unwrap().id();
     let head_id = repo.head().unwrap().peel_to_commit().unwrap().id();
 
-    // Branch at c2 and HEAD
+    // Create two independent paths from c1
     {
+        let c1 = repo.find_commit(c1_id).unwrap();
         let c2 = repo.find_commit(c2_id).unwrap();
         let head = repo.find_commit(head_id).unwrap();
+
+        // fork-a is head (descendant of head_id)
         repo.branch("fork-a", &head, false).unwrap();
-        repo.branch("fork-b", &c2, false).unwrap();
+
+        // fork-b is a NEW commit from c1
+        let tree = c2.tree().unwrap();
+        let sig = repo.signature().unwrap();
+        let fork_b_id = repo
+            .commit(None, &sig, &sig, "fork-b commit", &tree, &[&c1])
+            .unwrap();
+        let fork_b = repo.find_commit(fork_b_id).unwrap();
+        repo.branch("fork-b", &fork_b, false).unwrap();
 
         // Current branch is 'base' at c1
-        let c1 = repo.find_commit(c1_id).unwrap();
         repo.branch("base", &c1, false).unwrap();
 
-        // Force checkout to c1 to be clean
-        repo.checkout_tree(
-            c1.as_object(),
-            Some(git2::build::CheckoutBuilder::new().force()),
-        )
-        .unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
     }
     repo.set_head("refs/heads/base").unwrap();
+    fs::remove_file(dir.path().join("file.txt")).unwrap();
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("checkout")
         .arg("up")
         .current_dir(dir.path())
-        .write_stdin("\n")
+        .env("TERM", "dumb")
         .assert()
-        .success();
+        .success()
+        .stdout(predicates::str::contains("auto-selecting first option"));
 
     let new_head = repo.head().unwrap().shorthand().unwrap().to_string();
     assert!(new_head == "fork-a" || new_head == "fork-b");
@@ -339,28 +347,38 @@ fn test_checkout_top_fork() {
 
     // Create two tips
     {
+        let c1_id = repo.revparse_single("HEAD~2").unwrap().id();
         let c2_id = repo.revparse_single("HEAD~1").unwrap().id();
         let head_id = repo.head().unwrap().peel_to_commit().unwrap().id();
+        let c1 = repo.find_commit(c1_id).unwrap();
         let c2 = repo.find_commit(c2_id).unwrap();
         let head = repo.find_commit(head_id).unwrap();
-        repo.branch("tip-a", &head, false).unwrap();
-        repo.branch("tip-b", &c2, false).unwrap();
 
-        // Ensure working directory is clean for checkout
-        repo.checkout_tree(
-            head.as_object(),
-            Some(git2::build::CheckoutBuilder::new().force()),
-        )
-        .unwrap();
+        // tip-a is head
+        repo.branch("tip-a", &head, false).unwrap();
+
+        // tip-b is a NEW commit from c1
+        let tree = c2.tree().unwrap();
+        let sig = repo.signature().unwrap();
+        let tip_b_id = repo
+            .commit(None, &sig, &sig, "tip-b commit", &tree, &[&c1])
+            .unwrap();
+        let tip_b = repo.find_commit(tip_b_id).unwrap();
+        repo.branch("tip-b", &tip_b, false).unwrap();
+
+        // Ensure working directory is clean
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
     }
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("checkout")
         .arg("top")
         .current_dir(dir.path())
-        .write_stdin("\n") // Select first option
+        .env("TERM", "dumb")
         .assert()
-        .success();
+        .success()
+        .stdout(predicates::str::contains("auto-selecting first option"));
 
     let new_head = repo.head().unwrap().shorthand().unwrap().to_string();
     assert!(new_head == "tip-a" || new_head == "tip-b");
@@ -372,12 +390,29 @@ fn test_split_fork_selection() {
 
     // Create two tips
     {
+        let c1_id = repo.revparse_single("HEAD~2").unwrap().id();
         let c2_id = repo.revparse_single("HEAD~1").unwrap().id();
         let head_id = repo.head().unwrap().peel_to_commit().unwrap().id();
-        let c2 = repo.find_commit(c2_id).unwrap();
         let head = repo.find_commit(head_id).unwrap();
+        let c2 = repo.find_commit(c2_id).unwrap();
+        let c1 = repo.find_commit(c1_id).unwrap();
+
+        // path-a is head
         repo.branch("path-a", &head, false).unwrap();
-        repo.branch("path-b", &c2, false).unwrap();
+
+        // path-b is a NEW commit from c1
+        let tree = c2.tree().unwrap();
+        let sig = repo.signature().unwrap();
+        let path_b_id = repo
+            .commit(None, &sig, &sig, "path-b commit", &tree, &[&c1])
+            .unwrap();
+        let path_b = repo.find_commit(path_b_id).unwrap();
+        repo.branch("path-b", &path_b, false).unwrap();
+
+        // Ensure we are at base (c1) to see both tips
+        repo.set_head_detached(c1.id()).unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
     }
 
     let editor_script = dir.path().join("editor.sh");
@@ -400,13 +435,13 @@ exit 0
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
-        .write_stdin("\n")
+        .env("TERM", "dumb")
         .assert()
-        .success();
+        .success()
+        .stdout(predicates::str::contains("auto-selecting first option"));
 }
 
 #[test]
-#[allow(clippy::zombie_processes)]
 fn test_checkout_all_works_without_main() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
@@ -428,57 +463,22 @@ fn test_checkout_all_works_without_main() {
     .unwrap();
 
     repo.set_head("refs/heads/trunk").unwrap();
+    fs::remove_file(dir.path().join("file.txt")).unwrap();
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("checkout")
         .arg("--all")
         .current_dir(dir.path())
         .env("TERM", "dumb")
-        .env("INQUIRE_SKIP_TTY_CHECK", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn gits");
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("auto-selecting first option"));
 
-    let stdout = child.stdout.take().expect("Failed to open stdout");
-    let stderr = child.stderr.take().expect("Failed to open stderr");
-
-    let (tx, rx) = std::sync::mpsc::channel();
-
-    let tx_stdout = tx.clone();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(line) = line
-                && line.contains("Select branch to checkout")
-            {
-                let _ = tx_stdout.send(true);
-                return;
-            }
-        }
-    });
-
-    let tx_stderr = tx;
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            if let Ok(line) = line
-                && line.contains("Select branch to checkout")
-            {
-                let _ = tx_stderr.send(true);
-                return;
-            }
-        }
-    });
-
-    let found_menu = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
-
-    let _ = child.kill();
-    assert!(found_menu, "Interactive menu did not appear");
+    let new_head = repo.head().unwrap().shorthand().unwrap().to_string();
+    assert_eq!(new_head, "trunk");
 }
 
 #[test]
-#[allow(clippy::zombie_processes)]
 fn test_checkout_all_detached_no_main() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
@@ -502,54 +502,17 @@ fn test_checkout_all_detached_no_main() {
 
     // Detach HEAD
     repo.set_head_detached(commit_id).unwrap();
+    fs::remove_file(dir.path().join("file.txt")).unwrap();
 
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.arg("checkout")
         .arg("--all")
         .current_dir(dir.path())
         .env("TERM", "dumb")
-        .env("INQUIRE_SKIP_TTY_CHECK", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn gits");
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("auto-selecting first option"));
 
-    let stdout = child.stdout.take().expect("Failed to open stdout");
-    let stderr = child.stderr.take().expect("Failed to open stderr");
-
-    let (tx, rx) = std::sync::mpsc::channel();
-
-    let tx_stdout = tx.clone();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(line) = line
-                && line.contains("Select branch to checkout")
-            {
-                let _ = tx_stdout.send(true);
-                return;
-            }
-        }
-    });
-
-    let tx_stderr = tx;
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            if let Ok(line) = line
-                && line.contains("Select branch to checkout")
-            {
-                let _ = tx_stderr.send(true);
-                return;
-            }
-        }
-    });
-
-    let found_menu = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
-
-    let _ = child.kill();
-    assert!(
-        found_menu,
-        "Interactive menu did not appear in detached HEAD state"
-    );
+    let new_head = repo.head().unwrap().shorthand().unwrap().to_string();
+    assert_eq!(new_head, "trunk");
 }

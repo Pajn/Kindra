@@ -31,7 +31,8 @@ pub fn commit(args: &[String]) -> Result<()> {
     let merge_base = repo.merge_base(upstream_id, head_id)?;
 
     // Capture stack state BEFORE commit
-    let all_branches_in_stack = get_all_stack_branches(&repo, merge_base, &upstream_name)?;
+    let all_branches_in_stack =
+        get_stack_branches_from_merge_base(&repo, merge_base, &upstream_name)?;
 
     // Run the actual git commit
     let is_non_interactive = args

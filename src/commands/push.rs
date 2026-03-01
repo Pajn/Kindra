@@ -2,7 +2,6 @@ use crate::commands::find_upstream;
 use crate::stack::get_stack_branches;
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Repository};
-use inquire::MultiSelect;
 use std::fmt;
 use std::process::Command;
 
@@ -62,11 +61,10 @@ pub fn push() -> Result<()> {
             return Ok(());
         }
 
-        let selected = MultiSelect::new(
+        let selected = crate::commands::prompt_multi_select(
             "Select branches to set upstream and push (Space to toggle, Enter to confirm):",
             options,
-        )
-        .prompt()?;
+        )?;
 
         if selected.is_empty() && branches_to_push.is_empty() {
             println!("No branches selected to push.");
