@@ -62,7 +62,6 @@ fn setup_repo() -> (tempfile::TempDir, Repository) {
 fn test_split_move_branch() {
     let (dir, repo) = setup_repo();
     
-    // Create an initial branch at the tip
     {
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         repo.branch("feature-x", &head, false).unwrap();
@@ -90,7 +89,6 @@ sed -i '/commit 2/a branch feature-x' "$file"
         .assert()
         .success();
 
-    // Verify branch moved
     let branch = repo.find_branch("feature-x", git2::BranchType::Local).unwrap();
     let target = branch.get().target().unwrap();
     let commit = repo.find_commit(target).unwrap();
@@ -125,7 +123,6 @@ sed -i '/commit 3/a branch another-feat' "$file"
     assert!(repo.find_branch("new-feat", git2::BranchType::Local).is_ok());
     assert!(repo.find_branch("another-feat", git2::BranchType::Local).is_ok());
 
-    // Now delete 'new-feat'
     fs::write(&editor_script, r#"#!/bin/sh
 file=$1
 sed -i '/branch new-feat/d' "$file"
@@ -200,4 +197,33 @@ sed -i '/branch current/d' "$file"
 
     assert!(repo.head_detached().unwrap());
     assert!(repo.find_branch("current", git2::BranchType::Local).is_err());
+}
+
+#[test]
+fn test_push_multiple_remotes_no_origin_error() {
+    let (dir, repo) = setup_repo();
+    
+    // Setup two remotes, neither is origin
+    repo.remote("remote1", "http://example.com/r1.git").unwrap();
+    repo.remote("remote2", "http://example.com/r2.git").unwrap();
+
+    let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.arg("push")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("'origin' remote not found and multiple remotes exist"));
+}
+
+#[test]
+fn test_push_no_remotes_error() {
+    let (dir, _repo) = setup_repo();
+    // No remotes by default from setup_repo (except if we added any)
+    
+    let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.arg("push")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("No remotes configured"));
 }
