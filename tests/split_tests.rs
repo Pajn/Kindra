@@ -102,6 +102,7 @@ perl -i -pe 's/(commit 2)/$1\nbranch feature-x/' "$file"
     }
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -140,6 +141,7 @@ perl -i -pe 's/(commit 3)/$1\nbranch another-feat/' "$file"
     }
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -166,6 +168,7 @@ perl -i -pe 's/.*branch new-feat.*\n?//g' "$file"
     .unwrap();
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -204,6 +207,7 @@ perl -i -pe 's/^[0-9a-f]{7}/deadbee/' "$file"
     }
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -240,6 +244,7 @@ perl -i -pe 's/.*branch current.*\n?//g' "$file"
     }
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -262,6 +267,7 @@ fn test_push_multiple_remotes_no_origin_error() {
     repo.remote("remote2", "http://example.com/r2.git").unwrap();
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     cmd.arg("push")
         .current_dir(dir.path())
         .assert()
@@ -277,6 +283,7 @@ fn test_push_no_remotes_error() {
     // No remotes by default from setup_repo (except if we added any)
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     cmd.arg("push")
         .current_dir(dir.path())
         .assert()
@@ -315,6 +322,9 @@ fn test_checkout_up_fork() {
     repo.set_head("refs/heads/base").unwrap();
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
+    // fork-a and fork-b are both descendants of c1.
+    // They should both be in successors.
     cmd.arg("checkout")
         .arg("up")
         .current_dir(dir.path())
@@ -348,6 +358,7 @@ fn test_checkout_top_fork() {
     }
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     cmd.arg("checkout")
         .arg("top")
         .current_dir(dir.path())
@@ -390,6 +401,7 @@ exit 0
     }
 
     let mut cmd = Command::cargo_bin("gits").unwrap();
+    cmd.env("TERM", "xterm");
     // Select first path
     cmd.arg("split")
         .current_dir(dir.path())
