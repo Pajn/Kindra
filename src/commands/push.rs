@@ -3,14 +3,12 @@ use crate::stack::get_stack_branches;
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Repository};
 use inquire::MultiSelect;
-use std::collections::HashMap;
 use std::fmt;
 use std::process::Command;
 
 pub fn push() -> Result<()> {
     let repo = Repository::open(".").context("Failed to open git repository.")?;
 
-    // Check remotes first to avoid hanging on interactive prompt if it will fail anyway
     let remote_name = resolve_remote(&repo)?;
 
     let upstream_name = find_upstream(&repo)?;
@@ -47,9 +45,8 @@ pub fn push() -> Result<()> {
     }
 
     if branches_without_upstream.is_empty() {
-        perform_push(&repo, branches_to_push)?;
+        perform_push(&repo, branches_to_push, &remote_name)?;
     } else {
-        // Show list and allow marking for upstream
         let mut all_branches = branches_to_push.clone();
         all_branches.extend(branches_without_upstream.clone());
         all_branches.sort_by(|a, b| a.name.cmp(&b.name));
@@ -61,7 +58,7 @@ pub fn push() -> Result<()> {
             .collect::<Vec<_>>();
 
         if options.is_empty() {
-            perform_push(&repo, branches_to_push)?;
+            perform_push(&repo, branches_to_push, &remote_name)?;
             return Ok(());
         }
 
@@ -76,19 +73,33 @@ pub fn push() -> Result<()> {
             return Ok(());
         }
 
-        // Set upstreams for selected branches
-        for mut branch_status in selected {
-            let mut branch = repo.find_branch(&branch_status.name, BranchType::Local)?;
-            let upstream_ref = format!("refs/remotes/{}/{}", remote_name, branch_status.name);
-            branch
-                .set_upstream(Some(&upstream_ref))
-                .context(format!("Failed to set upstream for {}", branch_status.name))?;
-
-            branch_status.upstream = Some(upstream_ref);
-            branches_to_push.push(branch_status);
+        let mut branches_with_upstream = Vec::new();
+        for branch_status in selected {
+            branches_with_upstream.push(branch_status.name.clone());
         }
 
-        perform_push(&repo, branches_to_push)?;
+        let mut branches_to_push_with_upstream = Vec::new();
+        for name in &branches_with_upstream {
+            branches_to_push_with_upstream.push(BranchStatus {
+                name: (*name).clone(),
+                upstream: Some(format!("{}/{}", remote_name, name)),
+            });
+        }
+
+        branches_to_push.extend(branches_to_push_with_upstream);
+
+        perform_push_with_upstream(&repo, &branches_with_upstream, &remote_name)?;
+
+        let pushed_names: Vec<&String> = branches_with_upstream.iter().collect();
+        let existing_upstream: Vec<BranchStatus> = branches_to_push
+            .iter()
+            .filter(|b| b.upstream.is_some() && !pushed_names.contains(&&b.name))
+            .cloned()
+            .collect();
+
+        if !existing_upstream.is_empty() {
+            perform_push(&repo, existing_upstream, &remote_name)?;
+        }
     }
 
     Ok(())
@@ -126,43 +137,73 @@ fn resolve_remote(repo: &Repository) -> Result<String> {
     }
 }
 
-fn perform_push(_repo: &Repository, branches: Vec<BranchStatus>) -> Result<()> {
+fn perform_push_with_upstream(_repo: &Repository, branches: &[String], remote: &str) -> Result<()> {
+    if branches.is_empty() {
+        return Ok(());
+    }
+
+    println!(
+        "Pushing {} branches with upstream to {}...",
+        branches.len(),
+        remote
+    );
+    let mut cmd = Command::new("git");
+    cmd.arg("push")
+        .arg("--atomic")
+        .arg("--force-with-lease")
+        .arg("-u")
+        .arg(remote);
+
+    for branch in branches {
+        cmd.arg(format!("{}:{}", branch, branch));
+    }
+
+    let status = cmd.status()?;
+    if !status.success() {
+        return Err(anyhow!("Push failed for remote '{}'", remote));
+    }
+
+    Ok(())
+}
+
+fn perform_push(_repo: &Repository, branches: Vec<BranchStatus>, remote: &str) -> Result<()> {
     if branches.is_empty() {
         println!("Nothing to push.");
         return Ok(());
     }
 
-    // Identify which remotes we are pushing to.
-    // Atomic push only works for a single remote at a time.
-    let mut remote_to_refs: HashMap<String, Vec<String>> = HashMap::new();
-    for b in branches {
-        if let Some(upstream) = b.upstream {
+    let refs: Vec<String> = branches
+        .into_iter()
+        .filter_map(|b| b.upstream)
+        .filter_map(|upstream| {
             let parts: Vec<&str> = upstream.splitn(2, '/').collect();
             if parts.len() == 2 {
-                remote_to_refs
-                    .entry(parts[0].to_string())
-                    .or_default()
-                    .push(b.name);
+                Some(parts[1].to_string())
+            } else {
+                None
             }
-        }
+        })
+        .collect();
+
+    if refs.is_empty() {
+        println!("No branches with upstream to push.");
+        return Ok(());
     }
 
-    for (remote, refs) in remote_to_refs {
-        println!("Pushing {} branches to {}...", refs.len(), remote);
-        let mut cmd = Command::new("git");
-        cmd.arg("push")
-            .arg("--atomic")
-            .arg("--force-with-lease")
-            .arg(&remote);
+    println!("Pushing {} branches to {}...", refs.len(), remote);
+    let mut cmd = Command::new("git");
+    cmd.arg("push")
+        .arg("--atomic")
+        .arg("--force-with-lease")
+        .arg(remote);
 
-        for r in refs {
-            cmd.arg(format!("{}:{}", r, r));
-        }
+    for r in &refs {
+        cmd.arg(format!("{}:{}", r, r));
+    }
 
-        let status = cmd.status()?;
-        if !status.success() {
-            return Err(anyhow!("Push failed for remote '{}'", remote));
-        }
+    let status = cmd.status()?;
+    if !status.success() {
+        return Err(anyhow!("Push failed for remote '{}'", remote));
     }
 
     Ok(())
