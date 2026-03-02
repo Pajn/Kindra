@@ -2,12 +2,10 @@ use crate::gh::{self, CreatePrParams};
 use crate::stack::{
     StackBranch, compute_base_map, get_stack_branches, sort_branches_topologically,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use git2::{BranchType, Repository};
-use std::env;
 use std::fs;
 use std::io::Write;
-use std::process::Command;
 use tempfile::NamedTempFile;
 
 pub fn pr() -> Result<()> {
@@ -58,13 +56,13 @@ pub fn pr() -> Result<()> {
     );
 
     for (sb, _remote_upstream) in &branches_with_upstream {
-        let base = base_map
+        let git_base = base_map
             .get(&sb.name)
             .cloned()
             .unwrap_or_else(|| upstream_name.clone());
-        let base = normalize_base_for_gh(&base);
+        let gh_base = normalize_base_for_gh(&git_base);
 
-        process_branch_pr(&repo, &sb.name, &base)?;
+        process_branch_pr(&repo, &sb.name, &git_base, &gh_base)?;
         println!();
     }
 
@@ -82,24 +80,29 @@ fn normalize_base_for_gh(base: &str) -> String {
         .to_string()
 }
 
-fn process_branch_pr(repo: &Repository, branch_name: &str, base: &str) -> Result<()> {
+fn process_branch_pr(
+    repo: &Repository,
+    branch_name: &str,
+    git_base: &str,
+    gh_base: &str,
+) -> Result<()> {
     println!("── {} ──", branch_name);
 
     // Check for an existing open PR
     match gh::find_open_pr(branch_name)? {
         Some(existing) => {
             println!("  Open PR #{} found.", existing.number);
-            if existing.base_branch != base {
-                println!("  Updating base: {} → {}", existing.base_branch, base);
-                gh::update_pr_base(existing.number, base)?;
+            if existing.base_branch != gh_base {
+                println!("  Updating base: {} → {}", existing.base_branch, gh_base);
+                gh::update_pr_base(existing.number, gh_base)?;
                 println!("  ✓ Base updated.");
             } else {
-                println!("  Base is already '{}'. Nothing to update.", base);
+                println!("  Base is already '{}'. Nothing to update.", gh_base);
             }
         }
         None => {
             // New PR: run the interactive wizard
-            create_pr_interactive(repo, branch_name, base)?;
+            create_pr_interactive(repo, branch_name, git_base, gh_base)?;
         }
     }
 
@@ -110,13 +113,18 @@ fn process_branch_pr(repo: &Repository, branch_name: &str, base: &str) -> Result
 // Interactive PR creation wizard
 // ────────────────────────────────────────────────────────────────────────────
 
-fn create_pr_interactive(repo: &Repository, branch_name: &str, base: &str) -> Result<()> {
-    let commits = get_branch_commits(repo, branch_name, base)?;
+fn create_pr_interactive(
+    repo: &Repository,
+    branch_name: &str,
+    git_base: &str,
+    gh_base: &str,
+) -> Result<()> {
+    let commits = get_branch_commits(repo, branch_name, git_base)?;
 
     if commits.is_empty() {
         println!(
             "No commits on this branch compared to '{}'. Skipping.",
-            base
+            git_base
         );
         return Ok(());
     }
@@ -138,7 +146,7 @@ fn create_pr_interactive(repo: &Repository, branch_name: &str, base: &str) -> Re
     let url = gh::create_pr(&CreatePrParams {
         title,
         body,
-        base: base.to_string(),
+        base: gh_base.to_string(),
         head: branch_name.to_string(),
         draft: submission.draft,
         labels: submission.labels,
@@ -266,20 +274,11 @@ fn prompt_body(branch_name: &str, commits: &[CommitSummary]) -> Result<String> {
 }
 
 fn open_editor_for_body(prefill: &str) -> Result<String> {
-    let editor = env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-
     let mut temp = NamedTempFile::new()?;
     temp.write_all(prefill.as_bytes())?;
     let path = temp.path().to_path_buf();
 
-    let status = Command::new(&editor)
-        .arg(&path)
-        .status()
-        .with_context(|| format!("Failed to launch editor '{}'", editor))?;
-
-    if !status.success() {
-        return Err(anyhow!("Editor exited with non-zero status"));
-    }
+    crate::editor::launch_editor(&path)?;
 
     let body = fs::read_to_string(&path)?;
 

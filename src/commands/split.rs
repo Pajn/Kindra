@@ -3,10 +3,8 @@ use crate::stack::get_stack_tips;
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Repository};
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::fs;
 use std::io::Write;
-use std::process::Command;
 use tempfile::NamedTempFile;
 
 pub fn split() -> Result<()> {
@@ -110,15 +108,7 @@ pub fn split() -> Result<()> {
     temp_file.write_all(buffer.as_bytes())?;
     let temp_path = temp_file.path().to_path_buf();
 
-    let editor = env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-    let status = Command::new(&editor)
-        .arg(&temp_path)
-        .status()
-        .context(format!("Failed to launch editor: {}", editor))?;
-
-    if !status.success() {
-        return Err(anyhow!("Editor exited with non-zero status"));
-    }
+    crate::editor::launch_editor(&temp_path)?;
 
     let edited_buffer = fs::read_to_string(&temp_path)?;
 

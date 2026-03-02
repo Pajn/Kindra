@@ -1,4 +1,5 @@
 mod commands;
+mod editor;
 mod gh;
 mod rebase_utils;
 mod stack;

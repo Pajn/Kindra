@@ -562,3 +562,116 @@ exit 1
         feature_b_section
     );
 }
+
+#[test]
+fn slash_base_branch_uses_git_base_for_local_history() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let main_id = make_commit(&repo, "refs/heads/main", "main.txt", "main", "initial", &[]);
+    let base_id = {
+        let main = repo.find_commit(main_id).unwrap();
+        make_commit(
+            &repo,
+            "refs/heads/feature/base",
+            "base.txt",
+            "base",
+            "feat: base",
+            &[&main],
+        )
+    };
+    {
+        let base = repo.find_commit(base_id).unwrap();
+        make_commit(
+            &repo,
+            "refs/heads/feature/child",
+            "child.txt",
+            "child",
+            "feat: child",
+            &[&base],
+        );
+    }
+
+    repo.set_head("refs/heads/feature/child").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &[
+            "push",
+            "-u",
+            "origin",
+            "main",
+            "feature/base",
+            "feature/child",
+        ],
+        dir.path(),
+    );
+    assert!(
+        repo.find_branch("base", git2::BranchType::Local).is_err(),
+        "test setup should not have a local 'base' branch"
+    );
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo "no pull requests found for branch" >&2
+    exit 1
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
+    echo "https://github.com/test/repo/pull/1"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = Command::cargo_bin("gits")
+        .unwrap()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "gits pr failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
+    let child_section = combined.split("── feature/child ──").nth(1).unwrap_or("");
+
+    assert!(
+        child_section.contains("feat: child"),
+        "child branch should use its own commits. Got:\n{}",
+        child_section
+    );
+    assert!(
+        !child_section.contains("feat: base"),
+        "child branch should not include base branch commit. Got:\n{}",
+        child_section
+    );
+}
