@@ -1,6 +1,16 @@
+use assert_cmd::Command;
 use git2::{Repository, Signature};
 use std::fs;
 use tempfile::tempdir;
+
+fn gits_cmd() -> Command {
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    cmd.env("GIT_AUTHOR_NAME", "Test User")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test User")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com");
+    cmd
+}
 
 fn setup_repo() -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
@@ -116,7 +126,7 @@ fn test_commit_rebases_descendants() {
     );
 
     // Run gits commit
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("new a")
@@ -213,7 +223,7 @@ fn test_commit_amend_rebases_descendants() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("commit")
         .arg("--amend")
         .arg("--no-edit")
@@ -278,7 +288,7 @@ fn test_commit_no_changes() {
         .unwrap();
 
     // Run gits commit without staging anything
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("nothing")
@@ -381,7 +391,7 @@ fn test_commit_forked_stack() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("new a")
@@ -444,7 +454,7 @@ fn test_commit_on_main() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("on main")
@@ -526,7 +536,7 @@ fn test_commit_conflict_and_continue() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("conflicting a")
@@ -557,11 +567,13 @@ fn test_commit_conflict_and_continue() {
     );
 
     // Continue with gits (which will run git rebase --continue for us)
-    let mut cmd_cont = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd_cont = gits_cmd();
     cmd_cont
         .arg("continue")
         .current_dir(dir.path())
         .env("GIT_EDITOR", "true")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
         .assert()
         .success();
 
@@ -651,7 +663,7 @@ fn test_commit_abort() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("conflict")
@@ -666,7 +678,7 @@ fn test_commit_abort() {
     assert!(dir.path().join(".git/gits_rebase_state.json").exists());
 
     // Abort
-    let mut cmd_abort = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd_abort = gits_cmd();
     cmd_abort
         .arg("abort")
         .current_dir(dir.path())
@@ -685,7 +697,7 @@ fn test_commit_reentry_guard() {
     fs::write(&state_path, "{}").unwrap();
 
     // Attempt to run gits commit
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("test")
@@ -736,7 +748,7 @@ fn test_commit_on_main_rebases_descendant() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("new main commit")
@@ -837,7 +849,7 @@ fn test_commit_on_main_rebases_multi_level_stack() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("new main commit 2")
@@ -878,7 +890,7 @@ fn test_commit_failure_is_propagated() {
     let (dir, _repo) = setup_repo();
 
     // Run gits commit with nothing staged - it should fail and show why
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("no changes")

@@ -1,7 +1,17 @@
 #![allow(deprecated)]
+use assert_cmd::Command;
 use git2::{Repository, Signature};
 use std::fs;
 use tempfile::tempdir;
+
+fn gits_cmd() -> Command {
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    cmd.env("GIT_AUTHOR_NAME", "Test User")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test User")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com");
+    cmd
+}
 
 fn setup_repo() -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
@@ -108,7 +118,7 @@ perl -i -pe 's/(commit 2)/$1\nbranch feature-x/' "$file"
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -146,7 +156,7 @@ perl -i -pe 's/(commit 3)/$1\nbranch another-feat/' "$file"
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -172,7 +182,7 @@ perl -i -pe 's/.*branch new-feat.*\n?//g' "$file"
     )
     .unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -210,7 +220,7 @@ perl -i -pe 's/^[0-9a-f]{7}/deadbee/' "$file"
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -246,7 +256,7 @@ perl -i -pe 's/.*branch current.*\n?//g' "$file"
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -268,7 +278,7 @@ fn test_push_multiple_remotes_no_origin_error() {
     repo.remote("remote1", "http://example.com/r1.git").unwrap();
     repo.remote("remote2", "http://example.com/r2.git").unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("push")
         .current_dir(dir.path())
         .assert()
@@ -283,7 +293,7 @@ fn test_push_no_remotes_error() {
     let (dir, _repo) = setup_repo();
     // No remotes by default from setup_repo (except if we added any)
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("push")
         .current_dir(dir.path())
         .assert()
@@ -328,7 +338,7 @@ fn test_checkout_up_fork() {
     repo.set_head("refs/heads/base").unwrap();
     fs::remove_file(dir.path().join("file.txt")).unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("checkout")
         .arg("up")
         .current_dir(dir.path())
@@ -371,7 +381,7 @@ fn test_checkout_top_fork() {
             .unwrap();
     }
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("checkout")
         .arg("top")
         .current_dir(dir.path())
@@ -431,7 +441,7 @@ exit 0
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -465,7 +475,7 @@ fn test_checkout_all_works_without_main() {
     repo.set_head("refs/heads/trunk").unwrap();
     fs::remove_file(dir.path().join("file.txt")).unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("checkout")
         .arg("--all")
         .current_dir(dir.path())
@@ -504,7 +514,7 @@ fn test_checkout_all_detached_no_main() {
     repo.set_head_detached(commit_id).unwrap();
     fs::remove_file(dir.path().join("file.txt")).unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("checkout")
         .arg("--all")
         .current_dir(dir.path())

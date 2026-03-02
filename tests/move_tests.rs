@@ -4,6 +4,15 @@ use git2::{Repository, Signature};
 use std::fs;
 use tempfile::tempdir;
 
+fn gits_cmd() -> Command {
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    cmd.env("GIT_AUTHOR_NAME", "Test User")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test User")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com");
+    cmd
+}
+
 fn setup_repo() -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
@@ -98,7 +107,7 @@ fn test_move_stack() {
     )
     .unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.env("TERM", "xterm");
     cmd.arg("move")
         .arg("--onto")
@@ -177,7 +186,7 @@ exec {} "$@"
         fs::set_permissions(&git_mock, perms).unwrap();
     }
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.env("TERM", "xterm");
 
     let old_path = std::env::var_os("PATH").unwrap_or_default();
@@ -214,7 +223,7 @@ fn test_move_upstream_error() {
         .assert()
         .success();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("some-branch")
@@ -288,7 +297,7 @@ fn test_move_conflict_and_continue() {
     )
     .unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -310,7 +319,7 @@ fn test_move_conflict_and_continue() {
         .assert()
         .success();
 
-    let mut cmd_cont = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd_cont = gits_cmd();
     cmd_cont
         .arg("continue")
         .current_dir(dir.path())
@@ -345,7 +354,7 @@ fn test_move_abort() {
     )
     .unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -353,7 +362,7 @@ fn test_move_abort() {
         .assert()
         .success();
 
-    let mut cmd_abort = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd_abort = gits_cmd();
     cmd_abort
         .arg("abort")
         .current_dir(dir.path())
@@ -376,7 +385,7 @@ fn test_move_all_onto_main() {
     )
     .unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("move")
         .arg("--all")
         .arg("--onto")
@@ -414,7 +423,7 @@ fn test_move_all_from_main_error() {
         .assert()
         .success();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("move")
         .arg("--all")
         .arg("--onto")
@@ -497,7 +506,7 @@ fn test_move_all_between_stacks() {
     )
     .unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("move")
         .arg("--all")
         .arg("--onto")
@@ -588,7 +597,7 @@ fn test_move_onto_descendant() {
     )
     .unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("feature-b")
@@ -672,7 +681,7 @@ fn test_move_abort_cleans_up_git_rebase() {
     .unwrap();
 
     // 4. Start move and hit conflict
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -691,7 +700,7 @@ fn test_move_abort_cleans_up_git_rebase() {
     );
 
     // 5. Abort move
-    let mut cmd_abort = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd_abort = gits_cmd();
     cmd_abort
         .arg("abort")
         .current_dir(dir.path())
@@ -746,7 +755,7 @@ exec {} "$@"
     new_path.push(old_path);
 
     // 4. Run gits move abort - it should fail because rebase --abort failed
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("abort")
         .current_dir(dir.path())
         .env("PATH", &new_path)
@@ -850,7 +859,7 @@ fn test_move_conflict_and_continue_no_re_rebase() {
     new_path.push(old_path);
 
     // 1. Start move -> should fail with conflict
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -878,7 +887,7 @@ fn test_move_conflict_and_continue_no_re_rebase() {
     );
 
     // 3. Continue move
-    let mut cmd_cont = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd_cont = gits_cmd();
     cmd_cont
         .arg("continue")
         .current_dir(dir.path())
@@ -908,7 +917,7 @@ fn test_move_invalid_onto() {
     repo.branch("feature", &head, false).unwrap();
     repo.set_head("refs/heads/feature").unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("non-existent-branch")
@@ -977,7 +986,7 @@ exec {} "$@"
     // Create the failure trigger file
     fs::write(dir.path().join("fail_rebase"), "").unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -1005,7 +1014,7 @@ exec {} "$@"
     fs::remove_file(dir.path().join("fail_rebase")).unwrap();
 
     // Continue move
-    let mut cmd_cont = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd_cont = gits_cmd();
     cmd_cont
         .arg("continue")
         .current_dir(dir.path())
@@ -1033,7 +1042,7 @@ fn setup_abort_repo() -> (tempfile::TempDir, Repository) {
     let signature = Signature::now("Test User", "test@example.com").unwrap();
 
     // Initial commit
-    {
+    let main_commit_id = {
         let mut index = repo.index().unwrap();
         fs::write(dir.path().join("file.txt"), "initial").unwrap();
         index.add_path(std::path::Path::new("file.txt")).unwrap();
@@ -1047,8 +1056,11 @@ fn setup_abort_repo() -> (tempfile::TempDir, Repository) {
             &tree,
             &[],
         )
-        .unwrap();
-    }
+        .unwrap()
+    };
+
+    // Set HEAD to detached state so we can use repo.head() reliably
+    repo.set_head_detached(main_commit_id).unwrap();
 
     // Branch 'feature'
     {
@@ -1145,7 +1157,7 @@ fn test_move_abort_does_not_abort_manual_rebase() {
     );
 
     // Run gits move abort
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("abort").current_dir(dir.path()).assert().success();
 
     // Verify rebase is STILL in progress
@@ -1191,7 +1203,7 @@ fn test_move_abort_cleans_up_rebase_when_state_exists() {
     fs::write(&state_path, "{}").unwrap();
 
     // Run gits move abort
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = gits_cmd();
     cmd.arg("abort").current_dir(dir.path()).assert().success();
 
     // Verify state file is gone
