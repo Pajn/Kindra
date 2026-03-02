@@ -1,72 +1,42 @@
-#![allow(deprecated)]
-use assert_cmd::Command;
+mod common;
+
+use common::{gits_cmd, make_commit};
 use git2::{Repository, Signature};
 use std::fs;
 use tempfile::tempdir;
 
-fn gits_cmd() -> Command {
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
-    cmd.env("GIT_AUTHOR_NAME", "Test User")
-        .env("GIT_AUTHOR_EMAIL", "test@example.com")
-        .env("GIT_COMMITTER_NAME", "Test User")
-        .env("GIT_COMMITTER_EMAIL", "test@example.com");
-    cmd
-}
-
 fn setup_repo() -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
+    repo.set_head("refs/heads/main").unwrap();
 
-    let mut parent_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("file.txt"), "initial").unwrap();
-        index.add_path(std::path::Path::new("file.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/main"),
-            &signature,
-            &signature,
-            "initial commit",
-            &tree,
-            &[],
-        )
-        .unwrap()
-    };
+    let parent_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "initial",
+        "initial commit",
+        &[],
+    );
 
     let first_commit_id = parent_id;
+    let mut current_parent_id = parent_id;
 
     // Create a stack of 3 commits
     for i in 1..=3 {
-        let tree_oid = {
-            let mut index = repo.index().unwrap();
-            fs::write(
-                dir.path().join(format!("file{}.txt", i)),
-                format!("content {}", i),
-            )
-            .unwrap();
-            index
-                .add_path(std::path::Path::new(&format!("file{}.txt", i)))
-                .unwrap();
-            index.write_tree().unwrap()
-        };
-        let tree = repo.find_tree(tree_oid).unwrap();
-        let parent = repo.find_commit(parent_id).unwrap();
-        parent_id = repo
-            .commit(
-                None,
-                &signature,
-                &signature,
-                &format!("commit {}", i),
-                &tree,
-                &[&parent],
-            )
-            .unwrap();
+        let parent = repo.find_commit(current_parent_id).unwrap();
+        current_parent_id = make_commit(
+            &repo,
+            "HEAD", // commit to HEAD (detached later)
+            &format!("file{}.txt", i),
+            &format!("content {}", i),
+            &format!("commit {}", i),
+            &[&parent],
+        );
     }
 
     // Detach HEAD before moving main
-    repo.set_head_detached(parent_id).unwrap();
+    repo.set_head_detached(current_parent_id).unwrap();
 
     {
         // Reset main to the first commit
@@ -76,12 +46,6 @@ fn setup_repo() -> (tempfile::TempDir, Repository) {
 
     {
         // Clean up working directory to avoid checkout conflicts
-        let head_commit = repo.find_commit(parent_id).unwrap();
-        repo.checkout_tree(
-            head_commit.as_object(),
-            Some(git2::build::CheckoutBuilder::new().force()),
-        )
-        .unwrap();
         repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
             .unwrap();
     }
@@ -348,7 +312,11 @@ fn test_checkout_up_fork() {
         .stdout(predicates::str::contains("auto-selecting first option"));
 
     let new_head = repo.head().unwrap().shorthand().unwrap().to_string();
-    assert!(new_head == "fork-a" || new_head == "fork-b");
+    assert!(
+        new_head == "fork-a" || new_head == "fork-b",
+        "Expected fork-a or fork-b, but got: {}",
+        new_head
+    );
 }
 
 #[test]
@@ -379,7 +347,12 @@ fn test_checkout_top_fork() {
         // Ensure working directory is clean
         repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
             .unwrap();
+
+        // Current branch is 'base' at c1
+        repo.branch("base", &c1, false).unwrap();
     }
+    repo.set_head("refs/heads/base").unwrap();
+    fs::remove_file(dir.path().join("file.txt")).unwrap();
 
     let mut cmd = gits_cmd();
     cmd.arg("checkout")
@@ -391,7 +364,11 @@ fn test_checkout_top_fork() {
         .stdout(predicates::str::contains("auto-selecting first option"));
 
     let new_head = repo.head().unwrap().shorthand().unwrap().to_string();
-    assert!(new_head == "tip-a" || new_head == "tip-b");
+    assert!(
+        new_head == "tip-a" || new_head == "tip-b",
+        "Expected tip-a or tip-b, but got: {}",
+        new_head
+    );
 }
 
 #[test]

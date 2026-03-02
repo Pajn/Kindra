@@ -2,7 +2,7 @@ mod commands;
 mod editor;
 mod gh;
 mod rebase_utils;
-mod stack;
+pub mod stack;
 
 use crate::commands::abort_cmd::abort_cmd;
 use crate::commands::checkout::checkout;
@@ -16,6 +16,7 @@ use crate::commands::status_cmd::status_cmd;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
+use commands::CheckoutSubcommand;
 
 #[derive(Parser)]
 #[command(name = "gits")]
@@ -71,16 +72,6 @@ enum ShellChoice {
     PowerShell,
     Elvish,
     Nu,
-}
-
-#[derive(Subcommand)]
-pub enum CheckoutSubcommand {
-    /// Checkout the branch above the current one
-    Up,
-    /// Checkout the branch below the current one
-    Down,
-    /// Checkout the top branch in the stack
-    Top,
 }
 
 struct TerminalRestorer;

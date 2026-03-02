@@ -1,5 +1,5 @@
-use crate::CheckoutSubcommand;
-use crate::commands::find_upstream;
+use super::CheckoutSubcommand;
+use super::find_upstream;
 use crate::stack::{get_immediate_successors, get_stack_branches, get_stack_tips, visualize_stack};
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Repository};
@@ -47,6 +47,8 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
             let branches = crate::stack::get_stack_branches_from_merge_base(
                 &repo,
                 merge_base,
+                head_id,
+                upstream_id,
                 &upstream_name,
             )?;
             let mut successors = get_immediate_successors(&repo, head_id, &branches)?;
@@ -85,6 +87,8 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
             let branches = crate::stack::get_stack_branches_from_merge_base(
                 &repo,
                 merge_base,
+                head_id,
+                upstream_id,
                 &upstream_name,
             )?;
             let mut tips = get_stack_tips(&repo, &branches)?;
@@ -106,6 +110,8 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
             let all_branches = crate::stack::get_stack_branches_from_merge_base(
                 &repo,
                 merge_base,
+                head_id,
+                upstream_id,
                 &upstream_name,
             )?;
 

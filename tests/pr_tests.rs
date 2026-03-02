@@ -1,59 +1,9 @@
-#![allow(deprecated)]
-//! Integration tests for `gits pr`.
-//!
-//! Because `gits pr` requires `gh` to be installed and authenticated (and a
-//! real GitHub remote), these tests focus on the portions that are
-//! exercisable without a live GitHub connection:
-//!
-//! 1. The command fails fast with a clear error when `gh` is absent or
-//!    unauthenticated.
-//! 2. The command exits cleanly with "No branches" when the stack has no
-//!    branches with upstreams.
-//! 3. Title pre-filling: single-commit branch yields commit subject as
-//!    the prefilled title (tested via the internal library function directly).
-//! 4. Base-branch detection: a stacked branch topology is correctly resolved.
-//! 5. PR template detection from `.github/pull_request_template.md`.
-//! 6. Stacked branch shows only commits above base (not upstream).
+mod common;
 
-use assert_cmd::Command;
-use git2::{Repository, Signature};
+use common::{gits_cmd, make_commit, run_ok};
+use git2::Repository;
 use std::fs;
 use tempfile::tempdir;
-
-fn make_commit(
-    repo: &Repository,
-    refname: &str,
-    filename: &str,
-    content: &str,
-    message: &str,
-    parents: &[&git2::Commit<'_>],
-) -> git2::Oid {
-    let sig = Signature::now("Test User", "test@example.com").unwrap();
-    let mut index = repo.index().unwrap();
-    fs::write(repo.workdir().unwrap().join(filename), content).unwrap();
-    index.add_path(std::path::Path::new(filename)).unwrap();
-    index.write().unwrap();
-    let tree_oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(tree_oid).unwrap();
-    repo.commit(Some(refname), &sig, &sig, message, &tree, parents)
-        .unwrap()
-}
-
-fn run_ok(program: &str, args: &[&str], cwd: &std::path::Path) {
-    let output = std::process::Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "Command failed: {} {:?}\nstdout:\n{}\nstderr:\n{}",
-        program,
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
 
 /// Create a minimal repo with `main` + a feature branch stacked on top.
 ///
@@ -152,7 +102,7 @@ fn pr_fails_without_gh() {
     //   b) exits with "No branches with a remote upstream" (gh auth passed
     //      but nothing to do)
     // The important thing is it does NOT panic.
-    let mut cmd = Command::cargo_bin("gits").unwrap();
+    let mut cmd = gits_cmd();
     cmd.arg("pr").current_dir(dir.path());
 
     // The command is allowed to succeed (exit 0) only with the "nothing to do"
@@ -172,8 +122,7 @@ fn pr_no_upstreams_message() {
     // check. We skip the assertion in that case.
     let (dir, _repo) = setup_simple_stack();
 
-    let output = Command::cargo_bin("gits")
-        .unwrap()
+    let output = gits_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .output()
@@ -241,8 +190,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    let output = Command::cargo_bin("gits")
-        .unwrap()
+    let output = gits_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .env(
@@ -318,7 +266,7 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
             break
         fi
         shift
-    done
+        done
     echo "https://github.com/test/repo/pull/1"
     exit 0
 fi
@@ -331,8 +279,7 @@ exit 1
 
     let captured_body_path = dir.path().join("captured_body.txt");
 
-    let output = Command::cargo_bin("gits")
-        .unwrap()
+    let output = gits_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .env(
@@ -435,8 +382,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    let output = Command::cargo_bin("gits")
-        .unwrap()
+    let output = gits_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .env(
@@ -526,8 +472,7 @@ exit 1
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
     // Run gits pr with the mock gh in PATH
-    let output = Command::cargo_bin("gits")
-        .unwrap()
+    let output = gits_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .env(
@@ -643,8 +588,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    let output = Command::cargo_bin("gits")
-        .unwrap()
+    let output = gits_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .env(

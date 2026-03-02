@@ -72,8 +72,13 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         let upstream_obj = repo.revparse_single(&upstream_name)?;
         let upstream_id = upstream_obj.id();
         let merge_base = repo.merge_base(upstream_id, head_id)?;
-        let all_branches_in_stack =
-            get_stack_branches_from_merge_base(repo, merge_base, &upstream_name)?;
+        let all_branches_in_stack = get_stack_branches_from_merge_base(
+            repo,
+            merge_base,
+            head_id,
+            upstream_id,
+            &upstream_name,
+        )?;
 
         let visualized = visualize_stack(repo, &all_branches_in_stack, Some(&current_branch_name))?;
 
@@ -109,7 +114,7 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
     let upstream_id = upstream_obj.id();
     let merge_base = repo.merge_base(upstream_id, head_id)?;
     let all_branches_in_stack =
-        get_stack_branches_from_merge_base(repo, merge_base, &upstream_name)?;
+        get_stack_branches_from_merge_base(repo, merge_base, head_id, upstream_id, &upstream_name)?;
 
     let mut sub_stack = Vec::new();
     collect_descendants(

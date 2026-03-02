@@ -19,8 +19,13 @@ pub fn split() -> Result<()> {
 
     let merge_base = repo.merge_base(upstream_id, head_id)?;
 
-    let stack_branches =
-        crate::stack::get_stack_branches_from_merge_base(&repo, merge_base, &upstream_name)?;
+    let stack_branches = crate::stack::get_stack_branches_from_merge_base(
+        &repo,
+        merge_base,
+        head_id,
+        upstream_id,
+        &upstream_name,
+    )?;
     let mut tips = get_stack_tips(&repo, &stack_branches)?;
     tips.sort();
 

@@ -1,57 +1,34 @@
-use assert_cmd::Command;
-use git2::{Repository, Signature};
+mod common;
+use common::{gits_cmd, make_commit};
+use git2::Repository;
 use std::fs;
 use tempfile::tempdir;
-
-fn gits_cmd() -> Command {
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
-    cmd.env("GIT_AUTHOR_NAME", "Test User")
-        .env("GIT_AUTHOR_EMAIL", "test@example.com")
-        .env("GIT_COMMITTER_NAME", "Test User")
-        .env("GIT_COMMITTER_EMAIL", "test@example.com");
-    cmd
-}
 
 fn setup_repo() -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
 
     // 1. Initial commit on main
-    let main_commit_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("file.txt"), "initial").unwrap();
-        index.add_path(std::path::Path::new("file.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/main"),
-            &signature,
-            &signature,
-            "initial commit",
-            &tree,
-            &[],
-        )
-        .unwrap()
-    };
+    let main_commit_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "initial",
+        "initial commit",
+        &[],
+    );
 
     // 2. Branch 'feature' on top of main
     {
         let main_commit = repo.find_commit(main_commit_id).unwrap();
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("feature.txt"), "feature").unwrap();
-        index.add_path(std::path::Path::new("feature.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/feature"),
-            &signature,
-            &signature,
+        make_commit(
+            &repo,
+            "refs/heads/feature",
+            "feature.txt",
+            "feature",
             "feature commit",
-            &tree,
             &[&main_commit],
-        )
-        .unwrap();
+        );
     }
 
     repo.set_head("refs/heads/main").unwrap();
@@ -64,46 +41,29 @@ fn setup_repo() -> (tempfile::TempDir, Repository) {
 #[test]
 fn test_commit_rebases_descendants() {
     let (dir, repo) = setup_repo();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
     let main_id = repo.revparse_single("main").unwrap().id();
     let main_commit = repo.find_commit(main_id).unwrap();
 
     // feature-a on main
-    let a_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("a.txt"), "a").unwrap();
-        index.add_path(std::path::Path::new("a.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/feature-a"),
-            &signature,
-            &signature,
-            "commit a",
-            &tree,
-            &[&main_commit],
-        )
-        .unwrap()
-    };
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "commit a",
+        &[&main_commit],
+    );
     let a_commit = repo.find_commit(a_id).unwrap();
 
     // feature-b on feature-a
-    let _b_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("b.txt"), "b").unwrap();
-        index.add_path(std::path::Path::new("b.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/feature-b"),
-            &signature,
-            &signature,
-            "commit b",
-            &tree,
-            &[&a_commit],
-        )
-        .unwrap()
-    };
+    let _b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "commit b",
+        &[&a_commit],
+    );
 
     // Checkout feature-a
     repo.set_head("refs/heads/feature-a").unwrap();
@@ -163,46 +123,29 @@ fn test_commit_rebases_descendants() {
 #[test]
 fn test_commit_amend_rebases_descendants() {
     let (dir, repo) = setup_repo();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
     let main_id = repo.revparse_single("main").unwrap().id();
     let main_commit = repo.find_commit(main_id).unwrap();
 
     // feature-a on main
-    let a_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("a.txt"), "a").unwrap();
-        index.add_path(std::path::Path::new("a.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/feature-a"),
-            &signature,
-            &signature,
-            "commit a",
-            &tree,
-            &[&main_commit],
-        )
-        .unwrap()
-    };
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "commit a",
+        &[&main_commit],
+    );
     let a_commit = repo.find_commit(a_id).unwrap();
 
     // feature-b on feature-a
-    let _b_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("b.txt"), "b").unwrap();
-        index.add_path(std::path::Path::new("b.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/feature-b"),
-            &signature,
-            &signature,
-            "commit b",
-            &tree,
-            &[&a_commit],
-        )
-        .unwrap()
-    };
+    let _b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "commit b",
+        &[&a_commit],
+    );
 
     // Checkout feature-a
     repo.set_head("refs/heads/feature-a").unwrap();
@@ -260,27 +203,18 @@ fn test_commit_amend_rebases_descendants() {
 #[test]
 fn test_commit_no_changes() {
     let (dir, repo) = setup_repo();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
     let main_id = repo.revparse_single("main").unwrap().id();
     let main_commit = repo.find_commit(main_id).unwrap();
 
     // feature-a on main
-    let a_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("a.txt"), "a").unwrap();
-        index.add_path(std::path::Path::new("a.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/feature-a"),
-            &signature,
-            &signature,
-            "commit a",
-            &tree,
-            &[&main_commit],
-        )
-        .unwrap()
-    };
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "commit a",
+        &[&main_commit],
+    );
 
     // Checkout feature-a
     repo.set_head("refs/heads/feature-a").unwrap();
@@ -312,64 +246,39 @@ fn test_commit_no_changes() {
 #[test]
 fn test_commit_forked_stack() {
     let (dir, repo) = setup_repo();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
     let main_id = repo.revparse_single("main").unwrap().id();
     let main_commit = repo.find_commit(main_id).unwrap();
 
     // feature-a on main
-    let a_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("a.txt"), "a").unwrap();
-        index.add_path(std::path::Path::new("a.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/feature-a"),
-            &signature,
-            &signature,
-            "commit a",
-            &tree,
-            &[&main_commit],
-        )
-        .unwrap()
-    };
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "commit a",
+        &[&main_commit],
+    );
     let a_commit = repo.find_commit(a_id).unwrap();
 
     // feature-b on feature-a
-    let _b_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("b.txt"), "b").unwrap();
-        index.add_path(std::path::Path::new("b.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/feature-b"),
-            &signature,
-            &signature,
-            "commit b",
-            &tree,
-            &[&a_commit],
-        )
-        .unwrap()
-    };
+    let _b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "commit b",
+        &[&a_commit],
+    );
 
     // feature-c on feature-a (fork)
-    let _c_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("c.txt"), "c").unwrap();
-        index.add_path(std::path::Path::new("c.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/feature-c"),
-            &signature,
-            &signature,
-            "commit c",
-            &tree,
-            &[&a_commit],
-        )
-        .unwrap()
-    };
+    let _c_id = make_commit(
+        &repo,
+        "refs/heads/feature-c",
+        "c.txt",
+        "c",
+        "commit c",
+        &[&a_commit],
+    );
 
     // Checkout feature-a
     repo.set_head("refs/heads/feature-a").unwrap();
@@ -476,46 +385,29 @@ fn test_commit_on_main() {
 #[test]
 fn test_commit_conflict_and_continue() {
     let (dir, repo) = setup_repo();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
     let main_id = repo.revparse_single("main").unwrap().id();
     let main_commit = repo.find_commit(main_id).unwrap();
 
     // feature-a on main
-    let a_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("shared.txt"), "original").unwrap();
-        index.add_path(std::path::Path::new("shared.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/feature-a"),
-            &signature,
-            &signature,
-            "commit a",
-            &tree,
-            &[&main_commit],
-        )
-        .unwrap()
-    };
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "original",
+        "commit a",
+        &[&main_commit],
+    );
     let a_commit = repo.find_commit(a_id).unwrap();
 
     // feature-b on feature-a (will conflict)
-    let _b_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("shared.txt"), "feature b change").unwrap();
-        index.add_path(std::path::Path::new("shared.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/feature-b"),
-            &signature,
-            &signature,
-            "commit b",
-            &tree,
-            &[&a_commit],
-        )
-        .unwrap()
-    };
+    let _b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "shared.txt",
+        "feature b change",
+        "commit b",
+        &[&a_commit],
+    );
 
     // Checkout feature-a
     repo.set_head("refs/heads/feature-a").unwrap();
@@ -603,46 +495,29 @@ fn test_commit_conflict_and_continue() {
 #[test]
 fn test_commit_abort() {
     let (dir, repo) = setup_repo();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
     let main_id = repo.revparse_single("main").unwrap().id();
     let main_commit = repo.find_commit(main_id).unwrap();
 
     // feature-a on main
-    let a_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("shared.txt"), "original").unwrap();
-        index.add_path(std::path::Path::new("shared.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/feature-a"),
-            &signature,
-            &signature,
-            "commit a",
-            &tree,
-            &[&main_commit],
-        )
-        .unwrap()
-    };
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "original",
+        "commit a",
+        &[&main_commit],
+    );
     let a_commit = repo.find_commit(a_id).unwrap();
 
     // feature-b on feature-a (will conflict)
-    let _b_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("shared.txt"), "feature b change").unwrap();
-        index.add_path(std::path::Path::new("shared.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/feature-b"),
-            &signature,
-            &signature,
-            "commit b",
-            &tree,
-            &[&a_commit],
-        )
-        .unwrap()
-    };
+    let _b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "shared.txt",
+        "feature b change",
+        "commit b",
+        &[&a_commit],
+    );
 
     // Checkout feature-a
     repo.set_head("refs/heads/feature-a").unwrap();
@@ -783,7 +658,6 @@ fn test_commit_on_main_rebases_descendant() {
 #[test]
 fn test_commit_on_main_rebases_multi_level_stack() {
     let (dir, repo) = setup_repo();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
 
     // 1. Setup main -> feature -> feature2
     let main_id = repo
@@ -801,26 +675,14 @@ fn test_commit_on_main_rebases_multi_level_stack() {
         .unwrap();
     let feature_commit = repo.find_commit(feature_commit_id).unwrap();
 
-    let feature2_commit_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("feature2.txt"), "feature2").unwrap();
-        index
-            .add_path(std::path::Path::new("feature2.txt"))
-            .unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            None,
-            &signature,
-            &signature,
-            "feature2 commit",
-            &tree,
-            &[&feature_commit],
-        )
-        .unwrap()
-    };
-    let feature2_commit = repo.find_commit(feature2_commit_id).unwrap();
-    repo.branch("feature2", &feature2_commit, false).unwrap();
+    let feature2_commit_id = make_commit(
+        &repo,
+        "refs/heads/feature2",
+        "feature2.txt",
+        "feature2",
+        "feature2 commit",
+        &[&feature_commit],
+    );
 
     assert!(
         repo.graph_descendant_of(feature2_commit_id, feature_commit_id)
