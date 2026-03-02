@@ -30,8 +30,13 @@ pub fn commit(args: &[String]) -> Result<()> {
     let merge_base = repo.merge_base(upstream_id, head_id)?;
 
     // Capture stack state BEFORE commit
-    let all_branches_in_stack =
-        get_stack_branches_from_merge_base(&repo, merge_base, &upstream_name)?;
+    let all_branches_in_stack = get_stack_branches_from_merge_base(
+        &repo,
+        merge_base,
+        head_id,
+        upstream_id,
+        &upstream_name,
+    )?;
 
     // Run the actual git commit
     let status = Command::new("git").arg("commit").args(args).status()?;

@@ -1,68 +1,40 @@
-#![allow(deprecated)]
-use assert_cmd::Command;
-use git2::{Repository, Signature};
+mod common;
+use common::{gits_cmd, make_commit, run_ok};
+use git2::Repository;
 use std::fs;
 use tempfile::tempdir;
-
-fn gits_cmd() -> Command {
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
-    cmd.env("GIT_AUTHOR_NAME", "Test User")
-        .env("GIT_AUTHOR_EMAIL", "test@example.com")
-        .env("GIT_COMMITTER_NAME", "Test User")
-        .env("GIT_COMMITTER_EMAIL", "test@example.com");
-    cmd
-}
 
 fn setup_repo() -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
 
-    let mut parent_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("file.txt"), "initial").unwrap();
-        index.add_path(std::path::Path::new("file.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/main"),
-            &signature,
-            &signature,
-            "initial commit",
-            &tree,
-            &[],
-        )
-        .unwrap()
-    };
+    let mut parent_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "initial",
+        "initial commit",
+        &[],
+    );
 
     let first_commit_id = parent_id;
 
     for i in 1..=3 {
-        let tree_oid = {
-            let mut index = repo.index().unwrap();
-            fs::write(
-                dir.path().join(format!("file{}.txt", i)),
-                format!("content {}", i),
-            )
-            .unwrap();
-            index
-                .add_path(std::path::Path::new(&format!("file{}.txt", i)))
-                .unwrap();
-            index.write_tree().unwrap()
-        };
-        let tree = repo.find_tree(tree_oid).unwrap();
         let parent = repo.find_commit(parent_id).unwrap();
-        parent_id = repo
-            .commit(
-                None,
-                &signature,
-                &signature,
-                &format!("commit {}", i),
-                &tree,
-                &[&parent],
-            )
-            .unwrap();
+        parent_id = make_commit(
+            &repo,
+            "refs/heads/temp",
+            &format!("file{}.txt", i),
+            &format!("content {}", i),
+            &format!("commit {}", i),
+            &[&parent],
+        );
     }
+    // Remove the temp branch created by make_commit loop
+    repo.find_branch("temp", git2::BranchType::Local)
+        .unwrap()
+        .delete()
+        .unwrap();
 
     repo.set_head_detached(parent_id).unwrap();
 
@@ -215,13 +187,7 @@ exec {} "$@"
 fn test_move_upstream_error() {
     let (dir, _repo) = setup_repo();
 
-    let mut cmd_co = Command::new("git");
-    cmd_co
-        .arg("checkout")
-        .arg("main")
-        .current_dir(dir.path())
-        .assert()
-        .success();
+    run_ok("git", &["checkout", "main"], dir.path());
 
     let mut cmd = gits_cmd();
     cmd.arg("move")
@@ -239,55 +205,28 @@ fn test_move_upstream_error() {
 fn test_move_conflict_and_continue() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
 
-    fs::write(dir.path().join("file.txt"), "base").unwrap();
-    let mut index = repo.index().unwrap();
-    index.add_path(std::path::Path::new("file.txt")).unwrap();
-    let oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    let base_id = repo
-        .commit(
-            Some("refs/heads/main"),
-            &signature,
-            &signature,
-            "initial",
-            &tree,
-            &[],
-        )
-        .unwrap();
+    let base_id = make_commit(&repo, "refs/heads/main", "file.txt", "base", "initial", &[]);
     let base = repo.find_commit(base_id).unwrap();
 
-    fs::write(dir.path().join("file.txt"), "target content").unwrap();
-    index.add_path(std::path::Path::new("file.txt")).unwrap();
-    let oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    let target_id = repo
-        .commit(
-            Some("refs/heads/target"),
-            &signature,
-            &signature,
-            "target commit",
-            &tree,
-            &[&base],
-        )
-        .unwrap();
+    let target_id = make_commit(
+        &repo,
+        "refs/heads/target",
+        "file.txt",
+        "target content",
+        "target commit",
+        &[&base],
+    );
     let target = repo.find_commit(target_id).unwrap();
 
-    fs::write(dir.path().join("file.txt"), "feature content").unwrap();
-    index.add_path(std::path::Path::new("file.txt")).unwrap();
-    let oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    let feature_id = repo
-        .commit(
-            Some("refs/heads/feature"),
-            &signature,
-            &signature,
-            "feature commit",
-            &tree,
-            &[&base],
-        )
-        .unwrap();
+    let feature_id = make_commit(
+        &repo,
+        "refs/heads/feature",
+        "file.txt",
+        "feature content",
+        "feature commit",
+        &[&base],
+    );
     let feature = repo.find_commit(feature_id).unwrap();
 
     repo.set_head("refs/heads/feature").unwrap();
@@ -311,13 +250,7 @@ fn test_move_conflict_and_continue() {
         .stderr(predicates::str::contains("Resolve conflicts"));
 
     fs::write(dir.path().join("file.txt"), "resolved content").unwrap();
-    let mut cmd_git_add = Command::new("git");
-    cmd_git_add
-        .arg("add")
-        .arg("file.txt")
-        .current_dir(dir.path())
-        .assert()
-        .success();
+    run_ok("git", &["add", "file.txt"], dir.path());
 
     let mut cmd_cont = gits_cmd();
     cmd_cont
@@ -415,13 +348,7 @@ fn test_move_all_onto_main() {
 fn test_move_all_from_main_error() {
     let (dir, _repo) = setup_repo();
 
-    let mut cmd_co = Command::new("git");
-    cmd_co
-        .arg("checkout")
-        .arg("main")
-        .current_dir(dir.path())
-        .assert()
-        .success();
+    run_ok("git", &["checkout", "main"], dir.path());
 
     let mut cmd = gits_cmd();
     cmd.arg("move")
@@ -440,64 +367,39 @@ fn test_move_all_from_main_error() {
 fn test_move_all_between_stacks() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
 
-    fs::write(dir.path().join("root.txt"), "root").unwrap();
-    let mut index = repo.index().unwrap();
-    index.add_path(std::path::Path::new("root.txt")).unwrap();
-    let oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    let base_id = repo
-        .commit(
-            Some("refs/heads/main"),
-            &signature,
-            &signature,
-            "root",
-            &tree,
-            &[],
-        )
-        .unwrap();
+    let base_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
     let base = repo.find_commit(base_id).unwrap();
 
-    fs::write(dir.path().join("s1.txt"), "s1-a").unwrap();
-    let mut index = repo.index().unwrap();
-    index.add_path(std::path::Path::new("s1.txt")).unwrap();
-    let oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    let s1a_id = repo
-        .commit(None, &signature, &signature, "s1-a commit", &tree, &[&base])
-        .unwrap();
+    let s1a_id = make_commit(
+        &repo,
+        "refs/heads/s1-a",
+        "s1.txt",
+        "s1-a",
+        "s1-a commit",
+        &[&base],
+    );
     let s1a = repo.find_commit(s1a_id).unwrap();
-    repo.branch("s1-a", &s1a, false).unwrap();
 
-    fs::write(dir.path().join("s1_other.txt"), "s1-b").unwrap();
-    let mut index = repo.index().unwrap();
-    index
-        .add_path(std::path::Path::new("s1_other.txt"))
-        .unwrap();
-    let oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    let s1b_id = repo
-        .commit(None, &signature, &signature, "s1-b commit", &tree, &[&s1a])
-        .unwrap();
-    let s1b = repo.find_commit(s1b_id).unwrap();
-    repo.branch("s1-b", &s1b, false).unwrap();
+    let s1b_id = make_commit(
+        &repo,
+        "refs/heads/s1-b",
+        "s1_other.txt",
+        "s1-b",
+        "s1-b commit",
+        &[&s1a],
+    );
+    let _s1b = repo.find_commit(s1b_id).unwrap();
 
-    let mut index = repo.index().unwrap();
-    repo.checkout_tree(
-        base.as_object(),
-        Some(git2::build::CheckoutBuilder::new().force()),
-    )
-    .unwrap();
-    fs::write(dir.path().join("s2.txt"), "s2-a").unwrap();
-    index.add_path(std::path::Path::new("s2.txt")).unwrap();
-    let oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    let s2a_id = repo
-        .commit(None, &signature, &signature, "s2-a commit", &tree, &[&base])
-        .unwrap();
-    let s2a = repo.find_commit(s2a_id).unwrap();
-    repo.branch("s2-a", &s2a, false).unwrap();
+    let s2a_id = make_commit(
+        &repo,
+        "refs/heads/s2-a",
+        "s2.txt",
+        "s2-a",
+        "s2-a commit",
+        &[&base],
+    );
+    let _s2a = repo.find_commit(s2a_id).unwrap();
 
     repo.set_head("refs/heads/s1-a").unwrap();
     repo.checkout_tree(
@@ -544,51 +446,28 @@ fn test_move_all_between_stacks() {
 fn test_move_onto_descendant() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
 
-    fs::write(dir.path().join("root.txt"), "root").unwrap();
-    let mut index = repo.index().unwrap();
-    index.add_path(std::path::Path::new("root.txt")).unwrap();
-    let oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    let base_id = repo
-        .commit(
-            Some("refs/heads/main"),
-            &signature,
-            &signature,
-            "initial",
-            &tree,
-            &[],
-        )
-        .unwrap();
+    let base_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "initial", &[]);
     let base = repo.find_commit(base_id).unwrap();
 
-    fs::write(dir.path().join("a.txt"), "a").unwrap();
-    let mut index = repo.index().unwrap();
-    index.add_path(std::path::Path::new("a.txt")).unwrap();
-    let oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    let fa_id = repo
-        .commit(None, &signature, &signature, "a commit", &tree, &[&base])
-        .unwrap();
+    let fa_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "a commit",
+        &[&base],
+    );
     let fa = repo.find_commit(fa_id).unwrap();
-    repo.branch("feature-a", &fa, false).unwrap();
 
-    repo.checkout_tree(
-        fa.as_object(),
-        Some(git2::build::CheckoutBuilder::new().force()),
-    )
-    .unwrap();
-    fs::write(dir.path().join("b.txt"), "b").unwrap();
-    let mut index = repo.index().unwrap();
-    index.add_path(std::path::Path::new("b.txt")).unwrap();
-    let oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    let fb_id = repo
-        .commit(None, &signature, &signature, "b commit", &tree, &[&fa])
-        .unwrap();
-    let fb = repo.find_commit(fb_id).unwrap();
-    repo.branch("feature-b", &fb, false).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "b commit",
+        &[&fa],
+    );
 
     repo.set_head("refs/heads/feature-a").unwrap();
     repo.checkout_tree(
@@ -617,60 +496,31 @@ fn test_move_onto_descendant() {
 fn test_move_abort_cleans_up_git_rebase() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
 
     // 1. Initial commit
-    fs::write(dir.path().join("file.txt"), "base").unwrap();
-    let mut index = repo.index().unwrap();
-    index.add_path(std::path::Path::new("file.txt")).unwrap();
-    let oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    let base_id = repo
-        .commit(
-            Some("refs/heads/main"),
-            &signature,
-            &signature,
-            "initial",
-            &tree,
-            &[],
-        )
-        .unwrap();
+    let base_id = make_commit(&repo, "refs/heads/main", "file.txt", "base", "initial", &[]);
     let base = repo.find_commit(base_id).unwrap();
 
     // 2. Branch 'target'
-    fs::write(dir.path().join("file.txt"), "target content").unwrap();
-    let mut index = repo.index().unwrap();
-    index.add_path(std::path::Path::new("file.txt")).unwrap();
-    let oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    let target_id = repo
-        .commit(
-            Some("refs/heads/target"),
-            &signature,
-            &signature,
-            "target commit",
-            &tree,
-            &[&base],
-        )
-        .unwrap();
+    let target_id = make_commit(
+        &repo,
+        "refs/heads/target",
+        "file.txt",
+        "target content",
+        "target commit",
+        &[&base],
+    );
     let _target = repo.find_commit(target_id).unwrap();
 
     // 3. Branch 'feature' (conflicts)
-    fs::write(dir.path().join("file.txt"), "feature content").unwrap();
-    let mut index = repo.index().unwrap();
-    index.add_path(std::path::Path::new("file.txt")).unwrap();
-    let oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    let feature_id = repo
-        .commit(
-            Some("refs/heads/feature"),
-            &signature,
-            &signature,
-            "feature commit",
-            &tree,
-            &[&base],
-        )
-        .unwrap();
+    let feature_id = make_commit(
+        &repo,
+        "refs/heads/feature",
+        "file.txt",
+        "feature content",
+        "feature commit",
+        &[&base],
+    );
     let feature = repo.find_commit(feature_id).unwrap();
 
     repo.set_head("refs/heads/feature").unwrap();
@@ -773,55 +623,29 @@ exec {} "$@"
 fn test_move_conflict_and_continue_no_re_rebase() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
 
     // setup: main (file.txt: base) -> feature (file.txt: feat)
     // setup: target (file.txt: target)
-    fs::write(dir.path().join("file.txt"), "base").unwrap();
-    let mut index = repo.index().unwrap();
-    index.add_path(std::path::Path::new("file.txt")).unwrap();
-    let oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    let base_id = repo
-        .commit(
-            Some("refs/heads/main"),
-            &signature,
-            &signature,
-            "base",
-            &tree,
-            &[],
-        )
-        .unwrap();
+    let base_id = make_commit(&repo, "refs/heads/main", "file.txt", "base", "base", &[]);
     let base = repo.find_commit(base_id).unwrap();
 
-    fs::write(dir.path().join("file.txt"), "target").unwrap();
-    index.add_path(std::path::Path::new("file.txt")).unwrap();
-    let oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    repo.commit(
-        Some("refs/heads/target"),
-        &signature,
-        &signature,
+    make_commit(
+        &repo,
+        "refs/heads/target",
+        "file.txt",
         "target",
-        &tree,
+        "target",
         &[&base],
-    )
-    .unwrap();
+    );
 
-    fs::write(dir.path().join("file.txt"), "feat").unwrap();
-    index.add_path(std::path::Path::new("file.txt")).unwrap();
-    let oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(oid).unwrap();
-    let feat_id = repo
-        .commit(
-            Some("refs/heads/feature"),
-            &signature,
-            &signature,
-            "feat",
-            &tree,
-            &[&base],
-        )
-        .unwrap();
+    let feat_id = make_commit(
+        &repo,
+        "refs/heads/feature",
+        "file.txt",
+        "feat",
+        "feat",
+        &[&base],
+    );
     let feat = repo.find_commit(feat_id).unwrap();
 
     repo.set_head("refs/heads/feature").unwrap();
@@ -1039,78 +863,49 @@ exec {} "$@"
 fn setup_abort_repo() -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
-    let signature = Signature::now("Test User", "test@example.com").unwrap();
 
     // Initial commit
-    let main_commit_id = {
-        let mut index = repo.index().unwrap();
-        fs::write(dir.path().join("file.txt"), "initial").unwrap();
-        index.add_path(std::path::Path::new("file.txt")).unwrap();
-        let oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(oid).unwrap();
-        repo.commit(
-            Some("refs/heads/main"),
-            &signature,
-            &signature,
-            "initial commit",
-            &tree,
-            &[],
-        )
-        .unwrap()
-    };
+    let main_commit_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "initial",
+        "initial commit",
+        &[],
+    );
 
     // Set HEAD to detached state so we can use repo.head() reliably
     repo.set_head_detached(main_commit_id).unwrap();
 
     // Branch 'feature'
     {
-        let commit_id = {
-            let mut index = repo.index().unwrap();
-            fs::write(dir.path().join("file.txt"), "feature").unwrap();
-            index.add_path(std::path::Path::new("file.txt")).unwrap();
-            let oid = index.write_tree().unwrap();
-            let tree = repo.find_tree(oid).unwrap();
-            let parent = repo.head().unwrap().peel_to_commit().unwrap();
-            repo.commit(
-                None,
-                &signature,
-                &signature,
-                "feature commit",
-                &tree,
-                &[&parent],
-            )
-            .unwrap()
-        };
-        let commit = repo.find_commit(commit_id).unwrap();
-        repo.branch("feature", &commit, false).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        make_commit(
+            &repo,
+            "refs/heads/feature",
+            "file.txt",
+            "feature",
+            "feature commit",
+            &[&parent],
+        );
     }
 
     // Branch 'target' with conflict
     {
-        let commit_id = {
-            let mut index = repo.index().unwrap();
-            fs::write(dir.path().join("file.txt"), "target").unwrap();
-            index.add_path(std::path::Path::new("file.txt")).unwrap();
-            let oid = index.write_tree().unwrap();
-            let tree = repo.find_tree(oid).unwrap();
-            let parent = repo
-                .find_branch("main", git2::BranchType::Local)
-                .unwrap()
-                .get()
-                .peel_to_commit()
-                .unwrap();
-            repo.commit(
-                Some("refs/heads/target"),
-                &signature,
-                &signature,
-                "target commit",
-                &tree,
-                &[&parent],
-            )
+        let parent = repo
+            .find_branch("main", git2::BranchType::Local)
             .unwrap()
-        };
-        let commit = repo.find_commit(commit_id).unwrap();
-        repo.branch("target", &commit, true).unwrap();
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        make_commit(
+            &repo,
+            "refs/heads/target",
+            "file.txt",
+            "target",
+            "target commit",
+            &[&parent],
+        );
     }
 
     (dir, repo)

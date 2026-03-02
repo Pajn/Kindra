@@ -31,9 +31,23 @@ pub fn get_stack_branches(
             continue;
         }
 
-        if (repo.graph_descendant_of(id, upstream_id)? || id == upstream_id)
-            && (repo.graph_descendant_of(head_id, id)? || head_id == id)
-        {
+        // A branch is part of the current stack if its tip is reachable from HEAD.
+        let is_ancestor_of_head = repo.graph_descendant_of(head_id, id)? || head_id == id;
+        if !is_ancestor_of_head {
+            continue;
+        }
+
+        // AND it must NOT be reachable from upstream (i.e. not yet merged/on main).
+        let is_on_upstream = repo.graph_descendant_of(upstream_id, id)? || upstream_id == id;
+        if is_on_upstream {
+            continue;
+        }
+
+        // AND it must be a descendant of upstream (i.e. starts from main).
+        let is_descendant_of_upstream =
+            repo.graph_descendant_of(id, upstream_id)? || id == upstream_id;
+
+        if is_descendant_of_upstream {
             branches.push(StackBranch {
                 name: name.to_string(),
                 id,
@@ -47,6 +61,8 @@ pub fn get_stack_branches(
 pub fn get_stack_branches_from_merge_base(
     repo: &Repository,
     merge_base: Oid,
+    head_id: Oid,
+    upstream_id: Oid,
     upstream_name: &str,
 ) -> Result<Vec<StackBranch>> {
     let mut branches = Vec::new();
@@ -66,7 +82,7 @@ pub fn get_stack_branches_from_merge_base(
             continue;
         }
 
-        if repo.graph_descendant_of(id, merge_base)? || id == merge_base {
+        if is_stack_member(repo, id, merge_base, upstream_id, head_id)? {
             branches.push(StackBranch {
                 name: name.to_string(),
                 id,
@@ -75,6 +91,33 @@ pub fn get_stack_branches_from_merge_base(
     }
 
     Ok(branches)
+}
+
+fn is_stack_member(
+    repo: &Repository,
+    id: Oid,
+    merge_base: Oid,
+    upstream_id: Oid,
+    head_id: Oid,
+) -> Result<bool> {
+    // Is it reachable from the merge base?
+    let is_descendant_of_merge_base = repo.graph_descendant_of(id, merge_base)? || id == merge_base;
+    if !is_descendant_of_merge_base {
+        return Ok(false);
+    }
+
+    // AND it must NOT be reachable from upstream (i.e. not yet merged/on main).
+    let is_on_upstream = repo.graph_descendant_of(upstream_id, id)? || upstream_id == id;
+    if is_on_upstream {
+        return Ok(false);
+    }
+
+    // AND it must be on the same lineage as HEAD (ancestor or descendant)
+    let is_on_head_lineage = repo.graph_descendant_of(id, head_id)?
+        || repo.graph_descendant_of(head_id, id)?
+        || id == head_id;
+
+    Ok(is_on_head_lineage)
 }
 
 pub fn get_immediate_successors(
@@ -233,7 +276,8 @@ pub fn sort_branches_topologically(repo: &Repository, branches: &mut [StackBranc
 }
 
 /// For each branch build a map branch_name → base_branch_name.
-/// The base is the closest ancestor stack branch, or the repo upstream.
+/// The base is the closest ancestor stack branch that is NOT merged into upstream,
+/// or the repo upstream if all ancestors are merged.
 pub fn compute_base_map(
     repo: &Repository,
     branches: &[(StackBranch, String)],
@@ -250,7 +294,9 @@ pub fn compute_base_map(
                 continue;
             }
 
+            // The candidate must be an ancestor of the branch.
             if repo.graph_descendant_of(branch_id, candidate.id)? {
+                // We want the "closest" ancestor, i.e., the one that is NOT an ancestor of any other candidate ancestor.
                 if let Some(current_best) = best {
                     if repo.graph_descendant_of(candidate.id, current_best.id)? {
                         best = Some(candidate);

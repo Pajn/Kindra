@@ -9,8 +9,19 @@ pub mod split;
 pub mod status_cmd;
 
 use anyhow::{Context, Result, anyhow};
+use clap::Subcommand;
 use git2::{BranchType, Repository};
 use std::io::IsTerminal;
+
+#[derive(Subcommand, Clone, Copy)]
+pub enum CheckoutSubcommand {
+    /// Checkout the branch above the current one
+    Up,
+    /// Checkout the branch below the current one
+    Down,
+    /// Checkout the top branch in the stack
+    Top,
+}
 
 pub struct CommitInfo {
     pub id: String,
