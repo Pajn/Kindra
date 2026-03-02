@@ -17,6 +17,10 @@ pub fn get_stack_branches(
     let mut branches = Vec::new();
     let local_branches = repo.branches(Some(git2::BranchType::Local))?;
 
+    // Find the merge base of HEAD and upstream.
+    // Any branch that is a descendant of this merge base and NOT on upstream is part of the stack.
+    let merge_base = repo.merge_base(head_id, upstream_id)?;
+
     for res in local_branches {
         let (branch, _) = res?;
         let name = branch
@@ -31,23 +35,7 @@ pub fn get_stack_branches(
             continue;
         }
 
-        // A branch is part of the current stack if its tip is reachable from HEAD.
-        let is_ancestor_of_head = repo.graph_descendant_of(head_id, id)? || head_id == id;
-        if !is_ancestor_of_head {
-            continue;
-        }
-
-        // AND it must NOT be reachable from upstream (i.e. not yet merged/on main).
-        let is_on_upstream = repo.graph_descendant_of(upstream_id, id)? || upstream_id == id;
-        if is_on_upstream {
-            continue;
-        }
-
-        // AND it must be a descendant of upstream (i.e. starts from main).
-        let is_descendant_of_upstream =
-            repo.graph_descendant_of(id, upstream_id)? || id == upstream_id;
-
-        if is_descendant_of_upstream {
+        if is_stack_member(repo, id, merge_base, upstream_id, head_id)? {
             branches.push(StackBranch {
                 name: name.to_string(),
                 id,
