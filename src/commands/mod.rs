@@ -51,6 +51,17 @@ pub fn prompt_multi_select<T: std::fmt::Display>(message: &str, options: Vec<T>)
         .context("Multi-selection failed")
 }
 
+pub fn prompt_confirm(message: &str) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        println!("{} (non-interactive mode: auto-denying)", message);
+        return Ok(false);
+    }
+    inquire::Confirm::new(message)
+        .with_default(false)
+        .prompt()
+        .context("Confirmation failed")
+}
+
 pub fn find_upstream(repo: &Repository) -> Result<String> {
     let candidates = ["main", "master", "origin/main", "origin/master"];
     for name in candidates {

@@ -1,7 +1,7 @@
 use crate::commands::{CommitInfo, find_upstream};
-use crate::stack::get_stack_tips;
+use crate::stack::{collect_path_branches, get_stack_tips};
 use anyhow::{Context, Result, anyhow};
-use git2::{BranchType, Repository};
+use git2::{BranchType, ErrorCode, Repository};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -45,14 +45,7 @@ pub fn split() -> Result<()> {
     };
 
     // Now we only care about branches that are on the linear path to the target tip.
-    let mut path_branches = Vec::new();
-    for b in &stack_branches {
-        let is_on_path = (repo.graph_descendant_of(target_tip_id, b.id)? || target_tip_id == b.id)
-            && (repo.graph_descendant_of(b.id, merge_base)? || b.id == merge_base);
-        if is_on_path {
-            path_branches.push(b.clone());
-        }
-    }
+    let path_branches = collect_path_branches(&repo, target_tip_id, merge_base, &stack_branches)?;
 
     let mut revwalk = repo.revwalk()?;
     revwalk.push(target_tip_id)?;
@@ -168,12 +161,32 @@ pub fn split() -> Result<()> {
     let mut next_branches: HashMap<String, String> = HashMap::new();
     for (name, id_short) in new_branch_map {
         // Map short ID back to full ID
-        let full_id = commits
+        let matches: Vec<_> = commits
             .iter()
-            .find(|c| c.id.starts_with(&id_short))
-            .map(|c| c.id.clone())
-            .ok_or_else(|| anyhow!("Could not resolve commit {}", id_short))?;
-        next_branches.insert(name, full_id.clone());
+            .filter(|c| c.id.starts_with(&id_short))
+            .collect();
+
+        if matches.is_empty() {
+            return Err(anyhow!(
+                "Could not resolve commit {} for branch {}",
+                id_short,
+                name
+            ));
+        } else if matches.len() > 1 {
+            let candidates: Vec<_> = matches.iter().map(|c| &c.id[..7]).collect();
+            return Err(anyhow!(
+                "Ambiguous commit prefix {} for branch {}. Candidates: {:?}",
+                id_short,
+                name,
+                candidates
+            ));
+        }
+
+        if next_branches.contains_key(&name) {
+            return Err(anyhow!("Duplicate branch row for branch {}", name));
+        }
+
+        next_branches.insert(name, matches[0].id.clone());
     }
 
     // Apply changes
@@ -181,6 +194,7 @@ pub fn split() -> Result<()> {
         &repo,
         next_branches,
         path_branches.iter().map(|b| b.name.clone()).collect(),
+        commit_ids,
     )?;
 
     Ok(())
@@ -190,7 +204,62 @@ fn apply_split(
     repo: &Repository,
     next_branches: HashMap<String, String>,
     initial_branches: Vec<String>,
+    allowed_ids: HashSet<String>,
 ) -> Result<()> {
+    let initial_names: HashSet<String> = initial_branches.into_iter().collect();
+
+    // 1. Pre-flight validation and commit resolution
+    // We collect all necessary commits and decide which branches to skip or move.
+    let mut resolved_commits = Vec::new(); // (branch_name, commit_to_set, should_overwrite)
+    let mut skip_branches = HashSet::new();
+
+    for (name, id) in &next_branches {
+        let commit_obj = repo.revparse_single(id).context(format!(
+            "Failed to resolve target commit {} for branch {}",
+            id, name
+        ))?;
+        let _ = commit_obj
+            .as_commit()
+            .ok_or_else(|| anyhow!("Target {} for branch {} is not a commit", id, name))?;
+
+        match repo.find_branch(name, BranchType::Local) {
+            Ok(existing) => {
+                let target = existing.get().target();
+                let target_str = target.map(|t| t.to_string());
+                if target_str.as_deref() == Some(id) {
+                    skip_branches.insert(name.clone());
+                    continue;
+                }
+
+                // Guard: Only allow moving an existing branch if it was part of the original
+                // stack (by name or by pointing to one of the commits in the stack).
+                let is_safe = initial_names.contains(name)
+                    || target_str.as_ref().is_some_and(|t| allowed_ids.contains(t));
+
+                if !is_safe {
+                    let confirm_msg = format!(
+                        "Branch '{}' already exists and is NOT part of the stack. Do you want to overwrite it?",
+                        name
+                    );
+                    if !crate::commands::prompt_confirm(&confirm_msg)? {
+                        println!("Skipping branch '{}'", name);
+                        skip_branches.insert(name.clone());
+                        continue;
+                    }
+                }
+                resolved_commits.push((name.clone(), id.clone(), true));
+            }
+            Err(e) if e.code() == ErrorCode::NotFound => {
+                resolved_commits.push((name.clone(), id.clone(), false));
+            }
+            Err(e) => {
+                return Err(anyhow!(e)
+                    .context(format!("Failed to find branch {} during application", name)));
+            }
+        }
+    }
+
+    // 2. Destructive actions
     let head_detached = repo.head_detached()?;
     let current_branch = if !head_detached {
         repo.head()?.shorthand().map(|s| s.to_string())
@@ -199,9 +268,9 @@ fn apply_split(
     };
 
     // Delete branches that are no longer in next_branches
-    for name in initial_branches {
-        if !next_branches.contains_key(&name) {
-            if Some(&name) == current_branch.as_ref() {
+    for name in &initial_names {
+        if !next_branches.contains_key(name) {
+            if Some(name) == current_branch.as_ref() {
                 println!(
                     "Cannot delete current branch: {}. Detaching HEAD first.",
                     name
@@ -209,39 +278,43 @@ fn apply_split(
                 let head_commit = repo.head()?.peel_to_commit()?;
                 repo.set_head_detached(head_commit.id())?;
             }
-            if let Ok(mut branch) = repo.find_branch(&name, BranchType::Local) {
-                branch.delete()?;
-                println!("Deleted branch: {}", name);
+            match repo.find_branch(name, BranchType::Local) {
+                Ok(mut branch) => {
+                    branch.delete()?;
+                    println!("Deleted branch: {}", name);
+                }
+                Err(e) if e.code() == ErrorCode::NotFound => {
+                    // Branch already gone, skip.
+                }
+                Err(e) => {
+                    return Err(
+                        anyhow!(e).context(format!("Failed to find branch {} for deletion", name))
+                    );
+                }
             }
         }
     }
 
-    for (name, id) in next_branches {
+    // Create or move branches
+    for (name, id, force) in resolved_commits {
+        if skip_branches.contains(&name) {
+            continue;
+        }
+
         let commit_obj = repo.revparse_single(&id)?;
-        let commit = commit_obj
-            .as_commit()
-            .ok_or_else(|| anyhow!("{} is not a commit", id))?;
+        let commit = commit_obj.as_commit().unwrap(); // Already validated in pre-flight
 
-        match repo.find_branch(&name, BranchType::Local) {
-            Ok(existing) => {
-                let target = existing.get().target();
-                if target.map(|t| t.to_string()) == Some(id.clone()) {
-                    continue;
-                }
+        if Some(&name) == current_branch.as_ref() {
+            println!("Detaching HEAD to move current branch: {}", name);
+            let head_commit = repo.head()?.peel_to_commit()?;
+            repo.set_head_detached(head_commit.id())?;
+        }
 
-                if Some(&name) == current_branch.as_ref() {
-                    println!("Detaching HEAD to move current branch: {}", name);
-                    let head_commit = repo.head()?.peel_to_commit()?;
-                    repo.set_head_detached(head_commit.id())?;
-                }
-
-                repo.branch(&name, commit, true)?;
-                println!("Moved branch: {} -> {}", name, &id[..7]);
-            }
-            Err(_) => {
-                repo.branch(&name, commit, false)?;
-                println!("Created branch: {} -> {}", name, &id[..7]);
-            }
+        repo.branch(&name, commit, force)?;
+        if force {
+            println!("Moved branch: {} -> {}", name, &id[..7]);
+        } else {
+            println!("Created branch: {} -> {}", name, &id[..7]);
         }
     }
 

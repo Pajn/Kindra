@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use git2::{Oid, Repository};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
 pub struct StackBranch {
@@ -53,28 +53,104 @@ pub fn get_stack_branches_from_merge_base(
     upstream_id: Oid,
     upstream_name: &str,
 ) -> Result<Vec<StackBranch>> {
-    let mut branches = Vec::new();
+    // Walk from HEAD backward, stopping at upstream. This builds a set of all commits
+    // reachable from HEAD but NOT from upstream — the entire "private stack" range.
+    // Cost is O(stack_depth), not O(full repo history), making this fast even in huge repos.
+    // TOPOLOGICAL sort avoids the timestamp-ordering pitfall where libgit2 would otherwise
+    // eagerly process upstream's recent commits before the (potentially older) stack commits.
+    let mut ancestor_set = HashSet::new();
+    {
+        let mut walk = repo.revwalk()?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
+        walk.push(head_id)?;
+        walk.hide(upstream_id)?;
+        for id_res in walk {
+            ancestor_set.insert(id_res?);
+        }
+    }
+
     let local_branches = repo.branches(Some(git2::BranchType::Local))?;
+    let mut branches = Vec::new();
+    let mut candidates_above = Vec::new();
 
     for res in local_branches {
         let (branch, _) = res?;
-        let name = branch
-            .name()?
-            .ok_or_else(|| anyhow!("Invalid branch name"))?;
-        let id = branch
-            .get()
-            .target()
-            .ok_or_else(|| anyhow!("Branch target not found"))?;
-
+        let name = match branch.name()? {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
         if name == upstream_name {
             continue;
         }
+        let id = match branch.get().target() {
+            Some(id) => id,
+            None => continue,
+        };
 
-        if is_stack_member(repo, id, merge_base, upstream_id, head_id)? {
-            branches.push(StackBranch {
-                name: name.to_string(),
-                id,
-            });
+        if ancestor_set.contains(&id) {
+            // Tip is in the private stack range (ancestor of HEAD, not merged into upstream).
+            branches.push(StackBranch { name, id });
+        } else {
+            // Could be above HEAD in the stack, or completely unrelated.
+            candidates_above.push((name, id));
+        }
+    }
+
+    // ancestor_set is empty when HEAD is ON upstream (head_id == upstream_id or HEAD is
+    // already merged). This is a rare case (e.g., committing directly on main). Fall back
+    // to the original per-branch check which is correct for small test repos.
+    let head_is_on_upstream = ancestor_set.is_empty();
+
+    // Pre-compute HEAD's commit timestamp for the candidates_above pre-filter below.
+    // A branch can only be "above HEAD" (i.e., HEAD reachable from branch_tip) if the
+    // branch tip was committed at the same time as or after HEAD. This O(1) check
+    // eliminates the expensive per-branch revwalk for the vast majority of noise branches
+    // (old feature branches whose tips predate HEAD). Only computed when needed.
+    let head_time = if head_is_on_upstream {
+        0 // unused in the fallback path
+    } else {
+        repo.find_commit(head_id)?.time().seconds()
+    };
+
+    for (name, id) in candidates_above {
+        let in_stack = if head_is_on_upstream {
+            is_stack_member(repo, id, merge_base, upstream_id, head_id)?
+        } else {
+            // Fast pre-filter: a branch committed strictly before HEAD cannot be above it.
+            // Loading one commit object is O(1) — far cheaper than creating a revwalk in
+            // repos with many pack files (e.g. 825 packs × 25 ms/walk = 2.4 s for 96 noise
+            // branches; with this filter, old branches are skipped in ~30 µs each).
+            //
+            // Fallback: Git timestamps are not strictly monotonic (e.g., clock skew,
+            // rebase). If tip_time < head_time, we perform a definitive O(1) graph
+            // check via graph_descendant_of to avoid false negatives.
+            // We also must ensure the branch is not already merged into upstream.
+            let tip_time = repo.find_commit(id)?.time().seconds();
+            if tip_time < head_time {
+                repo.graph_descendant_of(id, head_id)?
+                    && !(repo.graph_descendant_of(upstream_id, id)? || upstream_id == id)
+            } else {
+                // Walk from this candidate backward (bounded by upstream) and check if
+                // head_id appears in its ancestry. If so, the candidate is above HEAD in
+                // the stack. TOPOLOGICAL sort ensures we traverse only the candidate's own
+                // commits without being side-tracked by upstream's recent history.
+                let mut walk = repo.revwalk()?;
+                walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
+                walk.push(id)?;
+                walk.hide(upstream_id)?;
+                let mut found = false;
+                for commit_res in walk {
+                    if commit_res? == head_id {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            }
+        };
+
+        if in_stack {
+            branches.push(StackBranch { name, id });
         }
     }
 
@@ -338,6 +414,23 @@ pub fn build_parent_maps(
 pub struct VisualBranch {
     pub name: String,
     pub display_name: String,
+}
+
+pub fn collect_path_branches(
+    repo: &Repository,
+    target_tip_id: Oid,
+    merge_base: Oid,
+    stack_branches: &[StackBranch],
+) -> Result<Vec<StackBranch>> {
+    let mut path_branches = Vec::new();
+    for b in stack_branches {
+        let is_on_path = (repo.graph_descendant_of(target_tip_id, b.id)? || target_tip_id == b.id)
+            && (repo.graph_descendant_of(b.id, merge_base)? || b.id == merge_base);
+        if is_on_path {
+            path_branches.push(b.clone());
+        }
+    }
+    Ok(path_branches)
 }
 
 pub fn visualize_stack(

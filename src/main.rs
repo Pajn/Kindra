@@ -2,7 +2,8 @@ mod commands;
 mod editor;
 mod gh;
 mod rebase_utils;
-pub mod stack;
+mod runtime;
+mod stack;
 
 use crate::commands::abort_cmd::abort_cmd;
 use crate::commands::checkout::checkout;
@@ -87,20 +88,10 @@ impl Drop for TerminalRestorer {
 fn main() -> Result<()> {
     let _restorer = TerminalRestorer;
 
-    // Increase the file descriptor limit on systems that support it.
-    // This helps prevent "Too many open files" errors in large repositories.
-    #[cfg(unix)]
-    {
-        use rustix::process::{Resource, getrlimit, setrlimit};
-        let limit = getrlimit(Resource::Nofile);
-        let mut new_limit = limit;
-        new_limit.current = new_limit.maximum;
-        let _ = setrlimit(Resource::Nofile, new_limit);
+    // SAFETY: We are at the very beginning of main, before any threads are spawned.
+    unsafe {
+        runtime::configure_runtime_tuning()?;
     }
-
-    // Set a limit on the number of open file descriptors libgit2 will use for packfiles.
-    // This helps prevent "Too many open files" errors on systems with low limits (like macOS).
-    let _ = unsafe { git2::opts::set_mwindow_file_limit(128) };
 
     let cli = Cli::parse();
 
