@@ -46,11 +46,11 @@ pub fn split() -> Result<()> {
 
     // Now we only care about branches that are on the linear path to the target tip.
     let mut path_branches = Vec::new();
-    for b in stack_branches {
+    for b in &stack_branches {
         let is_on_path = (repo.graph_descendant_of(target_tip_id, b.id)? || target_tip_id == b.id)
             && (repo.graph_descendant_of(b.id, merge_base)? || b.id == merge_base);
         if is_on_path {
-            path_branches.push(b);
+            path_branches.push(b.clone());
         }
     }
 
@@ -79,13 +79,13 @@ pub fn split() -> Result<()> {
 
     // Map commits to branches (only local branches pointing into our path)
     let mut commit_to_branches: HashMap<String, Vec<String>> = HashMap::new();
-    for branch in path_branches {
+    for branch in &path_branches {
         let id_str = branch.id.to_string();
         if commit_ids.contains(&id_str) {
             commit_to_branches
                 .entry(id_str)
                 .or_default()
-                .push(branch.name);
+                .push(branch.name.clone());
         }
     }
 
@@ -165,19 +165,6 @@ pub fn split() -> Result<()> {
         }
     }
 
-    // Apply changes
-    let head_detached = repo.head_detached()?;
-    let current_branch = if !head_detached {
-        repo.head()?.shorthand().map(|s| s.to_string())
-    } else {
-        None
-    };
-
-    let existing_managed_branches: HashMap<String, String> = commit_to_branches
-        .into_iter()
-        .flat_map(|(id, names)| names.into_iter().map(move |name| (name, id.clone())))
-        .collect();
-
     let mut next_branches: HashMap<String, String> = HashMap::new();
     for (name, id_short) in new_branch_map {
         // Map short ID back to full ID
@@ -186,13 +173,35 @@ pub fn split() -> Result<()> {
             .find(|c| c.id.starts_with(&id_short))
             .map(|c| c.id.clone())
             .ok_or_else(|| anyhow!("Could not resolve commit {}", id_short))?;
-        next_branches.insert(name, full_id);
+        next_branches.insert(name, full_id.clone());
     }
 
-    // Delete branches
-    for name in existing_managed_branches.keys() {
-        if !next_branches.contains_key(name) {
-            if Some(name) == current_branch.as_ref() {
+    // Apply changes
+    apply_split(
+        &repo,
+        next_branches,
+        path_branches.iter().map(|b| b.name.clone()).collect(),
+    )?;
+
+    Ok(())
+}
+
+fn apply_split(
+    repo: &Repository,
+    next_branches: HashMap<String, String>,
+    initial_branches: Vec<String>,
+) -> Result<()> {
+    let head_detached = repo.head_detached()?;
+    let current_branch = if !head_detached {
+        repo.head()?.shorthand().map(|s| s.to_string())
+    } else {
+        None
+    };
+
+    // Delete branches that are no longer in next_branches
+    for name in initial_branches {
+        if !next_branches.contains_key(&name) {
+            if Some(&name) == current_branch.as_ref() {
                 println!(
                     "Cannot delete current branch: {}. Detaching HEAD first.",
                     name
@@ -200,13 +209,13 @@ pub fn split() -> Result<()> {
                 let head_commit = repo.head()?.peel_to_commit()?;
                 repo.set_head_detached(head_commit.id())?;
             }
-            let mut branch = repo.find_branch(name, BranchType::Local)?;
-            branch.delete()?;
-            println!("Deleted branch: {}", name);
+            if let Ok(mut branch) = repo.find_branch(&name, BranchType::Local) {
+                branch.delete()?;
+                println!("Deleted branch: {}", name);
+            }
         }
     }
 
-    // Create or move branches
     for (name, id) in next_branches {
         let commit_obj = repo.revparse_single(&id)?;
         let commit = commit_obj

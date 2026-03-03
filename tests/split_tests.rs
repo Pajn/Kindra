@@ -503,3 +503,39 @@ fn test_checkout_all_detached_no_main() {
     let new_head = repo.head().unwrap().shorthand().unwrap().to_string();
     assert_eq!(new_head, "trunk");
 }
+
+#[test]
+fn test_split_invalid_edit_validation() {
+    let (dir, _repo) = setup_repo();
+
+    let editor_script = dir.path().join("editor.sh");
+    fs::write(
+        &editor_script,
+        r#"#!/bin/sh
+file=$1
+# Put a branch at the very top of the file, before any commits
+echo "branch invalid-move" > "$file.tmp"
+cat "$file" >> "$file.tmp"
+mv "$file.tmp" "$file"
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&editor_script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&editor_script, perms).unwrap();
+    }
+
+    let mut cmd = gits_cmd();
+    cmd.arg("split")
+        .current_dir(dir.path())
+        .env("EDITOR", &editor_script)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("must follow a commit line"));
+
+    // Verify state file does NOT exist
+    assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
+}

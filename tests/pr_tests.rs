@@ -108,7 +108,12 @@ fn pr_fails_without_gh() {
     // The command is allowed to succeed (exit 0) only with the "nothing to do"
     // message, or to fail. Either way, it must not crash (exit code 101+).
     let output = cmd.output().unwrap();
-    let code = output.status.code().unwrap_or(1);
+    let code = output.status.code().unwrap_or_else(|| {
+        panic!(
+            "gits pr was terminated by a signal. stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    });
     assert!(
         code != 101,
         "gits pr panicked (exit 101). stderr: {}",
