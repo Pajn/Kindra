@@ -1,10 +1,9 @@
 use crate::rebase_utils::state_path;
-use anyhow::{Context, Result, anyhow};
-use git2::Repository;
+use anyhow::{Result, anyhow};
 use std::process::Command;
 
 pub fn abort_cmd() -> Result<()> {
-    let repo = Repository::open(".").context("Failed to open git repository.")?;
+    let repo = crate::open_repo()?;
     let path = state_path(&repo);
     if path.exists() {
         // Only try to abort a git rebase if we were actually in a gits operation

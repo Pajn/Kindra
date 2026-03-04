@@ -11,7 +11,7 @@ use tempfile::NamedTempFile;
 pub fn pr() -> Result<()> {
     gh::check_gh().context("GitHub CLI check failed")?;
 
-    let repo = Repository::open(".").context("Failed to open git repository.")?;
+    let repo = crate::open_repo()?;
 
     let upstream_name = crate::commands::find_upstream(&repo)?;
     let upstream_obj = repo.revparse_single(&upstream_name)?;

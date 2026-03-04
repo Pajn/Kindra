@@ -2,6 +2,7 @@ mod commands;
 mod editor;
 mod gh;
 mod rebase_utils;
+mod repository;
 mod runtime;
 mod stack;
 
@@ -14,6 +15,7 @@ use crate::commands::pr::pr;
 use crate::commands::push::push;
 use crate::commands::split::split;
 use crate::commands::status_cmd::status_cmd;
+pub use crate::repository::open_repo;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};

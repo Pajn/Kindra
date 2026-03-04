@@ -8,8 +8,7 @@ use std::io::Write;
 use tempfile::NamedTempFile;
 
 pub fn split() -> Result<()> {
-    let repo =
-        Repository::open(".").context("Failed to open git repository. Are you in a git repo?")?;
+    let repo = crate::open_repo()?;
 
     let upstream_name = find_upstream(&repo)?;
     let upstream_obj = repo.revparse_single(&upstream_name)?;

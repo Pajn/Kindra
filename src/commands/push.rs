@@ -1,12 +1,12 @@
 use crate::commands::find_upstream;
 use crate::stack::get_stack_branches;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use git2::{BranchType, Repository};
 use std::fmt;
 use std::process::Command;
 
 pub fn push() -> Result<()> {
-    let repo = Repository::open(".").context("Failed to open git repository.")?;
+    let repo = crate::open_repo()?;
 
     let remote_name = resolve_remote(&repo)?;
 

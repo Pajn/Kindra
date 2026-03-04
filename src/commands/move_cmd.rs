@@ -16,7 +16,7 @@ pub struct MoveArgs {
 }
 
 pub fn move_cmd(args: &MoveArgs) -> Result<()> {
-    let repo = Repository::open(".").context("Failed to open git repository.")?;
+    let repo = crate::open_repo()?;
     start_move(&repo, args)
 }
 

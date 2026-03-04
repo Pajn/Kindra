@@ -1,12 +1,12 @@
 use super::CheckoutSubcommand;
 use super::find_upstream;
 use crate::stack::{get_immediate_successors, get_stack_branches, get_stack_tips, visualize_stack};
-use anyhow::{Context, Result, anyhow};
-use git2::{BranchType, Repository};
+use anyhow::{Result, anyhow};
+use git2::BranchType;
 use std::process::Command;
 
 pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()> {
-    let repo = Repository::open(".").context("Failed to open git repository.")?;
+    let repo = crate::open_repo()?;
 
     if all && subcommand.is_none() {
         let mut branch_names = Vec::new();

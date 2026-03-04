@@ -1,12 +1,11 @@
 use crate::commands::find_upstream;
 use crate::rebase_utils::{RebaseState, run_rebase_loop, save_state, state_path};
 use crate::stack::{collect_descendants, get_stack_branches_from_merge_base};
-use anyhow::{Context, Result, anyhow};
-use git2::Repository;
+use anyhow::{Result, anyhow};
 use std::process::Command;
 
 pub fn commit(args: &[String]) -> Result<()> {
-    let repo = Repository::open(".").context("Failed to open git repository.")?;
+    let repo = crate::open_repo()?;
 
     let path = state_path(&repo);
     if path.exists() {
@@ -46,7 +45,7 @@ pub fn commit(args: &[String]) -> Result<()> {
 
     // Refresh repo state after commit
 
-    let repo = Repository::open(".").context("Failed to reopen git repository.")?;
+    let repo = crate::open_repo()?;
     let new_head = repo.head()?;
     let new_head_id = new_head.peel_to_commit()?.id();
 
