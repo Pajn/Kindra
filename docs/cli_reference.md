@@ -29,15 +29,27 @@ This document provides a detailed overview of the commands available in `gits` a
 
 ### `commit`
 
-**Description:** Commits changes to the current branch and automatically rebases all descendant branches in the stack.
+**Description:** Commits changes and automatically rebases descendant branches in the affected stack.
 
 **Usage:**
 
 ```bash
 gits commit [git-commit-args]
+gits commit --on [<branch>] [git-commit-args]
 ```
 
 Any arguments you pass to `gits commit` (e.g., `-m "my message"`) are passed directly to `git commit`.
+
+- `--on <branch>`: Commit onto another branch instead of the current one. The next token is consumed as the branch name.
+- `--on=`: Open an interactive branch picker for the current stack.
+- `--on`: Open the interactive branch picker only when `--on` is the final token.
+
+Parser behavior:
+- `gits commit --on feature-a -m "msg"`: valid (`feature-a` is the target branch).
+- `gits commit --on -m "msg"`: invalid, because `--on` expects a branch unless used as the final token.
+- Use `gits commit --on= -m "msg"` (or `gits commit --on` as the last token) for interactive selection.
+
+When committing onto another branch, `gits` stashes non-staged files, switches to the target branch, commits, rebases dependents (unless you choose not to for an external stack), then returns to your original branch and unstages.
 
 **When to use it:** Use this instead of `git commit` when you are working on a branch that has other branches building on top of it. It saves you from having to manually rebase each dependent branch.
 

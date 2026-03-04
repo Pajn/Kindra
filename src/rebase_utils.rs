@@ -15,8 +15,13 @@ pub enum Operation {
 #[derive(Serialize, Deserialize)]
 pub struct RebaseState {
     pub operation: Operation,
+    /// Branch that acts as the rebase-root for this operation.
     pub original_branch: String,
+    /// Operation target branch (for move: onto branch, for commit: commit target).
     pub target_branch: String,
+    /// Branch to restore at the end (set for commit --on from another branch).
+    #[serde(default)]
+    pub caller_branch: Option<String>,
     /// List of branches remaining to be moved
     pub remaining_branches: Vec<String>,
     /// The branch currently being rebased
@@ -25,6 +30,12 @@ pub struct RebaseState {
     pub parent_id_map: HashMap<String, String>,
     /// branch_name -> original_parent_name (if it was a branch in the sub-stack)
     pub parent_name_map: HashMap<String, String>,
+    /// Optional stash token created by `gits commit --on` to preserve non-staged files.
+    #[serde(default)]
+    pub stash_ref: Option<String>,
+    /// Whether to run `git reset` when returning to the original branch.
+    #[serde(default)]
+    pub unstage_on_restore: bool,
 }
 
 pub fn state_path(repo: &Repository) -> PathBuf {
@@ -44,6 +55,86 @@ pub fn load_state(repo: &Repository) -> Result<RebaseState> {
     }
     let json = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&json)?)
+}
+
+pub fn checkout_branch(branch_name: &str) -> Result<()> {
+    let status = Command::new("git")
+        .arg("checkout")
+        .arg(branch_name)
+        .status()?;
+    if !status.success() {
+        return Err(anyhow!("Failed to checkout branch '{}'.", branch_name));
+    }
+    Ok(())
+}
+
+pub fn apply_stash(stash_ref: &str) -> Result<()> {
+    let resolved_ref = resolve_stash_reference(stash_ref)?;
+    let status = Command::new("git")
+        .arg("stash")
+        .arg("apply")
+        .arg(&resolved_ref)
+        .status()?;
+    if !status.success() {
+        return Err(anyhow!(
+            "Failed to apply stashed changes from '{}'. Resolve conflicts and run 'gits continue' or 'gits abort'.",
+            stash_ref
+        ));
+    }
+    Ok(())
+}
+
+pub fn drop_stash(stash_ref: &str) -> Result<()> {
+    let resolved_ref = resolve_stash_reference(stash_ref)?;
+    let status = Command::new("git")
+        .arg("stash")
+        .arg("drop")
+        .arg(&resolved_ref)
+        .status()?;
+    if !status.success() {
+        return Err(anyhow!("Failed to drop stash entry '{}'.", stash_ref));
+    }
+    Ok(())
+}
+
+fn resolve_stash_reference(stash_ref: &str) -> Result<String> {
+    if stash_ref.starts_with("stash@{") {
+        return Ok(stash_ref.to_string());
+    }
+
+    let output = Command::new("git")
+        .arg("stash")
+        .arg("list")
+        .arg("--format=%gd%x09%gs")
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!("Failed to list stash entries."));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some((reference, subject)) = line.split_once('\t') {
+            let parsed_message = subject
+                .split_once(": ")
+                .map(|(_, message)| message.trim())
+                .unwrap_or_else(|| subject.trim());
+            if parsed_message == stash_ref {
+                return Ok(reference.to_string());
+            }
+        }
+    }
+
+    Err(anyhow!("Could not locate stash entry '{}'.", stash_ref))
+}
+
+pub fn unstage_all() -> Result<()> {
+    let status = Command::new("git").arg("reset").status()?;
+    if !status.success() {
+        return Err(anyhow!(
+            "Failed to unstage files after returning to the original branch."
+        ));
+    }
+    Ok(())
 }
 
 pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> {
@@ -122,25 +213,39 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         }
     }
 
+    let restore_branch = state
+        .caller_branch
+        .clone()
+        .unwrap_or_else(|| state.original_branch.clone());
     println!(
         "Operation completed. Checking out original branch {}...",
-        state.original_branch
+        restore_branch
     );
-    let status = Command::new("git")
-        .arg("checkout")
-        .arg(&state.original_branch)
-        .status()?;
+    checkout_branch(&restore_branch).map_err(|e| {
+        anyhow!(
+            "Failed to checkout back to original branch '{}'. State file preserved. {}",
+            restore_branch,
+            e
+        )
+    })?;
 
-    if status.success() {
-        let path = state_path(repo);
-        if path.exists() {
-            fs::remove_file(path)?;
+    if let Some(stash_ref) = state.stash_ref.clone() {
+        println!("Restoring stashed non-staged files...");
+        apply_stash(&stash_ref)?;
+        state.stash_ref = None;
+        save_state(repo, &state)?;
+        if let Err(err) = drop_stash(&stash_ref) {
+            eprintln!("Warning: {}", err);
         }
-    } else {
-        return Err(anyhow!(
-            "Failed to checkout back to original branch '{}'. State file preserved.",
-            state.original_branch
-        ));
+    }
+
+    if state.unstage_on_restore {
+        unstage_all()?;
+    }
+
+    let path = state_path(repo);
+    if path.exists() {
+        fs::remove_file(path)?;
     }
 
     Ok(())

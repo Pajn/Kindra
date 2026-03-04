@@ -147,6 +147,7 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         operation: Operation::Move,
         original_branch: current_branch_name,
         target_branch: selected_target_name.clone(),
+        caller_branch: None,
         remaining_branches: sub_stack
             .into_iter()
             .map(|sb| sb.name)
@@ -155,6 +156,8 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         in_progress_branch: None,
         parent_id_map,
         parent_name_map,
+        stash_ref: None,
+        unstage_on_restore: false,
     };
 
     save_state(repo, &state)?;

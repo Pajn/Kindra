@@ -568,7 +568,19 @@ fn test_move_abort_preserves_state_on_rebase_abort_failure() {
 
     // 1. Manually create a gits move state file
     let state_path = dir.path().join(".git/gits_rebase_state.json");
-    fs::write(&state_path, "{}").unwrap();
+    fs::write(
+        &state_path,
+        r#"{
+  "operation": "Move",
+  "original_branch": "feature",
+  "target_branch": "target",
+  "remaining_branches": [],
+  "in_progress_branch": null,
+  "parent_id_map": {},
+  "parent_name_map": {}
+}"#,
+    )
+    .unwrap();
 
     // 2. Manually create a rebase-merge directory to simulate an active rebase
     fs::create_dir_all(dir.path().join(".git/rebase-merge")).unwrap();
@@ -995,7 +1007,19 @@ fn test_move_abort_cleans_up_rebase_when_state_exists() {
 
     // Manually create a gits move state file
     let state_path = dir.path().join(".git/gits_rebase_state.json");
-    fs::write(&state_path, "{}").unwrap();
+    fs::write(
+        &state_path,
+        r#"{
+  "operation": "Move",
+  "original_branch": "feature",
+  "target_branch": "target",
+  "remaining_branches": [],
+  "in_progress_branch": null,
+  "parent_id_map": {},
+  "parent_name_map": {}
+}"#,
+    )
+    .unwrap();
 
     // Run gits move abort
     let mut cmd = gits_cmd();

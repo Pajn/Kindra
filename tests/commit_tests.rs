@@ -1,7 +1,8 @@
 mod common;
-use common::{gits_cmd, make_commit};
+use common::{gits_cmd, make_commit, run_ok};
 use git2::Repository;
 use std::fs;
+use std::path::Path;
 use tempfile::tempdir;
 
 fn setup_repo() -> (tempfile::TempDir, Repository) {
@@ -36,6 +37,42 @@ fn setup_repo() -> (tempfile::TempDir, Repository) {
         .unwrap();
 
     (dir, repo)
+}
+
+fn git_stdout(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn assert_no_staged_changes(dir: &Path) {
+    let staged = git_stdout(dir, &["diff", "--cached", "--name-only"]);
+    assert!(
+        staged.trim().is_empty(),
+        "Expected no staged files, got:\n{}",
+        staged
+    );
+}
+
+fn assert_has_unstaged_file(dir: &Path, file: &str) {
+    let unstaged = git_stdout(dir, &["status", "--porcelain"]);
+    assert!(
+        unstaged
+            .lines()
+            .any(|line| { line.trim_end().ends_with(file) && line.chars().nth(1) != Some(' ') }),
+        "Expected '{}' to be unstaged, got:\n{}",
+        file,
+        unstaged
+    );
 }
 
 #[test]
@@ -564,6 +601,127 @@ fn test_commit_abort() {
 }
 
 #[test]
+fn test_abort_malformed_state() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "original",
+        "commit a",
+        &[&main_commit],
+    );
+    let a_commit = repo.find_commit(a_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "shared.txt",
+        "feature b change",
+        "commit b",
+        &[&a_commit],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("shared.txt"), "conflict").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("commit")
+        .arg("-m")
+        .arg("conflict")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .failure();
+
+    let state_path = dir.path().join(".git/gits_rebase_state.json");
+    assert!(state_path.exists());
+    fs::write(&state_path, "{ malformed json").unwrap();
+
+    let mut cmd_abort = gits_cmd();
+    cmd_abort
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .failure();
+
+    assert!(
+        state_path.exists(),
+        "Malformed state should be preserved when abort fails to parse it"
+    );
+}
+
+#[test]
+fn test_abort_uses_exact_stash_message_match() {
+    let (dir, _repo) = setup_repo();
+
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+
+    fs::write(dir.path().join("file.txt"), "stash one").unwrap();
+    run_ok(
+        "git",
+        &["stash", "push", "-m", "gits-commit-on-1-1"],
+        dir.path(),
+    );
+
+    fs::write(dir.path().join("file.txt"), "stash ten").unwrap();
+    run_ok(
+        "git",
+        &["stash", "push", "-m", "gits-commit-on-1-10"],
+        dir.path(),
+    );
+
+    let state_path = dir.path().join(".git/gits_rebase_state.json");
+    fs::write(
+        &state_path,
+        r#"{
+  "operation": "Commit",
+  "original_branch": "main",
+  "target_branch": "main",
+  "remaining_branches": [],
+  "in_progress_branch": null,
+  "parent_id_map": {},
+  "parent_name_map": {},
+  "stash_ref": "gits-commit-on-1-1",
+  "unstage_on_restore": false
+}"#,
+    )
+    .unwrap();
+
+    let mut cmd_abort = gits_cmd();
+    cmd_abort
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let stash_list = git_stdout(dir.path(), &["stash", "list"]);
+    let messages: Vec<&str> = stash_list
+        .lines()
+        .filter_map(|line| line.rsplit_once(": ").map(|(_, message)| message.trim()))
+        .collect();
+    assert!(
+        messages.contains(&"gits-commit-on-1-10"),
+        "Expected later stash to remain, got:\n{}",
+        stash_list
+    );
+    assert!(
+        !messages.contains(&"gits-commit-on-1-1"),
+        "Expected exact stash to be removed, got:\n{}",
+        stash_list
+    );
+}
+
+#[test]
 fn test_commit_reentry_guard() {
     let (dir, _repo) = setup_repo();
     let state_path = dir.path().join(".git/gits_rebase_state.json");
@@ -764,4 +922,489 @@ fn test_commit_failure_is_propagated() {
         .assert()
         .failure()
         .stdout(predicates::str::contains("nothing to commit"));
+}
+
+#[test]
+fn test_commit_on_branch_in_stack_restores_original_and_unstages() {
+    let (dir, repo) = setup_repo();
+
+    let feature_id = repo
+        .find_branch("feature", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let feature_commit = repo.find_commit(feature_id).unwrap();
+    let _feature_b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "feature-b.txt",
+        "feature-b",
+        "feature-b commit",
+        &[&feature_commit],
+    );
+
+    repo.set_head("refs/heads/feature-b").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("shared.txt"), "commit on feature").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+    fs::write(dir.path().join("scratch.txt"), "keep me unstaged").unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.arg("commit")
+        .arg("--on")
+        .arg("feature")
+        .arg("-m")
+        .arg("commit on feature")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "feature-b");
+
+    let new_feature_id = repo
+        .find_branch("feature", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    assert_ne!(new_feature_id, feature_id);
+
+    let new_feature_b_id = repo
+        .find_branch("feature-b", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let new_feature_b_commit = repo.find_commit(new_feature_b_id).unwrap();
+    assert_eq!(new_feature_b_commit.parent_id(0).unwrap(), new_feature_id);
+
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "keep me unstaged"
+    );
+    assert_has_unstaged_file(dir.path(), "scratch.txt");
+    assert_no_staged_changes(dir.path());
+}
+
+#[test]
+fn test_commit_on_branch_in_stack_three_level_restores_original_and_unstages() {
+    let (dir, repo) = setup_repo();
+
+    let feature_id = repo
+        .find_branch("feature", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let feature_commit = repo.find_commit(feature_id).unwrap();
+    let feature_b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "feature-b.txt",
+        "feature-b",
+        "feature-b commit",
+        &[&feature_commit],
+    );
+    let feature_b_commit = repo.find_commit(feature_b_id).unwrap();
+    let _feature_c_id = make_commit(
+        &repo,
+        "refs/heads/feature-c",
+        "feature-c.txt",
+        "feature-c",
+        "feature-c commit",
+        &[&feature_b_commit],
+    );
+
+    repo.set_head("refs/heads/feature-c").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("shared.txt"), "commit on feature").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+    fs::write(dir.path().join("scratch.txt"), "keep me unstaged").unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.arg("commit")
+        .arg("--on")
+        .arg("feature")
+        .arg("-m")
+        .arg("commit on feature")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "feature-c");
+
+    let new_feature_id = repo
+        .find_branch("feature", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    assert_ne!(new_feature_id, feature_id);
+
+    let new_feature_b_id = repo
+        .find_branch("feature-b", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let new_feature_b_commit = repo.find_commit(new_feature_b_id).unwrap();
+    assert_eq!(new_feature_b_commit.parent_id(0).unwrap(), new_feature_id);
+
+    let new_feature_c_id = repo
+        .find_branch("feature-c", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let new_feature_c_commit = repo.find_commit(new_feature_c_id).unwrap();
+    assert_eq!(new_feature_c_commit.parent_id(0).unwrap(), new_feature_b_id);
+
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "keep me unstaged"
+    );
+    assert_has_unstaged_file(dir.path(), "scratch.txt");
+    assert_no_staged_changes(dir.path());
+}
+
+#[test]
+fn test_commit_on_without_argument_uses_interactive_selection() {
+    let (dir, repo) = setup_repo();
+    let main_before = repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+
+    repo.set_head("refs/heads/main").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("interactive.txt"), "interactive").unwrap();
+    run_ok("git", &["add", "interactive.txt"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("commit")
+        .arg("--on=")
+        .arg("-m")
+        .arg("interactive target")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("auto-selecting first option"));
+
+    let main_after = repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    assert_ne!(main_after, main_before);
+}
+
+#[test]
+fn test_commit_on_requires_branch_when_followed_by_flag() {
+    let (dir, _repo) = setup_repo();
+
+    fs::write(dir.path().join("interactive-error.txt"), "interactive").unwrap();
+    run_ok("git", &["add", "interactive-error.txt"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("commit")
+        .arg("--on")
+        .arg("-m")
+        .arg("should fail")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "provide a branch name or use '--on=' for interactive selection",
+        ));
+}
+
+#[test]
+fn test_commit_on_other_stack_default_just_commits() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let root_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
+    let root = repo.find_commit(root_id).unwrap();
+
+    let s1a_id = make_commit(&repo, "refs/heads/s1-a", "s1.txt", "s1-a", "s1-a", &[&root]);
+    let s1a = repo.find_commit(s1a_id).unwrap();
+    let s1b_id = make_commit(&repo, "refs/heads/s1-b", "s1b.txt", "s1-b", "s1-b", &[&s1a]);
+    let s1b = repo.find_commit(s1b_id).unwrap();
+
+    let s2a_id = make_commit(&repo, "refs/heads/s2-a", "s2.txt", "s2-a", "s2-a", &[&root]);
+    let s2a = repo.find_commit(s2a_id).unwrap();
+    let s2b_id = make_commit(&repo, "refs/heads/s2-b", "s2b.txt", "s2-b", "s2-b", &[&s2a]);
+
+    repo.set_head("refs/heads/s1-b").unwrap();
+    repo.checkout_tree(
+        s1b.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+
+    fs::write(dir.path().join("cross.txt"), "cross stack commit").unwrap();
+    run_ok("git", &["add", "cross.txt"], dir.path());
+    fs::write(dir.path().join("scratch.txt"), "scratch").unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.arg("commit")
+        .arg("--on")
+        .arg("s2-a")
+        .arg("-m")
+        .arg("cross stack commit")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("auto-denying"));
+
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "s1-b");
+
+    let s2a_new = repo
+        .find_branch("s2-a", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    assert_ne!(s2a_new, s2a_id);
+
+    let s2b_new = repo
+        .find_branch("s2-b", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    assert_eq!(s2b_new, s2b_id, "s2-b should not be rebased by default");
+
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "scratch"
+    );
+    assert_has_unstaged_file(dir.path(), "scratch.txt");
+    assert_no_staged_changes(dir.path());
+}
+
+#[test]
+fn test_commit_on_conflict_and_continue_restores_original_context() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "base",
+        "feature-a",
+        &[&main_commit],
+    );
+    let a_commit = repo.find_commit(a_id).unwrap();
+    let _b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "shared.txt",
+        "feature-b change",
+        "feature-b",
+        &[&a_commit],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(
+        dir.path().join("shared.txt"),
+        "feature-a conflicting change",
+    )
+    .unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("commit")
+        .arg("--on")
+        .arg("feature-a")
+        .arg("-m")
+        .arg("feature-a conflict")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Resolve conflicts"));
+
+    assert!(dir.path().join(".git/gits_rebase_state.json").exists());
+
+    fs::write(dir.path().join("shared.txt"), "resolved").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+
+    let mut cmd_cont = gits_cmd();
+    cmd_cont
+        .arg("continue")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "feature-a");
+}
+
+#[test]
+fn test_commit_on_conflict_and_abort_restores_original_context() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "base",
+        "feature-a",
+        &[&main_commit],
+    );
+    let a_commit = repo.find_commit(a_id).unwrap();
+    let _b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "shared.txt",
+        "feature-b change",
+        "feature-b",
+        &[&a_commit],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(
+        dir.path().join("shared.txt"),
+        "feature-a conflicting change",
+    )
+    .unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("commit")
+        .arg("--on")
+        .arg("feature-a")
+        .arg("-m")
+        .arg("feature-a conflict")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .failure();
+
+    assert!(dir.path().join(".git/gits_rebase_state.json").exists());
+
+    let mut cmd_abort = gits_cmd();
+    cmd_abort
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(!dir.path().join(".git/rebase-merge").exists());
+    assert!(!dir.path().join(".git/rebase-apply").exists());
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "feature-a");
+}
+
+#[test]
+fn test_commit_on_checkout_conflict_restores_original_context() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "feature-a base",
+        "feature-a",
+        &[&main_commit],
+    );
+    let a_commit = repo.find_commit(a_id).unwrap();
+    let _b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "shared.txt",
+        "feature-b base",
+        "feature-b",
+        &[&a_commit],
+    );
+
+    repo.set_head("refs/heads/feature-b").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(
+        dir.path().join("shared.txt"),
+        "local staged change that blocks checkout",
+    )
+    .unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+    fs::write(dir.path().join("scratch.txt"), "scratch").unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.arg("commit")
+        .arg("--on")
+        .arg("feature-a")
+        .arg("-m")
+        .arg("should fail before commit")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "Failed to checkout branch 'feature-a'",
+        ));
+
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "feature-b");
+    assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "scratch"
+    );
+    assert_has_unstaged_file(dir.path(), "scratch.txt");
+    assert_no_staged_changes(dir.path());
 }

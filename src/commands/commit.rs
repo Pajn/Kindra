@@ -1,8 +1,13 @@
 use crate::commands::find_upstream;
-use crate::rebase_utils::{RebaseState, run_rebase_loop, save_state, state_path};
-use crate::stack::{collect_descendants, get_stack_branches_from_merge_base};
-use anyhow::{Result, anyhow};
+use crate::rebase_utils::{
+    RebaseState, apply_stash, checkout_branch, drop_stash, run_rebase_loop, save_state, state_path,
+    unstage_all,
+};
+use crate::stack::{StackBranch, collect_descendants, get_stack_branches_from_merge_base};
+use anyhow::{Context, Result, anyhow};
+use git2::{BranchType, Oid, Repository};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn commit(args: &[String]) -> Result<()> {
     let repo = crate::open_repo()?;
@@ -26,85 +31,363 @@ pub fn commit(args: &[String]) -> Result<()> {
     let upstream_obj = repo.revparse_single(&upstream_name)?;
     let upstream_id = upstream_obj.id();
     let head_id = head.peel_to_commit()?.id();
-    let merge_base = repo.merge_base(upstream_id, head_id)?;
+    let parsed = parse_commit_args(args)?;
+    let on_flag = parsed.on_target.is_some();
 
-    // Capture stack state BEFORE commit
-    let all_branches_in_stack = get_stack_branches_from_merge_base(
+    let current_stack = build_stack_context(&repo, head_id, upstream_id, &upstream_name)
+        .with_context(|| {
+            format!(
+                "Failed to discover stack context for current branch '{}'.",
+                current_branch_name
+            )
+        })?;
+
+    let target_branch = match parsed.on_target {
+        None => current_branch_name.clone(),
+        Some(Some(branch_name)) => branch_name,
+        Some(None) => select_target_branch(
+            &repo,
+            &current_branch_name,
+            head_id,
+            &current_stack.stack_branches,
+        )?,
+    };
+
+    repo.find_branch(&target_branch, BranchType::Local)
+        .with_context(|| format!("Target branch '{}' not found.", target_branch))?;
+    let target_old_head_id = repo.revparse_single(&target_branch)?.id();
+    let target_in_current_context = target_branch == upstream_name
+        || current_stack
+            .stack_branches
+            .iter()
+            .any(|b| b.name == target_branch);
+
+    let target_stack = build_stack_context(&repo, target_old_head_id, upstream_id, &upstream_name)?;
+    let target_sub_stack = collect_target_sub_stack(
         &repo,
-        merge_base,
-        head_id,
-        upstream_id,
+        &target_branch,
+        target_old_head_id,
         &upstream_name,
+        &target_stack.stack_branches,
     )?;
+    let target_has_dependents =
+        has_dependents_to_rebase(&target_branch, &upstream_name, &target_sub_stack);
+
+    let should_rebase = if !target_in_current_context && on_flag && target_has_dependents {
+        crate::commands::prompt_confirm(&format!(
+            "Branch '{}' has dependent branches in another stack. Rebase that stack as well?",
+            target_branch
+        ))?
+    } else {
+        true
+    };
+
+    let switching_branches = target_branch != current_branch_name;
+    let mut stash_ref = None;
+    if switching_branches {
+        stash_ref = stash_non_staged_changes()?;
+        if let Err(err) = checkout_branch(&target_branch) {
+            let restore_result =
+                restore_original_context(&current_branch_name, &mut stash_ref, switching_branches);
+            return match restore_result {
+                Ok(()) => Err(err),
+                Err(restore_err) => Err(restore_err.context(err)),
+            };
+        }
+    }
 
     // Run the actual git commit
-    let status = Command::new("git").arg("commit").args(args).status()?;
+    let status = Command::new("git")
+        .arg("commit")
+        .args(&parsed.git_commit_args)
+        .status()?;
     if !status.success() {
+        if switching_branches {
+            restore_original_context(&current_branch_name, &mut stash_ref, switching_branches)
+                .context("git commit failed and failed to restore original context")?;
+        }
         return Err(anyhow!("git commit failed"));
     }
 
     // Refresh repo state after commit
-
     let repo = crate::open_repo()?;
-    let new_head = repo.head()?;
-    let new_head_id = new_head.peel_to_commit()?.id();
+    let new_target_head_id = repo.revparse_single(&target_branch)?.id();
 
-    if head_id == new_head_id {
+    if target_old_head_id == new_target_head_id {
+        if switching_branches {
+            restore_original_context(&current_branch_name, &mut stash_ref, switching_branches)?;
+        }
         return Ok(());
     }
 
-    let mut sub_stack = Vec::new();
-    if current_branch_name == upstream_name {
-        // If we are on main, we want to rebase everything that was on top of the old main.
-        // head_id is the commit we just committed ON TOP OF (the old main).
-        crate::stack::collect_descendants_of_id(
-            &repo,
-            head_id,
-            &all_branches_in_stack,
-            &mut sub_stack,
-        )?;
-    } else {
-        collect_descendants(
-            &repo,
-            &current_branch_name,
-            &all_branches_in_stack,
-            &mut sub_stack,
-        )?;
-    }
-
-    if sub_stack.is_empty() || (sub_stack.len() == 1 && sub_stack[0].name == current_branch_name) {
-        // No descendants to rebase
+    if !should_rebase || !target_has_dependents {
+        if switching_branches {
+            restore_original_context(&current_branch_name, &mut stash_ref, switching_branches)?;
+        }
         return Ok(());
     }
 
-    // Sort sub_stack by topology
+    let mut sub_stack = target_sub_stack;
     crate::stack::sort_branches_topologically(&repo, &mut sub_stack)?;
 
     let (parent_id_map, parent_name_map) = crate::stack::build_parent_maps(
         &repo,
         &sub_stack,
-        &all_branches_in_stack,
-        merge_base,
-        head_id,
-        &current_branch_name,
+        &target_stack.stack_branches,
+        target_stack.merge_base,
+        target_old_head_id,
+        &target_branch,
     )?;
 
     let remaining_branches: Vec<String> = sub_stack
         .iter()
-        .filter(|sb| sb.name != current_branch_name)
+        .filter(|sb| sb.name != target_branch)
         .map(|sb| sb.name.clone())
         .collect();
 
+    if remaining_branches.is_empty() {
+        if switching_branches {
+            restore_original_context(&current_branch_name, &mut stash_ref, switching_branches)?;
+        }
+        return Ok(());
+    }
+
     let state = RebaseState {
         operation: crate::rebase_utils::Operation::Commit,
-        original_branch: current_branch_name.clone(),
-        target_branch: current_branch_name,
+        original_branch: target_branch.clone(),
+        target_branch,
+        caller_branch: if switching_branches {
+            Some(current_branch_name)
+        } else {
+            None
+        },
         remaining_branches,
         in_progress_branch: None,
         parent_id_map,
         parent_name_map,
+        stash_ref,
+        unstage_on_restore: switching_branches,
     };
 
     save_state(&repo, &state)?;
     run_rebase_loop(&repo, state)
+}
+
+struct StackContext {
+    merge_base: Oid,
+    stack_branches: Vec<StackBranch>,
+}
+
+#[derive(Default)]
+struct ParsedCommitArgs {
+    on_target: Option<Option<String>>,
+    git_commit_args: Vec<String>,
+}
+
+fn parse_commit_args(args: &[String]) -> Result<ParsedCommitArgs> {
+    let mut parsed = ParsedCommitArgs::default();
+    let mut idx = 0;
+
+    while idx < args.len() {
+        let arg = &args[idx];
+        if arg == "--" {
+            parsed.git_commit_args.extend(args[idx..].iter().cloned());
+            break;
+        }
+
+        if arg == "--on" {
+            if parsed.on_target.is_some() {
+                return Err(anyhow!("--on can only be specified once."));
+            }
+            if idx + 1 == args.len() {
+                parsed.on_target = Some(None);
+                idx += 1;
+                continue;
+            }
+            if args[idx + 1].starts_with('-') {
+                return Err(anyhow!(
+                    "When using '--on', provide a branch name or use '--on=' for interactive selection."
+                ));
+            }
+            parsed.on_target = Some(Some(args[idx + 1].clone()));
+            idx += 2;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--on=") {
+            if parsed.on_target.is_some() {
+                return Err(anyhow!("--on can only be specified once."));
+            }
+            if value.is_empty() {
+                parsed.on_target = Some(None);
+            } else {
+                parsed.on_target = Some(Some(value.to_string()));
+            }
+            idx += 1;
+            continue;
+        }
+
+        parsed.git_commit_args.push(arg.clone());
+        idx += 1;
+    }
+
+    Ok(parsed)
+}
+
+fn build_stack_context(
+    repo: &Repository,
+    head_id: Oid,
+    upstream_id: Oid,
+    upstream_name: &str,
+) -> Result<StackContext> {
+    let merge_base = repo.merge_base(upstream_id, head_id)?;
+    let stack_branches =
+        get_stack_branches_from_merge_base(repo, merge_base, head_id, upstream_id, upstream_name)?;
+    Ok(StackContext {
+        merge_base,
+        stack_branches,
+    })
+}
+
+fn select_target_branch(
+    repo: &Repository,
+    current_branch_name: &str,
+    current_head_id: Oid,
+    stack_branches: &[StackBranch],
+) -> Result<String> {
+    let mut options = stack_branches.to_vec();
+    if !options.iter().any(|b| b.name == current_branch_name) {
+        options.push(StackBranch {
+            name: current_branch_name.to_string(),
+            id: current_head_id,
+        });
+    }
+
+    if options.is_empty() {
+        return Err(anyhow!(
+            "No branches found in the current stack to commit onto."
+        ));
+    }
+
+    crate::stack::sort_branches_topologically(repo, &mut options)?;
+    let display: Vec<String> = options
+        .iter()
+        .map(|b| {
+            if b.name == current_branch_name {
+                format!("* {}", b.name)
+            } else {
+                format!("  {}", b.name)
+            }
+        })
+        .collect();
+    let selected_display =
+        crate::commands::prompt_select("Select branch to commit onto:", display)?;
+    options
+        .iter()
+        .find(|b| {
+            let rendered = if b.name == current_branch_name {
+                format!("* {}", b.name)
+            } else {
+                format!("  {}", b.name)
+            };
+            rendered == selected_display
+        })
+        .map(|b| b.name.clone())
+        .ok_or_else(|| anyhow!("Failed to resolve selected branch '{}'.", selected_display))
+}
+
+fn collect_target_sub_stack(
+    repo: &Repository,
+    target_branch: &str,
+    target_head_id: Oid,
+    upstream_name: &str,
+    all_branches_in_stack: &[StackBranch],
+) -> Result<Vec<StackBranch>> {
+    let mut sub_stack = Vec::new();
+    if target_branch == upstream_name {
+        crate::stack::collect_descendants_of_id(
+            repo,
+            target_head_id,
+            all_branches_in_stack,
+            &mut sub_stack,
+        )?;
+    } else if all_branches_in_stack
+        .iter()
+        .any(|b| b.name == target_branch)
+    {
+        collect_descendants(repo, target_branch, all_branches_in_stack, &mut sub_stack)?;
+    }
+    Ok(sub_stack)
+}
+
+fn has_dependents_to_rebase(
+    target_branch: &str,
+    upstream_name: &str,
+    sub_stack: &[StackBranch],
+) -> bool {
+    if target_branch == upstream_name {
+        !sub_stack.is_empty()
+    } else {
+        sub_stack.iter().any(|b| b.name != target_branch)
+    }
+}
+
+fn stash_head_ref() -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("-q")
+        .arg("refs/stash")
+        .output()?;
+    if output.status.success() {
+        let ref_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if ref_name.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(ref_name))
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+fn stash_non_staged_changes() -> Result<Option<String>> {
+    let before = stash_head_ref()?;
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let message = format!("gits-commit-on-{}-{}", std::process::id(), ts);
+    let status = Command::new("git")
+        .arg("stash")
+        .arg("push")
+        .arg("--keep-index")
+        .arg("--include-untracked")
+        .arg("-m")
+        .arg(&message)
+        .status()?;
+    if !status.success() {
+        return Err(anyhow!("Failed to stash non-staged files."));
+    }
+    let after = stash_head_ref()?;
+    if after != before {
+        Ok(Some(message))
+    } else {
+        Ok(None)
+    }
+}
+
+fn restore_original_context(
+    original_branch: &str,
+    stash_ref: &mut Option<String>,
+    unstage_on_restore: bool,
+) -> Result<()> {
+    checkout_branch(original_branch)?;
+    if let Some(stash_ref_value) = stash_ref.take() {
+        apply_stash(&stash_ref_value)?;
+        if let Err(err) = drop_stash(&stash_ref_value) {
+            eprintln!("Warning: {}", err);
+        }
+    }
+    if unstage_on_restore {
+        unstage_all()?;
+    }
+    Ok(())
 }
