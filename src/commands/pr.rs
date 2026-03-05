@@ -15,12 +15,15 @@ pub enum PrSubcommand {
     Open,
     /// Edit an existing PR from the current stack
     Edit,
+    /// Show status summary for all open PRs in the current stack
+    Status,
 }
 
 pub fn pr(subcommand: &Option<PrSubcommand>) -> Result<()> {
     match subcommand {
         Some(PrSubcommand::Open) => pr_open(),
         Some(PrSubcommand::Edit) => pr_edit(),
+        Some(PrSubcommand::Status) => pr_status(),
         None => pr_create_or_update(),
     }
 }
@@ -198,6 +201,79 @@ fn pr_edit() -> Result<()> {
     })?;
     println!("✓ PR updated: {}", existing.url);
     Ok(())
+}
+
+fn pr_status() -> Result<()> {
+    gh::check_gh().context("GitHub CLI check failed")?;
+
+    let repo = crate::open_repo()?;
+    let (_upstream_name, branches_with_upstream) = discover_stack_branches_with_upstream(&repo)?;
+
+    if branches_with_upstream.is_empty() {
+        println!("No branches with a remote upstream in stack.");
+        println!("Run `gits push` first to set upstreams.");
+        return Ok(());
+    }
+
+    let mut prs: Vec<(String, gh::EditablePr)> = Vec::new();
+    for (sb, _remote_upstream) in &branches_with_upstream {
+        if let Some(pr) = gh::find_open_pr_for_edit(&sb.name)? {
+            prs.push((sb.name.clone(), pr));
+        }
+    }
+
+    if prs.is_empty() {
+        println!("No open PRs found in the current stack.");
+        return Ok(());
+    }
+
+    for (idx, (branch, pr)) in prs.iter().enumerate() {
+        if idx > 0 {
+            println!();
+        }
+
+        let (owner, repo_name) = parse_github_owner_repo_from_pr_url(&pr.url)
+            .ok_or_else(|| anyhow::anyhow!("Could not parse owner/repo from PR URL: {}", pr.url))?;
+        let status = gh::get_pr_status(&owner, &repo_name, pr.number)?;
+
+        println!("── {} (#{}): {} ──", branch, pr.number, pr.title);
+        println!("URL: {}", pr.url);
+
+        if status.reviewer_statuses.is_empty() {
+            println!("Reviewers: none");
+        } else {
+            println!("Reviewers:");
+            for reviewer in &status.reviewer_statuses {
+                println!("  - {}: {}", reviewer.reviewer, reviewer.status);
+            }
+        }
+
+        println!("Unresolved comments: {}", status.unresolved_comments);
+
+        if status.running_checks.is_empty() {
+            println!("Running checks: none");
+        } else {
+            println!("Running checks: {}", status.running_checks.join(", "));
+        }
+
+        if status.failed_checks.is_empty() {
+            println!("Failed checks: none");
+        } else {
+            println!("Failed checks: {}", status.failed_checks.join(", "));
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_github_owner_repo_from_pr_url(url: &str) -> Option<(String, String)> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let mut parts = after_scheme.split('/');
+
+    let _host = parts.next()?;
+    let owner = parts.next()?.to_string();
+    let repo = parts.next()?.to_string();
+    Some((owner, repo))
 }
 
 fn discover_stack_branches_with_upstream(

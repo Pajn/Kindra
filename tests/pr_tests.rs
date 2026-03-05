@@ -929,3 +929,164 @@ exit 1
         stdout
     );
 }
+
+#[test]
+fn pr_status_shows_reviewers_comments_and_checks() {
+    let (dir, _repo) = setup_simple_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo '{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false},{"isResolved":true},{"isResolved":false}]},"reviewRequests":{"nodes":[{"requestedReviewer":{"login":"bob"}}]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}},{"state":"COMMENTED","author":{"login":"carol"}}]},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"ci/test","status":"COMPLETED","conclusion":"FAILURE"},{"__typename":"CheckRun","name":"ci/lint","status":"IN_PROGRESS","conclusion":null},{"__typename":"StatusContext","context":"build","state":"PENDING"}]}}}}]}}}}}'
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = gits_cmd()
+        .args(["pr", "status"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "gits pr status failed: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("── feature (#42): Feature title ──"));
+    assert!(stdout.contains("URL: https://github.com/test/repo/pull/42"));
+    assert!(stdout.contains("alice: approved"));
+    assert!(stdout.contains("bob: waiting"));
+    assert!(stdout.contains("carol: comments"));
+    assert!(stdout.contains("Unresolved comments: 2"));
+    assert!(stdout.contains("Running checks: build, ci/lint"));
+    assert!(stdout.contains("Failed checks: ci/test"));
+}
+
+#[test]
+fn pr_status_lists_multiple_stack_prs() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    number=""
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "-F" ]]; then
+            shift
+            if [[ "$1" == number=* ]]; then
+                number="${1#number=}"
+            fi
+        fi
+        shift
+    done
+    if [[ "$number" == "10" ]]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+        exit 0
+    fi
+    if [[ "$number" == "11" ]]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false}]},"reviewRequests":{"nodes":[{"requestedReviewer":{"login":"bob"}}]},"latestReviews":{"nodes":[]},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"ci/test","status":"COMPLETED","conclusion":"FAILURE"}]}}}}]}}}}}'
+        exit 0
+    fi
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = gits_cmd()
+        .args(["pr", "status"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "gits pr status failed: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("── feature-a (#10): A title ──"));
+    assert!(stdout.contains("── feature-b (#11): B title ──"));
+    assert!(stdout.contains("alice: approved"));
+    assert!(stdout.contains("bob: waiting"));
+    assert!(stdout.contains("Failed checks: ci/test"));
+}

@@ -44,6 +44,20 @@ pub struct EditablePr {
     pub reviewers: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReviewerStatus {
+    pub reviewer: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrStatusSummary {
+    pub reviewer_statuses: Vec<ReviewerStatus>,
+    pub unresolved_comments: usize,
+    pub running_checks: Vec<String>,
+    pub failed_checks: Vec<String>,
+}
+
 /// Check if an open PR exists for `branch`. Returns `Some(ExistingPr)` or `None`.
 pub fn find_open_pr(branch: &str) -> Result<Option<ExistingPr>> {
     #[derive(Deserialize)]
@@ -179,6 +193,261 @@ pub fn find_open_pr_for_edit(branch: &str) -> Result<Option<EditablePr>> {
         labels,
         reviewers,
     }))
+}
+
+/// Fetch reviewer/check status details for a PR.
+pub fn get_pr_status(owner: &str, repo: &str, pr_number: u64) -> Result<PrStatusSummary> {
+    #[derive(Deserialize)]
+    struct GraphQlResponse {
+        data: GraphQlData,
+    }
+    #[derive(Deserialize)]
+    struct GraphQlData {
+        repository: Option<RepoData>,
+    }
+    #[derive(Deserialize)]
+    struct RepoData {
+        #[serde(rename = "pullRequest")]
+        pull_request: Option<PullRequestData>,
+    }
+    #[derive(Deserialize)]
+    struct PullRequestData {
+        #[serde(rename = "reviewThreads")]
+        review_threads: ReviewThreadConnection,
+        #[serde(rename = "reviewRequests")]
+        review_requests: ReviewRequestConnection,
+        #[serde(rename = "latestReviews")]
+        latest_reviews: LatestReviewConnection,
+        commits: CommitConnection,
+    }
+    #[derive(Deserialize)]
+    struct ReviewThreadConnection {
+        nodes: Vec<ReviewThreadNode>,
+    }
+    #[derive(Deserialize)]
+    struct ReviewThreadNode {
+        #[serde(rename = "isResolved")]
+        is_resolved: bool,
+    }
+    #[derive(Deserialize)]
+    struct ReviewRequestConnection {
+        nodes: Vec<ReviewRequestNode>,
+    }
+    #[derive(Deserialize)]
+    struct ReviewRequestNode {
+        #[serde(rename = "requestedReviewer")]
+        requested_reviewer: Option<RequestedReviewer>,
+    }
+    #[derive(Deserialize)]
+    struct RequestedReviewer {
+        login: String,
+    }
+    #[derive(Deserialize)]
+    struct LatestReviewConnection {
+        nodes: Vec<LatestReviewNode>,
+    }
+    #[derive(Deserialize)]
+    struct LatestReviewNode {
+        state: String,
+        author: Option<ReviewAuthor>,
+    }
+    #[derive(Deserialize)]
+    struct ReviewAuthor {
+        login: String,
+    }
+    #[derive(Deserialize)]
+    struct CommitConnection {
+        nodes: Vec<CommitNode>,
+    }
+    #[derive(Deserialize)]
+    struct CommitNode {
+        commit: CommitStatusNode,
+    }
+    #[derive(Deserialize)]
+    struct CommitStatusNode {
+        #[serde(rename = "statusCheckRollup")]
+        status_check_rollup: Option<StatusCheckRollup>,
+    }
+    #[derive(Deserialize)]
+    struct StatusCheckRollup {
+        contexts: CheckContextConnection,
+    }
+    #[derive(Deserialize)]
+    struct CheckContextConnection {
+        nodes: Vec<CheckContextNode>,
+    }
+    #[derive(Deserialize)]
+    #[serde(tag = "__typename")]
+    enum CheckContextNode {
+        CheckRun {
+            name: String,
+            status: Option<String>,
+            conclusion: Option<String>,
+        },
+        StatusContext {
+            context: String,
+            state: String,
+        },
+    }
+
+    let query = r#"
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved
+        }
+      }
+      reviewRequests(first: 100) {
+        nodes {
+          requestedReviewer {
+            ... on User {
+              login
+            }
+          }
+        }
+      }
+      latestReviews(first: 100) {
+        nodes {
+          state
+          author {
+            login
+          }
+        }
+      }
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              contexts(first: 100) {
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    name
+                    status
+                    conclusion
+                  }
+                  ... on StatusContext {
+                    context
+                    state
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
+    let output = Command::new("gh")
+        .args(["api", "graphql", "-f", &format!("query={}", query)])
+        .args(["-F", &format!("owner={}", owner)])
+        .args(["-F", &format!("repo={}", repo)])
+        .args(["-F", &format!("number={}", pr_number)])
+        .output()
+        .context("Failed to run `gh api graphql`")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "Failed to fetch PR status details: {}",
+            stderr.trim()
+        ));
+    }
+
+    let parsed: GraphQlResponse =
+        serde_json::from_slice(&output.stdout).context("Failed to parse graphql output")?;
+    let pr = parsed
+        .data
+        .repository
+        .and_then(|r| r.pull_request)
+        .ok_or_else(|| anyhow!("PR not found in graphql response"))?;
+
+    let unresolved_comments = pr
+        .review_threads
+        .nodes
+        .into_iter()
+        .filter(|thread| !thread.is_resolved)
+        .count();
+
+    let mut reviewer_map: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for review in pr.latest_reviews.nodes {
+        if let Some(author) = review.author {
+            let status = match review.state.as_str() {
+                "APPROVED" => "approved",
+                "CHANGES_REQUESTED" => "requested changes",
+                "COMMENTED" => "comments",
+                _ => "comments",
+            };
+            reviewer_map.insert(author.login, status.to_string());
+        }
+    }
+    for req in pr.review_requests.nodes {
+        if let Some(reviewer) = req.requested_reviewer {
+            reviewer_map.insert(reviewer.login, "waiting".to_string());
+        }
+    }
+
+    let reviewer_statuses = reviewer_map
+        .into_iter()
+        .map(|(reviewer, status)| ReviewerStatus { reviewer, status })
+        .collect();
+
+    let mut running_checks_set = BTreeSet::new();
+    let mut failed_checks_set = BTreeSet::new();
+
+    if let Some(last_commit) = pr.commits.nodes.into_iter().last()
+        && let Some(rollup) = last_commit.commit.status_check_rollup
+    {
+        for node in rollup.contexts.nodes {
+            match node {
+                CheckContextNode::CheckRun {
+                    name,
+                    status,
+                    conclusion,
+                } => {
+                    let status_upper = status.unwrap_or_default().to_uppercase();
+                    let conclusion_upper = conclusion.unwrap_or_default().to_uppercase();
+                    if matches!(
+                        status_upper.as_str(),
+                        "IN_PROGRESS" | "PENDING" | "QUEUED" | "WAITING" | "REQUESTED"
+                    ) {
+                        running_checks_set.insert(name);
+                    } else if matches!(
+                        conclusion_upper.as_str(),
+                        "FAILURE"
+                            | "TIMED_OUT"
+                            | "CANCELLED"
+                            | "ACTION_REQUIRED"
+                            | "STARTUP_FAILURE"
+                            | "STALE"
+                    ) {
+                        failed_checks_set.insert(name);
+                    }
+                }
+                CheckContextNode::StatusContext { context, state } => {
+                    let state_upper = state.to_uppercase();
+                    if state_upper == "PENDING" {
+                        running_checks_set.insert(context);
+                    } else if matches!(state_upper.as_str(), "ERROR" | "FAILURE") {
+                        failed_checks_set.insert(context);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(PrStatusSummary {
+        reviewer_statuses,
+        unresolved_comments,
+        running_checks: running_checks_set.into_iter().collect(),
+        failed_checks: failed_checks_set.into_iter().collect(),
+    })
 }
 
 /// Update the base branch of an existing PR.
