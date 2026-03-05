@@ -28,6 +28,11 @@ pub struct ExistingPr {
     pub base_branch: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct OpenPrUrl {
+    pub url: String,
+}
+
 /// Check if an open PR exists for `branch`. Returns `Some(ExistingPr)` or `None`.
 pub fn find_open_pr(branch: &str) -> Result<Option<ExistingPr>> {
     #[derive(Deserialize)]
@@ -59,6 +64,37 @@ pub fn find_open_pr(branch: &str) -> Result<Option<ExistingPr>> {
             number: pr.number,
             base_branch: pr.base_ref_name,
         }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Check if an open PR exists for `branch`. Returns its URL if open.
+pub fn find_open_pr_url(branch: &str) -> Result<Option<OpenPrUrl>> {
+    #[derive(Deserialize)]
+    struct PrView {
+        url: String,
+        state: String,
+    }
+
+    let output = Command::new("gh")
+        .args(["pr", "view", branch, "--json", "url,state"])
+        .output()
+        .context("Failed to run `gh pr view`")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("no pull requests found for branch") {
+            return Ok(None);
+        }
+        return Err(anyhow!("`gh pr view` failed: {}", stderr.trim()));
+    }
+
+    let pr: PrView =
+        serde_json::from_slice(&output.stdout).context("Failed to parse `gh pr view` output")?;
+
+    if pr.state.eq_ignore_ascii_case("OPEN") {
+        Ok(Some(OpenPrUrl { url: pr.url }))
     } else {
         Ok(None)
     }
@@ -174,4 +210,51 @@ pub fn list_collaborators() -> Result<Vec<String>> {
         .collect();
 
     Ok(logins)
+}
+
+/// Open a URL in the default browser.
+pub fn open_url(url: &str) -> Result<()> {
+    if let Ok(command) = std::env::var("GITS_OPEN_COMMAND") {
+        let status = Command::new(command)
+            .arg(url)
+            .status()
+            .context("Failed to launch URL opener command from GITS_OPEN_COMMAND")?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "URL opener command from GITS_OPEN_COMMAND failed with status {}",
+            status
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    };
+
+    #[cfg(target_os = "linux")]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    };
+
+    let status = cmd
+        .status()
+        .context("Failed to launch default browser opener")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("Failed to open URL in browser: {}", url))
+    }
 }

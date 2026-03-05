@@ -11,7 +11,7 @@ use crate::commands::checkout::checkout;
 use crate::commands::commit::commit;
 use crate::commands::continue_cmd::continue_cmd;
 use crate::commands::move_cmd::{MoveArgs, move_cmd};
-use crate::commands::pr::pr;
+use crate::commands::pr::{PrSubcommand, pr};
 use crate::commands::push::push;
 use crate::commands::restack::restack;
 use crate::commands::split::split;
@@ -36,8 +36,11 @@ enum Commands {
     Split,
     /// Pushes all branches with upstreams (atomic, force-with-lease)
     Push,
-    /// Create or update pull requests for all branches with upstreams
-    Pr,
+    /// Create/update PRs for stack branches, or open existing PRs in the browser
+    Pr {
+        #[command(subcommand)]
+        subcommand: Option<PrSubcommand>,
+    },
     /// Interactive branch checkout
     #[command(alias = "co")]
     Checkout {
@@ -103,7 +106,7 @@ fn main() -> Result<()> {
     match &cli.command {
         Commands::Split => split()?,
         Commands::Push => push()?,
-        Commands::Pr => pr()?,
+        Commands::Pr { subcommand } => pr(subcommand)?,
         Commands::Commit { args } => commit(args)?,
         Commands::Checkout { subcommand, all } => checkout(subcommand, *all)?,
         Commands::Move(args) => move_cmd(args)?,

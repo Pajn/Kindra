@@ -3,41 +3,30 @@ use crate::stack::{
     StackBranch, compute_base_map, get_stack_branches, sort_branches_topologically,
 };
 use anyhow::{Context, Result};
+use clap::Subcommand;
 use git2::{BranchType, Repository};
 use std::fs;
 use std::io::Write;
 use tempfile::NamedTempFile;
 
-pub fn pr() -> Result<()> {
+#[derive(Subcommand, Clone, Copy)]
+pub enum PrSubcommand {
+    /// Open an existing PR from the current stack in your default browser
+    Open,
+}
+
+pub fn pr(subcommand: &Option<PrSubcommand>) -> Result<()> {
+    match subcommand {
+        Some(PrSubcommand::Open) => pr_open(),
+        None => pr_create_or_update(),
+    }
+}
+
+fn pr_create_or_update() -> Result<()> {
     gh::check_gh().context("GitHub CLI check failed")?;
 
     let repo = crate::open_repo()?;
-
-    let upstream_name = crate::commands::find_upstream(&repo)?;
-    let upstream_obj = repo.revparse_single(&upstream_name)?;
-    let upstream_id = upstream_obj.id();
-    let head_id = repo.head()?.peel_to_commit()?.id();
-
-    // Collect all stack branches and sort bottom→top so base branches are
-    // processed before the branches that depend on them.
-    let mut stack_branches = get_stack_branches(&repo, head_id, upstream_id, &upstream_name)?;
-    sort_branches_topologically(&repo, &mut stack_branches)?;
-
-    if stack_branches.is_empty() {
-        println!("No branches in stack.");
-        return Ok(());
-    }
-
-    // Only operate on branches that have a remote upstream configured.
-    let branches_with_upstream: Vec<(StackBranch, String)> = stack_branches
-        .into_iter()
-        .filter_map(|sb| {
-            let branch = repo.find_branch(&sb.name, BranchType::Local).ok()?;
-            let up = branch.upstream().ok()?;
-            let up_name = up.name().ok()??.to_string();
-            Some((sb, up_name))
-        })
-        .collect();
+    let (upstream_name, branches_with_upstream) = discover_stack_branches_with_upstream(&repo)?;
 
     if branches_with_upstream.is_empty() {
         println!("No branches with a remote upstream to create PRs for.");
@@ -67,6 +56,86 @@ pub fn pr() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn pr_open() -> Result<()> {
+    gh::check_gh().context("GitHub CLI check failed")?;
+
+    let repo = crate::open_repo()?;
+    let (_upstream_name, branches_with_upstream) = discover_stack_branches_with_upstream(&repo)?;
+
+    if branches_with_upstream.is_empty() {
+        println!("No branches with a remote upstream in stack.");
+        println!("Run `gits push` first to set upstreams.");
+        return Ok(());
+    }
+
+    let mut prs: Vec<(String, String)> = Vec::new();
+    for (sb, _remote_upstream) in &branches_with_upstream {
+        if let Some(open_pr) = gh::find_open_pr_url(&sb.name)? {
+            prs.push((sb.name.clone(), open_pr.url));
+        }
+    }
+
+    if prs.is_empty() {
+        println!("No open PRs found in the current stack.");
+        return Ok(());
+    }
+
+    if prs.len() == 1 {
+        let (branch, url) = &prs[0];
+        println!("Opening PR for {}: {}", branch, url);
+        gh::open_url(url)?;
+        return Ok(());
+    }
+
+    let options: Vec<String> = prs
+        .iter()
+        .map(|(branch, url)| format!("{} → {}", branch, url))
+        .collect();
+
+    let selection = crate::commands::prompt_select("Select PR to open:", options)?;
+    let selected_url = prs
+        .iter()
+        .find(|(branch, url)| format!("{} → {}", branch, url) == selection)
+        .map(|(_, url)| url)
+        .ok_or_else(|| anyhow::anyhow!("Selected PR not found"))?;
+
+    println!("Opening {}", selected_url);
+    gh::open_url(selected_url)?;
+    Ok(())
+}
+
+fn discover_stack_branches_with_upstream(
+    repo: &Repository,
+) -> Result<(String, Vec<(StackBranch, String)>)> {
+    let upstream_name = crate::commands::find_upstream(repo)?;
+    let upstream_obj = repo.revparse_single(&upstream_name)?;
+    let upstream_id = upstream_obj.id();
+    let head_id = repo.head()?.peel_to_commit()?.id();
+
+    // Collect all stack branches and sort bottom→top so base branches are
+    // processed before the branches that depend on them.
+    let mut stack_branches = get_stack_branches(repo, head_id, upstream_id, &upstream_name)?;
+    sort_branches_topologically(repo, &mut stack_branches)?;
+
+    if stack_branches.is_empty() {
+        println!("No branches in stack.");
+        return Ok((upstream_name, Vec::new()));
+    }
+
+    // Only operate on branches that have a remote upstream configured.
+    let branches_with_upstream: Vec<(StackBranch, String)> = stack_branches
+        .into_iter()
+        .filter_map(|sb| {
+            let branch = repo.find_branch(&sb.name, BranchType::Local).ok()?;
+            let up = branch.upstream().ok()?;
+            let up_name = up.name().ok()??.to_string();
+            Some((sb, up_name))
+        })
+        .collect();
+
+    Ok((upstream_name, branches_with_upstream))
 }
 
 // ────────────────────────────────────────────────────────────────────────────

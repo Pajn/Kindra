@@ -624,3 +624,157 @@ exit 1
         child_section
     );
 }
+
+#[test]
+fn pr_open_opens_single_pr_without_prompt() {
+    let (dir, _repo) = setup_simple_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo '{"url":"https://github.com/test/repo/pull/42","state":"OPEN"}'
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let open_mock = dir.path().join("mock-open");
+    std::fs::write(
+        &open_mock,
+        r#"#!/bin/bash
+printf "%s" "$1" > "$MOCK_OPEN_CAPTURE"
+exit 0
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", open_mock.to_str().unwrap()], dir.path());
+    let opened_url_path = dir.path().join("opened_url.txt");
+
+    let output = gits_cmd()
+        .args(["pr", "open"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("GITS_OPEN_COMMAND", open_mock.to_str().unwrap())
+        .env("MOCK_OPEN_CAPTURE", &opened_url_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "gits pr open failed: {:?}", output);
+    let opened_url = fs::read_to_string(&opened_url_path).unwrap();
+    assert_eq!(opened_url, "https://github.com/test/repo/pull/42");
+}
+
+#[test]
+fn pr_open_with_multiple_prs_uses_selection() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"url":"https://github.com/test/repo/pull/10","state":"OPEN"}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"url":"https://github.com/test/repo/pull/11","state":"OPEN"}'
+        exit 0
+    fi
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let open_mock = dir.path().join("mock-open");
+    std::fs::write(
+        &open_mock,
+        r#"#!/bin/bash
+printf "%s" "$1" > "$MOCK_OPEN_CAPTURE"
+exit 0
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", open_mock.to_str().unwrap()], dir.path());
+    let opened_url_path = dir.path().join("opened_url.txt");
+
+    let output = gits_cmd()
+        .args(["pr", "open"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("GITS_OPEN_COMMAND", open_mock.to_str().unwrap())
+        .env("MOCK_OPEN_CAPTURE", &opened_url_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "gits pr open failed: {:?}", output);
+    let opened_url = fs::read_to_string(&opened_url_path).unwrap();
+    // Non-interactive tests auto-select the first option.
+    assert_eq!(opened_url, "https://github.com/test/repo/pull/10");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Select PR to open:"),
+        "Expected selection prompt in output. Got:\n{}",
+        stdout
+    );
+}
