@@ -10,6 +10,7 @@
 - **Interactive Navigation**: Quickly hop between branches in your stack with `up`, `down`, and `top` commands.
 - **Visual Branch Splitting**: Assign branches to specific commits in a linear history using your favorite `$EDITOR`.
 - **Atomic Pushes**: Push all branches in your stack simultaneously with `force-with-lease` safety.
+- **PR Workflow Helpers**: Create/update stack PRs, open PRs in your browser, edit PR metadata, and inspect review/check status.
 
 ## Installation
 
@@ -31,6 +32,11 @@ cargo install --path .
 3. **Watch the magic**: `gits` will automatically rebase all branches that depend on your change.
 4. **Move the stack**: Ready to target a different feature? `gits move --onto main` to relocate the entire stack.
 5. **Restack after merges**: If lower PRs landed, run `gits restack` to rebase the remaining stack onto latest `main`.
+6. **Manage PRs in stack**:
+   - `gits pr` to create/update PRs
+   - `gits pr open` to open a PR from the stack
+   - `gits pr edit` to edit title/body/labels/reviewers
+   - `gits pr status` to inspect reviewers, unresolved comments, and failing/running checks
 
 For a full list of commands and detailed examples, see the [CLI Reference](docs/cli_reference.md).
 

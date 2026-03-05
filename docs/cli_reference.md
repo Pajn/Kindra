@@ -9,11 +9,12 @@ This document provides a detailed overview of the commands available in `gits` a
   - [commit](#commit)
   - [move](#move)
   - [restack](#restack)
-  - [checkout (co)](`#checkout-alias-co`)
+  - [checkout (co)](#checkout-alias-co)
   - [push](#push)
+  - [pr](#pr)
   - [split](#split)
   - [Status & Control (status, continue, abort)](#status--control)
-- [Shell Completions](#shell-completions)
+  - [Shell Completions](#shell-completions)
 
 ---
 
@@ -156,6 +157,31 @@ gits push
 This command performs an atomic push of all branches in the stack using `force-with-lease` to ensure safety.
 
 **When to use it:** Use this when you've updated multiple branches in your stack (e.g., after a `gits commit` or `gits move`) and want to sync them all to the remote in one go.
+
+---
+
+### `pr`
+
+**Description:** Manages pull requests for branches in the current stack.
+
+**Usage:**
+
+```bash
+gits pr
+gits pr open
+gits pr edit
+gits pr status
+```
+
+- `gits pr`: Create/update PRs for stack branches with upstreams.
+- `gits pr open`: Open a PR URL in the default browser (if multiple, choose one).
+- `gits pr edit`: Select a PR (if multiple), then edit title/body/labels/reviewers.
+- `gits pr status`: Show each stack PR's reviewer status, unresolved comments, and running/failed checks.
+
+**Notes:**
+
+- These commands require authenticated GitHub CLI (`gh auth status` must succeed).
+- `gits pr status` is PR-focused and different from top-level `gits status` (which is for in-progress `move`/`commit` operations).
 
 ---
 
