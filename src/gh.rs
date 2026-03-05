@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::process::Command;
 
 /// Verify that the `gh` CLI is installed and authenticated.
@@ -31,6 +32,16 @@ pub struct ExistingPr {
 #[derive(Debug, Clone)]
 pub struct OpenPrUrl {
     pub url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct EditablePr {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub url: String,
+    pub labels: Vec<String>,
+    pub reviewers: Vec<String>,
 }
 
 /// Check if an open PR exists for `branch`. Returns `Some(ExistingPr)` or `None`.
@@ -98,6 +109,76 @@ pub fn find_open_pr_url(branch: &str) -> Result<Option<OpenPrUrl>> {
     } else {
         Ok(None)
     }
+}
+
+/// Fetch editable details for an open PR on `branch`.
+pub fn find_open_pr_for_edit(branch: &str) -> Result<Option<EditablePr>> {
+    #[derive(Deserialize)]
+    struct Label {
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct User {
+        login: String,
+    }
+    #[derive(Deserialize)]
+    struct ReviewRequest {
+        #[serde(rename = "requestedReviewer")]
+        requested_reviewer: Option<User>,
+    }
+    #[derive(Deserialize)]
+    struct PrView {
+        number: u64,
+        title: String,
+        body: String,
+        url: String,
+        state: String,
+        labels: Vec<Label>,
+        #[serde(rename = "reviewRequests")]
+        review_requests: Vec<ReviewRequest>,
+    }
+
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            branch,
+            "--json",
+            "number,title,body,url,state,labels,reviewRequests",
+        ])
+        .output()
+        .context("Failed to run `gh pr view`")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("no pull requests found for branch") {
+            return Ok(None);
+        }
+        return Err(anyhow!("`gh pr view` failed: {}", stderr.trim()));
+    }
+
+    let pr: PrView =
+        serde_json::from_slice(&output.stdout).context("Failed to parse `gh pr view` output")?;
+
+    if !pr.state.eq_ignore_ascii_case("OPEN") {
+        return Ok(None);
+    }
+
+    let labels = pr.labels.into_iter().map(|l| l.name).collect();
+    let reviewers = pr
+        .review_requests
+        .into_iter()
+        .filter_map(|r| r.requested_reviewer.map(|u| u.login))
+        .collect();
+
+    Ok(Some(EditablePr {
+        number: pr.number,
+        title: pr.title,
+        body: pr.body,
+        url: pr.url,
+        labels,
+        reviewers,
+    }))
 }
 
 /// Update the base branch of an existing PR.
@@ -210,6 +291,58 @@ pub fn list_collaborators() -> Result<Vec<String>> {
         .collect();
 
     Ok(logins)
+}
+
+pub struct EditPrParams {
+    pub number: u64,
+    pub title: String,
+    pub body: Option<String>,
+    pub current_labels: Vec<String>,
+    pub labels: Vec<String>,
+    pub current_reviewers: Vec<String>,
+    pub reviewers: Vec<String>,
+}
+
+/// Edit an existing PR title/body/labels/reviewers.
+pub fn edit_pr(params: &EditPrParams) -> Result<()> {
+    let current_labels: BTreeSet<String> = params.current_labels.iter().cloned().collect();
+    let labels: BTreeSet<String> = params.labels.iter().cloned().collect();
+    let current_reviewers: BTreeSet<String> = params.current_reviewers.iter().cloned().collect();
+    let reviewers: BTreeSet<String> = params.reviewers.iter().cloned().collect();
+
+    let mut cmd = Command::new("gh");
+    cmd.args([
+        "pr",
+        "edit",
+        &params.number.to_string(),
+        "--title",
+        &params.title,
+    ]);
+
+    if let Some(body) = &params.body {
+        cmd.args(["--body", body]);
+    }
+
+    for label in labels.difference(&current_labels) {
+        cmd.args(["--add-label", label]);
+    }
+    for label in current_labels.difference(&labels) {
+        cmd.args(["--remove-label", label]);
+    }
+    for reviewer in reviewers.difference(&current_reviewers) {
+        cmd.args(["--add-reviewer", reviewer]);
+    }
+    for reviewer in current_reviewers.difference(&reviewers) {
+        cmd.args(["--remove-reviewer", reviewer]);
+    }
+
+    let output = cmd.output().context("Failed to run `gh pr edit`")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow!("Failed to edit PR #{}: {}", params.number, stderr))
+    }
 }
 
 /// Open a URL in the default browser.

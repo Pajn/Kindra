@@ -778,3 +778,154 @@ exit 0
         stdout
     );
 }
+
+#[test]
+fn pr_edit_single_open_pr_saves_with_prefilled_title() {
+    let (dir, _repo) = setup_simple_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo '{"number":42,"title":"Current title","body":"Current body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[{"name":"bug"}],"reviewRequests":[{"requestedReviewer":{"login":"alice"}}]}'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s" "$@" > "$MOCK_GH_EDIT_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let edit_args_path = dir.path().join("edit_args.txt");
+
+    let output = gits_cmd()
+        .args(["pr", "edit"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "gits pr edit failed: {:?}", output);
+    let args = fs::read_to_string(&edit_args_path).unwrap();
+    assert!(
+        args.contains("predit42--titleCurrent title"),
+        "Expected title to be passed through unchanged. Got:\n{}",
+        args
+    );
+    assert!(
+        !args.contains("--body"),
+        "Body should remain unchanged in non-interactive mode. Got:\n{}",
+        args
+    );
+}
+
+#[test]
+fn pr_edit_multiple_open_prs_uses_selection() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s" "$@" > "$MOCK_GH_EDIT_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let edit_args_path = dir.path().join("edit_args.txt");
+
+    let output = gits_cmd()
+        .args(["pr", "edit"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "gits pr edit failed: {:?}", output);
+    let args = fs::read_to_string(&edit_args_path).unwrap();
+    assert!(
+        args.contains("predit10--titleA title"),
+        "Non-interactive mode should auto-select first PR. Got:\n{}",
+        args
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Select PR to edit:"),
+        "Expected selection prompt in output. Got:\n{}",
+        stdout
+    );
+}
