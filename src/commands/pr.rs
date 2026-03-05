@@ -13,11 +13,14 @@ use tempfile::NamedTempFile;
 pub enum PrSubcommand {
     /// Open an existing PR from the current stack in your default browser
     Open,
+    /// Edit an existing PR from the current stack
+    Edit,
 }
 
 pub fn pr(subcommand: &Option<PrSubcommand>) -> Result<()> {
     match subcommand {
         Some(PrSubcommand::Open) => pr_open(),
+        Some(PrSubcommand::Edit) => pr_edit(),
         None => pr_create_or_update(),
     }
 }
@@ -103,6 +106,97 @@ fn pr_open() -> Result<()> {
 
     println!("Opening {}", selected_url);
     gh::open_url(selected_url)?;
+    Ok(())
+}
+
+fn pr_edit() -> Result<()> {
+    gh::check_gh().context("GitHub CLI check failed")?;
+
+    let repo = crate::open_repo()?;
+    let (_upstream_name, branches_with_upstream) = discover_stack_branches_with_upstream(&repo)?;
+
+    if branches_with_upstream.is_empty() {
+        println!("No branches with a remote upstream in stack.");
+        println!("Run `gits push` first to set upstreams.");
+        return Ok(());
+    }
+
+    let mut prs: Vec<(String, gh::EditablePr)> = Vec::new();
+    for (sb, _remote_upstream) in &branches_with_upstream {
+        if let Some(pr) = gh::find_open_pr_for_edit(&sb.name)? {
+            prs.push((sb.name.clone(), pr));
+        }
+    }
+
+    if prs.is_empty() {
+        println!("No open PRs found in the current stack.");
+        return Ok(());
+    }
+
+    let selected_index = if prs.len() == 1 {
+        0
+    } else {
+        let options: Vec<String> = prs
+            .iter()
+            .map(|(branch, pr)| format!("{} → {}", branch, pr.url))
+            .collect();
+        let selection = crate::commands::prompt_select("Select PR to edit:", options)?;
+        prs.iter()
+            .position(|(branch, pr)| format!("{} → {}", branch, pr.url) == selection)
+            .ok_or_else(|| anyhow::anyhow!("Selected PR not found"))?
+    };
+
+    let (branch_name, existing) = &prs[selected_index];
+    println!(
+        "Editing PR #{} for {} ({})",
+        existing.number, branch_name, existing.url
+    );
+
+    let title = prompt_edit_title(&existing.title)?;
+    let mut body = prompt_edit_body(&existing.body)?;
+    let mut labels = existing.labels.clone();
+    let mut reviewers = existing.reviewers.clone();
+
+    loop {
+        let mut menu_items = vec!["Save".to_string()];
+        if labels.is_empty() {
+            menu_items.push("Set labels".to_string());
+        } else {
+            menu_items.push(format!("Set labels [{}]", labels.join(", ")));
+        }
+        if reviewers.is_empty() {
+            menu_items.push("Set reviewers".to_string());
+        } else {
+            menu_items.push(format!("Set reviewers [{}]", reviewers.join(", ")));
+        }
+        menu_items.push("Edit body".to_string());
+
+        let choice = crate::commands::prompt_select("PR edit options:", menu_items)?;
+        match choice.as_str() {
+            "Save" => break,
+            s if s.starts_with("Set labels") => {
+                labels = prompt_labels_for_edit(&labels)?;
+            }
+            s if s.starts_with("Set reviewers") => {
+                reviewers = prompt_reviewers_for_edit(&reviewers)?;
+            }
+            "Edit body" => {
+                body = prompt_edit_body(&existing.body)?;
+            }
+            _ => {}
+        }
+    }
+
+    gh::edit_pr(&gh::EditPrParams {
+        number: existing.number,
+        title,
+        body,
+        current_labels: existing.labels.clone(),
+        labels,
+        current_reviewers: existing.reviewers.clone(),
+        reviewers,
+    })?;
+    println!("✓ PR updated: {}", existing.url);
     Ok(())
 }
 
@@ -355,6 +449,118 @@ fn open_editor_for_body(prefill: &str) -> Result<String> {
     // the author's reference and should not appear in the PR description.
     let cleaned = strip_html_comment(&body);
     Ok(cleaned.trim().to_string())
+}
+
+fn open_editor_for_plain_body(prefill: &str) -> Result<String> {
+    let mut temp = NamedTempFile::new()?;
+    temp.write_all(prefill.as_bytes())?;
+    let path = temp.path().to_path_buf();
+
+    crate::editor::launch_editor(&path)?;
+    let body = fs::read_to_string(&path)?;
+    Ok(body)
+}
+
+fn prompt_edit_title(current_title: &str) -> Result<String> {
+    if !std::io::stdin().is_terminal() {
+        println!("  [non-interactive] Keeping title: {}", current_title);
+        return Ok(current_title.to_string());
+    }
+
+    let edited = inquire::Text::new("  PR title:")
+        .with_initial_value(current_title)
+        .prompt()
+        .context("Title prompt failed")?;
+
+    if edited.trim().is_empty() {
+        Ok(current_title.to_string())
+    } else {
+        Ok(edited)
+    }
+}
+
+fn prompt_edit_body(current_body: &str) -> Result<Option<String>> {
+    if !std::io::stdin().is_terminal() {
+        println!("  [non-interactive] Keeping body unchanged");
+        return Ok(None);
+    }
+
+    println!("  PR body: [e] open editor  [enter] keep unchanged");
+    loop {
+        crossterm::terminal::enable_raw_mode()?;
+        let key = read_single_key();
+        crossterm::terminal::disable_raw_mode()?;
+        match key.as_deref() {
+            Some("e") => {
+                println!("e");
+                let edited = open_editor_for_plain_body(current_body)?;
+                return Ok(Some(edited));
+            }
+            Some("\r") | Some("\n") | Some("") => {
+                println!();
+                return Ok(None);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn prompt_labels_for_edit(current: &[String]) -> Result<Vec<String>> {
+    let available = gh::list_labels().unwrap_or_default();
+    if available.is_empty() {
+        println!("  No labels found in this repository.");
+        return Ok(current.to_vec());
+    }
+
+    if !std::io::stdin().is_terminal() {
+        println!("  [non-interactive] Keeping labels unchanged");
+        return Ok(current.to_vec());
+    }
+
+    let default_indexes: Vec<usize> = available
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| current.contains(*l))
+        .map(|(idx, _)| idx)
+        .collect();
+
+    let selected = inquire::MultiSelect::new(
+        "  Select labels (Space to toggle, Enter to confirm):",
+        available,
+    )
+    .with_default(&default_indexes)
+    .prompt()
+    .context("Label selection failed")?;
+    Ok(selected)
+}
+
+fn prompt_reviewers_for_edit(current: &[String]) -> Result<Vec<String>> {
+    let available = gh::list_collaborators().unwrap_or_default();
+    if available.is_empty() {
+        println!("  No collaborators found for this repository.");
+        return Ok(current.to_vec());
+    }
+
+    if !std::io::stdin().is_terminal() {
+        println!("  [non-interactive] Keeping reviewers unchanged");
+        return Ok(current.to_vec());
+    }
+
+    let default_indexes: Vec<usize> = available
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| current.contains(*r))
+        .map(|(idx, _)| idx)
+        .collect();
+
+    let selected = inquire::MultiSelect::new(
+        "  Select reviewers (Space to toggle, Enter to confirm):",
+        available,
+    )
+    .with_default(&default_indexes)
+    .prompt()
+    .context("Reviewer selection failed")?;
+    Ok(selected)
 }
 
 fn strip_html_comment(s: &str) -> &str {
