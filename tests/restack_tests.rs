@@ -292,6 +292,208 @@ fn restack_handles_merged_lower_branch() {
 }
 
 #[test]
+fn restack_rebases_onto_remote_tracking_base_when_local_base_is_stale() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let remote_dir = dir.path().join("remote.git");
+    fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+    run_ok("git", &["push", "-u", "origin", "main:main"], dir.path());
+
+    let feature_before = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "feature.txt",
+        "feature",
+        "feature a",
+        &[&base],
+    );
+
+    let remote_worktree = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote_dir.to_str().unwrap(),
+            remote_worktree.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "main"], remote_worktree.path());
+    fs::write(remote_worktree.path().join("remote.txt"), "remote main").unwrap();
+    run_ok("git", &["add", "remote.txt"], remote_worktree.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "remote main advanced"],
+        remote_worktree.path(),
+    );
+    run_ok("git", &["push", "origin", "main"], remote_worktree.path());
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    let local_main_before = repo
+        .find_branch("main", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let origin_main_before = repo.revparse_single("origin/main").unwrap().id();
+    assert_eq!(local_main_before, origin_main_before);
+
+    let mut cmd = gits_cmd();
+    cmd.arg("restack")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let origin_main_after_restack = repo.revparse_single("origin/main").unwrap().id();
+    let feature_after = repo
+        .find_branch("feature-a", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let feature_after_commit = repo.find_commit(feature_after).unwrap();
+
+    assert_ne!(origin_main_before, origin_main_after_restack);
+    assert_ne!(feature_after, feature_before);
+    assert!(
+        repo.graph_descendant_of(feature_after, origin_main_after_restack)
+            .unwrap()
+    );
+    assert_eq!(
+        feature_after_commit.parent_id(0).unwrap(),
+        origin_main_after_restack
+    );
+}
+
+#[test]
+fn restack_treats_slashed_base_branch_name_as_local_before_remote() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let remote_dir = dir.path().join("upstream.git");
+    fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "upstream", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/release/2026.03",
+        "release.txt",
+        "base",
+        "release base",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+    run_ok(
+        "git",
+        &["push", "-u", "upstream", "release/2026.03:release/2026.03"],
+        dir.path(),
+    );
+    fs::write(
+        repo.path().join("gits.toml"),
+        r#"upstream_branch = "release/2026.03""#,
+    )
+    .unwrap();
+
+    let feature_before = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "feature.txt",
+        "feature",
+        "feature a",
+        &[&base],
+    );
+
+    let remote_worktree = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote_dir.to_str().unwrap(),
+            remote_worktree.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["checkout", "release/2026.03"],
+        remote_worktree.path(),
+    );
+    fs::write(remote_worktree.path().join("remote.txt"), "remote release").unwrap();
+    run_ok("git", &["add", "remote.txt"], remote_worktree.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "remote release advanced"],
+        remote_worktree.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "origin", "release/2026.03"],
+        remote_worktree.path(),
+    );
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    let upstream_before = repo
+        .revparse_single("upstream/release/2026.03")
+        .unwrap()
+        .id();
+    let local_release_before = repo
+        .find_branch("release/2026.03", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    assert_eq!(upstream_before, local_release_before);
+
+    let mut cmd = gits_cmd();
+    cmd.arg("restack")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let upstream_after = repo
+        .revparse_single("upstream/release/2026.03")
+        .unwrap()
+        .id();
+    let feature_after = repo
+        .find_branch("feature-a", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let feature_after_commit = repo.find_commit(feature_after).unwrap();
+
+    assert_ne!(upstream_before, upstream_after);
+    assert_ne!(feature_before, feature_after);
+    assert_eq!(feature_after_commit.parent_id(0).unwrap(), upstream_after);
+}
+
+#[test]
 fn restack_reports_rebase_conflict() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
