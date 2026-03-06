@@ -67,13 +67,7 @@ pub fn prompt_confirm(message: &str) -> Result<bool> {
 
 pub fn find_upstream(repo: &Repository) -> Result<String> {
     if let Some(upstream) = read_repo_upstream_override(repo)? {
-        if branch_exists(repo, &upstream) {
-            return Ok(upstream);
-        }
-        return Err(anyhow!(
-            "Configured upstream branch '{}' in .git/gits.toml was not found",
-            upstream
-        ));
+        return Ok(upstream);
     }
 
     let mut local_candidates = Vec::new();
@@ -119,6 +113,21 @@ fn branch_exists(repo: &Repository, name: &str) -> bool {
         || repo.find_branch(name, BranchType::Remote).is_ok()
 }
 
+fn resolve_branch_name(repo: &Repository, name: &str) -> Option<String> {
+    if branch_exists(repo, name) {
+        return Some(name.to_string());
+    }
+
+    if !name.starts_with("origin/") {
+        let origin_name = format!("origin/{name}");
+        if branch_exists(repo, &origin_name) {
+            return Some(origin_name);
+        }
+    }
+
+    None
+}
+
 #[derive(Deserialize)]
 struct RepoConfig {
     upstream_branch: Option<String>,
@@ -143,8 +152,20 @@ fn read_repo_upstream_override(repo: &Repository) -> Result<Option<String>> {
         )
     })?;
 
-    Ok(cfg
+    let upstream = cfg
         .upstream_branch
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty()))
+        .filter(|value| !value.is_empty());
+
+    match upstream {
+        Some(upstream) => resolve_branch_name(repo, &upstream)
+            .map(Some)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Configured upstream branch '{}' in .git/gits.toml was not found",
+                    upstream
+                )
+            }),
+        None => Ok(None),
+    }
 }

@@ -149,3 +149,31 @@ fn upstream_detection_slash_default_branch_exists_only_remotely() {
     let upstream = find_upstream(&repo).unwrap();
     assert_eq!(upstream, "origin/feature/base");
 }
+
+#[test]
+fn upstream_override_slash_branch_exists_only_remotely() {
+    let (_dir, repo) = setup_repo_with_base("work");
+
+    let work_tip = repo
+        .revparse_single("work")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id();
+    repo.reference(
+        "refs/remotes/origin/feature/base",
+        work_tip,
+        true,
+        "test remote override branch",
+    )
+    .unwrap();
+
+    fs::write(
+        repo.path().join("gits.toml"),
+        r#"upstream_branch = "feature/base""#,
+    )
+    .unwrap();
+
+    let upstream = find_upstream(&repo).unwrap();
+    assert_eq!(upstream, "origin/feature/base");
+}

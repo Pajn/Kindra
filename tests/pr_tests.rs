@@ -311,6 +311,227 @@ exit 1
     );
 }
 
+#[test]
+fn pr_adds_stack_section_to_multi_pr_descriptions() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo "no pull requests found for branch" >&2
+    exit 1
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
+    head=""
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--head" ]]; then
+            head="$2"
+            break
+        fi
+        shift
+    done
+    if [[ "$head" == "feature-a" ]]; then
+        echo "https://github.com/test/repo/pull/10"
+        exit 0
+    fi
+    if [[ "$head" == "feature-b" ]]; then
+        echo "https://github.com/test/repo/pull/11"
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    pr_number="$3"
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--body" ]]; then
+            printf "%s" "$2" > "$MOCK_GH_BODY_DIR/pr_${pr_number}.txt"
+            exit 0
+        fi
+        shift
+    done
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let captured_body_dir = dir.path().join("captured-bodies");
+    std::fs::create_dir_all(&captured_body_dir).unwrap();
+
+    let output = gits_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_BODY_DIR", &captured_body_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "gits pr failed: {:?}", output);
+
+    let feature_a_body = fs::read_to_string(captured_body_dir.join("pr_10.txt")).unwrap();
+    assert!(
+        feature_a_body.contains("## Stack"),
+        "feature-a body should include a stack section. Got:\n{}",
+        feature_a_body
+    );
+    assert!(
+        feature_a_body.contains("- → feature-a #10"),
+        "feature-a body should mark the current PR. Got:\n{}",
+        feature_a_body
+    );
+    assert!(
+        feature_a_body.contains("- [feature-b](https://github.com/test/repo/pull/11) #11"),
+        "feature-a body should link the other PR. Got:\n{}",
+        feature_a_body
+    );
+
+    let feature_b_body = fs::read_to_string(captured_body_dir.join("pr_11.txt")).unwrap();
+    assert!(
+        feature_b_body.contains("- [feature-a](https://github.com/test/repo/pull/10) #10"),
+        "feature-b body should link the other PR. Got:\n{}",
+        feature_b_body
+    );
+    assert!(
+        feature_b_body.contains("- → feature-b #11"),
+        "feature-b body should mark the current PR. Got:\n{}",
+        feature_b_body
+    );
+}
+
+#[test]
+fn pr_stack_sync_continues_when_one_edit_fails() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo "no pull requests found for branch" >&2
+    exit 1
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
+    head=""
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--head" ]]; then
+            head="$2"
+            break
+        fi
+        shift
+    done
+    if [[ "$head" == "feature-a" ]]; then
+        echo "https://github.com/test/repo/pull/10"
+        exit 0
+    fi
+    if [[ "$head" == "feature-b" ]]; then
+        echo "https://github.com/test/repo/pull/11"
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    pr_number="$3"
+    if [[ "$pr_number" == "10" ]]; then
+        echo "simulated edit failure" >&2
+        exit 1
+    fi
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--body" ]]; then
+            printf "%s" "$2" > "$MOCK_GH_BODY_DIR/pr_${pr_number}.txt"
+            exit 0
+        fi
+        shift
+    done
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let captured_body_dir = dir.path().join("captured-bodies");
+    std::fs::create_dir_all(&captured_body_dir).unwrap();
+
+    let output = gits_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_BODY_DIR", &captured_body_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "gits pr failed: {:?}", output);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to sync stack section for PR #10"),
+        "Expected sync failure to be reported. Got:\n{}",
+        stderr
+    );
+
+    let feature_b_body = fs::read_to_string(captured_body_dir.join("pr_11.txt")).unwrap();
+    assert!(
+        feature_b_body.contains("- → feature-b #11"),
+        "feature-b body should still be updated after feature-a edit fails. Got:\n{}",
+        feature_b_body
+    );
+}
+
 // Test: multi-commit branch → title is NOT prefilled (shows commit list instead)
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -789,6 +1010,194 @@ exit 0
 }
 
 #[test]
+fn pr_edit_preserves_stack_block() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    # Return different PR info depending on which branch is requested
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"title":"PR A","body":"Body A","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}'
+    elif [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"title":"PR B","body":"Body B","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}'
+    fi
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s" "$@" > "$MOCK_GH_EDIT_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let edit_args_path = dir.path().join("edit_args.txt");
+
+    let output = gits_cmd()
+        .args(["pr", "edit"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "gits pr edit failed: {:?}", output);
+    let args = fs::read_to_string(&edit_args_path).unwrap();
+
+    // Verify that the body was updated to include the stack section
+    assert!(
+        args.contains("## Stack"),
+        "Expected stack section in PR body. Got:\n{}",
+        args
+    );
+    assert!(
+        args.contains("feature-a"),
+        "Expected feature-a in stack section. Got:\n{}",
+        args
+    );
+    assert!(
+        args.contains("feature-b"),
+        "Expected feature-b in stack section. Got:\n{}",
+        args
+    );
+}
+
+#[test]
+fn pr_edit_cleans_duplicate_stack_blocks() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    let start = "<!-- gits-stack:start -->";
+    let end = "<!-- gits-stack:end -->";
+    let body_with_duplicates = format!(
+        "Original Body\n\n{}\nOld Stack 1\n{}\n\nMiddle Text\n\n{}\nOld Stack 2\n{}",
+        start, end, start, end
+    );
+
+    // Escape for JSON and then for Bash
+    let body_for_bash = body_with_duplicates
+        .replace("\n", "\\n")
+        .replace("\"", "\\\"");
+
+    std::fs::write(
+        &gh_mock,
+        format!(
+            r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{{"number":10,"title":"PR A","body":"{}","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}}'
+    elif [[ "$3" == "feature-b" ]]; then
+        echo '{{"number":11,"title":"PR B","body":"Body B","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}}'
+    fi
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s" "$@" > "$MOCK_GH_EDIT_ARGS"
+    exit 0
+fi
+exit 1
+"#,
+            body_for_bash
+        ),
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let edit_args_path = dir.path().join("edit_args.txt");
+
+    let output = gits_cmd()
+        .args(["pr", "edit"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "gits pr edit failed: {:?}", output);
+    let args = fs::read_to_string(&edit_args_path).unwrap();
+
+    // Verify it contains exactly one ## Stack header
+    let stack_count = args.matches("## Stack").count();
+    assert_eq!(
+        stack_count, 1,
+        "Expected exactly one Stack header, got {}. Full args:\n{}",
+        stack_count, args
+    );
+
+    // Verify it contains the new stack info but not the old ones
+    assert!(args.contains("feature-a"), "Should contain feature-a");
+    assert!(
+        !args.contains("Old Stack 1"),
+        "Should not contain Old Stack 1"
+    );
+    assert!(
+        !args.contains("Old Stack 2"),
+        "Should not contain Old Stack 2"
+    );
+    assert!(
+        args.contains("Original Body"),
+        "Should contain Original Body"
+    );
+    assert!(args.contains("Middle Text"), "Should contain Middle Text");
+}
+
+#[test]
 fn pr_edit_single_open_pr_saves_with_prefilled_title() {
     let (dir, _repo) = setup_simple_stack();
 
@@ -936,6 +1345,98 @@ exit 1
         stdout.contains("Select PR to edit:"),
         "Expected selection prompt in output. Got:\n{}",
         stdout
+    );
+}
+
+#[test]
+fn pr_edit_reapplies_stack_section_for_multi_pr_stack() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"title":"A title","body":"A body without stack","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"title":"B title","body":"B body without stack","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    pr_number="$3"
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--body" ]]; then
+            printf "%s" "$2" > "$MOCK_GH_BODY_DIR/pr_${pr_number}.txt"
+            exit 0
+        fi
+        shift
+    done
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let captured_body_dir = dir.path().join("captured-bodies");
+    std::fs::create_dir_all(&captured_body_dir).unwrap();
+
+    let output = gits_cmd()
+        .args(["pr", "edit"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_BODY_DIR", &captured_body_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "gits pr edit failed: {:?}", output);
+
+    let body = fs::read_to_string(captured_body_dir.join("pr_10.txt")).unwrap();
+    assert!(
+        body.contains("<!-- gits-stack:start -->"),
+        "Expected stack block to be reinserted. Got:\n{}",
+        body
+    );
+    assert!(
+        body.contains("- → feature-a #10"),
+        "Current PR should be marked in the stack block. Got:\n{}",
+        body
+    );
+    assert!(
+        body.contains("- [feature-b](https://github.com/test/repo/pull/11) #11"),
+        "Other PR should remain linked in the stack block. Got:\n{}",
+        body
     );
 }
 

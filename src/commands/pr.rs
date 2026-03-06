@@ -2,7 +2,7 @@ use crate::gh::{self, CreatePrParams};
 use crate::stack::{
     StackBranch, compute_base_map, get_stack_branches, sort_branches_topologically,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Subcommand;
 use git2::{BranchType, Repository};
 use std::fs;
@@ -28,6 +28,15 @@ pub fn pr(subcommand: &Option<PrSubcommand>) -> Result<()> {
     }
 }
 
+const STACK_SECTION_START: &str = "<!-- gits-stack:start -->";
+const STACK_SECTION_END: &str = "<!-- gits-stack:end -->";
+
+#[derive(Clone)]
+struct StackPr {
+    branch_name: String,
+    pr: gh::EditablePr,
+}
+
 fn pr_create_or_update() -> Result<()> {
     gh::check_gh().context("GitHub CLI check failed")?;
 
@@ -50,6 +59,7 @@ fn pr_create_or_update() -> Result<()> {
         branches_with_upstream.len()
     );
 
+    let mut open_prs = Vec::new();
     for (sb, _remote_upstream) in &branches_with_upstream {
         let git_base = base_map
             .get(&sb.name)
@@ -57,9 +67,16 @@ fn pr_create_or_update() -> Result<()> {
             .unwrap_or_else(|| upstream_name.clone());
         let gh_base = normalize_base_for_gh(&git_base);
 
-        process_branch_pr(&repo, &sb.name, &git_base, &gh_base)?;
+        if let Some(pr) = process_branch_pr(&repo, &sb.name, &git_base, &gh_base)? {
+            open_prs.push(StackPr {
+                branch_name: sb.name.clone(),
+                pr,
+            });
+        }
         println!();
     }
+
+    sync_stack_descriptions(&open_prs)?;
 
     Ok(())
 }
@@ -124,32 +141,39 @@ fn pr_edit() -> Result<()> {
         return Ok(());
     }
 
-    let mut prs: Vec<(String, gh::EditablePr)> = Vec::new();
+    let mut all_stack_prs: Vec<StackPr> = Vec::new();
     for (sb, _remote_upstream) in &branches_with_upstream {
         if let Some(pr) = gh::find_open_pr_for_edit(&sb.name)? {
-            prs.push((sb.name.clone(), pr));
+            all_stack_prs.push(StackPr {
+                branch_name: sb.name.clone(),
+                pr,
+            });
         }
     }
 
-    if prs.is_empty() {
+    if all_stack_prs.is_empty() {
         println!("No open PRs found in the current stack.");
         return Ok(());
     }
 
-    let selected_index = if prs.len() == 1 {
+    let selected_index = if all_stack_prs.len() == 1 {
         0
     } else {
-        let options: Vec<String> = prs
+        let options: Vec<String> = all_stack_prs
             .iter()
-            .map(|(branch, pr)| format!("{} → {}", branch, pr.url))
+            .map(|pr| format!("{} → {}", pr.branch_name, pr.pr.url))
             .collect();
         let selection = crate::commands::prompt_select("Select PR to edit:", options)?;
-        prs.iter()
-            .position(|(branch, pr)| format!("{} → {}", branch, pr.url) == selection)
+        all_stack_prs
+            .iter()
+            .position(|pr| format!("{} → {}", pr.branch_name, pr.pr.url) == selection)
             .ok_or_else(|| anyhow::anyhow!("Selected PR not found"))?
     };
 
-    let (branch_name, existing) = &prs[selected_index];
+    let selected = &all_stack_prs[selected_index];
+    let branch_name = selected.branch_name.clone();
+    let existing = selected.pr.clone();
+
     println!(
         "Editing PR #{} for {} ({})",
         existing.number, branch_name, existing.url
@@ -190,10 +214,20 @@ fn pr_edit() -> Result<()> {
         }
     }
 
+    let body_for_reconciliation = body.as_deref().unwrap_or(&existing.body);
+    let stack_section = render_stack_section(&all_stack_prs, &branch_name);
+    let final_body = update_stack_section(body_for_reconciliation, stack_section);
+
+    let body_to_send = if final_body == existing.body && body.is_none() {
+        None
+    } else {
+        Some(final_body)
+    };
+
     gh::edit_pr(&gh::EditPrParams {
         number: existing.number,
         title,
-        body,
+        body: body_to_send,
         current_labels: existing.labels.clone(),
         labels,
         current_reviewers: existing.reviewers.clone(),
@@ -313,10 +347,12 @@ fn discover_stack_branches_with_upstream(
 // ────────────────────────────────────────────────────────────────────────────
 
 fn normalize_base_for_gh(base: &str) -> String {
-    base.rsplit_once('/')
-        .map(|(_, short)| short)
-        .unwrap_or(base)
-        .to_string()
+    if let Some((first, rest)) = base.split_once('/')
+        && (first == "origin" || first == "upstream")
+    {
+        return rest.to_string();
+    }
+    base.to_string()
 }
 
 fn process_branch_pr(
@@ -324,7 +360,7 @@ fn process_branch_pr(
     branch_name: &str,
     git_base: &str,
     gh_base: &str,
-) -> Result<()> {
+) -> Result<Option<gh::EditablePr>> {
     println!("── {} ──", branch_name);
 
     // Check for an existing open PR
@@ -338,14 +374,20 @@ fn process_branch_pr(
             } else {
                 println!("  Base is already '{}'. Nothing to update.", gh_base);
             }
+            let pr = gh::find_open_pr_for_edit(branch_name)?.ok_or_else(|| {
+                anyhow!(
+                    "Expected editable PR details for branch '{}' after finding PR #{}.",
+                    branch_name,
+                    existing.number
+                )
+            })?;
+            Ok(Some(pr))
         }
         None => {
             // New PR: run the interactive wizard
-            create_pr_interactive(repo, branch_name, git_base, gh_base)?;
+            create_pr_interactive(repo, branch_name, git_base, gh_base)
         }
     }
-
-    Ok(())
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -357,7 +399,7 @@ fn create_pr_interactive(
     branch_name: &str,
     git_base: &str,
     gh_base: &str,
-) -> Result<()> {
+) -> Result<Option<gh::EditablePr>> {
     let commits = get_branch_commits(repo, branch_name, git_base)?;
 
     if commits.is_empty() {
@@ -365,14 +407,14 @@ fn create_pr_interactive(
             "No commits on this branch compared to '{}'. Skipping.",
             git_base
         );
-        return Ok(());
+        return Ok(None);
     }
 
     // ── Step 1: Title ────────────────────────────────────────────────────────
     let title = prompt_title(&commits)?;
     if title.is_empty() {
         println!("  PR title is empty. Skipping {}.", branch_name);
-        return Ok(());
+        return Ok(None);
     }
 
     // ── Step 2: Body ─────────────────────────────────────────────────────────
@@ -380,11 +422,13 @@ fn create_pr_interactive(
 
     // ── Step 3: Submit options ───────────────────────────────────────────────
     let submission = prompt_submit_options()?;
+    let labels = submission.labels.clone();
+    let reviewers = submission.reviewers.clone();
 
     println!("  Creating PR...");
     let url = gh::create_pr(&CreatePrParams {
-        title,
-        body,
+        title: title.clone(),
+        body: body.clone(),
         base: gh_base.to_string(),
         head: branch_name.to_string(),
         draft: submission.draft,
@@ -393,7 +437,140 @@ fn create_pr_interactive(
     })?;
 
     println!("  ✓ PR created: {}", url);
+    Ok(Some(gh::EditablePr {
+        number: parse_pr_number_from_url(&url)?,
+        title,
+        body,
+        url,
+        labels,
+        reviewers,
+    }))
+}
+
+fn sync_stack_descriptions(prs: &[StackPr]) -> Result<()> {
+    for pr in prs {
+        let updated_body =
+            update_stack_section(&pr.pr.body, render_stack_section(prs, &pr.branch_name));
+        if updated_body == pr.pr.body {
+            continue;
+        }
+
+        println!("Syncing stack section for PR #{}.", pr.pr.number);
+        if let Err(err) = gh::edit_pr(&gh::EditPrParams {
+            number: pr.pr.number,
+            title: pr.pr.title.clone(),
+            body: Some(updated_body),
+            current_labels: pr.pr.labels.clone(),
+            labels: pr.pr.labels.clone(),
+            current_reviewers: pr.pr.reviewers.clone(),
+            reviewers: pr.pr.reviewers.clone(),
+        }) {
+            eprintln!(
+                "Failed to sync stack section for PR #{}: {}",
+                pr.pr.number, err
+            );
+        }
+    }
+
     Ok(())
+}
+
+fn render_stack_section(prs: &[StackPr], current_branch: &str) -> Option<String> {
+    if prs.len() <= 1 {
+        return None;
+    }
+
+    let mut section = String::from(STACK_SECTION_START);
+    section.push_str("\n## Stack\n");
+
+    for pr in prs {
+        if pr.branch_name == current_branch {
+            section.push_str(&format!("- → {} #{}\n", pr.branch_name, pr.pr.number));
+        } else {
+            section.push_str(&format!(
+                "- [{}]({}) #{}\n",
+                pr.branch_name, pr.pr.url, pr.pr.number
+            ));
+        }
+    }
+
+    section.push_str(STACK_SECTION_END);
+    Some(section)
+}
+
+fn update_stack_section(body: &str, stack_section: Option<String>) -> String {
+    let (body_without_section, removed_existing_section) = remove_existing_stack_section(body);
+
+    match stack_section {
+        Some(section) => {
+            let trimmed = body_without_section.trim_end();
+            if trimmed.is_empty() {
+                section
+            } else {
+                format!("{trimmed}\n\n{section}")
+            }
+        }
+        None if removed_existing_section => body_without_section.trim_end().to_string(),
+        None => body.to_string(),
+    }
+}
+
+fn remove_existing_stack_section(body: &str) -> (String, bool) {
+    let mut current_body = body.to_string();
+    let mut any_removed = false;
+
+    loop {
+        if let Some(start_idx) = current_body.find(STACK_SECTION_START) {
+            let search_after_start = start_idx + STACK_SECTION_START.len();
+            if let Some(end_offset) = current_body[search_after_start..].find(STACK_SECTION_END) {
+                let end_idx = search_after_start + end_offset;
+                let slice_end = end_idx + STACK_SECTION_END.len();
+
+                let before = current_body[..start_idx].trim_end();
+                let after = current_body[slice_end..].trim_start();
+
+                current_body = match (before.is_empty(), after.is_empty()) {
+                    (true, true) => String::new(),
+                    (false, true) => before.to_string(),
+                    (true, false) => after.to_string(),
+                    (false, false) => format!("{before}\n\n{after}"),
+                };
+                any_removed = true;
+                continue;
+            }
+        }
+        break;
+    }
+
+    (current_body, any_removed)
+}
+
+fn parse_pr_number_from_url(url: &str) -> Result<u64> {
+    let path = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split_once('/')
+        .map(|(_, path)| path)
+        .unwrap_or("");
+
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.len() < 2 || segments[segments.len() - 2] != "pull" {
+        return Err(anyhow!(
+            "Could not parse PR number from URL '{}': expected '/pull/<number>' in URL",
+            url
+        ));
+    }
+
+    segments[segments.len() - 1].parse().map_err(|_| {
+        anyhow!(
+            "Could not parse PR number from URL '{}': expected '/pull/<number>' in URL",
+            url
+        )
+    })
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -768,3 +945,77 @@ fn prompt_reviewers() -> Result<Vec<String>> {
 // ────────────────────────────────────────────────────────────────────────────
 
 use std::io::IsTerminal;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_base_for_gh() {
+        assert_eq!(normalize_base_for_gh("main"), "main");
+        assert_eq!(normalize_base_for_gh("origin/main"), "main");
+        assert_eq!(normalize_base_for_gh("upstream/main"), "main");
+        assert_eq!(normalize_base_for_gh("feature/base"), "feature/base");
+        assert_eq!(normalize_base_for_gh("origin/feature/base"), "feature/base");
+        assert_eq!(
+            normalize_base_for_gh("upstream/feature/base"),
+            "feature/base"
+        );
+    }
+
+    #[test]
+    fn test_remove_existing_stack_section() {
+        let start = STACK_SECTION_START;
+        let end = STACK_SECTION_END;
+
+        // Normal case
+        let body = format!("Hello\n\n{}\nSome stack info\n{}\nWorld", start, end);
+        let (cleaned, removed) = remove_existing_stack_section(&body);
+        assert!(removed);
+        assert_eq!(cleaned, "Hello\n\nWorld");
+
+        // Duplicate case
+        let body = format!(
+            "Hello\n\n{}\nSection 1\n{}\nMid\n{}\nSection 2\n{}\nWorld",
+            start, end, start, end
+        );
+        let (cleaned, removed) = remove_existing_stack_section(&body);
+        assert!(removed);
+        assert_eq!(cleaned, "Hello\n\nMid\n\nWorld");
+
+        // Malformed (missing end) - Should not remove anything if no matching END follows START
+        let body = format!("Hello\n\n{}\nMissing end\nWorld", start);
+        let (cleaned, removed) = remove_existing_stack_section(&body);
+        assert!(!removed);
+        assert_eq!(cleaned, body);
+
+        // Malformed (end before start) - Should ignore ENDs before STARTs
+        let body = format!("{}Hello\n{}\nWorld", end, start);
+        let (cleaned, _removed) = remove_existing_stack_section(&body);
+        assert_eq!(cleaned, body);
+    }
+
+    #[test]
+    fn parse_pr_number_from_standard_github_url() {
+        assert_eq!(
+            parse_pr_number_from_url("https://github.com/test/repo/pull/123").unwrap(),
+            123
+        );
+    }
+
+    #[test]
+    fn parse_pr_number_rejects_non_pull_urls() {
+        let err = parse_pr_number_from_url("https://github.com/test/repo/issues/123").unwrap_err();
+        assert!(err.to_string().contains("expected '/pull/<number>' in URL"));
+    }
+
+    #[test]
+    fn normalize_base_keeps_branch_paths() {
+        assert_eq!(normalize_base_for_gh("feature/base"), "feature/base");
+    }
+
+    #[test]
+    fn normalize_base_strips_single_remote_prefix() {
+        assert_eq!(normalize_base_for_gh("origin/feature/base"), "feature/base");
+    }
+}
