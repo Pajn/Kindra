@@ -2,6 +2,7 @@ use crate::commands::find_upstream;
 use crate::rebase_utils::state_path;
 use crate::stack::{find_restack_boundary, get_stack_branches_from_merge_base, get_stack_tips};
 use anyhow::{Result, anyhow};
+use git2::BranchType;
 use std::io::IsTerminal;
 use std::process::Command;
 
@@ -31,8 +32,10 @@ pub fn restack() -> Result<()> {
             upstream_name
         ));
     }
+    let rebase_onto_name = resolve_restack_onto(&repo, &upstream_name)?;
+    fetch_restack_remote(&rebase_onto_name)?;
 
-    let upstream_obj = repo.revparse_single(&upstream_name)?;
+    let upstream_obj = repo.revparse_single(&rebase_onto_name)?;
     let upstream_id = upstream_obj.id();
     let merge_base = repo.merge_base(upstream_id, head_id)?;
     let stack_branches = get_stack_branches_from_merge_base(
@@ -40,7 +43,7 @@ pub fn restack() -> Result<()> {
         merge_base,
         head_id,
         upstream_id,
-        &upstream_name,
+        &rebase_onto_name,
     )?;
 
     if stack_branches.is_empty() {
@@ -70,11 +73,11 @@ pub fn restack() -> Result<()> {
     }
 
     let repo = crate::open_repo()?;
-    let boundary = find_restack_boundary(&repo, &top_branch, &upstream_name)?;
+    let boundary = find_restack_boundary(&repo, &top_branch, &rebase_onto_name)?;
     let Some(boundary) = boundary else {
         println!(
             "All commits in this stack appear to be integrated into {}.",
-            upstream_name
+            rebase_onto_name
         );
         return Ok(());
     };
@@ -85,7 +88,7 @@ pub fn restack() -> Result<()> {
         .arg("rebase")
         .arg("--update-refs")
         .arg("--onto")
-        .arg(&upstream_name)
+        .arg(&rebase_onto_name)
         .arg(boundary.old_base.to_string())
         .arg(&top_branch)
         .status()?;
@@ -109,6 +112,53 @@ fn ensure_no_native_git_operation(repo: &git2::Repository) -> Result<()> {
     if rebase_in_progress || merge_in_progress || cherry_pick_in_progress {
         return Err(anyhow!(
             "A native git operation is in progress. Resolve it first with 'git rebase --continue'/'git rebase --abort', 'git merge --abort', or 'git cherry-pick --continue'/'git cherry-pick --abort'. If this came from a gits-managed rebase, use 'gits continue' or 'gits abort'."
+        ));
+    }
+
+    Ok(())
+}
+
+fn resolve_restack_onto(repo: &git2::Repository, upstream_name: &str) -> Result<String> {
+    if let Ok(branch) = repo.find_branch(upstream_name, BranchType::Local)
+        && let Ok(upstream_branch) = branch.upstream()
+        && let Some(upstream_ref) = upstream_branch.name()?
+    {
+        return Ok(upstream_ref.to_string());
+    }
+
+    let remotes = repo.remotes()?;
+    let remote_names: Vec<String> = remotes.iter().flatten().map(|s| s.to_string()).collect();
+    if let Some((prefix, _)) = upstream_name.split_once('/')
+        && remote_names.iter().any(|remote| remote == prefix)
+    {
+        return Ok(upstream_name.to_string());
+    }
+
+    let origin_candidate = format!("origin/{upstream_name}");
+    if repo.revparse_single(&origin_candidate).is_ok() {
+        return Ok(origin_candidate);
+    }
+
+    if remote_names.len() == 1 {
+        let only_remote_candidate = format!("{}/{}", remote_names[0], upstream_name);
+        if repo.revparse_single(&only_remote_candidate).is_ok() {
+            return Ok(only_remote_candidate);
+        }
+    }
+
+    Ok(upstream_name.to_string())
+}
+
+fn fetch_restack_remote(rebase_onto_name: &str) -> Result<()> {
+    let Some((remote_name, _)) = rebase_onto_name.split_once('/') else {
+        return Ok(());
+    };
+
+    let status = Command::new("git").arg("fetch").arg(remote_name).status()?;
+    if !status.success() {
+        return Err(anyhow!(
+            "git fetch failed for remote '{}' while preparing restack.",
+            remote_name
         ));
     }
 
