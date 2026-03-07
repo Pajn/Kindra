@@ -13,6 +13,9 @@ pub struct MoveArgs {
     /// List all local branches instead of just the stack
     #[arg(long)]
     pub all: bool,
+    /// Force the move even if branches are checked out in other worktrees
+    #[arg(long)]
+    pub force: bool,
 }
 
 pub fn move_cmd(args: &MoveArgs) -> Result<()> {
@@ -134,6 +137,14 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
 
     crate::stack::sort_branches_topologically(repo, &mut sub_stack)?;
 
+    let remaining_branches: Vec<String> = sub_stack
+        .iter()
+        .map(|sb| sb.name.clone())
+        .filter(|name| name != &selected_target_name)
+        .collect();
+
+    crate::rebase_utils::check_worktrees(&remaining_branches, args.force)?;
+
     let (parent_id_map, parent_name_map) = crate::stack::build_parent_maps(
         repo,
         &sub_stack,
@@ -148,11 +159,7 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         original_branch: current_branch_name,
         target_branch: selected_target_name.clone(),
         caller_branch: None,
-        remaining_branches: sub_stack
-            .into_iter()
-            .map(|sb| sb.name)
-            .filter(|name| name != &selected_target_name)
-            .collect(),
+        remaining_branches,
         in_progress_branch: None,
         parent_id_map,
         parent_name_map,

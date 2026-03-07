@@ -1396,10 +1396,20 @@ fn test_commit_on_checkout_conflict_restores_original_context() {
         .assert()
         .failure()
         .stderr(predicates::str::contains(
-            "Failed to checkout branch 'feature-a'",
+            "git checkout failed for branch 'feature-a'",
         ));
 
     assert_eq!(repo.head().unwrap().shorthand().unwrap(), "feature-b");
+    assert!(dir.path().join(".git/gits_rebase_state.json").exists());
+
+    // Abort should clean up the state and restore context
+    let mut abort_cmd = gits_cmd();
+    abort_cmd
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
     assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
     assert_eq!(
         fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),

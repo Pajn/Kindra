@@ -27,8 +27,10 @@ pub struct RebaseState {
     /// The branch currently being rebased
     pub in_progress_branch: Option<String>,
     /// branch_name -> original_parent_id_str
+    #[serde(default)]
     pub parent_id_map: HashMap<String, String>,
     /// branch_name -> original_parent_name (if it was a branch in the sub-stack)
+    #[serde(default)]
     pub parent_name_map: HashMap<String, String>,
     /// Optional stash token created by `gits commit --on` to preserve non-staged files.
     #[serde(default)]
@@ -63,8 +65,65 @@ pub fn checkout_branch(branch_name: &str) -> Result<()> {
         .arg(branch_name)
         .status()?;
     if !status.success() {
-        return Err(anyhow!("Failed to checkout branch '{}'.", branch_name));
+        return Err(anyhow!("git checkout failed for branch '{}'", branch_name));
     }
+    Ok(())
+}
+
+pub fn check_worktrees(branches: &[String], force: bool) -> Result<()> {
+    if force {
+        return Ok(());
+    }
+
+    let current_worktree_output = Command::new("git")
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()?;
+    if !current_worktree_output.status.success() {
+        return Err(anyhow!("Failed to determine current worktree path."));
+    }
+    let current_worktree = String::from_utf8_lossy(&current_worktree_output.stdout)
+        .trim()
+        .to_string();
+
+    let worktree_list_output = Command::new("git")
+        .arg("worktree")
+        .arg("list")
+        .arg("--porcelain")
+        .output()?;
+    if !worktree_list_output.status.success() {
+        return Err(anyhow!("Failed to list git worktrees."));
+    }
+
+    let stdout = String::from_utf8_lossy(&worktree_list_output.stdout);
+    let mut worktree_map: HashMap<String, String> = HashMap::new(); // branch_name -> worktree_path
+    let mut current_path = String::new();
+
+    for line in stdout.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current_path = path.trim().to_string();
+        } else if let Some(branch_ref) = line.strip_prefix("branch ") {
+            let branch_name = branch_ref
+                .strip_prefix("refs/heads/")
+                .unwrap_or(branch_ref)
+                .trim()
+                .to_string();
+            worktree_map.insert(branch_name, current_path.clone());
+        }
+    }
+
+    for branch in branches {
+        if let Some(path) = worktree_map.get(branch)
+            && path != &current_worktree
+        {
+            return Err(anyhow!(
+                "{} is checked out in {}, aborting as a full rebase can not be completed. Use --force to ignore this check.",
+                branch,
+                path
+            ));
+        }
+    }
+
     Ok(())
 }
 

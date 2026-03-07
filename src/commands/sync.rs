@@ -1,12 +1,20 @@
 use crate::commands::find_upstream;
-use crate::rebase_utils::state_path;
+use crate::rebase_utils::{checkout_branch, state_path};
 use crate::stack::{find_sync_boundary, get_stack_branches_from_merge_base, get_stack_tips};
 use anyhow::{Result, anyhow};
+use clap::Args;
 use git2::BranchType;
 use std::io::IsTerminal;
 use std::process::Command;
 
-pub fn sync() -> Result<()> {
+#[derive(Args)]
+pub struct SyncArgs {
+    /// Force the sync even if branches are checked out in other worktrees
+    #[arg(long)]
+    pub force: bool,
+}
+
+pub fn sync(args: &SyncArgs) -> Result<()> {
     let repo = crate::open_repo()?;
 
     let path = state_path(&repo);
@@ -50,6 +58,15 @@ pub fn sync() -> Result<()> {
         println!("No branches found in the current stack.");
         return Ok(());
     }
+
+    crate::rebase_utils::check_worktrees(
+        &stack_branches
+            .iter()
+            .map(|sb| sb.name.clone())
+            .collect::<Vec<_>>(),
+        args.force,
+    )?;
+
     let mut tips = get_stack_tips(&repo, &stack_branches)?;
     tips.sort();
     let top_branch = match tips.len() {
@@ -169,14 +186,6 @@ fn fetch_sync_remote(remote_name: Option<&str>) -> Result<()> {
         ));
     }
 
-    Ok(())
-}
-
-fn checkout_branch(name: &str) -> Result<()> {
-    let status = Command::new("git").arg("checkout").arg(name).status()?;
-    if !status.success() {
-        return Err(anyhow!("git checkout failed for branch '{}'", name));
-    }
     Ok(())
 }
 

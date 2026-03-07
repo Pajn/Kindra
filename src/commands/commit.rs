@@ -1,11 +1,11 @@
 use crate::commands::find_upstream;
 use crate::rebase_utils::{
-    RebaseState, apply_stash, checkout_branch, drop_stash, run_rebase_loop, save_state, state_path,
-    unstage_all,
+    RebaseState, check_worktrees, checkout_branch, run_rebase_loop, save_state, state_path,
 };
 use crate::stack::{StackBranch, collect_descendants, get_stack_branches_from_merge_base};
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Oid, Repository};
+use std::collections::HashMap;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -83,61 +83,8 @@ pub fn commit(args: &[String]) -> Result<()> {
     };
 
     let switching_branches = target_branch != current_branch_name;
-    let mut stash_ref = None;
-    if switching_branches {
-        stash_ref = stash_non_staged_changes()?;
-        if let Err(err) = checkout_branch(&target_branch) {
-            let restore_result =
-                restore_original_context(&current_branch_name, &mut stash_ref, switching_branches);
-            return match restore_result {
-                Ok(()) => Err(err),
-                Err(restore_err) => Err(restore_err.context(err)),
-            };
-        }
-    }
-
-    // Run the actual git commit
-    let status = Command::new("git")
-        .arg("commit")
-        .args(&parsed.git_commit_args)
-        .status()?;
-    if !status.success() {
-        if switching_branches {
-            restore_original_context(&current_branch_name, &mut stash_ref, switching_branches)
-                .context("git commit failed and failed to restore original context")?;
-        }
-        return Err(anyhow!("git commit failed"));
-    }
-
-    // Refresh repo state after commit
-    let repo = crate::open_repo()?;
-    let new_target_head_id = repo.revparse_single(&target_branch)?.id();
-
-    if target_old_head_id == new_target_head_id {
-        if switching_branches {
-            restore_original_context(&current_branch_name, &mut stash_ref, switching_branches)?;
-        }
-        return Ok(());
-    }
-
-    if !should_rebase || !target_has_dependents {
-        if switching_branches {
-            restore_original_context(&current_branch_name, &mut stash_ref, switching_branches)?;
-        }
-        return Ok(());
-    }
-
     let mut sub_stack = target_sub_stack;
     crate::stack::sort_branches_topologically(&repo, &mut sub_stack)?;
-
-    let (parent_id_map, parent_name_map) = crate::stack::build_parent_maps(
-        &repo,
-        &sub_stack,
-        &target_stack.stack_branches,
-        target_stack.merge_base,
-        target_old_head_id,
-        &target_branch,
-    )?;
 
     let remaining_branches: Vec<String> = sub_stack
         .iter()
@@ -145,32 +92,90 @@ pub fn commit(args: &[String]) -> Result<()> {
         .map(|sb| sb.name.clone())
         .collect();
 
-    if remaining_branches.is_empty() {
-        if switching_branches {
-            restore_original_context(&current_branch_name, &mut stash_ref, switching_branches)?;
-        }
-        return Ok(());
+    let will_rebase = should_rebase && target_has_dependents && !remaining_branches.is_empty();
+
+    // The check_worktrees call must run before the code path that performs the commit and
+    // mutates target_branch so failures don't leave state unpersisted.
+    if will_rebase {
+        check_worktrees(&remaining_branches, parsed.force)?;
     }
 
-    let state = RebaseState {
-        operation: crate::rebase_utils::Operation::Commit,
-        original_branch: target_branch.clone(),
-        target_branch,
-        caller_branch: if switching_branches {
-            Some(current_branch_name)
+    if switching_branches || will_rebase {
+        let stash_ref = if switching_branches {
+            stash_non_staged_changes()?
         } else {
             None
-        },
-        remaining_branches,
-        in_progress_branch: None,
-        parent_id_map,
-        parent_name_map,
-        stash_ref,
-        unstage_on_restore: switching_branches,
-    };
+        };
 
-    save_state(&repo, &state)?;
-    run_rebase_loop(&repo, state)
+        let (parent_id_map, parent_name_map) = if will_rebase {
+            crate::stack::build_parent_maps(
+                &repo,
+                &sub_stack,
+                &target_stack.stack_branches,
+                target_stack.merge_base,
+                target_old_head_id,
+                &target_branch,
+            )?
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
+
+        let state = RebaseState {
+            operation: crate::rebase_utils::Operation::Commit,
+            original_branch: target_branch.clone(),
+            target_branch: target_branch.clone(),
+            caller_branch: if switching_branches {
+                Some(current_branch_name)
+            } else {
+                None
+            },
+            remaining_branches: if will_rebase {
+                remaining_branches
+            } else {
+                Vec::new()
+            },
+            in_progress_branch: None,
+            parent_id_map,
+            parent_name_map,
+            stash_ref,
+            unstage_on_restore: switching_branches,
+        };
+
+        save_state(&repo, &state)?;
+
+        if switching_branches && let Err(err) = checkout_branch(&target_branch) {
+            return Err(err.context(
+                "Failed to checkout target branch. Use 'gits abort' to restore original state.",
+            ));
+        }
+
+        // Run the actual git commit
+        let status = Command::new("git")
+            .arg("commit")
+            .args(&parsed.git_commit_args)
+            .status()?;
+        if !status.success() {
+            return Err(anyhow!(
+                "git commit failed. Resolve and run 'gits continue', or run 'gits abort'."
+            ));
+        }
+
+        // Refresh repo state after commit
+        let repo = crate::open_repo()?;
+        let _new_target_head_id = repo.revparse_single(&target_branch)?.id();
+
+        run_rebase_loop(&repo, state)
+    } else {
+        // Run the actual git commit
+        let status = Command::new("git")
+            .arg("commit")
+            .args(&parsed.git_commit_args)
+            .status()?;
+        if !status.success() {
+            return Err(anyhow!("git commit failed"));
+        }
+        Ok(())
+    }
 }
 
 struct StackContext {
@@ -181,6 +186,7 @@ struct StackContext {
 #[derive(Default)]
 struct ParsedCommitArgs {
     on_target: Option<Option<String>>,
+    force: bool,
     git_commit_args: Vec<String>,
 }
 
@@ -193,6 +199,12 @@ fn parse_commit_args(args: &[String]) -> Result<ParsedCommitArgs> {
         if arg == "--" {
             parsed.git_commit_args.extend(args[idx..].iter().cloned());
             break;
+        }
+
+        if arg == "--force" {
+            parsed.force = true;
+            idx += 1;
+            continue;
         }
 
         if arg == "--on" {
@@ -372,22 +384,4 @@ fn stash_non_staged_changes() -> Result<Option<String>> {
     } else {
         Ok(None)
     }
-}
-
-fn restore_original_context(
-    original_branch: &str,
-    stash_ref: &mut Option<String>,
-    unstage_on_restore: bool,
-) -> Result<()> {
-    checkout_branch(original_branch)?;
-    if let Some(stash_ref_value) = stash_ref.take() {
-        apply_stash(&stash_ref_value)?;
-        if let Err(err) = drop_stash(&stash_ref_value) {
-            eprintln!("Warning: {}", err);
-        }
-    }
-    if unstage_on_restore {
-        unstage_all()?;
-    }
-    Ok(())
 }

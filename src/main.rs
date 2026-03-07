@@ -15,7 +15,7 @@ use crate::commands::pr::{PrSubcommand, pr};
 use crate::commands::push::push;
 use crate::commands::split::split;
 use crate::commands::status_cmd::status_cmd;
-use crate::commands::sync::sync;
+use crate::commands::sync::{SyncArgs, sync};
 pub use crate::repository::open_repo;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -53,10 +53,10 @@ enum Commands {
     /// Move current branch stack onto another branch
     Move(MoveArgs),
     /// Rebase the current stack onto the upstream branch in one pass
-    Sync,
+    Sync(SyncArgs),
     /// Commits and rebases dependent branches
     Commit {
-        /// Arguments to pass to git commit
+        /// Arguments to pass to git commit. Supports --on <branch> and --force.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -107,10 +107,10 @@ fn main() -> Result<()> {
         Commands::Split => split()?,
         Commands::Push => push()?,
         Commands::Pr { subcommand } => pr(subcommand)?,
-        Commands::Commit { args } => commit(args)?,
         Commands::Checkout { subcommand, all } => checkout(subcommand, *all)?,
         Commands::Move(args) => move_cmd(args)?,
-        Commands::Sync => sync()?,
+        Commands::Sync(args) => sync(args)?,
+        Commands::Commit { args } => commit(args)?,
         Commands::Continue => continue_cmd()?,
         Commands::Abort => abort_cmd()?,
         Commands::Status => status_cmd()?,
