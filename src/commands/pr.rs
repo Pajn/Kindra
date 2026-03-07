@@ -5,6 +5,7 @@ use crate::stack::{
 use anyhow::{Context, Result, anyhow};
 use clap::Subcommand;
 use git2::{BranchType, Repository};
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use tempfile::NamedTempFile;
@@ -35,6 +36,22 @@ const STACK_SECTION_END: &str = "<!-- gits-stack:end -->";
 struct StackPr {
     branch_name: String,
     pr: gh::EditablePr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct StoredPr {
+    branch_name: String,
+    url: String,
+    number: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RenderItem {
+    branch_name: String,
+    url: String,
+    number: u64,
+    is_current: bool,
+    is_merged: bool,
 }
 
 fn pr_create_or_update() -> Result<()> {
@@ -76,6 +93,8 @@ fn pr_create_or_update() -> Result<()> {
         println!();
     }
 
+    // Now that we have all active PRs, update descriptions to include the full stack
+    // (including merged ones parsed from existing descriptions).
     sync_stack_descriptions(&open_prs)?;
 
     Ok(())
@@ -215,7 +234,9 @@ fn pr_edit() -> Result<()> {
     }
 
     let body_for_reconciliation = body.as_deref().unwrap_or(&existing.body);
-    let stack_section = render_stack_section(&all_stack_prs, &branch_name);
+    let old_list = parse_stack_section(body_for_reconciliation);
+    let merged_list = merge_stack_lists(&old_list, &all_stack_prs, &branch_name)?;
+    let stack_section = render_stack_section(&merged_list);
     let final_body = update_stack_section(body_for_reconciliation, stack_section);
 
     let body_to_send = if final_body == existing.body && body.is_none() {
@@ -449,8 +470,11 @@ fn create_pr_interactive(
 
 fn sync_stack_descriptions(prs: &[StackPr]) -> Result<()> {
     for pr in prs {
-        let updated_body =
-            update_stack_section(&pr.pr.body, render_stack_section(prs, &pr.branch_name));
+        let old_list = parse_stack_section(&pr.pr.body);
+        let merged_list = merge_stack_lists(&old_list, prs, &pr.branch_name)?;
+        let stack_section = render_stack_section(&merged_list);
+        let updated_body = update_stack_section(&pr.pr.body, stack_section);
+
         if updated_body == pr.pr.body {
             continue;
         }
@@ -475,21 +499,153 @@ fn sync_stack_descriptions(prs: &[StackPr]) -> Result<()> {
     Ok(())
 }
 
-fn render_stack_section(prs: &[StackPr], current_branch: &str) -> Option<String> {
-    if prs.len() <= 1 {
+fn parse_stack_section(body: &str) -> Vec<StoredPr> {
+    let mut prs = Vec::new();
+    let start_idx = body.find(STACK_SECTION_START);
+    let end_idx = body.find(STACK_SECTION_END);
+
+    if let (Some(start), Some(end)) = (start_idx, end_idx)
+        && start < end
+    {
+        let section_start = start + STACK_SECTION_START.len();
+        let section = &body[section_start..end];
+        for line in section.lines() {
+            let line = line.trim();
+            if (line.starts_with("- [") || line.starts_with("- → ") || line.starts_with("- ~"))
+                && let Some(pr) = parse_stack_line(line)
+            {
+                prs.push(pr);
+            }
+        }
+    }
+    prs
+}
+
+fn parse_stack_line(line: &str) -> Option<StoredPr> {
+    // Case 1: - [branch](url) #number (possibly with ~ for strikethrough)
+    // Case 2: - → branch #number
+    if let Some(rest) = line.strip_prefix("- → ") {
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let branch_name = parts[0].to_string();
+            let number_str = parts[1].trim_start_matches('#');
+            if let Ok(number) = number_str.parse::<u64>() {
+                return Some(StoredPr {
+                    branch_name,
+                    url: String::new(), // We'll fix this during merge if needed
+                    number,
+                });
+            }
+        }
+    } else if line.starts_with("- [") || line.starts_with("- ~[") {
+        // Line like: - [branch](url) #number
+        // or - ~[branch](url) #number~ (merged)
+        let line = line
+            .trim_start_matches("- ")
+            .trim_start_matches('~')
+            .trim_end_matches(" (merged)")
+            .trim_end_matches('~');
+        if let Some(branch_end) = line.find("](") {
+            let branch_name = line[1..branch_end].to_string();
+            let rest = &line[branch_end + 2..];
+            if let Some(url_end) = rest.find(')') {
+                let url = rest[..url_end].to_string();
+                let after_url = rest[url_end + 1..].trim();
+                if let Some(hash_idx) = after_url.find('#') {
+                    let number_part = &after_url[hash_idx + 1..];
+                    let number_str: String = number_part
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    if let Ok(number) = number_str.parse::<u64>() {
+                        return Some(StoredPr {
+                            branch_name,
+                            url,
+                            number,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn merge_stack_lists(
+    old_list: &[StoredPr],
+    active_prs: &[StackPr],
+    current_branch: &str,
+) -> Result<Vec<RenderItem>> {
+    let mut items = Vec::new();
+    let mut emitted_numbers = HashSet::new();
+
+    // Preserve original ordering from the existing description.
+    for old in old_list {
+        if let Some(active) = active_prs.iter().find(|p| p.pr.number == old.number) {
+            items.push(RenderItem {
+                branch_name: active.branch_name.clone(),
+                url: active.pr.url.clone(),
+                number: active.pr.number,
+                is_current: active.branch_name == current_branch,
+                is_merged: false,
+            });
+            emitted_numbers.insert(active.pr.number);
+        } else {
+            // Check state for PRs not in the active local stack.
+            let state = gh::get_pr_state(old.number)
+                .with_context(|| format!("Failed to check state for PR #{}", old.number))?;
+
+            if state == "MERGED" {
+                items.push(RenderItem {
+                    branch_name: old.branch_name.clone(),
+                    url: old.url.clone(),
+                    number: old.number,
+                    is_current: false,
+                    is_merged: true,
+                });
+                emitted_numbers.insert(old.number);
+            }
+            // else: skip (it was closed but not merged, or it's now inaccessible).
+        }
+    }
+
+    // Append any new active PRs not already in the list.
+    for active in active_prs {
+        if !emitted_numbers.contains(&active.pr.number) {
+            items.push(RenderItem {
+                branch_name: active.branch_name.clone(),
+                url: active.pr.url.clone(),
+                number: active.pr.number,
+                is_current: active.branch_name == current_branch,
+                is_merged: false,
+            });
+            emitted_numbers.insert(active.pr.number);
+        }
+    }
+
+    Ok(items)
+}
+
+fn render_stack_section(items: &[RenderItem]) -> Option<String> {
+    if items.len() <= 1 {
         return None;
     }
 
     let mut section = String::from(STACK_SECTION_START);
     section.push_str("\n## Stack\n");
 
-    for pr in prs {
-        if pr.branch_name == current_branch {
-            section.push_str(&format!("- → {} #{}\n", pr.branch_name, pr.pr.number));
+    for item in items {
+        if item.is_current {
+            section.push_str(&format!("- → {} #{}\n", item.branch_name, item.number));
+        } else if item.is_merged {
+            section.push_str(&format!(
+                "- ~[{}]({}) #{}~ (merged)\n",
+                item.branch_name, item.url, item.number
+            ));
         } else {
             section.push_str(&format!(
                 "- [{}]({}) #{}\n",
-                pr.branch_name, pr.pr.url, pr.pr.number
+                item.branch_name, item.url, item.number
             ));
         }
     }
@@ -949,6 +1105,48 @@ use std::io::IsTerminal;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_stack_line() {
+        // Case: current branch
+        let line = "- → feature-a #123";
+        let pr = parse_stack_line(line).unwrap();
+        assert_eq!(pr.branch_name, "feature-a");
+        assert_eq!(pr.number, 123);
+        assert_eq!(pr.url, "");
+
+        // Case: other branch
+        let line = "- [feature-b](https://github.com/u/r/pull/124) #124";
+        let pr = parse_stack_line(line).unwrap();
+        assert_eq!(pr.branch_name, "feature-b");
+        assert_eq!(pr.number, 124);
+        assert_eq!(pr.url, "https://github.com/u/r/pull/124");
+
+        // Case: merged branch (strikethrough)
+        let line = "- ~[feature-c](https://github.com/u/r/pull/122) #122~ (merged)";
+        let pr = parse_stack_line(line).unwrap();
+        assert_eq!(pr.branch_name, "feature-c");
+        assert_eq!(pr.number, 122);
+        assert_eq!(pr.url, "https://github.com/u/r/pull/122");
+    }
+
+    #[test]
+    fn test_parse_stack_section() {
+        let start = STACK_SECTION_START;
+        let end = STACK_SECTION_END;
+        let body = format!(
+            "Check out my stack:\n\n{}\n## Stack\n- ~[old](url1) #111~ (merged)\n- [current](url2) #222\n- → next #333\n{}\nFooter",
+            start, end
+        );
+        let prs = parse_stack_section(&body);
+        assert_eq!(prs.len(), 3);
+        assert_eq!(prs[0].branch_name, "old");
+        assert_eq!(prs[1].branch_name, "current");
+        assert_eq!(prs[2].branch_name, "next");
+        assert_eq!(prs[0].number, 111);
+        assert_eq!(prs[1].number, 222);
+        assert_eq!(prs[2].number, 333);
+    }
 
     #[test]
     fn test_normalize_base_for_gh() {
