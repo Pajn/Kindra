@@ -68,7 +68,11 @@ fn sync_handles_rebased_lower_branch() {
         .unwrap();
 
     let mut cmd = gits_cmd();
-    cmd.arg("sync").current_dir(dir.path()).assert().success();
+    cmd.arg("sync")
+        .arg("--no-delete")
+        .current_dir(dir.path())
+        .assert()
+        .success();
 
     let repo = Repository::open(dir.path()).unwrap();
 
@@ -164,7 +168,11 @@ fn sync_handles_squashed_lower_branch() {
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
     let mut cmd = gits_cmd();
-    cmd.arg("sync").current_dir(dir.path()).assert().success();
+    cmd.arg("sync")
+        .arg("--no-delete")
+        .current_dir(dir.path())
+        .assert()
+        .success();
 
     let repo = Repository::open(dir.path()).unwrap();
 
@@ -252,7 +260,11 @@ fn sync_handles_merged_lower_branch() {
         .unwrap();
 
     let mut cmd = gits_cmd();
-    cmd.arg("sync").current_dir(dir.path()).assert().success();
+    cmd.arg("sync")
+        .arg("--no-delete")
+        .current_dir(dir.path())
+        .assert()
+        .success();
 
     let repo = Repository::open(dir.path()).unwrap();
 
@@ -348,7 +360,11 @@ fn sync_rebases_onto_remote_tracking_base_when_local_base_is_stale() {
     assert_eq!(local_main_before, origin_main_before);
 
     let mut cmd = gits_cmd();
-    cmd.arg("sync").current_dir(dir.path()).assert().success();
+    cmd.arg("sync")
+        .arg("--no-delete")
+        .current_dir(dir.path())
+        .assert()
+        .success();
 
     let repo = Repository::open(dir.path()).unwrap();
     let origin_main_after_sync = repo.revparse_single("origin/main").unwrap().id();
@@ -458,7 +474,11 @@ fn sync_treats_slashed_base_branch_name_as_local_before_remote() {
     assert_eq!(upstream_before, local_release_before);
 
     let mut cmd = gits_cmd();
-    cmd.arg("sync").current_dir(dir.path()).assert().success();
+    cmd.arg("sync")
+        .arg("--no-delete")
+        .current_dir(dir.path())
+        .assert()
+        .success();
 
     let repo = Repository::open(dir.path()).unwrap();
     let upstream_after = repo
@@ -771,14 +791,13 @@ fn sync_checkout_error_includes_branch_name() {
 }
 
 #[test]
-fn sync_handles_local_branch_with_slash_correctly() {
+fn sync_deletes_merged_branches() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
 
-    // Create a local branch with a slash that is NOT a remote
     let base_id = make_commit(
         &repo,
-        "refs/heads/feature/base",
+        "refs/heads/main",
         "base.txt",
         "base",
         "base commit",
@@ -794,21 +813,322 @@ fn sync_handles_local_branch_with_slash_correctly() {
         "feature a",
         &[&base],
     );
-    let _a = repo.find_commit(a_id).unwrap();
+    let a = repo.find_commit(a_id).unwrap();
 
-    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    let _b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "feature b",
+        &[&a],
+    );
 
-    // Override upstream to be our slashed local branch
-    fs::write(
-        repo.path().join("gits.toml"),
-        r#"upstream_branch = "feature/base""#,
-    )
-    .unwrap();
+    // Merge feature-a into main
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    run_ok("git", &["merge", "--ff-only", "feature-a"], dir.path());
+
+    run_ok("git", &["checkout", "-f", "feature-b"], dir.path());
 
     let mut cmd = gits_cmd();
-    // This should NOT fail trying to fetch from remote "feature"
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
-    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-a"));
+    assert!(repo.find_branch("feature-a", BranchType::Local).is_err());
+    assert!(repo.find_branch("feature-b", BranchType::Local).is_ok());
+
+    // Check that feature-b is rebased onto main
+    let main_tip = repo.revparse_single("main").unwrap().id();
+    let feature_b_tip = repo.revparse_single("feature-b").unwrap().id();
+    assert!(repo.graph_descendant_of(feature_b_tip, main_tip).unwrap());
+}
+
+#[test]
+fn sync_deletes_current_branch_if_merged() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feature a",
+        &[&base],
+    );
+
+    // Merge feature-a into main
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    run_ok(
+        "git",
+        &["merge", "--ff-only", &a_id.to_string()],
+        dir.path(),
+    );
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert!(repo.find_branch("feature-a", BranchType::Local).is_err());
+    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+}
+
+#[test]
+fn sync_no_delete_flag_works() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feature a",
+        &[&base],
+    );
+
+    // Merge feature-a into main
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    run_ok(
+        "git",
+        &["merge", "--ff-only", &a_id.to_string()],
+        dir.path(),
+    );
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync")
+        .arg("--no-delete")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert!(repo.find_branch("feature-a", BranchType::Local).is_ok());
+}
+
+#[test]
+fn sync_refuses_to_delete_branch_checked_out_in_other_worktree() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    let _base = repo.find_commit(base_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feature a",
+        &[&repo.find_commit(base_id).unwrap()],
+    );
+
+    let _b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "feature b",
+        &[&repo.find_commit(a_id).unwrap()],
+    );
+
+    // Merge feature-a into main
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    run_ok("git", &["merge", "--ff-only", "feature-a"], dir.path());
+
+    // Create a worktree for feature-a
+    let wt_dir = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "worktree",
+            "add",
+            wt_dir.path().to_str().unwrap(),
+            "feature-a",
+        ],
+        dir.path(),
+    );
+
+    run_ok("git", &["checkout", "-f", "feature-b"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is checked out in"));
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert!(repo.find_branch("feature-a", BranchType::Local).is_ok());
+
+    // Force should proceed but git branch -D will still warn and skip deletion
+    let mut cmd = gits_cmd();
+    cmd.arg("sync")
+        .arg("--force")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Warning: Failed to delete merged branch: feature-a",
+        ));
+
+    let repo = Repository::open(dir.path()).unwrap();
+    // It remains because git refused to delete it even with -D (it's checked out in another worktree)
+    assert!(repo.find_branch("feature-a", BranchType::Local).is_ok());
+}
+
+#[test]
+fn sync_falls_back_to_local_upstream_on_deletion() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let remote_dir = dir.path().join("remote.git");
+    fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    run_ok("git", &["push", "-u", "origin", "main:main"], dir.path());
+
+    let feature_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feature a",
+        &[&repo.find_commit(base_id).unwrap()],
+    );
+    run_ok(
+        "git",
+        &["push", "origin", "feature-a:feature-a"],
+        dir.path(),
+    );
+
+    // Merge feature-a into main on "remote"
+    let remote_worktree = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote_dir.to_str().unwrap(),
+            remote_worktree.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "main"], remote_worktree.path());
+    run_ok("git", &["fetch", "origin"], remote_worktree.path());
+    run_ok(
+        "git",
+        &["merge", "--ff-only", &feature_id.to_string()],
+        remote_worktree.path(),
+    );
+    run_ok("git", &["push", "origin", "main"], remote_worktree.path());
+
+    // Local main is still at base_id, origin/main is advanced.
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert!(repo.find_branch("feature-a", BranchType::Local).is_err());
+    // Should be on local main, not origin/main (detached)
+    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+    assert!(!repo.head_detached().unwrap());
+}
+
+#[test]
+fn sync_does_not_delete_branch_with_only_tree_match() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    // Create feature-a: add a file
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feature a",
+        &[&base],
+    );
+    let _a = repo.find_commit(a_id).unwrap();
+
+    // Revert it on feature-a: tree becomes same as base
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    run_ok("git", &["rm", "a.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "revert a"], dir.path());
+
+    // feature-a tip tree is now same as main tip tree.
+    // But it's not merged.
+
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    let _other_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "feature b",
+        &[&base],
+    );
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    // feature-a should NOT be deleted even though its tree matches main
+    assert!(repo.find_branch("feature-a", BranchType::Local).is_ok());
 }
