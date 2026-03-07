@@ -1,12 +1,12 @@
 use crate::commands::find_upstream;
 use crate::rebase_utils::state_path;
-use crate::stack::{find_restack_boundary, get_stack_branches_from_merge_base, get_stack_tips};
+use crate::stack::{find_sync_boundary, get_stack_branches_from_merge_base, get_stack_tips};
 use anyhow::{Result, anyhow};
 use git2::BranchType;
 use std::io::IsTerminal;
 use std::process::Command;
 
-pub fn restack() -> Result<()> {
+pub fn sync() -> Result<()> {
     let repo = crate::open_repo()?;
 
     let path = state_path(&repo);
@@ -28,12 +28,12 @@ pub fn restack() -> Result<()> {
     let upstream_name = find_upstream(&repo)?;
     if current_branch_name.as_deref() == Some(&upstream_name) {
         return Err(anyhow!(
-            "Branch '{}' is the upstream branch. Switch to a stack branch before running 'restack'.",
+            "Branch '{}' is the upstream branch. Switch to a stack branch before running 'sync'.",
             upstream_name
         ));
     }
-    let rebase_onto_name = resolve_restack_onto(&repo, &upstream_name)?;
-    fetch_restack_remote(&rebase_onto_name)?;
+    let (rebase_onto_name, fetch_remote) = resolve_sync_onto(&repo, &upstream_name)?;
+    fetch_sync_remote(fetch_remote.as_deref())?;
 
     let upstream_obj = repo.revparse_single(&rebase_onto_name)?;
     let upstream_id = upstream_obj.id();
@@ -61,7 +61,7 @@ pub fn restack() -> Result<()> {
         _ => {
             if !std::io::stdin().is_terminal() {
                 return Err(anyhow!(
-                    "Multiple stack tips found. Run 'gits restack' interactively to choose one, or checkout the desired tip branch and rerun."
+                    "Multiple stack tips found. Run 'gits sync' interactively to choose one, or checkout the desired tip branch and rerun."
                 ));
             }
             crate::commands::prompt_select("Multiple stack tips found. Select one:", tips)?
@@ -73,7 +73,7 @@ pub fn restack() -> Result<()> {
     }
 
     let repo = crate::open_repo()?;
-    let boundary = find_restack_boundary(&repo, &top_branch, &rebase_onto_name)?;
+    let boundary = find_sync_boundary(&repo, &top_branch, &rebase_onto_name)?;
     let Some(boundary) = boundary else {
         println!(
             "All commits in this stack appear to be integrated into {}.",
@@ -118,12 +118,19 @@ fn ensure_no_native_git_operation(repo: &git2::Repository) -> Result<()> {
     Ok(())
 }
 
-fn resolve_restack_onto(repo: &git2::Repository, upstream_name: &str) -> Result<String> {
+fn resolve_sync_onto(
+    repo: &git2::Repository,
+    upstream_name: &str,
+) -> Result<(String, Option<String>)> {
     if let Ok(branch) = repo.find_branch(upstream_name, BranchType::Local)
         && let Ok(upstream_branch) = branch.upstream()
         && let Some(upstream_ref) = upstream_branch.name()?
     {
-        return Ok(upstream_ref.to_string());
+        let remote_name = repo
+            .branch_remote_name(upstream_branch.get().name().unwrap())
+            .ok()
+            .and_then(|buf| buf.as_str().map(|s| s.to_string()));
+        return Ok((upstream_ref.to_string(), remote_name));
     }
 
     let remotes = repo.remotes()?;
@@ -131,33 +138,33 @@ fn resolve_restack_onto(repo: &git2::Repository, upstream_name: &str) -> Result<
     if let Some((prefix, _)) = upstream_name.split_once('/')
         && remote_names.iter().any(|remote| remote == prefix)
     {
-        return Ok(upstream_name.to_string());
+        return Ok((upstream_name.to_string(), Some(prefix.to_string())));
     }
 
     let origin_candidate = format!("origin/{upstream_name}");
     if repo.revparse_single(&origin_candidate).is_ok() {
-        return Ok(origin_candidate);
+        return Ok((origin_candidate, Some("origin".to_string())));
     }
 
     if remote_names.len() == 1 {
         let only_remote_candidate = format!("{}/{}", remote_names[0], upstream_name);
         if repo.revparse_single(&only_remote_candidate).is_ok() {
-            return Ok(only_remote_candidate);
+            return Ok((only_remote_candidate, Some(remote_names[0].clone())));
         }
     }
 
-    Ok(upstream_name.to_string())
+    Ok((upstream_name.to_string(), None))
 }
 
-fn fetch_restack_remote(rebase_onto_name: &str) -> Result<()> {
-    let Some((remote_name, _)) = rebase_onto_name.split_once('/') else {
+fn fetch_sync_remote(remote_name: Option<&str>) -> Result<()> {
+    let Some(remote_name) = remote_name else {
         return Ok(());
     };
 
     let status = Command::new("git").arg("fetch").arg(remote_name).status()?;
     if !status.success() {
         return Err(anyhow!(
-            "git fetch failed for remote '{}' while preparing restack.",
+            "git fetch failed for remote '{}' while preparing sync.",
             remote_name
         ));
     }
@@ -177,21 +184,21 @@ fn ensure_git_supports_update_refs() -> Result<()> {
     let output = Command::new("git").arg("--version").output()?;
     if !output.status.success() {
         return Err(anyhow!(
-            "restack requires Git >= 2.38.0 because it uses '--update-refs', but 'git --version' failed."
+            "sync requires Git >= 2.38.0 because it uses '--update-refs', but 'git --version' failed."
         ));
     }
 
     let version_output = String::from_utf8_lossy(&output.stdout);
     let version = parse_git_semver(&version_output).ok_or_else(|| {
         anyhow!(
-            "restack requires Git >= 2.38.0 because it uses '--update-refs', but could not parse `git --version` output: {}",
+            "sync requires Git >= 2.38.0 because it uses '--update-refs', but could not parse `git --version` output: {}",
             version_output.trim()
         )
     })?;
 
     if version < (2, 38, 0) {
         return Err(anyhow!(
-            "restack requires Git >= 2.38.0 because '--update-refs' is used during rebase. Detected Git {}.{}.{}.",
+            "sync requires Git >= 2.38.0 because '--update-refs' is used during rebase. Detected Git {}.{}.{}.",
             version.0,
             version.1,
             version.2

@@ -11,15 +11,15 @@ pub struct StackBranch {
 }
 
 #[derive(Clone, Debug)]
-pub struct RestackBoundary {
+pub struct SyncBoundary {
     pub old_base: Oid,
 }
 
-pub fn find_restack_boundary(
+pub fn find_sync_boundary(
     repo: &Repository,
     top_branch: &str,
     upstream_name: &str,
-) -> Result<Option<RestackBoundary>> {
+) -> Result<Option<SyncBoundary>> {
     let top_id = repo.revparse_single(top_branch)?.id();
     let upstream_id = repo.revparse_single(upstream_name)?.id();
     let merge_base = repo.merge_base(top_id, upstream_id)?;
@@ -72,12 +72,12 @@ pub fn find_restack_boundary(
     let first = repo.find_commit(first_commit)?;
     if first.parent_count() == 0 {
         return Err(anyhow!(
-            "Cannot restack from root commit {} without a parent base.",
+            "Cannot sync from root commit {} without a parent base.",
             first_commit
         ));
     }
 
-    Ok(Some(RestackBoundary {
+    Ok(Some(SyncBoundary {
         old_base: first.parent_id(0)?,
     }))
 }
@@ -131,7 +131,7 @@ fn cherry_equivalent_commits(
 
     if !output.status.success() {
         return Err(anyhow!(
-            "git cherry failed while computing restack boundary for '{}'.",
+            "git cherry failed while computing sync boundary for '{}'.",
             top_branch
         ));
     }

@@ -7,7 +7,7 @@ use std::fs;
 use tempfile::tempdir;
 
 #[test]
-fn restack_handles_rebased_lower_branch() {
+fn sync_handles_rebased_lower_branch() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
 
@@ -68,10 +68,7 @@ fn restack_handles_rebased_lower_branch() {
         .unwrap();
 
     let mut cmd = gits_cmd();
-    cmd.arg("restack")
-        .current_dir(dir.path())
-        .assert()
-        .success();
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
 
@@ -112,7 +109,7 @@ fn restack_handles_rebased_lower_branch() {
 }
 
 #[test]
-fn restack_handles_squashed_lower_branch() {
+fn sync_handles_squashed_lower_branch() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
 
@@ -167,10 +164,7 @@ fn restack_handles_squashed_lower_branch() {
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
     let mut cmd = gits_cmd();
-    cmd.arg("restack")
-        .current_dir(dir.path())
-        .assert()
-        .success();
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
 
@@ -208,7 +202,7 @@ fn restack_handles_squashed_lower_branch() {
 }
 
 #[test]
-fn restack_handles_merged_lower_branch() {
+fn sync_handles_merged_lower_branch() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
 
@@ -258,10 +252,7 @@ fn restack_handles_merged_lower_branch() {
         .unwrap();
 
     let mut cmd = gits_cmd();
-    cmd.arg("restack")
-        .current_dir(dir.path())
-        .assert()
-        .success();
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
 
@@ -292,7 +283,7 @@ fn restack_handles_merged_lower_branch() {
 }
 
 #[test]
-fn restack_rebases_onto_remote_tracking_base_when_local_base_is_stale() {
+fn sync_rebases_onto_remote_tracking_base_when_local_base_is_stale() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
 
@@ -357,13 +348,10 @@ fn restack_rebases_onto_remote_tracking_base_when_local_base_is_stale() {
     assert_eq!(local_main_before, origin_main_before);
 
     let mut cmd = gits_cmd();
-    cmd.arg("restack")
-        .current_dir(dir.path())
-        .assert()
-        .success();
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
-    let origin_main_after_restack = repo.revparse_single("origin/main").unwrap().id();
+    let origin_main_after_sync = repo.revparse_single("origin/main").unwrap().id();
     let feature_after = repo
         .find_branch("feature-a", BranchType::Local)
         .unwrap()
@@ -372,20 +360,20 @@ fn restack_rebases_onto_remote_tracking_base_when_local_base_is_stale() {
         .unwrap();
     let feature_after_commit = repo.find_commit(feature_after).unwrap();
 
-    assert_ne!(origin_main_before, origin_main_after_restack);
+    assert_ne!(origin_main_before, origin_main_after_sync);
     assert_ne!(feature_after, feature_before);
     assert!(
-        repo.graph_descendant_of(feature_after, origin_main_after_restack)
+        repo.graph_descendant_of(feature_after, origin_main_after_sync)
             .unwrap()
     );
     assert_eq!(
         feature_after_commit.parent_id(0).unwrap(),
-        origin_main_after_restack
+        origin_main_after_sync
     );
 }
 
 #[test]
-fn restack_treats_slashed_base_branch_name_as_local_before_remote() {
+fn sync_treats_slashed_base_branch_name_as_local_before_remote() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
 
@@ -470,10 +458,7 @@ fn restack_treats_slashed_base_branch_name_as_local_before_remote() {
     assert_eq!(upstream_before, local_release_before);
 
     let mut cmd = gits_cmd();
-    cmd.arg("restack")
-        .current_dir(dir.path())
-        .assert()
-        .success();
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
     let upstream_after = repo
@@ -494,7 +479,7 @@ fn restack_treats_slashed_base_branch_name_as_local_before_remote() {
 }
 
 #[test]
-fn restack_reports_rebase_conflict() {
+fn sync_reports_rebase_conflict() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
 
@@ -539,7 +524,7 @@ fn restack_reports_rebase_conflict() {
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
     let mut cmd = gits_cmd();
-    cmd.arg("restack")
+    cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
         .failure()
@@ -555,7 +540,7 @@ fn restack_reports_rebase_conflict() {
 }
 
 #[test]
-fn restack_refuses_when_git_rebase_in_progress() {
+fn sync_refuses_when_git_rebase_in_progress() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
 
@@ -589,7 +574,7 @@ fn restack_refuses_when_git_rebase_in_progress() {
     std::fs::create_dir_all(dir.path().join(".git/rebase-merge")).unwrap();
 
     let mut cmd = gits_cmd();
-    cmd.arg("restack")
+    cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
         .failure()
@@ -597,7 +582,7 @@ fn restack_refuses_when_git_rebase_in_progress() {
 }
 
 #[test]
-fn restack_refuses_to_auto_pick_tip_in_non_interactive_mode() {
+fn sync_refuses_to_auto_pick_tip_in_non_interactive_mode() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
 
@@ -641,7 +626,7 @@ fn restack_refuses_to_auto_pick_tip_in_non_interactive_mode() {
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
     let mut cmd = gits_cmd();
-    cmd.arg("restack")
+    cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
         .failure()
@@ -650,7 +635,7 @@ fn restack_refuses_to_auto_pick_tip_in_non_interactive_mode() {
 
 #[cfg(unix)]
 #[test]
-fn restack_errors_when_git_too_old_for_update_refs() {
+fn sync_errors_when_git_too_old_for_update_refs() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempdir().unwrap();
@@ -707,20 +692,20 @@ fn restack_errors_when_git_too_old_for_update_refs() {
     let new_path = format!("{}:{}", dir.path().display(), old_path);
 
     let mut cmd = gits_cmd();
-    cmd.arg("restack")
+    cmd.arg("sync")
         .current_dir(dir.path())
         .env("PATH", new_path)
         .assert()
         .failure()
         .stderr(
-            predicate::str::contains("restack requires Git >= 2.38.0")
+            predicate::str::contains("sync requires Git >= 2.38.0")
                 .and(predicate::str::contains("--update-refs")),
         );
 }
 
 #[cfg(unix)]
 #[test]
-fn restack_checkout_error_includes_branch_name() {
+fn sync_checkout_error_includes_branch_name() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempdir().unwrap();
@@ -775,7 +760,7 @@ fn restack_checkout_error_includes_branch_name() {
     let new_path = format!("{}:{}", dir.path().display(), old_path);
 
     let mut cmd = gits_cmd();
-    cmd.arg("restack")
+    cmd.arg("sync")
         .current_dir(dir.path())
         .env("PATH", new_path)
         .assert()
@@ -783,4 +768,47 @@ fn restack_checkout_error_includes_branch_name() {
         .stderr(predicate::str::contains(
             "git checkout failed for branch 'feature-b'",
         ));
+}
+
+#[test]
+fn sync_handles_local_branch_with_slash_correctly() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    // Create a local branch with a slash that is NOT a remote
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/feature/base",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feature a",
+        &[&base],
+    );
+    let _a = repo.find_commit(a_id).unwrap();
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    // Override upstream to be our slashed local branch
+    fs::write(
+        repo.path().join("gits.toml"),
+        r#"upstream_branch = "feature/base""#,
+    )
+    .unwrap();
+
+    let mut cmd = gits_cmd();
+    // This should NOT fail trying to fetch from remote "feature"
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-a"));
 }
