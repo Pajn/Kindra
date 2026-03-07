@@ -5,7 +5,7 @@
 ## Key Features
 
 - **Stacked Commits**: Automatically rebase all descendant branches when you commit in the middle of a stack.
-- **Atomic Stack Moves**: Move a branch and all its descendants onto a new base branch with a single command.
+- **Atomic Stack Moves**: Move a branch and all its descendants onto a new base branch in one pass using `--update-refs`.
 - **Smart Sync**: Rebase the current stack onto `main`/`master` in one pass using `--update-refs`, while skipping already-landed lower PRs.
 - **Auto-Restack**: Automatically identify and repair "floating" branches that were based on an old version of the current branch (e.g., after an `amend` or `rebase`).
 - **Interactive Navigation**: Quickly hop between branches in your stack with `up`, `down`, and `top` commands.

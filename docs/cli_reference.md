@@ -31,7 +31,7 @@ This document provides a detailed overview of the commands available in `gits` a
 
 ### `commit`
 
-**Description:** Commits changes and automatically rebases descendant branches in the affected stack.
+**Description:** Commits changes and automatically rebases descendant branches in the affected stack in a single pass using `--update-refs` (Requires Git >= 2.38.0).
 
 **Usage:**
 
@@ -73,7 +73,7 @@ main -> [A1] -> [A2] -> (feature-A) -> [B1'] -> (feature-B) -> [C1'] -> (feature
 
 ### `move`
 
-**Description:** Moves the current branch and all its descendants onto a new target branch.
+**Description:** Moves the current branch and all its descendants onto a new target branch in a single pass using `--update-refs` (Requires Git >= 2.38.0).
 
 **Usage:**
 
@@ -267,10 +267,10 @@ main -> [C1] -> (feature-part-1) -> [C2] -> (feature-part-2) -> [C3] -> (my-feat
 
 ### Status & Control
 
-If a `gits commit` or `gits move` operation is interrupted (e.g., due to a merge conflict), use these commands to manage it:
+If a `gits commit`, `gits move`, or `gits restack` operation is interrupted (e.g., due to a merge conflict), use these commands to manage it:
 
 - **`gits status`**: Shows the current state of an in-progress operation, including which branch is currently being rebased and which ones are remaining.
-- **`gits continue`**: Resumes the operation after you've resolved conflicts (runs `git rebase --continue` internally).
+- **`gits continue`**: Resumes the operation after you've resolved conflicts. It handles the underlying `git rebase --continue` and then proceeds with the remaining branches in the stack.
 - **`gits abort`**: Cancels the current operation and cleans up the state.
 
 ---

@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use git2::Repository;
+use git2::{Oid, Repository};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -197,6 +197,9 @@ pub fn unstage_all() -> Result<()> {
 }
 
 pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> {
+    ensure_git_supports_update_refs()?;
+
+    let mut started_any = false;
     while !state.remaining_branches.is_empty() {
         let current_name = state.remaining_branches[0].clone();
 
@@ -217,23 +220,48 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
             }
         };
 
-        if is_resuming {
-            // If no rebase is active, check if the user finished it manually
-            if !repo.path().join("rebase-merge").exists()
-                && !repo.path().join("rebase-apply").exists()
-            {
-                let branch_id = repo.revparse_single(&current_name)?.id();
-                let new_base_id = repo.revparse_single(&new_base)?.id();
+        // Check if the branch is already rebased (e.g. by a previous --update-refs)
+        let current_id = repo.revparse_single(&current_name)?.id();
+        let new_base_id = repo.revparse_single(&new_base)?.id();
+        let mut is_done =
+            repo.graph_descendant_of(current_id, new_base_id)? || current_id == new_base_id;
 
-                if repo.graph_descendant_of(branch_id, new_base_id)? {
-                    println!("Branch {} already rebased.", current_name);
-                    state.remaining_branches.remove(0);
-                    state.in_progress_branch = None;
-                    save_state(repo, &state)?;
-                    continue;
+        if is_done && current_id != new_base_id {
+            // Stricter check: the first commit in the branch's delta (relative to its new base)
+            // must now be a child of new_base_id.
+            // We walk from current_id back to new_base_id.
+            let mut walk = repo.revwalk()?;
+            walk.push(current_id)?;
+            walk.hide(new_base_id)?;
+            let mut commits: Vec<Oid> = walk.filter_map(|id| id.ok()).collect();
+            commits.reverse(); // Now oldest to newest
+
+            if let Some(&first_id) = commits.first() {
+                let first_commit = repo.find_commit(first_id)?;
+                if first_commit.parent_count() > 0 && first_commit.parent_id(0)? != new_base_id {
+                    // It's a descendant of new_base, but not immediately building on it.
+                    // This could mean it's based on an old version of the base.
+                    is_done = false;
                 }
             }
-        } else {
+        }
+
+        if is_done
+            && (is_resuming || started_any)
+            && !repo.path().join("rebase-merge").exists()
+            && !repo.path().join("rebase-apply").exists()
+        {
+            println!("Branch {} already rebased.", current_name);
+            state.remaining_branches.remove(0);
+            if is_resuming {
+                state.in_progress_branch = None;
+                started_any = true;
+            }
+            save_state(repo, &state)?;
+            continue;
+        }
+
+        if !is_resuming {
             state.in_progress_branch = Some(current_name.clone());
             save_state(repo, &state)?;
         }
@@ -242,6 +270,7 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         let status = Command::new("git")
             .arg("rebase")
             .arg("--no-ff")
+            .arg("--update-refs")
             .arg("--onto")
             .arg(&new_base)
             .arg(old_parent_id_str)
@@ -251,6 +280,7 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         if status.success() {
             state.remaining_branches.remove(0);
             state.in_progress_branch = None;
+            started_any = true;
             save_state(repo, &state)?;
         } else {
             // Check if a rebase is in progress (meaning it started but hit conflicts)
@@ -308,4 +338,74 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
     }
 
     Ok(())
+}
+
+pub fn ensure_git_supports_update_refs() -> Result<()> {
+    let output = Command::new("git").arg("--version").output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "This operation requires Git >= 2.38.0 because it uses '--update-refs', but 'git --version' failed."
+        ));
+    }
+
+    let version_output = String::from_utf8_lossy(&output.stdout);
+    let version = parse_git_semver(&version_output).ok_or_else(|| {
+        anyhow!(
+            "This operation requires Git >= 2.38.0 because it uses '--update-refs', but could not parse `git --version` output: {}",
+            version_output.trim()
+        )
+    })?;
+
+    if version < (2, 38, 0) {
+        return Err(anyhow!(
+            "This operation requires Git >= 2.38.0 because '--update-refs' is used during rebase. Detected Git {}.{}.{}.",
+            version.0,
+            version.1,
+            version.2
+        ));
+    }
+
+    Ok(())
+}
+
+fn parse_git_semver(version_output: &str) -> Option<(u64, u64, u64)> {
+    let version_token = version_output
+        .split_whitespace()
+        .find(|part| part.as_bytes().first().is_some_and(u8::is_ascii_digit))?;
+
+    let numbers = version_token
+        .split('.')
+        .filter_map(|segment| {
+            let digits: String = segment
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect();
+            (!digits.is_empty())
+                .then_some(digits)
+                .and_then(|d| d.parse::<u64>().ok())
+        })
+        .collect::<Vec<u64>>();
+
+    if numbers.len() < 3 {
+        return None;
+    }
+
+    Some((numbers[0], numbers[1], numbers[2]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_git_semver;
+
+    #[test]
+    fn parse_git_semver_ignores_non_numeric_dot_segments() {
+        let parsed = parse_git_semver("git version 2.44.0.windows.1");
+        assert_eq!(parsed, Some((2, 44, 0)));
+    }
+
+    #[test]
+    fn parse_git_semver_requires_three_components() {
+        let parsed = parse_git_semver("git version 2.44");
+        assert_eq!(parsed, None);
+    }
 }

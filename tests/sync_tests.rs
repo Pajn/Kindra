@@ -718,7 +718,7 @@ fn sync_errors_when_git_too_old_for_update_refs() {
         .assert()
         .failure()
         .stderr(
-            predicate::str::contains("sync requires Git >= 2.38.0")
+            predicate::str::contains("operation requires Git >= 2.38.0")
                 .and(predicate::str::contains("--update-refs")),
         );
 }

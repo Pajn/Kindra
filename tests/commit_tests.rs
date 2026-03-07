@@ -1347,6 +1347,111 @@ fn test_commit_on_conflict_and_abort_restores_original_context() {
 }
 
 #[test]
+fn test_rebase_loop_skips_resumed_and_subsequent_done_branches() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    // Setup stack: main -> a -> b
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "commit a",
+        &[&main_commit],
+    );
+    let a_commit = repo.find_commit(a_id).unwrap();
+    let b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b-unique",
+        "commit b",
+        &[&a_commit],
+    );
+
+    // 1. Move main
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    fs::write(dir.path().join("main_new.txt"), "new").unwrap();
+    run_ok("git", &["add", "main_new.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "new main"], dir.path());
+    let _new_main_id = repo.revparse_single("main").unwrap().id();
+
+    // 2. Manually rebase a but NOT b.
+    // Use git branch -f to move feature-a without moving b.
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    fs::write(dir.path().join("a_new.txt"), "a_new").unwrap();
+    run_ok("git", &["add", "a_new.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "new a"], dir.path());
+    let new_a_id = repo.revparse_single("HEAD").unwrap().id();
+    run_ok(
+        "git",
+        &["branch", "-f", "feature-a", &new_a_id.to_string()],
+        dir.path(),
+    );
+
+    // Now feature-a is at new_a_id.
+    // feature-b is still at b_id (which builds on OLD a_id).
+    // So feature-b is NOT a descendant of new_a_id.
+    assert!(!repo.graph_descendant_of(b_id, new_a_id).unwrap());
+
+    // 3. Setup state: resuming a (which is done), b is next (not done)
+    let state_path = dir.path().join(".git/gits_rebase_state.json");
+    fs::write(
+        &state_path,
+        format!(
+            r#"{{
+  "operation": "Move",
+  "original_branch": "feature-a",
+  "target_branch": "main",
+  "remaining_branches": ["feature-a", "feature-b"],
+  "in_progress_branch": "feature-a",
+  "parent_id_map": {{
+    "feature-a": "{main_id}",
+    "feature-b": "{a_id}"
+  }},
+  "parent_name_map": {{
+    "feature-b": "feature-a"
+  }},
+  "caller_branch": null,
+  "stash_ref": null,
+  "unstage_on_restore": false
+}}"#,
+            main_id = main_id,
+            a_id = a_id
+        ),
+    )
+    .unwrap();
+
+    // 4. Run continue. a should be skipped, b should be rebased.
+    // Note: feature-a is "done" because its tip is new_a_id, and its parent in state is main_id (oops, should be new_main_id).
+    // Wait, if target_branch is "main", and main is now new_main_id.
+    // Is new_a_id a descendant of new_main_id? YES. So a is done.
+    // feature-b is still at b_id (descendant of OLD a_id).
+    // Its new_base is "feature-a" (new_a_id).
+    // Is b_id a descendant of new_a_id? NO.
+    // So b should be rebased.
+    let mut cmd = gits_cmd();
+    cmd.arg("continue")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "Branch feature-a already rebased.",
+        ))
+        .stdout(predicates::str::contains("Rebasing feature-b..."));
+
+    assert!(!state_path.exists());
+    let new_b_id = repo.revparse_single("feature-b").unwrap().id();
+    assert!(repo.graph_descendant_of(new_b_id, new_a_id).unwrap());
+}
+
+#[test]
 fn test_commit_on_checkout_conflict_restores_original_context() {
     let (dir, repo) = setup_repo();
     let main_id = repo.revparse_single("main").unwrap().id();
