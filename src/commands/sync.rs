@@ -105,7 +105,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
     }
 
     if let Some(old_base) = boundary.old_base {
-        ensure_git_supports_update_refs()?;
+        crate::rebase_utils::ensure_git_supports_update_refs()?;
 
         let status = Command::new("git")
             .arg("rebase")
@@ -254,74 +254,4 @@ fn fetch_sync_remote(remote_name: Option<&str>) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn ensure_git_supports_update_refs() -> Result<()> {
-    let output = Command::new("git").arg("--version").output()?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "sync requires Git >= 2.38.0 because it uses '--update-refs', but 'git --version' failed."
-        ));
-    }
-
-    let version_output = String::from_utf8_lossy(&output.stdout);
-    let version = parse_git_semver(&version_output).ok_or_else(|| {
-        anyhow!(
-            "sync requires Git >= 2.38.0 because it uses '--update-refs', but could not parse `git --version` output: {}",
-            version_output.trim()
-        )
-    })?;
-
-    if version < (2, 38, 0) {
-        return Err(anyhow!(
-            "sync requires Git >= 2.38.0 because '--update-refs' is used during rebase. Detected Git {}.{}.{}.",
-            version.0,
-            version.1,
-            version.2
-        ));
-    }
-
-    Ok(())
-}
-
-fn parse_git_semver(version_output: &str) -> Option<(u64, u64, u64)> {
-    let version_token = version_output
-        .split_whitespace()
-        .find(|part| part.as_bytes().first().is_some_and(u8::is_ascii_digit))?;
-
-    let numbers = version_token
-        .split('.')
-        .filter_map(|segment| {
-            let digits: String = segment
-                .chars()
-                .take_while(|ch| ch.is_ascii_digit())
-                .collect();
-            (!digits.is_empty())
-                .then_some(digits)
-                .and_then(|d| d.parse::<u64>().ok())
-        })
-        .collect::<Vec<u64>>();
-
-    if numbers.len() < 3 {
-        return None;
-    }
-
-    Some((numbers[0], numbers[1], numbers[2]))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_git_semver;
-
-    #[test]
-    fn parse_git_semver_ignores_non_numeric_dot_segments() {
-        let parsed = parse_git_semver("git version 2.44.0.windows.1");
-        assert_eq!(parsed, Some((2, 44, 0)));
-    }
-
-    #[test]
-    fn parse_git_semver_requires_three_components() {
-        let parsed = parse_git_semver("git version 2.44");
-        assert_eq!(parsed, None);
-    }
 }

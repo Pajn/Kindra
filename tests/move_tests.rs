@@ -736,11 +736,11 @@ fn test_move_conflict_and_continue_no_re_rebase() {
     let log_after = fs::read_to_string(&log_path).unwrap();
     let rebase_calls_after = log_after
         .lines()
-        .filter(|l| l.contains("rebase --no-ff --onto"))
+        .filter(|l| l.contains("rebase --no-ff") && l.contains("--onto target"))
         .count();
     assert_eq!(
         rebase_calls_after, 1,
-        "Should NOT have called rebase again for 'feature'"
+        "Should have called rebase exactly once for 'feature'"
     );
 }
 

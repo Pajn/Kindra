@@ -71,34 +71,32 @@ pub fn find_upstream(repo: &Repository) -> Result<String> {
         return Ok(upstream);
     }
 
-    let mut local_candidates = Vec::new();
+    let mut candidates = Vec::new();
     if let Ok(default_branch) = repo.config()?.get_string("init.defaultBranch") {
         let default_branch = default_branch.trim();
         if !default_branch.is_empty() {
-            local_candidates.push(default_branch.to_string());
+            candidates.push(default_branch.to_string());
         }
     }
-    local_candidates.extend(["main", "master", "trunk"].iter().map(|s| s.to_string()));
+    candidates.extend(["main", "master", "trunk"].iter().map(|s| s.to_string()));
 
-    let mut seen_local = HashSet::new();
-    local_candidates.retain(|candidate| seen_local.insert(candidate.clone()));
+    let mut seen = HashSet::new();
+    candidates.retain(|candidate| seen.insert(candidate.clone()));
 
-    for name in &local_candidates {
+    for name in &candidates {
         if repo.find_branch(name, BranchType::Local).is_ok() {
             return Ok(name.clone());
         }
     }
 
-    let mut candidates = local_candidates.clone();
-    for name in &local_candidates {
+    let mut remote_candidates = Vec::new();
+    for name in &candidates {
         if !name.starts_with("origin/") {
-            candidates.push(format!("origin/{name}"));
+            remote_candidates.push(format!("origin/{name}"));
         }
     }
-    let mut seen_candidates = HashSet::new();
-    candidates.retain(|candidate| seen_candidates.insert(candidate.clone()));
 
-    for name in candidates {
+    for name in remote_candidates {
         if branch_exists(repo, &name) {
             return Ok(name);
         }
