@@ -13,6 +13,7 @@ use crate::commands::continue_cmd::continue_cmd;
 use crate::commands::move_cmd::{MoveArgs, move_cmd};
 use crate::commands::pr::{PrSubcommand, pr};
 use crate::commands::push::push;
+use crate::commands::restack::restack;
 use crate::commands::split::split;
 use crate::commands::status_cmd::status_cmd;
 use crate::commands::sync::{SyncArgs, sync};
@@ -54,6 +55,8 @@ enum Commands {
     Move(MoveArgs),
     /// Rebase the current stack onto the upstream branch in one pass
     Sync(SyncArgs),
+    /// Repair stack dependencies by rebasing detached children onto the current branch
+    Restack,
     /// Commits and rebases dependent branches
     Commit {
         /// Arguments to pass to git commit. Supports --on <branch> and --force.
@@ -110,6 +113,7 @@ fn main() -> Result<()> {
         Commands::Checkout { subcommand, all } => checkout(subcommand, *all)?,
         Commands::Move(args) => move_cmd(args)?,
         Commands::Sync(args) => sync(args)?,
+        Commands::Restack => restack()?,
         Commands::Commit { args } => commit(args)?,
         Commands::Continue => continue_cmd()?,
         Commands::Abort => abort_cmd()?,

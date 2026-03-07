@@ -9,6 +9,7 @@ This document provides a detailed overview of the commands available in `gits` a
   - [commit](#commit)
   - [move](#move)
   - [sync](#sync)
+  - [restack](#restack)
   - [checkout (co)](#checkout-alias-co)
   - [push](#push)
   - [pr](#pr)
@@ -127,6 +128,43 @@ gits sync [--force] [--no-delete]
 **When to use it:** Use this after one or more lower PRs in your stack have already landed on the upstream branch, and you want to sync all remaining branches and clean up the merged ones in one pass.
 
 **Conflict handling:** If rebase conflicts occur, resolve them and continue with `git rebase --continue` (or cancel with `git rebase --abort`).
+
+---
+
+### `restack`
+
+**Description:** Automatically identifies and repairs "floating" branches that were based on an old version of the current branch (e.g., after an `amend` or `rebase`).
+
+**Usage:**
+
+```bash
+gits restack
+```
+
+**What it does:**
+- Scans all local branches for those whose history includes a commit that "matches" the current `HEAD` (by patch-id or tree-hash) but is not part of the current branch's ancestry.
+- These branches are considered "floating" because they are pointing to a commit that has been replaced.
+- `gits restack` will automatically rebase these floating branches onto the new `HEAD`.
+
+**When to use it:** Use this after you've amended a commit or rebased a branch that has other branches building on top of it. Instead of manually rebasing each dependent branch, `gits restack` will find and fix them for you.
+
+**ASCII-Art Visualization:**
+
+```text
+Before 'amend' on 'feature-A':
+main -> [A1] -> (feature-A) -> [B1] -> (feature-B)
+
+$ git commit --amend -m "A modified"
+
+After 'amend' (feature-B is now floating on old A1):
+main -> [A1'] -> (feature-A)
+      \-> [A1] -> [B1] -> (feature-B)
+
+$ gits restack
+
+After gits restack:
+main -> [A1'] -> (feature-A) -> [B1'] -> (feature-B)
+```
 
 ---
 

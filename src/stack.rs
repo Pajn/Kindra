@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use git2::{Oid, Repository};
+use git2::{Commit, Oid, Repository};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
@@ -169,7 +169,7 @@ fn is_commit_in_upstream_or_patch_equivalent(
     Ok(in_upstream || cherry_equivalent.contains(&commit_id))
 }
 
-fn cherry_equivalent_commits(
+pub fn cherry_equivalent_commits(
     repo: &Repository,
     upstream_name: &str,
     top_branch: &str,
@@ -205,6 +205,67 @@ fn cherry_equivalent_commits(
     }
 
     Ok(result)
+}
+
+pub fn find_floating_base(
+    repo: &Repository,
+    branch_tip: Oid,
+    branch_name: &str,
+    target_commit: &Commit,
+    target_branch_name: &str,
+) -> Result<Option<Oid>> {
+    let target_id = target_commit.id();
+    let target_tree_id = target_commit.tree_id();
+
+    // Only check if it's not already a descendant or ancestor
+    if repo.graph_descendant_of(branch_tip, target_id)? || branch_tip == target_id {
+        return Ok(None);
+    }
+
+    // We only compute cherry equivalence once per branch check.
+    let cherry_equivalent = cherry_equivalent_commits(repo, target_branch_name, branch_name)?;
+    let target_summary = target_commit.summary().unwrap_or("").trim().to_string();
+    let target_email = target_commit.author().email().unwrap_or("").to_string();
+
+    let mut walk = repo.revwalk()?;
+    walk.push(branch_tip)?;
+    walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
+
+    // We limit the search depth to avoid scanning the entire history of huge repos.
+    for oid_res in walk.take(100) {
+        let oid = oid_res?;
+
+        // Optimization: If we hit a commit that is reachable from the target, we stop.
+        // Because any match found *after* this point would be a common ancestor, not a floating base.
+        if repo.graph_descendant_of(target_id, oid)? {
+            break;
+        }
+
+        if oid == target_id {
+            return Ok(Some(oid));
+        }
+
+        let commit = repo.find_commit(oid)?;
+
+        // Match by tree-hash
+        if commit.tree_id() == target_tree_id {
+            return Ok(Some(oid));
+        }
+
+        // Match by patch-id
+        if cherry_equivalent.contains(&oid) {
+            return Ok(Some(oid));
+        }
+
+        // Fallback: match by metadata (summary + email)
+        let summary = commit.summary().unwrap_or("").trim().to_string();
+        let email = commit.author().email().unwrap_or("").to_string();
+        if summary == target_summary && email == target_email {
+            return Ok(Some(oid));
+        }
+    }
+
+    Ok(None)
 }
 
 fn commits_with_trees_on_upstream(

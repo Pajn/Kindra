@@ -5,6 +5,7 @@ pub mod continue_cmd;
 pub mod move_cmd;
 pub mod pr;
 pub mod push;
+pub mod restack;
 pub mod split;
 pub mod status_cmd;
 pub mod sync;

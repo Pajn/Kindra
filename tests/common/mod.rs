@@ -2,9 +2,9 @@ use assert_cmd::Command;
 use git2::{Repository, Signature};
 use std::fs;
 
+#[allow(dead_code)]
 pub fn gits_cmd() -> Command {
-    #[allow(deprecated)]
-    let mut cmd = Command::cargo_bin("gits").expect("Failed to create gits command");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
     cmd.env("GIT_AUTHOR_NAME", "Test User")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test User")
