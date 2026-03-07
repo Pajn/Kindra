@@ -19,12 +19,12 @@ fn setup_repo_with_base(base_branch: &str) -> (tempfile::TempDir, Repository) {
 }
 
 #[test]
-fn restack_uses_trunk_when_main_master_missing() {
+fn sync_uses_trunk_when_main_master_missing() {
     let (dir, repo) = setup_repo_with_base("trunk");
     repo.set_head("refs/heads/trunk").unwrap();
 
     let mut cmd = gits_cmd();
-    cmd.arg("restack")
+    cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
         .failure()
@@ -32,7 +32,7 @@ fn restack_uses_trunk_when_main_master_missing() {
 }
 
 #[test]
-fn restack_prefers_init_default_branch_before_hardcoded_candidates() {
+fn sync_prefers_init_default_branch_before_hardcoded_candidates() {
     let (dir, repo) = setup_repo_with_base("main");
     let main_tip = repo
         .revparse_single("main")
@@ -46,7 +46,7 @@ fn restack_prefers_init_default_branch_before_hardcoded_candidates() {
     cfg.set_str("init.defaultBranch", "trunk").unwrap();
 
     let mut cmd = gits_cmd();
-    cmd.arg("restack")
+    cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
         .failure()
@@ -54,7 +54,7 @@ fn restack_prefers_init_default_branch_before_hardcoded_candidates() {
 }
 
 #[test]
-fn restack_uses_repo_override_from_git_dir_config() {
+fn sync_uses_repo_override_from_git_dir_config() {
     let (dir, repo) = setup_repo_with_base("main");
     let main_tip = repo
         .revparse_single("main")
@@ -71,7 +71,7 @@ fn restack_uses_repo_override_from_git_dir_config() {
     .unwrap();
 
     let mut cmd = gits_cmd();
-    cmd.arg("restack")
+    cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
         .failure()
@@ -79,7 +79,7 @@ fn restack_uses_repo_override_from_git_dir_config() {
 }
 
 #[test]
-fn restack_errors_when_repo_override_branch_missing() {
+fn sync_errors_when_repo_override_branch_missing() {
     let (dir, repo) = setup_repo_with_base("main");
 
     fs::write(
@@ -89,7 +89,7 @@ fn restack_errors_when_repo_override_branch_missing() {
     .unwrap();
 
     let mut cmd = gits_cmd();
-    cmd.arg("restack")
+    cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
         .failure()
@@ -99,7 +99,7 @@ fn restack_errors_when_repo_override_branch_missing() {
 }
 
 #[test]
-fn restack_errors_when_repo_override_is_not_a_branch() {
+fn sync_errors_when_repo_override_is_not_a_branch() {
     let (dir, repo) = setup_repo_with_base("main");
     let main_tip = repo
         .revparse_single("main")
@@ -116,7 +116,7 @@ fn restack_errors_when_repo_override_is_not_a_branch() {
     .unwrap();
 
     let mut cmd = gits_cmd();
-    cmd.arg("restack")
+    cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
         .failure()
