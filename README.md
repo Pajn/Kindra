@@ -7,7 +7,9 @@
 - **Stacked Commits**: Automatically rebase all descendant branches when you commit in the middle of a stack.
 - **Atomic Stack Moves**: Move a branch and all its descendants onto a new base branch with a single command.
 - **Smart Sync**: Rebase the current stack onto `main`/`master` in one pass using `--update-refs`, while skipping already-landed lower PRs.
+- **Auto-Restack**: Automatically identify and repair "floating" branches that were based on an old version of the current branch (e.g., after an `amend` or `rebase`).
 - **Interactive Navigation**: Quickly hop between branches in your stack with `up`, `down`, and `top` commands.
+
 - **Visual Branch Splitting**: Assign branches to specific commits in a linear history using your favorite `$EDITOR`.
 - **Atomic Pushes**: Push all branches in your stack simultaneously with `force-with-lease` safety.
 - **PR Workflow Helpers**: Create/update stack PRs, open PRs in your browser, edit PR metadata, and inspect review/check status.
@@ -32,7 +34,8 @@ cargo install --path .
 3. **Watch the magic**: `gits` will automatically rebase all branches that depend on your change.
 4. **Move the stack**: Ready to target a different feature? `gits move --onto main` to relocate the entire stack.
 5. **Sync after merges**: If lower PRs landed, run `gits sync` to rebase the remaining stack onto latest `main`.
-6. **Manage PRs in stack**:
+6. **Repair broken stacks**: Amended a commit and left dependent branches "floating"? Run `gits restack` to fix them.
+7. **Manage PRs in stack**:
    - `gits pr` to create/update PRs
    - `gits pr open` to open a PR from the stack
    - `gits pr edit` to edit title/body/labels/reviewers
