@@ -12,6 +12,10 @@ pub struct SyncArgs {
     /// Force the sync even if branches are checked out in other worktrees
     #[arg(long)]
     pub force: bool,
+
+    /// Do not delete merged branches
+    #[arg(long)]
+    pub no_delete: bool,
 }
 
 pub fn sync(args: &SyncArgs) -> Result<()> {
@@ -34,6 +38,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
     };
 
     let upstream_name = find_upstream(&repo)?;
+    let local_upstream = upstream_name.clone();
     if current_branch_name.as_deref() == Some(&upstream_name) {
         return Err(anyhow!(
             "Branch '{}' is the upstream branch. Switch to a stack branch before running 'sync'.",
@@ -54,25 +59,16 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
         &rebase_onto_name,
     )?;
 
-    if stack_branches.is_empty() {
-        println!("No branches found in the current stack.");
-        return Ok(());
-    }
-
-    crate::rebase_utils::check_worktrees(
-        &stack_branches
-            .iter()
-            .map(|sb| sb.name.clone())
-            .collect::<Vec<_>>(),
-        args.force,
-    )?;
-
     let mut tips = get_stack_tips(&repo, &stack_branches)?;
     tips.sort();
     let top_branch = match tips.len() {
         0 => {
-            println!("No branches in stack.");
-            return Ok(());
+            if let Some(ref name) = current_branch_name {
+                name.clone()
+            } else {
+                println!("No branches found in the current stack.");
+                return Ok(());
+            }
         }
         1 => tips[0].clone(),
         _ => {
@@ -89,33 +85,104 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
         checkout_branch(&top_branch)?;
     }
 
-    let repo = crate::open_repo()?;
     let boundary = find_sync_boundary(&repo, &top_branch, &rebase_onto_name)?;
-    let Some(boundary) = boundary else {
+
+    let mut branches_to_check = stack_branches
+        .iter()
+        .map(|sb| sb.name.clone())
+        .collect::<Vec<_>>();
+
+    if !args.no_delete {
+        for mb in &boundary.merged_branches {
+            if !branches_to_check.contains(mb) {
+                branches_to_check.push(mb.clone());
+            }
+        }
+    }
+
+    if !branches_to_check.is_empty() {
+        crate::rebase_utils::check_worktrees(&branches_to_check, args.force)?;
+    }
+
+    if let Some(old_base) = boundary.old_base {
+        ensure_git_supports_update_refs()?;
+
+        let status = Command::new("git")
+            .arg("rebase")
+            .arg("--update-refs")
+            .arg("--onto")
+            .arg(&rebase_onto_name)
+            .arg(old_base.to_string())
+            .arg(&top_branch)
+            .status()?;
+
+        if !status.success() {
+            return Err(anyhow!(
+                "git rebase failed. Resolve conflicts and run 'git rebase --continue' or 'git rebase --abort'."
+            ));
+        }
+    } else {
         println!(
             "All commits in this stack appear to be integrated into {}.",
             rebase_onto_name
         );
-        return Ok(());
-    };
-
-    ensure_git_supports_update_refs()?;
-
-    let status = Command::new("git")
-        .arg("rebase")
-        .arg("--update-refs")
-        .arg("--onto")
-        .arg(&rebase_onto_name)
-        .arg(boundary.old_base.to_string())
-        .arg(&top_branch)
-        .status()?;
-
-    if !status.success() {
-        return Err(anyhow!(
-            "git rebase failed. Resolve conflicts and run 'git rebase --continue' or 'git rebase --abort'."
-        ));
     }
 
+    if !args.no_delete {
+        delete_merged_branches(&repo, &boundary.merged_branches, &local_upstream)?;
+    }
+
+    Ok(())
+}
+
+fn delete_merged_branches(
+    repo: &git2::Repository,
+    branches: &[String],
+    checkout_fallback: &str,
+) -> Result<()> {
+    if branches.is_empty() {
+        return Ok(());
+    }
+
+    let head = repo.head()?;
+    let current_branch = if !repo.head_detached()? {
+        head.shorthand()
+    } else {
+        None
+    };
+
+    if let Some(cb) = current_branch
+        && branches.iter().any(|b| b == cb)
+    {
+        println!(
+            "Current branch '{}' is merged. Switching to '{}' before deletion.",
+            cb, checkout_fallback
+        );
+        checkout_branch(checkout_fallback).map_err(|e| {
+            anyhow!(
+                "fallback git checkout failed for branch '{}': {}",
+                checkout_fallback,
+                e
+            )
+        })?;
+    }
+
+    for branch_name in branches {
+        let status = Command::new("git")
+            .arg("branch")
+            .arg("-D")
+            .arg(branch_name)
+            .status()?;
+
+        if !status.success() {
+            println!(
+                "Warning: Failed to delete merged branch: {}. It might be checked out in another worktree.",
+                branch_name
+            );
+        } else {
+            println!("Deleted merged branch: {}", branch_name);
+        }
+    }
     Ok(())
 }
 

@@ -12,23 +12,20 @@ pub struct StackBranch {
 
 #[derive(Clone, Debug)]
 pub struct SyncBoundary {
-    pub old_base: Oid,
+    pub old_base: Option<Oid>,
+    pub merged_branches: Vec<String>,
 }
 
 pub fn find_sync_boundary(
     repo: &Repository,
     top_branch: &str,
     upstream_name: &str,
-) -> Result<Option<SyncBoundary>> {
+) -> Result<SyncBoundary> {
     let top_id = repo.revparse_single(top_branch)?.id();
     let upstream_id = repo.revparse_single(upstream_name)?.id();
     let merge_base = repo.merge_base(top_id, upstream_id)?;
 
     let first_parent_chain = collect_first_parent_chain(repo, merge_base, top_id)?;
-    if first_parent_chain.is_empty() {
-        return Ok(None);
-    }
-
     let cherry_equivalent = cherry_equivalent_commits(repo, upstream_name, top_branch)?;
     let matching_trees = commits_with_trees_on_upstream(repo, upstream_id, &first_parent_chain)?;
 
@@ -62,13 +59,67 @@ pub fn find_sync_boundary(
         }
     }
 
+    // Identify all local branches that are merged.
+    let mut merged_branches = Vec::new();
+    let local_branches = repo.branches(Some(git2::BranchType::Local))?;
+
+    let upstream_ref_name = repo
+        .resolve_reference_from_short_name(upstream_name)
+        .ok()
+        .and_then(|r| r.name().map(|s| s.to_string()));
+
+    for res in local_branches {
+        let (branch, _) = res?;
+        let name = match branch.name()? {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if name == upstream_name {
+            continue;
+        }
+        let id = match branch.get().target() {
+            Some(id) => id,
+            None => continue,
+        };
+
+        if let Some(ref ref_name) = upstream_ref_name {
+            if branch.get().name() == Some(ref_name) {
+                continue;
+            }
+            if let Ok(upstream) = branch.upstream()
+                && upstream.get().name() == Some(ref_name)
+            {
+                continue;
+            }
+        }
+
+        // Is this branch part of the stack?
+        // We define it as an ancestor of top_branch and descendant of merge_base.
+        let is_in_stack_lineage = (repo.graph_descendant_of(top_id, id)? || top_id == id)
+            && (repo.graph_descendant_of(id, merge_base)? || id == merge_base);
+
+        if !is_in_stack_lineage {
+            continue;
+        }
+
+        // Is it merged?
+        let merged_by_graph = repo.graph_descendant_of(upstream_id, id)? || upstream_id == id;
+        let merged_by_patch = cherry_equivalent.contains(&id);
+
+        if merged_by_graph || merged_by_patch {
+            merged_branches.push(name);
+        }
+    }
+
     let first_unmerged_idx = (prefix_end + 1) as usize;
     if first_unmerged_idx >= first_parent_chain.len() {
-        return Ok(None);
+        return Ok(SyncBoundary {
+            old_base: None,
+            merged_branches,
+        });
     }
 
     let first_commit = first_parent_chain[first_unmerged_idx];
-
     let first = repo.find_commit(first_commit)?;
     if first.parent_count() == 0 {
         return Err(anyhow!(
@@ -77,9 +128,10 @@ pub fn find_sync_boundary(
         ));
     }
 
-    Ok(Some(SyncBoundary {
-        old_base: first.parent_id(0)?,
-    }))
+    Ok(SyncBoundary {
+        old_base: Some(first.parent_id(0)?),
+        merged_branches,
+    })
 }
 
 fn collect_first_parent_chain(
