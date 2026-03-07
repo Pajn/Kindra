@@ -463,6 +463,29 @@ pub fn update_pr_base(pr_number: u64, new_base: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fetch the state of a PR (e.g., "OPEN", "MERGED", "CLOSED").
+pub fn get_pr_state(pr_number: u64) -> Result<String> {
+    #[derive(Deserialize)]
+    struct PrView {
+        state: String,
+    }
+
+    let output = Command::new("gh")
+        .args(["pr", "view", &pr_number.to_string(), "--json", "state"])
+        .output()
+        .context("Failed to run `gh pr view`")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("`gh pr view` failed: {}", stderr.trim()));
+    }
+
+    let pr: PrView =
+        serde_json::from_slice(&output.stdout).context("Failed to parse `gh pr view` output")?;
+
+    Ok(pr.state.to_uppercase())
+}
+
 /// Create a new PR. Returns the URL of the created PR.
 pub fn create_pr(params: &CreatePrParams) -> Result<String> {
     let mut cmd = Command::new("gh");
