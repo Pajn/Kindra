@@ -1,9 +1,18 @@
+use crate::commands::resolve_restack_history_limit;
 use crate::rebase_utils::{Operation, RebaseState, run_rebase_loop, state_path};
 use anyhow::{Result, anyhow};
+use clap::Args;
 use git2::{BranchType, Commit, Oid, Repository};
 use std::collections::HashMap;
 
-pub fn restack() -> Result<()> {
+#[derive(Args)]
+pub struct RestackArgs {
+    /// Maximum first-parent history depth to scan when detecting floating branches (0 = unbounded)
+    #[arg(long)]
+    pub history_limit: Option<usize>,
+}
+
+pub fn restack(args: &RestackArgs) -> Result<()> {
     let repo = crate::open_repo()?;
 
     if state_path(&repo).exists() {
@@ -22,7 +31,9 @@ pub fn restack() -> Result<()> {
         current_branch_name
     );
 
-    let children = find_floating_children(&repo, &head_commit, &current_branch_name)?;
+    let history_limit = resolve_restack_history_limit(&repo, args.history_limit)?;
+    let children =
+        find_floating_children(&repo, &head_commit, &current_branch_name, history_limit)?;
 
     if children.is_empty() {
         println!("No floating children found.");
@@ -64,8 +75,17 @@ fn find_floating_children(
     repo: &Repository,
     head_commit: &Commit,
     current_branch: &str,
+    history_limit: usize,
 ) -> Result<Vec<(String, Oid)>> {
     let mut results = Vec::new();
+    let mut patch_id_cache = HashMap::new();
+    let target = crate::stack::build_floating_target_context(
+        repo,
+        head_commit,
+        current_branch,
+        history_limit,
+        &mut patch_id_cache,
+    )?;
     let branches = repo.branches(Some(BranchType::Local))?;
 
     for branch_res in branches {
@@ -84,9 +104,13 @@ fn find_floating_children(
             None => continue,
         };
 
-        if let Some(old_base) =
-            crate::stack::find_floating_base(repo, tip, &name, head_commit, current_branch)?
-        {
+        if let Some(old_base) = crate::stack::find_floating_base(
+            repo,
+            tip,
+            &target,
+            history_limit,
+            &mut patch_id_cache,
+        )? {
             results.push((name, old_base));
         }
     }
