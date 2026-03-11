@@ -16,6 +16,7 @@ use git2::{BranchType, Repository};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::io::IsTerminal;
+use std::path::PathBuf;
 
 #[derive(Subcommand, Clone, Copy)]
 pub enum CheckoutSubcommand {
@@ -130,26 +131,47 @@ fn resolve_branch_name(repo: &Repository, name: &str) -> Option<String> {
 #[derive(Deserialize)]
 struct RepoConfig {
     upstream_branch: Option<String>,
+    restack: Option<RestackConfig>,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+struct RestackConfig {
+    history_limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct GlobalConfig {
+    restack: Option<RestackConfig>,
+}
+
+pub const DEFAULT_RESTACK_HISTORY_LIMIT: usize = 100;
+
+pub fn resolve_restack_history_limit(
+    repo: &Repository,
+    cli_override: Option<usize>,
+) -> Result<usize> {
+    if let Some(limit) = cli_override {
+        return Ok(limit);
+    }
+
+    if let Some(limit) = read_repo_config(repo)?
+        .restack
+        .and_then(|cfg| cfg.history_limit)
+    {
+        return Ok(limit);
+    }
+
+    if let Some(limit) =
+        read_global_config()?.and_then(|cfg| cfg.restack.and_then(|r| r.history_limit))
+    {
+        return Ok(limit);
+    }
+
+    Ok(DEFAULT_RESTACK_HISTORY_LIMIT)
 }
 
 fn read_repo_upstream_override(repo: &Repository) -> Result<Option<String>> {
-    let config_path = repo.path().join("gits.toml");
-    if !config_path.exists() {
-        return Ok(None);
-    }
-
-    let raw = std::fs::read_to_string(&config_path).with_context(|| {
-        format!(
-            "Failed to read repository config at {}",
-            config_path.display()
-        )
-    })?;
-    let cfg: RepoConfig = toml::from_str(&raw).with_context(|| {
-        format!(
-            "Failed to parse repository config at {}",
-            config_path.display()
-        )
-    })?;
+    let cfg = read_repo_config(repo)?;
 
     let upstream = cfg
         .upstream_branch
@@ -167,4 +189,50 @@ fn read_repo_upstream_override(repo: &Repository) -> Result<Option<String>> {
             }),
         None => Ok(None),
     }
+}
+
+fn read_repo_config(repo: &Repository) -> Result<RepoConfig> {
+    read_toml_config(repo.path().join("gits.toml"), "repository")?.map_or_else(
+        || {
+            Ok(RepoConfig {
+                upstream_branch: None,
+                restack: None,
+            })
+        },
+        Ok,
+    )
+}
+
+fn read_global_config() -> Result<Option<GlobalConfig>> {
+    let Some(config_path) = global_config_path() else {
+        return Ok(None);
+    };
+    read_toml_config(config_path, "global")
+}
+
+fn read_toml_config<T: for<'de> Deserialize<'de>>(
+    config_path: PathBuf,
+    config_kind: &str,
+) -> Result<Option<T>> {
+    if !config_path.exists() {
+        return Ok(None);
+    }
+
+    let raw = std::fs::read_to_string(&config_path).with_context(|| {
+        format!(
+            "Failed to read {config_kind} config at {}",
+            config_path.display()
+        )
+    })?;
+    let cfg = toml::from_str(&raw).with_context(|| {
+        format!(
+            "Failed to parse {config_kind} config at {}",
+            config_path.display()
+        )
+    })?;
+    Ok(Some(cfg))
+}
+
+fn global_config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("gits").join("config.toml"))
 }

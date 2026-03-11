@@ -3,6 +3,7 @@ use git2::{Commit, Oid, Repository};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
+use std::process::Stdio;
 
 #[derive(Clone, Debug)]
 pub struct StackBranch {
@@ -27,35 +28,15 @@ pub fn find_sync_boundary(
 
     let first_parent_chain = collect_first_parent_chain(repo, merge_base, top_id)?;
     let cherry_equivalent = cherry_equivalent_commits(repo, upstream_name, top_branch)?;
-    let matching_trees = commits_with_trees_on_upstream(repo, upstream_id, &first_parent_chain)?;
 
     let mut prefix_end: isize = -1;
-    let mut last_tree_match: isize = -1;
 
     for (idx, &commit_id) in first_parent_chain.iter().enumerate() {
-        if matching_trees.contains(&commit_id) {
-            last_tree_match = idx as isize;
-        }
-
         let merged_by_graph =
             repo.graph_descendant_of(upstream_id, commit_id)? || upstream_id == commit_id;
         let merged_by_patch = cherry_equivalent.contains(&commit_id);
         if merged_by_graph || merged_by_patch {
             prefix_end = idx as isize;
-        }
-    }
-
-    // Tree matches can be ambiguous; only advance when ancestry or patch
-    // equivalence confirms the commit already landed upstream.
-    if last_tree_match > prefix_end {
-        let tree_match_commit = first_parent_chain[last_tree_match as usize];
-        if is_commit_in_upstream_or_patch_equivalent(
-            repo,
-            upstream_id,
-            tree_match_commit,
-            &cherry_equivalent,
-        )? {
-            prefix_end = last_tree_match;
         }
     }
 
@@ -159,16 +140,6 @@ fn collect_first_parent_chain(
     Ok(chain)
 }
 
-fn is_commit_in_upstream_or_patch_equivalent(
-    repo: &Repository,
-    upstream_id: Oid,
-    commit_id: Oid,
-    cherry_equivalent: &HashSet<Oid>,
-) -> Result<bool> {
-    let in_upstream = repo.graph_descendant_of(upstream_id, commit_id)? || upstream_id == commit_id;
-    Ok(in_upstream || cherry_equivalent.contains(&commit_id))
-}
-
 pub fn cherry_equivalent_commits(
     repo: &Repository,
     upstream_name: &str,
@@ -207,33 +178,108 @@ pub fn cherry_equivalent_commits(
     Ok(result)
 }
 
+pub struct FloatingTargetContext {
+    candidates: Vec<FloatingTargetCandidate>,
+    candidate_ids: HashSet<Oid>,
+    patch_ids: HashSet<String>,
+    reflog_ids: HashSet<Oid>,
+}
+
+#[derive(Clone)]
+struct FloatingTargetCandidate {
+    id: Oid,
+    tree_id: Oid,
+    summary: String,
+    email: String,
+    parent_id: Option<Oid>,
+}
+
+pub fn build_floating_target_context(
+    repo: &Repository,
+    target_commit: &Commit,
+    target_branch: &str,
+    history_limit: usize,
+    patch_id_cache: &mut HashMap<Oid, Option<String>>,
+) -> Result<FloatingTargetContext> {
+    let mut candidates = Vec::new();
+    let mut commit_ids = Vec::new();
+    let mut current = Some(target_commit.id());
+    let mut remaining = history_limit;
+
+    while let Some(commit_id) = current {
+        if history_limit != 0 && remaining == 0 {
+            break;
+        }
+        let commit = repo.find_commit(commit_id)?;
+        candidates.push(FloatingTargetCandidate {
+            id: commit_id,
+            tree_id: commit.tree_id(),
+            summary: commit.summary().unwrap_or("").trim().to_string(),
+            email: commit.author().email().unwrap_or("").to_string(),
+            parent_id: if commit.parent_count() > 0 {
+                Some(commit.parent_id(0)?)
+            } else {
+                None
+            },
+        });
+        commit_ids.push(commit_id);
+        current = if commit.parent_count() > 0 {
+            Some(commit.parent_id(0)?)
+        } else {
+            None
+        };
+        if history_limit != 0 {
+            remaining -= 1;
+        }
+    }
+
+    ensure_patch_ids(repo, &commit_ids, patch_id_cache)?;
+    let patch_ids = commit_ids
+        .iter()
+        .filter_map(|oid| patch_id_cache.get(oid).and_then(|v| v.as_ref()).cloned())
+        .collect();
+    let reflog_ids = read_branch_reflog_ids(repo, target_branch);
+
+    Ok(FloatingTargetContext {
+        candidate_ids: commit_ids.into_iter().collect(),
+        candidates,
+        patch_ids,
+        reflog_ids,
+    })
+}
+
 pub fn find_floating_base(
     repo: &Repository,
     branch_tip: Oid,
-    branch_name: &str,
-    target_commit: &Commit,
-    target_branch_name: &str,
+    target: &FloatingTargetContext,
+    history_limit: usize,
+    patch_id_cache: &mut HashMap<Oid, Option<String>>,
 ) -> Result<Option<Oid>> {
-    let target_id = target_commit.id();
-    let target_tree_id = target_commit.tree_id();
+    let target_id = target
+        .candidates
+        .first()
+        .map(|candidate| candidate.id)
+        .ok_or_else(|| {
+            anyhow!("Expected at least one target commit for floating-base detection.")
+        })?;
 
-    // Only check if it's not already a descendant or ancestor
+    // If the branch is already on top of, already part of, or already integrated
+    // into the target branch, it is not a floating child that needs restacking.
     if repo.graph_descendant_of(branch_tip, target_id)? || branch_tip == target_id {
         return Ok(None);
     }
+    if repo.graph_descendant_of(target_id, branch_tip)? {
+        return Ok(None);
+    }
 
-    // We only compute cherry equivalence once per branch check.
-    let cherry_equivalent = cherry_equivalent_commits(repo, target_branch_name, branch_name)?;
-    let target_summary = target_commit.summary().unwrap_or("").trim().to_string();
-    let target_email = target_commit.author().email().unwrap_or("").to_string();
+    let mut patch_candidates = Vec::new();
+    let mut current = Some(branch_tip);
+    let mut remaining = history_limit;
 
-    let mut walk = repo.revwalk()?;
-    walk.push(branch_tip)?;
-    walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
-
-    // We limit the search depth to avoid scanning the entire history of huge repos.
-    for oid_res in walk.take(100) {
-        let oid = oid_res?;
+    while let Some(oid) = current {
+        if history_limit != 0 && remaining == 0 {
+            break;
+        }
 
         // Optimization: If we hit a commit that is reachable from the target, we stop.
         // Because any match found *after* this point would be a common ancestor, not a floating base.
@@ -241,26 +287,54 @@ pub fn find_floating_base(
             break;
         }
 
-        if oid == target_id {
-            return Ok(Some(oid));
-        }
-
         let commit = repo.find_commit(oid)?;
-
-        // Match by tree-hash
-        if commit.tree_id() == target_tree_id {
-            return Ok(Some(oid));
+        current = if commit.parent_count() > 0 {
+            Some(commit.parent_id(0)?)
+        } else {
+            None
+        };
+        if history_limit != 0 {
+            remaining -= 1;
         }
 
-        // Match by patch-id
-        if cherry_equivalent.contains(&oid) {
-            return Ok(Some(oid));
+        if target.candidate_ids.contains(&oid) {
+            if oid != branch_tip {
+                return Ok(Some(oid));
+            }
+            continue;
         }
 
-        // Fallback: match by metadata (summary + email)
-        let summary = commit.summary().unwrap_or("").trim().to_string();
-        let email = commit.author().email().unwrap_or("").to_string();
-        if summary == target_summary && email == target_email {
+        // Match by tree-hash against rewritten target commits.
+        if target
+            .candidates
+            .iter()
+            .any(|candidate| candidate.tree_id == commit.tree_id())
+        {
+            if oid != branch_tip {
+                return Ok(Some(oid));
+            }
+            continue;
+        }
+
+        // Metadata matches narrow the patch-id fallback, but are not sufficient on their own.
+        if metadata_matches_target_candidate(&commit, oid, target)? {
+            if oid != branch_tip {
+                return Ok(Some(oid));
+            }
+            continue;
+        }
+
+        patch_candidates.push(oid);
+    }
+
+    ensure_patch_ids(repo, &patch_candidates, patch_id_cache)?;
+    for oid in patch_candidates {
+        if oid == branch_tip {
+            continue;
+        }
+        if let Some(patch_id) = patch_id_cache.get(&oid).and_then(|v| v.as_ref())
+            && target.patch_ids.contains(patch_id)
+        {
             return Ok(Some(oid));
         }
     }
@@ -268,47 +342,133 @@ pub fn find_floating_base(
     Ok(None)
 }
 
-fn commits_with_trees_on_upstream(
-    repo: &Repository,
-    upstream_id: Oid,
-    commits: &[Oid],
-) -> Result<HashSet<Oid>> {
-    let mut tree_to_commits: HashMap<Oid, Vec<Oid>> = HashMap::new();
-    for commit_id in commits {
-        let commit = repo.find_commit(*commit_id)?;
-        tree_to_commits
-            .entry(commit.tree_id())
-            .or_default()
-            .push(*commit_id);
+fn metadata_matches_target_candidate(
+    commit: &Commit,
+    oid: Oid,
+    target: &FloatingTargetContext,
+) -> Result<bool> {
+    if !target.reflog_ids.contains(&oid) {
+        return Ok(false);
     }
 
-    let mut missing_tree_ids: HashSet<Oid> = tree_to_commits.keys().copied().collect();
-    let mut matched_commits = HashSet::new();
+    let summary = commit.summary().unwrap_or("").trim();
+    let author = commit.author();
+    let email = author.email().unwrap_or("");
+    let parent_id = if commit.parent_count() > 0 {
+        Some(commit.parent_id(0)?)
+    } else {
+        None
+    };
 
-    let mut walk = repo.revwalk()?;
-    walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
-    walk.push(upstream_id)?;
+    Ok(target.candidates.iter().any(|candidate| {
+        candidate.summary == summary && candidate.email == email && candidate.parent_id == parent_id
+    }))
+}
 
-    for id in walk {
-        let upstream_commit_id = id?;
-        let upstream_commit = repo.find_commit(upstream_commit_id)?;
-        let tree_id = upstream_commit.tree_id();
-        if !missing_tree_ids.remove(&tree_id) {
-            continue;
-        }
+fn read_branch_reflog_ids(repo: &Repository, branch_name: &str) -> HashSet<Oid> {
+    let reflog_name = if branch_name.starts_with("refs/") {
+        branch_name.to_string()
+    } else {
+        format!("refs/heads/{branch_name}")
+    };
 
-        if let Some(commits_for_tree) = tree_to_commits.get(&tree_id) {
-            for commit_id in commits_for_tree {
-                matched_commits.insert(*commit_id);
+    let Ok(reflog) = repo.reflog(&reflog_name) else {
+        return HashSet::new();
+    };
+
+    let mut ids = HashSet::new();
+    for index in 0..reflog.len() {
+        if let Some(entry) = reflog.get(index) {
+            let oid = entry.id_new();
+            if !oid.is_zero() {
+                ids.insert(oid);
+            }
+            let oid = entry.id_old();
+            if !oid.is_zero() {
+                ids.insert(oid);
             }
         }
+    }
 
-        if missing_tree_ids.is_empty() {
-            break;
+    ids
+}
+
+fn ensure_patch_ids(
+    repo: &Repository,
+    commit_ids: &[Oid],
+    patch_id_cache: &mut HashMap<Oid, Option<String>>,
+) -> Result<()> {
+    let missing: Vec<Oid> = commit_ids
+        .iter()
+        .copied()
+        .filter(|oid| !patch_id_cache.contains_key(oid))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let computed = compute_patch_ids(repo, &missing)?;
+    for oid in missing {
+        patch_id_cache.insert(oid, computed.get(&oid).cloned());
+    }
+
+    Ok(())
+}
+
+fn compute_patch_ids(repo: &Repository, commit_ids: &[Oid]) -> Result<HashMap<Oid, String>> {
+    if commit_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut result = HashMap::new();
+    const PATCH_ID_BATCH_SIZE: usize = 512;
+
+    for chunk in commit_ids.chunks(PATCH_ID_BATCH_SIZE) {
+        let mut show = Command::new("git");
+        show.arg("show").arg("--no-ext-diff").arg("--no-color");
+        for oid in chunk {
+            show.arg(oid.to_string());
+        }
+
+        let mut show_child = show
+            .current_dir(repo_root(repo)?)
+            .stdout(Stdio::piped())
+            .spawn()?;
+
+        let show_stdout = show_child.stdout.take().ok_or_else(|| {
+            anyhow!("Failed to capture git show output for patch-id calculation.")
+        })?;
+
+        let patch_output = Command::new("git")
+            .arg("patch-id")
+            .arg("--stable")
+            .current_dir(repo_root(repo)?)
+            .stdin(Stdio::from(show_stdout))
+            .output()?;
+
+        let show_status = show_child.wait()?;
+        if !show_status.success() {
+            return Err(anyhow!("git show failed while computing patch ids."));
+        }
+        if !patch_output.status.success() {
+            return Err(anyhow!("git patch-id failed while computing patch ids."));
+        }
+
+        let stdout = String::from_utf8_lossy(&patch_output.stdout);
+        for line in stdout.lines() {
+            let mut parts = line.split_whitespace();
+            let patch_id = parts.next().unwrap_or_default();
+            let commit_id = parts.next().unwrap_or_default();
+            if patch_id.is_empty() || commit_id.is_empty() {
+                continue;
+            }
+            if let Ok(oid) = Oid::from_str(commit_id) {
+                result.insert(oid, patch_id.to_string());
+            }
         }
     }
 
-    Ok(matched_commits)
+    Ok(result)
 }
 
 fn repo_root(repo: &Repository) -> Result<&Path> {

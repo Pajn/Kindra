@@ -138,13 +138,29 @@ gits sync [--force] [--no-delete]
 **Usage:**
 
 ```bash
-gits restack
+gits restack [--history-limit <n>]
 ```
 
 **What it does:**
 - Scans all local branches for those whose history includes a commit that "matches" the current `HEAD` (by patch-id or tree-hash) but is not part of the current branch's ancestry.
 - These branches are considered "floating" because they are pointing to a commit that has been replaced.
 - `gits restack` will automatically rebase these floating branches onto the new `HEAD`.
+
+**Arguments:**
+- `--history-limit <n>`: Maximum first-parent history depth to scan while detecting floating branches. `0` disables the limit and scans the full history.
+
+**History limit resolution order:**
+- CLI override: `--history-limit <n>`
+- Repository config: `.git/gits.toml`
+- Global config: the standard platform config directory as `gits/config.toml`
+- Default: `100`
+
+Example config:
+
+```toml
+[restack]
+history_limit = 250
+```
 
 **When to use it:** Use this after you've amended a commit or rebased a branch that has other branches building on top of it. Instead of manually rebasing each dependent branch, `gits restack` will find and fix them for you.
 

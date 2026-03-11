@@ -57,6 +57,26 @@ Commands that need an upstream/base branch (for example `sync`, `split`, `push`,
 3. Built-in defaults: `main`, `master`, `trunk`
 4. Remote fallbacks: `origin/<branch>`
 
+## Restack History Limit
+
+`gits restack` bounds floating-branch discovery by default so very deep repositories do not pay for an unbounded first-parent scan.
+
+Resolution order:
+
+1. CLI override: `gits restack --history-limit <n>`
+2. Repository config in `.git/gits.toml`
+3. Global config in the standard platform config directory as `gits/config.toml`
+4. Built-in default: `100`
+
+Use `0` to disable the bound and scan the full first-parent history.
+
+Example repository config:
+
+```toml
+[restack]
+history_limit = 250
+```
+
 ## Benchmarking
 
 Run the permanent Criterion benchmarks for stack navigation (`checkout top`, `co up`, `co down`) across two repository shapes:
