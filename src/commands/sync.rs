@@ -1,4 +1,5 @@
 use crate::commands::find_upstream;
+use crate::commands::resolve_rebase_autostash;
 use crate::rebase_utils::{checkout_branch, state_path};
 use crate::stack::{find_sync_boundary, get_stack_branches_from_merge_base, get_stack_tips};
 use anyhow::{Result, anyhow};
@@ -16,6 +17,14 @@ pub struct SyncArgs {
     /// Do not delete merged branches
     #[arg(long)]
     pub no_delete: bool,
+
+    /// Allow git rebase to autostash tracked worktree changes
+    #[arg(long, overrides_with = "no_autostash")]
+    pub autostash: bool,
+
+    /// Disable git rebase autostash even if configured
+    #[arg(long, overrides_with = "autostash")]
+    pub no_autostash: bool,
 }
 
 pub fn sync(args: &SyncArgs) -> Result<()> {
@@ -106,9 +115,24 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
 
     if let Some(old_base) = boundary.old_base {
         crate::rebase_utils::ensure_git_supports_update_refs()?;
+        let autostash = resolve_rebase_autostash(
+            &repo,
+            if args.autostash {
+                Some(true)
+            } else if args.no_autostash {
+                Some(false)
+            } else {
+                None
+            },
+        )?;
 
         let status = Command::new("git")
             .arg("rebase")
+            .arg(if autostash {
+                "--autostash"
+            } else {
+                "--no-autostash"
+            })
             .arg("--update-refs")
             .arg("--onto")
             .arg(&rebase_onto_name)

@@ -77,6 +77,24 @@ Example repository config:
 history_limit = 250
 ```
 
+## Rebase Autostash
+
+Commands that start a Git rebase (`commit`, `move`, `sync`, and `restack`) default to `--no-autostash` so dirty tracked changes do not get hidden implicitly.
+
+Resolution order:
+
+1. CLI override: `--autostash` or `--no-autostash`
+2. Repository config in `.git/gits.toml`
+3. Global config in the standard platform config directory as `gits/config.toml`
+4. Built-in default: `false`
+
+Example config:
+
+```toml
+[rebase]
+autostash = true
+```
+
 ## Benchmarking
 
 Run the permanent Criterion benchmarks for stack navigation (`checkout top`, `co up`, `co down`) across two repository shapes:

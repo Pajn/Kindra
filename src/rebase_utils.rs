@@ -38,6 +38,9 @@ pub struct RebaseState {
     /// Whether to run `git reset` when returning to the original branch.
     #[serde(default)]
     pub unstage_on_restore: bool,
+    /// Whether git rebase should use autostash for this operation.
+    #[serde(default)]
+    pub autostash: bool,
 }
 
 pub fn state_path(repo: &Repository) -> PathBuf {
@@ -270,6 +273,11 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         let status = Command::new("git")
             .arg("rebase")
             .arg("--no-ff")
+            .arg(if state.autostash {
+                "--autostash"
+            } else {
+                "--no-autostash"
+            })
             .arg("--update-refs")
             .arg("--onto")
             .arg(&new_base)

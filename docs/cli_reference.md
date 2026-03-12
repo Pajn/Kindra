@@ -45,6 +45,8 @@ Any arguments you pass to `gits commit` (e.g., `-m "my message"`) are passed dir
 - `--on <branch>`: Commit onto another branch instead of the current one. The next token is consumed as the branch name.
 - `--on=`: Open an interactive branch picker for the current stack.
 - `--on`: Open the interactive branch picker only when `--on` is the final token.
+- `--autostash`: Allow the descendant rebase phase to use Git autostash.
+- `--no-autostash`: Disable Git autostash even if configured globally or for the repo.
 
 Parser behavior:
 - `gits commit --on feature-a -m "msg"`: valid (`feature-a` is the target branch).
@@ -78,11 +80,13 @@ main -> [A1] -> [A2] -> (feature-A) -> [B1'] -> (feature-B) -> [C1'] -> (feature
 **Usage:**
 
 ```bash
-gits move [--onto <target>] [--all]
+gits move [--onto <target>] [--all] [--autostash|--no-autostash]
 ```
 
 - `--onto <target>`: The branch to move the current stack onto.
 - `--all`: If no target is specified, list all local branches to choose from (instead of just branches in the current stack).
+- `--autostash`: Allow the rebase loop to use Git autostash.
+- `--no-autostash`: Disable Git autostash even if configured globally or for the repo.
 
 **When to use it:** Use this when you want to relocate a whole set of changes to a new base branch (e.g., moving a feature stack from `develop` to `main`).
 
@@ -109,12 +113,14 @@ main -> [M1] -> [A1'] -> (feature-A) -> [B1'] -> (feature-B)
 **Usage:**
 
 ```bash
-gits sync [--force] [--no-delete]
+gits sync [--force] [--no-delete] [--autostash|--no-autostash]
 ```
 
 **Arguments:**
 - `--force`: Force the sync even if branches in the stack are checked out in other worktrees.
 - `--no-delete`: Do not automatically delete branches that have already been integrated into the upstream branch.
+- `--autostash`: Allow the sync rebase to use Git autostash.
+- `--no-autostash`: Disable Git autostash even if configured globally or for the repo.
 
 **What it does:**
 
@@ -138,7 +144,7 @@ gits sync [--force] [--no-delete]
 **Usage:**
 
 ```bash
-gits restack [--history-limit <n>]
+gits restack [--history-limit <n>] [--autostash|--no-autostash]
 ```
 
 **What it does:**
@@ -148,6 +154,8 @@ gits restack [--history-limit <n>]
 
 **Arguments:**
 - `--history-limit <n>`: Maximum first-parent history depth to scan while detecting floating branches. `0` disables the limit and scans the full history.
+- `--autostash`: Allow the rebase loop to use Git autostash.
+- `--no-autostash`: Disable Git autostash even if configured globally or for the repo.
 
 **History limit resolution order:**
 - CLI override: `--history-limit <n>`
@@ -160,6 +168,19 @@ Example config:
 ```toml
 [restack]
 history_limit = 250
+```
+
+**Rebase autostash resolution order:**
+- CLI override: `--autostash` or `--no-autostash`
+- Repository config: `.git/gits.toml`
+- Global config: the standard platform config directory as `gits/config.toml`
+- Default: `false`
+
+Example config:
+
+```toml
+[rebase]
+autostash = true
 ```
 
 **When to use it:** Use this after you've amended a commit or rebased a branch that has other branches building on top of it. Instead of manually rebasing each dependent branch, `gits restack` will find and fix them for you.

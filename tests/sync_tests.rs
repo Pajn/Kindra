@@ -4,7 +4,35 @@ use common::{gits_cmd, make_commit, run_ok};
 use git2::{BranchType, Repository};
 use predicates::prelude::*;
 use std::fs;
+use tempfile::TempDir;
 use tempfile::tempdir;
+
+fn test_global_config_dir(root: &std::path::Path) -> std::path::PathBuf {
+    if cfg!(target_os = "macos") {
+        return root
+            .join("Library")
+            .join("Application Support")
+            .join("gits");
+    }
+    if cfg!(target_os = "windows") {
+        return root.join("AppData").join("Roaming").join("gits");
+    }
+
+    root.join(".config").join("gits")
+}
+
+fn apply_global_config_env(cmd: &mut assert_cmd::Command, root: &std::path::Path) {
+    cmd.env("HOME", root);
+
+    if cfg!(target_os = "linux") || cfg!(target_os = "freebsd") || cfg!(target_os = "openbsd") {
+        cmd.env("XDG_CONFIG_HOME", root.join(".config"));
+    }
+
+    if cfg!(target_os = "windows") {
+        cmd.env("APPDATA", root.join("AppData").join("Roaming"));
+        cmd.env("LOCALAPPDATA", root.join("AppData").join("Local"));
+    }
+}
 
 #[test]
 fn sync_handles_rebased_lower_branch() {
@@ -651,6 +679,170 @@ fn sync_refuses_to_auto_pick_tip_in_non_interactive_mode() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("Multiple stack tips found"));
+}
+
+#[test]
+fn sync_ignores_rebase_autostash_config() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "base\n",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "file.txt",
+        "base\nfeature\n",
+        "feature a",
+        &[&base],
+    );
+
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "base\nmain\n",
+        "main change",
+        &[&base],
+    );
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    run_ok("git", &["config", "rebase.autostash", "true"], dir.path());
+    fs::write(dir.path().join("file.txt"), "base\nfeature\ndirty\n").unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync").current_dir(dir.path()).assert().failure();
+
+    assert!(
+        !dir.path().join(".git/rebase-merge").exists()
+            && !dir.path().join(".git/rebase-apply").exists(),
+        "sync should fail before starting a rebase when the worktree is dirty"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "base\nfeature\ndirty\n"
+    );
+}
+
+#[test]
+fn sync_cli_no_autostash_overrides_repo_config() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "base\n",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "file.txt",
+        "base\nfeature\n",
+        "feature a",
+        &[&base],
+    );
+
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "base\nmain\n",
+        "main change",
+        &[&base],
+    );
+
+    std::fs::write(
+        repo.path().join("gits.toml"),
+        "[rebase]\nautostash = true\n",
+    )
+    .unwrap();
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    fs::write(dir.path().join("file.txt"), "base\nfeature\ndirty\n").unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync")
+        .arg("--no-autostash")
+        .current_dir(dir.path())
+        .assert()
+        .failure();
+
+    assert!(
+        !dir.path().join(".git/rebase-merge").exists()
+            && !dir.path().join(".git/rebase-apply").exists(),
+        "CLI --no-autostash should override repo config"
+    );
+}
+
+#[test]
+fn sync_global_config_enables_autostash() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "base\n",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "file.txt",
+        "base\nfeature\n",
+        "feature a",
+        &[&base],
+    );
+
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "base\nmain\n",
+        "main change",
+        &[&base],
+    );
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    fs::write(dir.path().join("file.txt"), "base\nfeature\ndirty\n").unwrap();
+
+    let global_config_root = TempDir::new().unwrap();
+    let global_config_dir = test_global_config_dir(global_config_root.path());
+    std::fs::create_dir_all(&global_config_dir).unwrap();
+    std::fs::write(
+        global_config_dir.join("config.toml"),
+        "[rebase]\nautostash = true\n",
+    )
+    .unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.current_dir(dir.path());
+    apply_global_config_env(&mut cmd, global_config_root.path());
+    cmd.arg("sync").assert().failure();
+
+    assert!(
+        dir.path().join(".git/rebase-merge").exists()
+            || dir.path().join(".git/rebase-apply").exists(),
+        "global config should allow sync to start rebasing with autostash"
+    );
 }
 
 #[cfg(unix)]
