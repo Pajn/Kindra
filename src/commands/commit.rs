@@ -1,4 +1,4 @@
-use crate::commands::find_upstream;
+use crate::commands::{find_upstream, resolve_rebase_autostash};
 use crate::rebase_utils::{
     RebaseState, check_worktrees, checkout_branch, run_rebase_loop, save_state, state_path,
 };
@@ -32,6 +32,7 @@ pub fn commit(args: &[String]) -> Result<()> {
     let upstream_id = upstream_obj.id();
     let head_id = head.peel_to_commit()?.id();
     let parsed = parse_commit_args(args)?;
+    let autostash = resolve_rebase_autostash(&repo, parsed.autostash)?;
     let on_flag = parsed.on_target.is_some();
 
     let current_stack = build_stack_context(&repo, head_id, upstream_id, &upstream_name)
@@ -139,6 +140,7 @@ pub fn commit(args: &[String]) -> Result<()> {
             parent_name_map,
             stash_ref,
             unstage_on_restore: switching_branches,
+            autostash,
         };
 
         save_state(&repo, &state)?;
@@ -187,6 +189,7 @@ struct StackContext {
 struct ParsedCommitArgs {
     on_target: Option<Option<String>>,
     force: bool,
+    autostash: Option<bool>,
     git_commit_args: Vec<String>,
 }
 
@@ -203,6 +206,18 @@ fn parse_commit_args(args: &[String]) -> Result<ParsedCommitArgs> {
 
         if arg == "--force" {
             parsed.force = true;
+            idx += 1;
+            continue;
+        }
+
+        if arg == "--autostash" {
+            parsed.autostash = Some(true);
+            idx += 1;
+            continue;
+        }
+
+        if arg == "--no-autostash" {
+            parsed.autostash = Some(false);
             idx += 1;
             continue;
         }

@@ -1,4 +1,4 @@
-use crate::commands::find_upstream;
+use crate::commands::{find_upstream, resolve_rebase_autostash};
 use crate::rebase_utils::{Operation, RebaseState, run_rebase_loop, save_state, state_path};
 use crate::stack::{collect_descendants, get_stack_branches_from_merge_base, visualize_stack};
 use anyhow::{Context, Result, anyhow};
@@ -16,6 +16,12 @@ pub struct MoveArgs {
     /// Force the move even if branches are checked out in other worktrees
     #[arg(long)]
     pub force: bool,
+    /// Allow git rebase to autostash tracked worktree changes
+    #[arg(long, overrides_with = "no_autostash")]
+    pub autostash: bool,
+    /// Disable git rebase autostash even if configured
+    #[arg(long, overrides_with = "autostash")]
+    pub no_autostash: bool,
 }
 
 pub fn move_cmd(args: &MoveArgs) -> Result<()> {
@@ -137,6 +143,17 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
 
     crate::stack::sort_branches_topologically(repo, &mut sub_stack)?;
 
+    let autostash = resolve_rebase_autostash(
+        repo,
+        if args.autostash {
+            Some(true)
+        } else if args.no_autostash {
+            Some(false)
+        } else {
+            None
+        },
+    )?;
+
     let remaining_branches: Vec<String> = sub_stack
         .iter()
         .map(|sb| sb.name.clone())
@@ -165,6 +182,7 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         parent_name_map,
         stash_ref: None,
         unstage_on_restore: false,
+        autostash,
     };
 
     save_state(repo, &state)?;

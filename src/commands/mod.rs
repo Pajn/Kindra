@@ -132,6 +132,7 @@ fn resolve_branch_name(repo: &Repository, name: &str) -> Option<String> {
 struct RepoConfig {
     upstream_branch: Option<String>,
     restack: Option<RestackConfig>,
+    rebase: Option<RebaseConfig>,
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -139,9 +140,15 @@ struct RestackConfig {
     history_limit: Option<usize>,
 }
 
+#[derive(Deserialize, Clone, Copy)]
+struct RebaseConfig {
+    autostash: Option<bool>,
+}
+
 #[derive(Deserialize)]
 struct GlobalConfig {
     restack: Option<RestackConfig>,
+    rebase: Option<RebaseConfig>,
 }
 
 pub const DEFAULT_RESTACK_HISTORY_LIMIT: usize = 100;
@@ -168,6 +175,24 @@ pub fn resolve_restack_history_limit(
     }
 
     Ok(DEFAULT_RESTACK_HISTORY_LIMIT)
+}
+
+pub fn resolve_rebase_autostash(repo: &Repository, cli_override: Option<bool>) -> Result<bool> {
+    if let Some(autostash) = cli_override {
+        return Ok(autostash);
+    }
+
+    if let Some(autostash) = read_repo_config(repo)?.rebase.and_then(|cfg| cfg.autostash) {
+        return Ok(autostash);
+    }
+
+    if let Some(autostash) =
+        read_global_config()?.and_then(|cfg| cfg.rebase.and_then(|r| r.autostash))
+    {
+        return Ok(autostash);
+    }
+
+    Ok(false)
 }
 
 fn read_repo_upstream_override(repo: &Repository) -> Result<Option<String>> {
@@ -197,6 +222,7 @@ fn read_repo_config(repo: &Repository) -> Result<RepoConfig> {
             Ok(RepoConfig {
                 upstream_branch: None,
                 restack: None,
+                rebase: None,
             })
         },
         Ok,

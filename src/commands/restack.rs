@@ -1,4 +1,4 @@
-use crate::commands::resolve_restack_history_limit;
+use crate::commands::{resolve_rebase_autostash, resolve_restack_history_limit};
 use crate::rebase_utils::{Operation, RebaseState, run_rebase_loop, state_path};
 use anyhow::{Result, anyhow};
 use clap::Args;
@@ -10,6 +10,12 @@ pub struct RestackArgs {
     /// Maximum first-parent history depth to scan when detecting floating branches (0 = unbounded)
     #[arg(long)]
     pub history_limit: Option<usize>,
+    /// Allow git rebase to autostash tracked worktree changes
+    #[arg(long, overrides_with = "no_autostash")]
+    pub autostash: bool,
+    /// Disable git rebase autostash even if configured
+    #[arg(long, overrides_with = "autostash")]
+    pub no_autostash: bool,
 }
 
 pub fn restack(args: &RestackArgs) -> Result<()> {
@@ -32,6 +38,16 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
     );
 
     let history_limit = resolve_restack_history_limit(&repo, args.history_limit)?;
+    let autostash = resolve_rebase_autostash(
+        &repo,
+        if args.autostash {
+            Some(true)
+        } else if args.no_autostash {
+            Some(false)
+        } else {
+            None
+        },
+    )?;
     let children =
         find_floating_children(&repo, &head_commit, &current_branch_name, history_limit)?;
 
@@ -63,6 +79,7 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
         parent_name_map,
         stash_ref: None,
         unstage_on_restore: false,
+        autostash,
     };
 
     crate::rebase_utils::save_state(&repo, &state)?;

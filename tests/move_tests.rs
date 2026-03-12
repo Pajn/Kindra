@@ -769,6 +769,124 @@ fn test_move_invalid_onto() {
 }
 
 #[test]
+fn test_move_ignores_rebase_autostash_config() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(&repo, "refs/heads/main", "file.txt", "base\n", "base", &[]);
+    let base = repo.find_commit(base_id).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/target",
+        "file.txt",
+        "base\ntarget\n",
+        "target",
+        &[&base],
+    );
+
+    let feature_id = make_commit(
+        &repo,
+        "refs/heads/feature",
+        "file.txt",
+        "base\nfeature\n",
+        "feature",
+        &[&base],
+    );
+    let feature = repo.find_commit(feature_id).unwrap();
+
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_tree(
+        feature.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+
+    run_ok("git", &["config", "rebase.autostash", "true"], dir.path());
+    fs::write(dir.path().join("file.txt"), "base\nfeature\ndirty\n").unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.arg("move")
+        .arg("--onto")
+        .arg("target")
+        .current_dir(dir.path())
+        .assert()
+        .failure();
+
+    assert!(
+        !dir.path().join(".git/rebase-merge").exists()
+            && !dir.path().join(".git/rebase-apply").exists(),
+        "move should fail before starting a rebase when the worktree is dirty"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "base\nfeature\ndirty\n"
+    );
+}
+
+#[test]
+fn test_move_repo_config_enables_autostash_and_persists_in_state() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(&repo, "refs/heads/main", "file.txt", "base\n", "base", &[]);
+    let base = repo.find_commit(base_id).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/target",
+        "file.txt",
+        "base\ntarget\n",
+        "target",
+        &[&base],
+    );
+
+    let feature_id = make_commit(
+        &repo,
+        "refs/heads/feature",
+        "file.txt",
+        "base\nfeature\n",
+        "feature",
+        &[&base],
+    );
+    let feature = repo.find_commit(feature_id).unwrap();
+
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_tree(
+        feature.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+
+    std::fs::write(
+        repo.path().join("gits.toml"),
+        "[rebase]\nautostash = true\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("file.txt"), "base\nfeature\ndirty\n").unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.arg("move")
+        .arg("--onto")
+        .arg("target")
+        .current_dir(dir.path())
+        .assert()
+        .failure();
+
+    assert!(
+        dir.path().join(".git/rebase-merge").exists()
+            || dir.path().join(".git/rebase-apply").exists(),
+        "repo config should allow move to start rebasing with autostash"
+    );
+
+    let state = fs::read_to_string(dir.path().join(".git/gits_rebase_state.json")).unwrap();
+    assert!(
+        state.contains("\"autostash\": true"),
+        "rebase state should persist autostash preference: {state}"
+    );
+}
+
+#[test]
 fn test_move_fails_immediately_does_not_skip_branch() {
     let (dir, repo) = setup_repo();
 
