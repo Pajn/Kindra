@@ -19,20 +19,16 @@ fn setup_repo_with_base(base_branch: &str) -> (tempfile::TempDir, Repository) {
 }
 
 #[test]
-fn sync_uses_trunk_when_main_master_missing() {
+fn sync_allows_trunk_when_main_master_missing() {
     let (dir, repo) = setup_repo_with_base("trunk");
     repo.set_head("refs/heads/trunk").unwrap();
 
     let mut cmd = gits_cmd();
-    cmd.arg("sync")
-        .current_dir(dir.path())
-        .assert()
-        .failure()
-        .stderr(contains("Branch 'trunk' is the upstream branch"));
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
 }
 
 #[test]
-fn sync_prefers_init_default_branch_before_hardcoded_candidates() {
+fn sync_allows_init_default_branch_when_checked_out() {
     let (dir, repo) = setup_repo_with_base("main");
     let main_tip = repo
         .revparse_single("main")
@@ -46,15 +42,11 @@ fn sync_prefers_init_default_branch_before_hardcoded_candidates() {
     cfg.set_str("init.defaultBranch", "trunk").unwrap();
 
     let mut cmd = gits_cmd();
-    cmd.arg("sync")
-        .current_dir(dir.path())
-        .assert()
-        .failure()
-        .stderr(contains("Branch 'trunk' is the upstream branch"));
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
 }
 
 #[test]
-fn sync_uses_repo_override_from_git_dir_config() {
+fn sync_allows_repo_override_from_git_dir_config() {
     let (dir, repo) = setup_repo_with_base("main");
     let main_tip = repo
         .revparse_single("main")
@@ -71,11 +63,7 @@ fn sync_uses_repo_override_from_git_dir_config() {
     .unwrap();
 
     let mut cmd = gits_cmd();
-    cmd.arg("sync")
-        .current_dir(dir.path())
-        .assert()
-        .failure()
-        .stderr(contains("Branch 'develop' is the upstream branch"));
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
 }
 
 #[test]

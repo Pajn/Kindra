@@ -1,7 +1,10 @@
 use crate::commands::find_upstream;
 use crate::commands::resolve_rebase_autostash;
 use crate::rebase_utils::{checkout_branch, state_path};
-use crate::stack::{find_sync_boundary, get_stack_branches_from_merge_base, get_stack_tips};
+use crate::stack::{
+    collect_merged_local_branches, find_sync_boundary, get_stack_branches_from_merge_base,
+    get_stack_tips,
+};
 use anyhow::{Result, anyhow};
 use clap::Args;
 use git2::BranchType;
@@ -48,14 +51,12 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
 
     let upstream_name = find_upstream(&repo)?;
     let local_upstream = upstream_name.clone();
-    if current_branch_name.as_deref() == Some(&upstream_name) {
-        return Err(anyhow!(
-            "Branch '{}' is the upstream branch. Switch to a stack branch before running 'sync'.",
-            upstream_name
-        ));
-    }
     let (rebase_onto_name, fetch_remote) = resolve_sync_onto(&repo, &upstream_name)?;
     fetch_sync_remote(fetch_remote.as_deref())?;
+
+    if current_branch_name.as_deref() == Some(&upstream_name) {
+        return sync_upstream_branch(&repo, args, &upstream_name, &rebase_onto_name);
+    }
 
     let upstream_obj = repo.revparse_single(&rebase_onto_name)?;
     let upstream_id = upstream_obj.id();
@@ -154,6 +155,62 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
 
     if !args.no_delete {
         delete_merged_branches(&repo, &boundary.merged_branches, &local_upstream)?;
+    }
+
+    Ok(())
+}
+
+fn sync_upstream_branch(
+    repo: &git2::Repository,
+    args: &SyncArgs,
+    upstream_name: &str,
+    rebase_onto_name: &str,
+) -> Result<()> {
+    let merged_branches = if args.no_delete {
+        Vec::new()
+    } else {
+        collect_merged_local_branches(repo, rebase_onto_name, &[upstream_name])?
+    };
+
+    if !merged_branches.is_empty() {
+        crate::rebase_utils::check_worktrees(&merged_branches, args.force)?;
+    }
+
+    let upstream_id = repo.revparse_single(upstream_name)?.id();
+    let rebase_onto_id = repo.revparse_single(rebase_onto_name)?.id();
+    if upstream_id != rebase_onto_id {
+        let autostash = resolve_rebase_autostash(
+            repo,
+            if args.autostash {
+                Some(true)
+            } else if args.no_autostash {
+                Some(false)
+            } else {
+                None
+            },
+        )?;
+
+        let status = Command::new("git")
+            .arg("rebase")
+            .arg(if autostash {
+                "--autostash"
+            } else {
+                "--no-autostash"
+            })
+            .arg(rebase_onto_name)
+            .status()?;
+
+        if !status.success() {
+            return Err(anyhow!(
+                "git rebase failed. Resolve conflicts and run 'git rebase --continue' or 'git rebase --abort'."
+            ));
+        }
+    } else {
+        println!("{} is already up to date.", upstream_name);
+    }
+
+    if !args.no_delete {
+        delete_merged_branches(repo, &merged_branches, upstream_name)?;
     }
 
     Ok(())

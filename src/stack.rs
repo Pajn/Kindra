@@ -178,6 +178,100 @@ pub fn cherry_equivalent_commits(
     Ok(result)
 }
 
+pub fn collect_reachable_patch_ids(repo: &Repository, ref_name: &str) -> Result<HashSet<String>> {
+    let target_id = repo.revparse_single(ref_name)?.id();
+    let mut walk = repo.revwalk()?;
+    walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
+    walk.push(target_id)?;
+
+    let mut commit_ids = Vec::new();
+    for id_res in walk {
+        commit_ids.push(id_res?);
+    }
+
+    let mut patch_id_cache = HashMap::new();
+    ensure_patch_ids(repo, &commit_ids, &mut patch_id_cache)?;
+    Ok(commit_ids
+        .into_iter()
+        .filter_map(|oid| patch_id_cache.remove(&oid).flatten())
+        .collect())
+}
+
+pub fn compute_patch_ids_for_commits(
+    repo: &Repository,
+    commit_ids: &[Oid],
+) -> Result<HashMap<Oid, String>> {
+    compute_patch_ids(repo, commit_ids)
+}
+
+pub fn collect_merged_local_branches(
+    repo: &Repository,
+    target_ref_name: &str,
+    protected_branches: &[&str],
+) -> Result<Vec<String>> {
+    let target_id = repo.revparse_single(target_ref_name)?.id();
+    let target_patch_ids = collect_reachable_patch_ids(repo, target_ref_name)?;
+    let full_target_ref_name = repo
+        .resolve_reference_from_short_name(target_ref_name)
+        .ok()
+        .and_then(|reference| reference.name().map(|name| name.to_string()));
+    let protected_branches = protected_branches
+        .iter()
+        .map(|name| name.to_string())
+        .collect::<HashSet<_>>();
+
+    let mut branches = Vec::new();
+    for branch_result in repo.branches(Some(git2::BranchType::Local))? {
+        let (branch, _) = branch_result?;
+        let Some(name) = branch.name()? else {
+            continue;
+        };
+        if protected_branches.contains(name) {
+            continue;
+        }
+
+        if let Some(ref full_target_ref_name) = full_target_ref_name {
+            if branch.get().name() == Some(full_target_ref_name.as_str()) {
+                continue;
+            }
+
+            if let Ok(upstream_branch) = branch.upstream()
+                && upstream_branch.get().name() == Some(full_target_ref_name.as_str())
+            {
+                continue;
+            }
+        }
+
+        let Some(branch_id) = branch.get().target() else {
+            continue;
+        };
+        branches.push((name.to_string(), branch_id));
+    }
+
+    let mut merged_branches = Vec::new();
+    for (name, branch_id) in branches {
+        let merged_by_graph =
+            target_id == branch_id || repo.graph_descendant_of(target_id, branch_id)?;
+        let merged_by_patch = if merged_by_graph {
+            false
+        } else {
+            let exclusive_commit_ids = collect_exclusive_commits(repo, branch_id, target_id)?;
+            let exclusive_patch_ids = compute_patch_ids_for_commits(repo, &exclusive_commit_ids)?
+                .into_values()
+                .collect::<HashSet<_>>();
+
+            !exclusive_patch_ids.is_empty() && exclusive_patch_ids.is_subset(&target_patch_ids)
+        };
+
+        if merged_by_graph || merged_by_patch {
+            merged_branches.push(name);
+        }
+    }
+
+    merged_branches.sort();
+    Ok(merged_branches)
+}
+
 pub struct FloatingTargetContext {
     candidates: Vec<FloatingTargetCandidate>,
     candidate_ids: HashSet<Oid>,
@@ -469,6 +563,24 @@ fn compute_patch_ids(repo: &Repository, commit_ids: &[Oid]) -> Result<HashMap<Oi
     }
 
     Ok(result)
+}
+
+fn collect_exclusive_commits(
+    repo: &Repository,
+    branch_id: Oid,
+    target_id: Oid,
+) -> Result<Vec<Oid>> {
+    let mut walk = repo.revwalk()?;
+    walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
+    walk.push(branch_id)?;
+    walk.hide(target_id)?;
+
+    let mut commit_ids = Vec::new();
+    for id_res in walk {
+        commit_ids.push(id_res?);
+    }
+
+    Ok(commit_ids)
 }
 
 fn repo_root(repo: &Repository) -> Result<&Path> {
