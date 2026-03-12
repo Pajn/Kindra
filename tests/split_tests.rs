@@ -235,7 +235,7 @@ perl -i -pe 's/.*branch current.*\n?//g' "$file"
 }
 
 #[test]
-fn test_push_multiple_remotes_no_origin_error() {
+fn test_push_multiple_remotes_no_origin_when_stack_empty() {
     let (dir, repo) = setup_repo();
 
     // Setup two remotes, neither is origin
@@ -246,14 +246,12 @@ fn test_push_multiple_remotes_no_origin_error() {
     cmd.arg("push")
         .current_dir(dir.path())
         .assert()
-        .failure()
-        .stderr(predicates::str::contains(
-            "'origin' remote not found and multiple remotes exist",
-        ));
+        .success()
+        .stdout(predicates::str::contains("No branches in stack to push."));
 }
 
 #[test]
-fn test_push_no_remotes_error() {
+fn test_push_no_remotes_when_stack_empty() {
     let (dir, _repo) = setup_repo();
     // No remotes by default from setup_repo (except if we added any)
 
@@ -261,8 +259,8 @@ fn test_push_no_remotes_error() {
     cmd.arg("push")
         .current_dir(dir.path())
         .assert()
-        .failure()
-        .stderr(predicates::str::contains("No remotes configured"));
+        .success()
+        .stdout(predicates::str::contains("No branches in stack to push."));
 }
 
 #[test]

@@ -118,3 +118,384 @@ fn test_push_entire_stack() {
         "feature-b was not pushed to remote"
     );
 }
+
+#[test]
+fn test_push_on_main_pushes_main() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let main_commit_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "main.txt",
+        "initial",
+        "initial commit",
+        &[],
+    );
+    let main_commit = repo.find_commit(main_commit_id).unwrap();
+
+    let remote_dir = tempdir().unwrap();
+    run_ok("git", &["init", "--bare"], remote_dir.path());
+    run_ok(
+        "git",
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+
+    run_ok("git", &["push", "-u", "origin", "main"], dir.path());
+
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "main-2.txt",
+        "next",
+        "main follow-up",
+        &[&main_commit],
+    );
+
+    repo.set_head("refs/heads/main").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let output = gits_cmd()
+        .arg("push")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let remote_repo = Repository::open(remote_dir.path()).unwrap();
+    let remote_main_tip = remote_repo
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .target()
+        .unwrap();
+    let local_main_tip = repo
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .target()
+        .unwrap();
+
+    assert_eq!(
+        remote_main_tip, local_main_tip,
+        "main was not pushed to remote"
+    );
+}
+
+#[test]
+fn test_push_on_main_uses_tracked_remote() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let main_commit_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "main.txt",
+        "initial",
+        "initial commit",
+        &[],
+    );
+    let main_commit = repo.find_commit(main_commit_id).unwrap();
+
+    let origin_dir = tempdir().unwrap();
+    let upstream_dir = tempdir().unwrap();
+    run_ok("git", &["init", "--bare"], origin_dir.path());
+    run_ok("git", &["init", "--bare"], upstream_dir.path());
+    run_ok(
+        "git",
+        &[
+            "remote",
+            "add",
+            "origin",
+            origin_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &[
+            "remote",
+            "add",
+            "upstream",
+            upstream_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+
+    run_ok("git", &["push", "-u", "upstream", "main"], dir.path());
+    run_ok("git", &["push", "origin", "main"], dir.path());
+
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "main-2.txt",
+        "next",
+        "main follow-up",
+        &[&main_commit],
+    );
+
+    repo.set_head("refs/heads/main").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let output = gits_cmd()
+        .arg("push")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let upstream_repo = Repository::open(upstream_dir.path()).unwrap();
+    let upstream_main_tip = upstream_repo
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .target()
+        .unwrap();
+    let origin_repo = Repository::open(origin_dir.path()).unwrap();
+    let origin_main_tip = origin_repo
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .target()
+        .unwrap();
+    let local_main_tip = repo
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .target()
+        .unwrap();
+
+    assert_eq!(upstream_main_tip, local_main_tip);
+    assert_ne!(origin_main_tip, local_main_tip);
+}
+
+#[test]
+fn test_push_on_main_uses_tracked_remote_without_origin() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let main_commit_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "main.txt",
+        "initial",
+        "initial commit",
+        &[],
+    );
+    let main_commit = repo.find_commit(main_commit_id).unwrap();
+
+    let upstream_dir = tempdir().unwrap();
+    run_ok("git", &["init", "--bare"], upstream_dir.path());
+    run_ok(
+        "git",
+        &[
+            "remote",
+            "add",
+            "upstream",
+            upstream_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+
+    run_ok("git", &["push", "-u", "upstream", "main"], dir.path());
+
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "main-2.txt",
+        "next",
+        "main follow-up",
+        &[&main_commit],
+    );
+
+    repo.set_head("refs/heads/main").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let output = gits_cmd()
+        .arg("push")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let upstream_repo = Repository::open(upstream_dir.path()).unwrap();
+    let upstream_main_tip = upstream_repo
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .target()
+        .unwrap();
+    let local_main_tip = repo
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .target()
+        .unwrap();
+
+    assert_eq!(upstream_main_tip, local_main_tip);
+}
+
+#[test]
+fn test_push_tracked_stack_uses_tracked_remote_without_origin() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let main_commit_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "main.txt",
+        "initial",
+        "initial commit",
+        &[],
+    );
+    let main_commit = repo.find_commit(main_commit_id).unwrap();
+
+    let a_commit_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feat: a",
+        &[&main_commit],
+    );
+    let a_commit = repo.find_commit(a_commit_id).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "feat: b",
+        &[&a_commit],
+    );
+
+    let extra_remote_dir = tempdir().unwrap();
+    let upstream_dir = tempdir().unwrap();
+    run_ok("git", &["init", "--bare"], extra_remote_dir.path());
+    run_ok("git", &["init", "--bare"], upstream_dir.path());
+    run_ok(
+        "git",
+        &[
+            "remote",
+            "add",
+            "backup",
+            extra_remote_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &[
+            "remote",
+            "add",
+            "upstream",
+            upstream_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+
+    run_ok("git", &["push", "-u", "upstream", "main"], dir.path());
+    run_ok("git", &["push", "-u", "upstream", "feature-a"], dir.path());
+    run_ok("git", &["push", "-u", "upstream", "feature-b"], dir.path());
+
+    repo.set_head("refs/heads/feature-b").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+    let b_tip = repo.head().unwrap().peel_to_commit().unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b2.txt",
+        "b2",
+        "feat: b extension",
+        &[&b_tip],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let output = gits_cmd()
+        .arg("push")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let upstream_repo = Repository::open(upstream_dir.path()).unwrap();
+    let upstream_b_tip = upstream_repo
+        .find_reference("refs/heads/feature-b")
+        .unwrap()
+        .target()
+        .unwrap();
+    let local_b_tip = repo
+        .find_reference("refs/heads/feature-b")
+        .unwrap()
+        .target()
+        .unwrap();
+
+    assert_eq!(upstream_b_tip, local_b_tip);
+}
+
+#[test]
+fn test_push_empty_stack_does_not_resolve_remote() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "main.txt",
+        "initial",
+        "initial commit",
+        &[],
+    );
+
+    let backup_dir = tempdir().unwrap();
+    let upstream_dir = tempdir().unwrap();
+    run_ok("git", &["init", "--bare"], backup_dir.path());
+    run_ok("git", &["init", "--bare"], upstream_dir.path());
+    run_ok(
+        "git",
+        &[
+            "remote",
+            "add",
+            "backup",
+            backup_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &[
+            "remote",
+            "add",
+            "upstream",
+            upstream_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+
+    run_ok("git", &["checkout", "--detach", "main"], dir.path());
+
+    let output = gits_cmd()
+        .arg("push")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "gits push should succeed on an empty stack even without a resolvable default remote: {:?}",
+        output
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No branches in stack to push."));
+}
