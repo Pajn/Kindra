@@ -253,12 +253,33 @@ gits pr
 gits pr open
 gits pr edit
 gits pr status
+gits pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--reviewer <login>] [--bots|--no-bots]
 ```
 
 - `gits pr`: Create/update PRs for stack branches with upstreams.
 - `gits pr open`: Open a PR URL in the default browser (if multiple, choose one).
 - `gits pr edit`: Select a PR (if multiple), then edit title/body/labels/reviewers.
 - `gits pr status`: Show each stack PR's reviewer status, unresolved comments, and running/failed checks.
+- `gits pr review`: Select an open PR in the current stack, fetch its review threads through `gh api graphql`, and render them as markdown.
+
+`gits pr review` defaults to unresolved threads only, includes both human and bot comments, and keeps outdated comments unless you opt out.
+
+**Arguments:**
+
+- `-o, --output <path>`: Write the rendered markdown to a file.
+- `--copy`: Copy the rendered markdown to the terminal clipboard using OSC 52.
+- `--no-outdated`: Exclude outdated review threads.
+- `--resolved`: Include resolved review threads.
+- `--reviewer <login>`: Only include comments authored by the specified reviewer/login.
+- `--bots`: Explicitly include bot comments/replies (this is the default).
+- `--no-bots`: Restrict output to human-authored comments/replies.
+
+**Formatting details:**
+
+- Each top-level review thread is rendered as markdown with the file path and line number above the comment body.
+- Replies are shown beneath the original comment in chronological order with one blank line between entries.
+- Top-level review threads are separated by two blank lines.
+- Outdated threads are labeled `OUTDATED` and include the original comment line number when rendered.
 
 **Notes:**
 

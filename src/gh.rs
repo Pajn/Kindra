@@ -58,6 +58,31 @@ pub struct PrStatusSummary {
     pub failed_checks: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReviewCommentAuthor {
+    pub login: String,
+    pub is_bot: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrReviewComment {
+    pub author: ReviewCommentAuthor,
+    pub body: String,
+    pub path: String,
+    pub line: Option<u64>,
+    pub start_line: Option<u64>,
+    pub original_line: Option<u64>,
+    pub original_start_line: Option<u64>,
+    pub outdated: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrReviewThread {
+    pub is_resolved: bool,
+    pub comments: Vec<PrReviewComment>,
+}
+
 /// Check if an open PR exists for `branch`. Returns `Some(ExistingPr)` or `None`.
 pub fn find_open_pr(branch: &str) -> Result<Option<ExistingPr>> {
     #[derive(Deserialize)]
@@ -448,6 +473,173 @@ query($owner: String!, $repo: String!, $number: Int!) {
         running_checks: running_checks_set.into_iter().collect(),
         failed_checks: failed_checks_set.into_iter().collect(),
     })
+}
+
+/// Fetch review threads/comments for a PR.
+pub fn get_pr_review_threads(
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+) -> Result<Vec<PrReviewThread>> {
+    #[derive(Deserialize)]
+    struct GraphQlResponse {
+        data: GraphQlData,
+    }
+    #[derive(Deserialize)]
+    struct GraphQlData {
+        repository: Option<RepoData>,
+    }
+    #[derive(Deserialize)]
+    struct RepoData {
+        #[serde(rename = "pullRequest")]
+        pull_request: Option<PullRequestData>,
+    }
+    #[derive(Deserialize)]
+    struct PullRequestData {
+        #[serde(rename = "reviewThreads")]
+        review_threads: ReviewThreadConnection,
+    }
+    #[derive(Deserialize)]
+    struct ReviewThreadConnection {
+        nodes: Vec<ReviewThreadNode>,
+    }
+    #[derive(Deserialize)]
+    struct ReviewThreadNode {
+        #[serde(rename = "isResolved")]
+        is_resolved: bool,
+        comments: ReviewCommentConnection,
+    }
+    #[derive(Deserialize)]
+    struct ReviewCommentConnection {
+        nodes: Vec<ReviewCommentNode>,
+    }
+    #[derive(Deserialize)]
+    struct ReviewCommentNode {
+        body: String,
+        path: String,
+        line: Option<u64>,
+        #[serde(rename = "startLine")]
+        start_line: Option<u64>,
+        #[serde(rename = "originalLine")]
+        original_line: Option<u64>,
+        #[serde(rename = "originalStartLine")]
+        original_start_line: Option<u64>,
+        outdated: bool,
+        #[serde(rename = "createdAt")]
+        created_at: String,
+        author: Option<ReviewCommentAuthorNode>,
+    }
+    #[derive(Deserialize)]
+    struct ReviewCommentAuthorNode {
+        login: String,
+        #[serde(rename = "__typename")]
+        type_name: String,
+    }
+
+    let query = r#"
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved
+          comments(first: 100) {
+            nodes {
+              body
+              path
+              line
+              startLine
+              originalLine
+              originalStartLine
+              outdated
+              createdAt
+              author {
+                __typename
+                login
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
+    let output = Command::new("gh")
+        .args(["api", "graphql", "-f", &format!("query={query}")])
+        .args(["-F", &format!("owner={owner}")])
+        .args(["-F", &format!("repo={repo}")])
+        .args(["-F", &format!("number={pr_number}")])
+        .output()
+        .context("Failed to run `gh api graphql`")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "Failed to fetch PR review comments: {}",
+            stderr.trim()
+        ));
+    }
+
+    let parsed: GraphQlResponse =
+        serde_json::from_slice(&output.stdout).context("Failed to parse graphql output")?;
+    let pr = parsed
+        .data
+        .repository
+        .and_then(|r| r.pull_request)
+        .ok_or_else(|| anyhow!("PR not found in graphql response"))?;
+
+    let mut threads = Vec::new();
+    for thread in pr.review_threads.nodes {
+        let mut comments: Vec<PrReviewComment> = thread
+            .comments
+            .nodes
+            .into_iter()
+            .map(|comment| {
+                let author = comment.author.map_or(
+                    ReviewCommentAuthor {
+                        login: "ghost".to_string(),
+                        is_bot: false,
+                    },
+                    |author| ReviewCommentAuthor {
+                        login: author.login,
+                        is_bot: author.type_name == "Bot",
+                    },
+                );
+
+                PrReviewComment {
+                    author,
+                    body: comment.body,
+                    path: comment.path,
+                    line: comment.line,
+                    start_line: comment.start_line,
+                    original_line: comment.original_line,
+                    original_start_line: comment.original_start_line,
+                    outdated: comment.outdated,
+                    created_at: comment.created_at,
+                }
+            })
+            .collect();
+
+        comments.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        if comments.is_empty() {
+            continue;
+        }
+
+        threads.push(PrReviewThread {
+            is_resolved: thread.is_resolved,
+            comments,
+        });
+    }
+
+    threads.sort_by(|left, right| {
+        left.comments[0]
+            .created_at
+            .cmp(&right.comments[0].created_at)
+    });
+
+    Ok(threads)
 }
 
 /// Update the base branch of an existing PR.

@@ -1,5 +1,6 @@
 mod common;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use common::{gits_cmd, make_commit, run_ok};
 use git2::Repository;
 use std::fs;
@@ -1599,4 +1600,393 @@ exit 1
     assert!(stdout.contains("alice: approved"));
     assert!(stdout.contains("bob: waiting"));
     assert!(stdout.contains("Failed checks: ci/test"));
+}
+
+#[test]
+fn pr_review_renders_markdown_threads_and_replies() {
+    let (dir, _repo) = setup_simple_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo '{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"comments":{"nodes":[{"body":"Please rename this variable.","path":"src/lib.rs","line":14,"startLine":14,"originalLine":14,"originalStartLine":14,"outdated":false,"createdAt":"2024-01-01T00:00:00Z","author":{"__typename":"User","login":"alice"}},{"body":"Done.","path":"src/lib.rs","line":14,"startLine":14,"originalLine":14,"originalStartLine":14,"outdated":false,"createdAt":"2024-01-01T00:01:00Z","author":{"__typename":"User","login":"bob"}}]}},{"isResolved":false,"comments":{"nodes":[{"body":"This was on an old diff.","path":"src/main.rs","line":null,"startLine":null,"originalLine":27,"originalStartLine":27,"outdated":true,"createdAt":"2024-01-01T00:02:00Z","author":{"__typename":"User","login":"carol"}}]}},{"isResolved":true,"comments":{"nodes":[{"body":"Already fixed.","path":"src/old.rs","line":8,"startLine":8,"originalLine":8,"originalStartLine":8,"outdated":false,"createdAt":"2024-01-01T00:03:00Z","author":{"__typename":"User","login":"dave"}}]}}]}}}}}'
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = gits_cmd()
+        .args(["pr", "review"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "gits pr review failed: {:?}",
+        output
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("### `src/lib.rs:14` — @alice"));
+    assert!(stdout.contains("Please rename this variable."));
+    assert!(stdout.contains("**Reply from @bob**\nDone."));
+    assert!(
+        stdout.contains(
+            "Done.\n\n\n### `src/main.rs` — @carol [OUTDATED, original comment line: 27]"
+        )
+    );
+    assert!(!stdout.contains("Already fixed."));
+}
+
+#[test]
+fn pr_review_multiple_prs_uses_selection() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    number=""
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "-F" ]]; then
+            shift
+            if [[ "$1" == number=* ]]; then
+                number="${1#number=}"
+            fi
+        fi
+        shift
+    done
+    if [[ "$number" == "10" ]]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"comments":{"nodes":[{"body":"Review for A.","path":"a.txt","line":5,"startLine":5,"originalLine":5,"originalStartLine":5,"outdated":false,"createdAt":"2024-01-01T00:00:00Z","author":{"__typename":"User","login":"alice"}}]}}]}}}}}'
+        exit 0
+    fi
+    if [[ "$number" == "11" ]]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"comments":{"nodes":[{"body":"Review for B.","path":"b.txt","line":7,"startLine":7,"originalLine":7,"originalStartLine":7,"outdated":false,"createdAt":"2024-01-01T00:00:00Z","author":{"__typename":"User","login":"bob"}}]}}]}}}}}'
+        exit 0
+    fi
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = gits_cmd()
+        .args(["pr", "review"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "gits pr review failed: {:?}",
+        output
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Select PR to review:"));
+    assert!(stdout.contains("Review for A."));
+    assert!(!stdout.contains("Review for B."));
+}
+
+#[test]
+fn pr_review_applies_reviewer_bot_outdated_and_resolved_filters() {
+    let (dir, _repo) = setup_simple_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo '{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"comments":{"nodes":[{"body":"Please update the docs.","path":"README.md","line":9,"startLine":9,"originalLine":9,"originalStartLine":9,"outdated":false,"createdAt":"2024-01-01T00:00:00Z","author":{"__typename":"User","login":"alice"}},{"body":"Bot follow-up.","path":"README.md","line":9,"startLine":9,"originalLine":9,"originalStartLine":9,"outdated":false,"createdAt":"2024-01-01T00:01:00Z","author":{"__typename":"Bot","login":"copilot-swe-agent"}}]}},{"isResolved":false,"comments":{"nodes":[{"body":"Bot root comment.","path":"src/lib.rs","line":4,"startLine":4,"originalLine":4,"originalStartLine":4,"outdated":false,"createdAt":"2024-01-01T00:02:00Z","author":{"__typename":"Bot","login":"copilot-swe-agent"}}]}},{"isResolved":false,"comments":{"nodes":[{"body":"Outdated note.","path":"src/main.rs","line":null,"startLine":null,"originalLine":30,"originalStartLine":30,"outdated":true,"createdAt":"2024-01-01T00:03:00Z","author":{"__typename":"User","login":"alice"}}]}},{"isResolved":true,"comments":{"nodes":[{"body":"Resolved Alice comment.","path":"src/lib.rs","line":22,"startLine":22,"originalLine":22,"originalStartLine":22,"outdated":false,"createdAt":"2024-01-01T00:04:00Z","author":{"__typename":"User","login":"alice"}}]}}]}}}}}'
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = gits_cmd()
+        .args([
+            "pr",
+            "review",
+            "--reviewer",
+            "alice",
+            "--no-bots",
+            "--no-outdated",
+            "--resolved",
+        ])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "gits pr review failed: {:?}",
+        output
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Please update the docs."));
+    assert!(stdout.contains("Resolved Alice comment."));
+    assert!(!stdout.contains("Bot follow-up."));
+    assert!(!stdout.contains("Bot root comment."));
+    assert!(!stdout.contains("Outdated note."));
+}
+
+#[test]
+fn pr_review_writes_output_and_copies_with_osc52() {
+    let (dir, _repo) = setup_simple_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo '{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"comments":{"nodes":[{"body":"Looks good.","path":"src/lib.rs","line":9,"startLine":9,"originalLine":9,"originalStartLine":9,"outdated":false,"createdAt":"2024-01-01T00:00:00Z","author":{"__typename":"User","login":"alice"}}]}}]}}}}}'
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output_path = dir.path().join("review.md");
+    let output = gits_cmd()
+        .args([
+            "pr",
+            "review",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--copy",
+        ])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "gits pr review failed: {:?}",
+        output
+    );
+
+    let saved_markdown = fs::read_to_string(&output_path).unwrap();
+    assert_eq!(saved_markdown, "### `src/lib.rs:9` — @alice\nLooks good.");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected_osc52 = format!(
+        "\u{1b}]52;c;{}\u{7}",
+        STANDARD.encode(saved_markdown.as_bytes())
+    );
+    assert!(stderr.contains(&expected_osc52));
+    assert!(stderr.contains("Saved review markdown to"));
+    assert!(stderr.contains("Copied review markdown to clipboard"));
+}
+
+#[test]
+fn pr_review_strips_html_comments_from_output() {
+    let (dir, _repo) = setup_simple_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo '{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"comments":{"nodes":[{"body":"Visible text.\n<!-- hidden top-level -->\nStill visible.","path":"src/lib.rs","line":9,"startLine":9,"originalLine":9,"originalStartLine":9,"outdated":false,"createdAt":"2024-01-01T00:00:00Z","author":{"__typename":"User","login":"alice"}},{"body":"<!-- hidden reply -->Ack.","path":"src/lib.rs","line":9,"startLine":9,"originalLine":9,"originalStartLine":9,"outdated":false,"createdAt":"2024-01-01T00:01:00Z","author":{"__typename":"User","login":"bob"}}]}}]}}}}}'
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = gits_cmd()
+        .args(["pr", "review"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "gits pr review failed: {:?}",
+        output
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Visible text.\n\nStill visible."));
+    assert!(stdout.contains("**Reply from @bob**\nAck."));
+    assert!(!stdout.contains("hidden top-level"));
+    assert!(!stdout.contains("hidden reply"));
+    assert!(!stdout.contains("<!--"));
 }
