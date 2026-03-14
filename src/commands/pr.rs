@@ -1,3 +1,4 @@
+use crate::commands::pr_merge::pr_merge;
 use crate::gh::{self, CreatePrParams};
 use crate::stack::{
     StackBranch, compute_base_map, get_stack_branches, sort_branches_topologically,
@@ -18,6 +19,8 @@ pub enum PrSubcommand {
     Open,
     /// Edit an existing PR from the current stack
     Edit,
+    /// Merge an open PR from the current stack
+    Merge,
     /// Show status summary for all open PRs in the current stack
     Status,
     /// Fetch and render review comments for an open PR in the current stack
@@ -59,6 +62,7 @@ pub fn pr(subcommand: &Option<PrSubcommand>) -> Result<()> {
     match subcommand {
         Some(PrSubcommand::Open) => pr_open(),
         Some(PrSubcommand::Edit) => pr_edit(),
+        Some(PrSubcommand::Merge) => pr_merge(),
         Some(PrSubcommand::Status) => pr_status(),
         Some(PrSubcommand::Review(args)) => pr_review(args),
         None => pr_create_or_update(),
@@ -69,9 +73,9 @@ const STACK_SECTION_START: &str = "<!-- gits-stack:start -->";
 const STACK_SECTION_END: &str = "<!-- gits-stack:end -->";
 
 #[derive(Clone)]
-struct StackPr {
-    branch_name: String,
-    pr: gh::EditablePr,
+pub(crate) struct StackPr {
+    pub(crate) branch_name: String,
+    pub(crate) pr: gh::EditablePr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -384,7 +388,7 @@ fn pr_status() -> Result<()> {
     Ok(())
 }
 
-fn parse_github_owner_repo_from_pr_url(url: &str) -> Option<(String, String)> {
+pub(crate) fn parse_github_owner_repo_from_pr_url(url: &str) -> Option<(String, String)> {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     let mut parts = after_scheme.split('/');
 
@@ -394,7 +398,7 @@ fn parse_github_owner_repo_from_pr_url(url: &str) -> Option<(String, String)> {
     Some((owner, repo))
 }
 
-fn collect_open_stack_prs(
+pub(crate) fn collect_open_stack_prs(
     branches_with_upstream: &[(StackBranch, String)],
 ) -> Result<Vec<StackPr>> {
     let mut stack_prs = Vec::new();
@@ -410,7 +414,7 @@ fn collect_open_stack_prs(
     Ok(stack_prs)
 }
 
-fn select_stack_pr<'a>(prs: &'a [StackPr], prompt: &str) -> Result<&'a StackPr> {
+pub(crate) fn select_stack_pr<'a>(prs: &'a [StackPr], prompt: &str) -> Result<&'a StackPr> {
     if prs.len() == 1 {
         return Ok(&prs[0]);
     }
@@ -426,7 +430,7 @@ fn format_stack_pr_option(pr: &StackPr) -> String {
     format!("{} → {}", pr.branch_name, pr.pr.url)
 }
 
-fn discover_stack_branches_with_upstream(
+pub(crate) fn discover_stack_branches_with_upstream(
     repo: &Repository,
 ) -> Result<(String, Vec<(StackBranch, String)>)> {
     let upstream_name = crate::commands::find_upstream(repo)?;
@@ -612,7 +616,7 @@ fn trim_trailing_newlines(text: &str) -> &str {
 // Per-branch PR logic
 // ────────────────────────────────────────────────────────────────────────────
 
-fn normalize_base_for_gh(base: &str) -> String {
+pub(crate) fn normalize_base_for_gh(base: &str) -> String {
     if let Some((first, rest)) = base.split_once('/')
         && (first == "origin" || first == "upstream")
     {

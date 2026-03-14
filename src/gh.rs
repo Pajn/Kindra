@@ -56,6 +56,11 @@ pub struct PrStatusSummary {
     pub unresolved_comments: usize,
     pub running_checks: Vec<String>,
     pub failed_checks: Vec<String>,
+    pub head_ref_oid: Option<String>,
+    pub review_decision: Option<String>,
+    pub merge_state_status: String,
+    pub mergeable: String,
+    pub is_draft: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +248,16 @@ pub fn get_pr_status(owner: &str, repo: &str, pr_number: u64) -> Result<PrStatus
         review_requests: ReviewRequestConnection,
         #[serde(rename = "latestReviews")]
         latest_reviews: LatestReviewConnection,
+        #[serde(rename = "headRefOid", default)]
+        head_ref_oid: Option<String>,
+        #[serde(rename = "reviewDecision", default)]
+        review_decision: Option<String>,
+        #[serde(rename = "mergeStateStatus", default)]
+        merge_state_status: String,
+        #[serde(default)]
+        mergeable: String,
+        #[serde(rename = "isDraft", default)]
+        is_draft: bool,
         commits: CommitConnection,
     }
     #[derive(Deserialize)]
@@ -341,6 +356,11 @@ query($owner: String!, $repo: String!, $number: Int!) {
           }
         }
       }
+      headRefOid
+      reviewDecision
+      mergeStateStatus
+      mergeable
+      isDraft
       commits(last: 1) {
         nodes {
           commit {
@@ -472,6 +492,11 @@ query($owner: String!, $repo: String!, $number: Int!) {
         unresolved_comments,
         running_checks: running_checks_set.into_iter().collect(),
         failed_checks: failed_checks_set.into_iter().collect(),
+        head_ref_oid: pr.head_ref_oid,
+        review_decision: pr.review_decision,
+        merge_state_status: pr.merge_state_status,
+        mergeable: pr.mergeable,
+        is_draft: pr.is_draft,
     })
 }
 
@@ -759,6 +784,32 @@ query($threadId: ID!, $commentsCursor: String) {
     });
 
     Ok(threads)
+}
+
+/// Merge a PR through the GitHub CLI.
+pub fn merge_pr(pr_number: u64, head_oid: Option<&str>) -> Result<()> {
+    let pr_number = pr_number.to_string();
+    let mut command = Command::new("gh");
+    command.args(["pr", "merge", &pr_number]);
+    if let Some(head_oid) = head_oid {
+        command.args(["--match-head-commit", head_oid]);
+    }
+    let output = command.output().context("Failed to run `gh pr merge`")?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "gh pr merge exited with a non-zero status".to_string()
+        };
+        Err(anyhow!("Failed to merge PR #{}: {}", pr_number, detail))
+    }
 }
 
 /// Update the base branch of an existing PR.

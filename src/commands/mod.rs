@@ -4,6 +4,7 @@ pub mod commit;
 pub mod continue_cmd;
 pub mod move_cmd;
 pub mod pr;
+pub(crate) mod pr_merge;
 pub mod push;
 pub mod restack;
 pub mod split;

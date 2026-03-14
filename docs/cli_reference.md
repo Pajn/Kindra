@@ -252,6 +252,7 @@ This command performs an atomic push of all branches in the stack using `force-w
 gits pr
 gits pr open
 gits pr edit
+gits pr merge
 gits pr status
 gits pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--reviewer <login>] [--bots|--no-bots]
 ```
@@ -259,8 +260,11 @@ gits pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--review
 - `gits pr`: Create/update PRs for stack branches with upstreams.
 - `gits pr open`: Open a PR URL in the default browser (if multiple, choose one).
 - `gits pr edit`: Select a PR (if multiple), then edit title/body/labels/reviewers.
+- `gits pr merge`: Select an open PR in the current stack and merge it only when review/check state is ready, or prompt/error with the blocking reasons.
 - `gits pr status`: Show each stack PR's reviewer status, unresolved comments, and running/failed checks.
 - `gits pr review`: Select an open PR in the current stack, fetch its review threads through `gh api graphql`, and render them as markdown.
+
+`gits pr merge` automatically merges when the PR has no unresolved review comments, no outstanding review state, no running/failed checks, and GitHub reports the PR as mergeable. If issues remain but GitHub would still allow merging, `gits` prints the outstanding reviews/checks and asks for confirmation. If GitHub/repository rules block the merge, `gits` exits with a clear reason instead of attempting it.
 
 `gits pr review` defaults to unresolved threads only, includes both human and bot comments, and keeps outdated comments unless you opt out.
 

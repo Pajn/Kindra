@@ -12,7 +12,7 @@
 
 - **Visual Branch Splitting**: Assign branches to specific commits in a linear history using your favorite `$EDITOR`.
 - **Atomic Pushes**: Push all branches in your stack simultaneously with `force-with-lease` safety.
-- **PR Workflow Helpers**: Create/update stack PRs, open PRs in your browser, edit PR metadata, inspect review/check status, and export threaded review comments as markdown.
+- **PR Workflow Helpers**: Create/update stack PRs, open PRs in your browser, edit PR metadata, inspect review/check status, export threaded review comments as markdown, and merge stack PRs with readiness checks.
 
 ## Installation
 
@@ -41,6 +41,7 @@ cargo install --path .
    - `gits pr edit` to edit title/body/labels/reviewers
    - `gits pr status` to inspect reviewers, unresolved comments, and failing/running checks
    - `gits pr review` to render PR review threads as markdown, optionally write them to a file, or copy them via OSC 52
+   - `gits pr merge` to merge a stack PR only when reviews/checks are ready, or clearly explain/prompt when GitHub would still allow an override
 
 For a full list of commands and detailed examples, see the [CLI Reference](docs/cli_reference.md).
 

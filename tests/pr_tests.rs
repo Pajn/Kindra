@@ -2066,3 +2066,822 @@ exit 1
     assert!(!stdout.contains("hidden reply"));
     assert!(!stdout.contains("<!--"));
 }
+
+#[test]
+fn pr_merge_merges_ready_single_pr() {
+    let (dir, _repo) = setup_simple_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "42" ]]; then
+        echo '{"state":"MERGED"}'
+        exit 0
+    fi
+    echo '{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
+    printf "%s\n" "$@" > "$MOCK_GH_MERGE_ARGS"
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s\n" "$@" > "$MOCK_GH_EDIT_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let merge_args_path = dir.path().join("merge_args.txt");
+    let edit_args_path = dir.path().join("edit_args.txt");
+    let output = gits_cmd()
+        .args(["pr", "merge"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_MERGE_ARGS", &merge_args_path)
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "gits pr merge failed: {:?}",
+        output
+    );
+    let merge_args = fs::read_to_string(&merge_args_path).unwrap();
+    assert!(merge_args.contains("pr\nmerge\n42"));
+    assert!(merge_args.contains("--match-head-commit\ndeadbeef42"));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Merging PR #42 for feature"));
+    assert!(stdout.contains("✓ Merged PR #42"));
+}
+
+#[test]
+fn pr_merge_multiple_prs_uses_selection() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "10" ]]; then
+        echo '{"state":"MERGED"}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    number=""
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "-F" ]]; then
+            shift
+            if [[ "$1" == number=* ]]; then
+                number="${1#number=}"
+            fi
+        fi
+        shift
+    done
+    if [[ "$number" == "10" ]]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+        exit 0
+    fi
+    if [[ "$number" == "11" ]]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"bob"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
+    printf "%s\n" "$@" > "$MOCK_GH_MERGE_ARGS"
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s\n" "$@" > "$MOCK_GH_EDIT_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let merge_args_path = dir.path().join("merge_args.txt");
+    let edit_args_path = dir.path().join("edit_args.txt");
+    let output = gits_cmd()
+        .args(["pr", "merge"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_MERGE_ARGS", &merge_args_path)
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "gits pr merge failed: {:?}",
+        output
+    );
+    let merge_args = fs::read_to_string(&merge_args_path).unwrap();
+    assert!(merge_args.contains("pr\nmerge\n10"));
+    let edit_args = fs::read_to_string(&edit_args_path).unwrap();
+    assert!(edit_args.contains("pr\nedit\n11\n--base\nmain"));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Select PR to merge:"));
+}
+
+#[test]
+fn pr_merge_approved_plus_commented_allows_merge() {
+    let (dir, _repo) = setup_simple_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "42" ]]; then
+        echo '{"state":"MERGED"}'
+        exit 0
+    fi
+    echo '{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}},{"state":"COMMENTED","author":{"login":"carol"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
+    printf "%s\n" "$@" > "$MOCK_GH_MERGE_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let merge_args_path = dir.path().join("merge_args.txt");
+    let output = gits_cmd()
+        .args(["pr", "merge"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_MERGE_ARGS", &merge_args_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "gits pr merge failed: {:?}",
+        output
+    );
+    let merge_args = fs::read_to_string(&merge_args_path).unwrap();
+    assert!(merge_args.contains("pr\nmerge\n42"));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Merging PR #42 for feature"));
+    assert!(stdout.contains("✓ Merged PR #42"));
+}
+
+#[test]
+fn pr_merge_retargets_child_pr_before_merging_parent() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "10" ]]; then
+        echo '{"state":"MERGED"}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    number=""
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "-F" ]]; then
+            shift
+            if [[ "$1" == number=* ]]; then
+                number="${1#number=}"
+            fi
+        fi
+        shift
+    done
+    if [[ "$number" == "10" ]]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s\n" "$@" >> "$MOCK_GH_EDIT_ARGS"
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
+    printf "%s\n" "$@" > "$MOCK_GH_MERGE_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let merge_args_path = dir.path().join("merge_args.txt");
+    let edit_args_path = dir.path().join("edit_args.txt");
+    let output = gits_cmd()
+        .args(["pr", "merge"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_MERGE_ARGS", &merge_args_path)
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "gits pr merge failed: {:?}",
+        output
+    );
+
+    let edit_args = fs::read_to_string(&edit_args_path).unwrap();
+    assert!(edit_args.contains("pr\nedit\n11\n--base\nmain"));
+
+    let merge_args = fs::read_to_string(&merge_args_path).unwrap();
+    assert!(merge_args.contains("pr\nmerge\n10"));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Retargeting dependent PR #11 for feature-b to base 'main'"));
+    assert!(stdout.contains("✓ Retargeted PR #11"));
+    assert!(stdout.contains("✓ Merged PR #10"));
+}
+
+#[test]
+fn pr_merge_does_not_retarget_on_merge_failure() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    number=""
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "-F" ]]; then
+            shift
+            if [[ "$1" == number=* ]]; then
+                number="${1#number=}"
+            fi
+        fi
+        shift
+    done
+    if [[ "$number" == "10" ]]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s\n" "$@" >> "$MOCK_GH_EDIT_ARGS"
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
+    printf "%s\n" "$@" > "$MOCK_GH_MERGE_ARGS"
+    echo "merge failed" >&2
+    exit 1
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let merge_args_path = dir.path().join("merge_args.txt");
+    let edit_args_path = dir.path().join("edit_args.txt");
+    let output = gits_cmd()
+        .args(["pr", "merge"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_MERGE_ARGS", &merge_args_path)
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "gits pr merge unexpectedly succeeded: {:?}",
+        output
+    );
+
+    let merge_args = fs::read_to_string(&merge_args_path).unwrap();
+    assert!(merge_args.contains("pr\nmerge\n10"));
+
+    let edit_args = fs::read_to_string(&edit_args_path).unwrap_or_default();
+    assert!(!edit_args.contains("pr\nedit\n11\n--base\nmain"));
+}
+
+#[test]
+fn pr_merge_does_not_retarget_when_merge_is_queued() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "10" ]]; then
+        echo '{"state":"QUEUED"}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    number=""
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "-F" ]]; then
+            shift
+            if [[ "$1" == number=* ]]; then
+                number="${1#number=}"
+            fi
+        fi
+        shift
+    done
+    if [[ "$number" == "10" ]]; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"queuedsha10","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s\n" "$@" >> "$MOCK_GH_EDIT_ARGS"
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
+    printf "%s\n" "$@" > "$MOCK_GH_MERGE_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let merge_args_path = dir.path().join("merge_args.txt");
+    let edit_args_path = dir.path().join("edit_args.txt");
+    let output = gits_cmd()
+        .args(["pr", "merge"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_MERGE_ARGS", &merge_args_path)
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "gits pr merge failed: {:?}",
+        output
+    );
+
+    let merge_args = fs::read_to_string(&merge_args_path).unwrap();
+    assert!(merge_args.contains("pr\nmerge\n10"));
+    assert!(merge_args.contains("--match-head-commit\nqueuedsha10"));
+
+    let edit_args = fs::read_to_string(&edit_args_path).unwrap_or_default();
+    assert!(!edit_args.contains("pr\nedit\n11\n--base\nmain"));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("current GitHub state is QUEUED"));
+    assert!(!stdout.contains("✓ Merged PR #10"));
+}
+
+#[test]
+fn pr_merge_prompts_and_errors_when_issues_remain_but_merge_is_allowed() {
+    let (dir, _repo) = setup_simple_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo '{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false}]},"reviewRequests":{"nodes":[{"requestedReviewer":{"login":"bob"}}]},"latestReviews":{"nodes":[{"state":"COMMENTED","author":{"login":"carol"}}]},"reviewDecision":"REVIEW_REQUIRED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"ci/test","status":"COMPLETED","conclusion":"FAILURE"}]}}}}]}}}}}'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
+    printf "%s\n" "$@" > "$MOCK_GH_MERGE_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let merge_args_path = dir.path().join("merge_args.txt");
+    let output = gits_cmd()
+        .args(["pr", "merge"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_MERGE_ARGS", &merge_args_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "gits pr merge unexpectedly succeeded: {:?}",
+        output
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("Unresolved review comments: 1"));
+    assert!(combined.contains("Outstanding reviews:"));
+    assert!(combined.contains("bob: waiting"));
+    assert!(combined.contains("overall review decision: review required"));
+    assert!(combined.contains("Failed checks: ci/test"));
+    assert!(combined.contains("GitHub would still allow merging this PR."));
+    assert!(combined.contains("Merge anyway despite outstanding reviews/checks?"));
+    assert!(combined.contains("Merge cancelled"));
+    assert!(!merge_args_path.exists());
+}
+
+#[test]
+fn pr_merge_surfaces_gh_failure_details() {
+    let (dir, _repo) = setup_simple_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo '{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
+    echo "merge failed because required check is stale" >&2
+    exit 1
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = gits_cmd()
+        .args(["pr", "merge"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "gits pr merge unexpectedly succeeded: {:?}",
+        output
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Failed to merge PR #42: merge failed because required check is stale")
+    );
+}
+
+#[test]
+fn pr_merge_errors_when_repo_rules_block_merging() {
+    let (dir, _repo) = setup_simple_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo '{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false}]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[]},"reviewDecision":"REVIEW_REQUIRED","mergeStateStatus":"BLOCKED","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
+    printf "%s\n" "$@" > "$MOCK_GH_MERGE_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let merge_args_path = dir.path().join("merge_args.txt");
+    let output = gits_cmd()
+        .args(["pr", "merge"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_MERGE_ARGS", &merge_args_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "gits pr merge unexpectedly succeeded: {:?}",
+        output
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("Merge blocked by GitHub: GitHub merge state is BLOCKED"));
+    assert!(combined.contains("Merge prevented for PR #42"));
+    assert!(!combined.contains("Merge anyway despite outstanding reviews/checks?"));
+    assert!(!merge_args_path.exists());
+}
