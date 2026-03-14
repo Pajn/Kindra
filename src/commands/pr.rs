@@ -3,14 +3,16 @@ use crate::stack::{
     StackBranch, compute_base_map, get_stack_branches, sort_branches_topologically,
 };
 use anyhow::{Context, Result, anyhow};
-use clap::Subcommand;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use clap::{Args, Subcommand};
 use git2::{BranchType, Repository};
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 use tempfile::NamedTempFile;
 
-#[derive(Subcommand, Clone, Copy)]
+#[derive(Subcommand, Clone)]
 pub enum PrSubcommand {
     /// Open an existing PR from the current stack in your default browser
     Open,
@@ -18,6 +20,39 @@ pub enum PrSubcommand {
     Edit,
     /// Show status summary for all open PRs in the current stack
     Status,
+    /// Fetch and render review comments for an open PR in the current stack
+    Review(PrReviewArgs),
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct PrReviewArgs {
+    /// Write the rendered markdown to a file
+    #[arg(short, long, value_name = "PATH")]
+    output: Option<PathBuf>,
+    /// Copy the rendered markdown to the terminal clipboard via OSC 52
+    #[arg(long)]
+    copy: bool,
+    /// Exclude outdated review threads
+    #[arg(long)]
+    no_outdated: bool,
+    /// Include resolved review threads
+    #[arg(long)]
+    resolved: bool,
+    /// Only include comments from a specific reviewer/login
+    #[arg(long)]
+    reviewer: Option<String>,
+    /// Include bot comments/replies
+    #[arg(long, conflicts_with = "no_bots")]
+    bots: bool,
+    /// Exclude bot comments/replies
+    #[arg(long = "no-bots", conflicts_with = "bots")]
+    no_bots: bool,
+}
+
+impl PrReviewArgs {
+    fn include_bots(&self) -> bool {
+        !self.no_bots
+    }
 }
 
 pub fn pr(subcommand: &Option<PrSubcommand>) -> Result<()> {
@@ -25,6 +60,7 @@ pub fn pr(subcommand: &Option<PrSubcommand>) -> Result<()> {
         Some(PrSubcommand::Open) => pr_open(),
         Some(PrSubcommand::Edit) => pr_edit(),
         Some(PrSubcommand::Status) => pr_status(),
+        Some(PrSubcommand::Review(args)) => pr_review(args),
         None => pr_create_or_update(),
     }
 }
@@ -160,36 +196,14 @@ fn pr_edit() -> Result<()> {
         return Ok(());
     }
 
-    let mut all_stack_prs: Vec<StackPr> = Vec::new();
-    for (sb, _remote_upstream) in &branches_with_upstream {
-        if let Some(pr) = gh::find_open_pr_for_edit(&sb.name)? {
-            all_stack_prs.push(StackPr {
-                branch_name: sb.name.clone(),
-                pr,
-            });
-        }
-    }
+    let all_stack_prs = collect_open_stack_prs(&branches_with_upstream)?;
 
     if all_stack_prs.is_empty() {
         println!("No open PRs found in the current stack.");
         return Ok(());
     }
 
-    let selected_index = if all_stack_prs.len() == 1 {
-        0
-    } else {
-        let options: Vec<String> = all_stack_prs
-            .iter()
-            .map(|pr| format!("{} → {}", pr.branch_name, pr.pr.url))
-            .collect();
-        let selection = crate::commands::prompt_select("Select PR to edit:", options)?;
-        all_stack_prs
-            .iter()
-            .position(|pr| format!("{} → {}", pr.branch_name, pr.pr.url) == selection)
-            .ok_or_else(|| anyhow::anyhow!("Selected PR not found"))?
-    };
-
-    let selected = &all_stack_prs[selected_index];
+    let selected = select_stack_pr(&all_stack_prs, "Select PR to edit:")?;
     let branch_name = selected.branch_name.clone();
     let existing = selected.pr.clone();
 
@@ -255,6 +269,55 @@ fn pr_edit() -> Result<()> {
         reviewers,
     })?;
     println!("✓ PR updated: {}", existing.url);
+    Ok(())
+}
+
+fn pr_review(args: &PrReviewArgs) -> Result<()> {
+    gh::check_gh().context("GitHub CLI check failed")?;
+
+    let repo = crate::open_repo()?;
+    let (_upstream_name, branches_with_upstream) = discover_stack_branches_with_upstream(&repo)?;
+
+    if branches_with_upstream.is_empty() {
+        println!("No branches with a remote upstream in stack.");
+        println!("Run `gits push` first to set upstreams.");
+        return Ok(());
+    }
+
+    let all_stack_prs = collect_open_stack_prs(&branches_with_upstream)?;
+    if all_stack_prs.is_empty() {
+        println!("No open PRs found in the current stack.");
+        return Ok(());
+    }
+
+    let selected = select_stack_pr(&all_stack_prs, "Select PR to review:")?;
+    let (owner, repo_name) =
+        parse_github_owner_repo_from_pr_url(&selected.pr.url).ok_or_else(|| {
+            anyhow!(
+                "Could not parse owner/repo from PR URL: {}",
+                selected.pr.url
+            )
+        })?;
+    let threads = gh::get_pr_review_threads(&owner, &repo_name, selected.pr.number)?;
+    let markdown = render_review_markdown(threads, args);
+
+    println!("{markdown}");
+
+    if let Some(path) = &args.output {
+        fs::write(path, &markdown).with_context(|| {
+            format!(
+                "Failed to write rendered review markdown to {}",
+                path.display()
+            )
+        })?;
+        eprintln!("Saved review markdown to {}", path.display());
+    }
+
+    if args.copy {
+        copy_via_osc52(&markdown)?;
+        eprintln!("Copied review markdown to clipboard");
+    }
+
     Ok(())
 }
 
@@ -331,6 +394,38 @@ fn parse_github_owner_repo_from_pr_url(url: &str) -> Option<(String, String)> {
     Some((owner, repo))
 }
 
+fn collect_open_stack_prs(
+    branches_with_upstream: &[(StackBranch, String)],
+) -> Result<Vec<StackPr>> {
+    let mut stack_prs = Vec::new();
+    for (sb, _remote_upstream) in branches_with_upstream {
+        if let Some(pr) = gh::find_open_pr_for_edit(&sb.name)? {
+            stack_prs.push(StackPr {
+                branch_name: sb.name.clone(),
+                pr,
+            });
+        }
+    }
+
+    Ok(stack_prs)
+}
+
+fn select_stack_pr<'a>(prs: &'a [StackPr], prompt: &str) -> Result<&'a StackPr> {
+    if prs.len() == 1 {
+        return Ok(&prs[0]);
+    }
+
+    let options: Vec<String> = prs.iter().map(format_stack_pr_option).collect();
+    let selection = crate::commands::prompt_select(prompt, options)?;
+    prs.iter()
+        .find(|pr| format_stack_pr_option(pr) == selection)
+        .ok_or_else(|| anyhow!("Selected PR not found"))
+}
+
+fn format_stack_pr_option(pr: &StackPr) -> String {
+    format!("{} → {}", pr.branch_name, pr.pr.url)
+}
+
 fn discover_stack_branches_with_upstream(
     repo: &Repository,
 ) -> Result<(String, Vec<(StackBranch, String)>)> {
@@ -361,6 +456,156 @@ fn discover_stack_branches_with_upstream(
         .collect();
 
     Ok((upstream_name, branches_with_upstream))
+}
+
+fn render_review_markdown(threads: Vec<gh::PrReviewThread>, args: &PrReviewArgs) -> String {
+    let filtered_threads: Vec<gh::PrReviewThread> = threads
+        .into_iter()
+        .filter(|thread| args.resolved || !thread.is_resolved)
+        .filter_map(|thread| {
+            let root = thread.comments.first()?;
+            if args.no_outdated && root.outdated {
+                return None;
+            }
+            if !review_comment_matches_filters(root, args) {
+                return None;
+            }
+
+            let mut comments = Vec::with_capacity(thread.comments.len());
+            comments.push(root.clone());
+            comments.extend(
+                thread
+                    .comments
+                    .iter()
+                    .skip(1)
+                    .filter(|comment| review_comment_matches_filters(comment, args))
+                    .cloned(),
+            );
+
+            Some(gh::PrReviewThread {
+                is_resolved: thread.is_resolved,
+                comments,
+            })
+        })
+        .collect();
+
+    if filtered_threads.is_empty() {
+        return "_No matching review comments found._".to_string();
+    }
+
+    filtered_threads
+        .iter()
+        .map(render_review_thread)
+        .collect::<Vec<_>>()
+        .join("\n\n\n")
+}
+
+fn render_review_thread(thread: &gh::PrReviewThread) -> String {
+    let root = &thread.comments[0];
+    let mut sections = vec![format!(
+        "{}\n{}",
+        render_review_heading(root, thread.is_resolved),
+        sanitize_review_body(&root.body)
+    )];
+
+    for reply in thread.comments.iter().skip(1) {
+        sections.push(format!(
+            "**Reply from @{}**\n{}",
+            reply.author.login,
+            sanitize_review_body(&reply.body)
+        ));
+    }
+
+    sections.join("\n\n")
+}
+
+fn render_review_heading(comment: &gh::PrReviewComment, is_resolved: bool) -> String {
+    let mut labels = Vec::new();
+    if is_resolved {
+        labels.push("RESOLVED".to_string());
+    }
+    if comment.outdated {
+        let original_line = comment
+            .original_start_line
+            .or(comment.original_line)
+            .map_or_else(|| "unknown".to_string(), |line| line.to_string());
+        labels.push(format!("OUTDATED, original comment line: {original_line}"));
+    }
+
+    let mut heading = format!(
+        "### `{}` — @{}",
+        render_review_location(comment),
+        comment.author.login
+    );
+    if !labels.is_empty() {
+        heading.push_str(" [");
+        heading.push_str(&labels.join(" | "));
+        heading.push(']');
+    }
+    heading
+}
+
+fn render_review_location(comment: &gh::PrReviewComment) -> String {
+    if comment.outdated {
+        return comment.path.clone();
+    }
+
+    match (comment.start_line.or(comment.line), comment.line) {
+        (Some(start), Some(end)) if start != end => format!("{}:{}-{}", comment.path, start, end),
+        (_, Some(line)) => format!("{}:{}", comment.path, line),
+        (Some(start), None) => format!("{}:{}", comment.path, start),
+        (None, None) => comment.path.clone(),
+    }
+}
+
+fn review_comment_matches_filters(comment: &gh::PrReviewComment, args: &PrReviewArgs) -> bool {
+    if !args.include_bots() && comment.author.is_bot {
+        return false;
+    }
+
+    if let Some(reviewer) = &args.reviewer {
+        return comment.author.login.eq_ignore_ascii_case(reviewer);
+    }
+
+    true
+}
+
+fn copy_via_osc52(text: &str) -> Result<()> {
+    let encoded = STANDARD.encode(text.as_bytes());
+    let mut stderr = std::io::stderr();
+    write!(stderr, "\x1b]52;c;{encoded}\x07").context("Failed to write OSC 52 sequence")?;
+    stderr.flush().context("Failed to flush OSC 52 sequence")?;
+    Ok(())
+}
+
+fn sanitize_review_body(text: &str) -> String {
+    trim_trailing_newlines(&strip_html_comments(text)).to_string()
+}
+
+fn strip_html_comments(text: &str) -> String {
+    let mut remaining = text;
+    let mut cleaned = String::new();
+
+    loop {
+        if let Some(start) = remaining.find("<!--") {
+            cleaned.push_str(&remaining[..start]);
+            let after_start = &remaining[start + 4..];
+            if let Some(end) = after_start.find("-->") {
+                remaining = &after_start[end + 3..];
+            } else {
+                break;
+            }
+        } else {
+            cleaned.push_str(remaining);
+            break;
+        }
+    }
+
+    cleaned
+}
+
+fn trim_trailing_newlines(text: &str) -> &str {
+    text.trim_end_matches('\n')
 }
 
 // ────────────────────────────────────────────────────────────────────────────
