@@ -91,6 +91,60 @@ fn setup_two_level_stack() -> (tempfile::TempDir, Repository) {
     (dir, repo)
 }
 
+/// Four-level history: main -> sync-main -> pr-review -> pr-merge.
+fn setup_review_merge_stack() -> (tempfile::TempDir, Repository) {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let main_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "README.md",
+        "hello",
+        "initial",
+        &[],
+    );
+    let sync_main_id = {
+        let main = repo.find_commit(main_id).unwrap();
+        make_commit(
+            &repo,
+            "refs/heads/sync-main",
+            "sync.txt",
+            "sync",
+            "feat: sync main",
+            &[&main],
+        )
+    };
+    let pr_review_id = {
+        let sync_main = repo.find_commit(sync_main_id).unwrap();
+        make_commit(
+            &repo,
+            "refs/heads/pr-review",
+            "review.txt",
+            "review",
+            "feat: pr review",
+            &[&sync_main],
+        )
+    };
+    {
+        let pr_review = repo.find_commit(pr_review_id).unwrap();
+        make_commit(
+            &repo,
+            "refs/heads/pr-merge",
+            "merge.txt",
+            "merge",
+            "feat: pr merge",
+            &[&pr_review],
+        );
+    }
+
+    repo.set_head("refs/heads/pr-merge").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    (dir, repo)
+}
+
 #[test]
 fn pr_fails_without_gh() {
     // Run in a temporary directory that is a valid git repo but has no
@@ -364,7 +418,7 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
     pr_number="$3"
     while [[ $# -gt 0 ]]; do
         if [[ "$1" == "--body" ]]; then
-            printf "%s" "$2" > "$MOCK_GH_BODY_DIR/pr_${pr_number}.txt"
+            printf "%s" "$2" > "$MOCK_GH_BODY_DIR/pr_$pr_number.txt"
             exit 0
         fi
         shift
@@ -484,7 +538,7 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
     fi
     while [[ $# -gt 0 ]]; do
         if [[ "$1" == "--body" ]]; then
-            printf "%s" "$2" > "$MOCK_GH_BODY_DIR/pr_${pr_number}.txt"
+            printf "%s" "$2" > "$MOCK_GH_BODY_DIR/pr_$pr_number.txt"
             exit 0
         fi
         shift
@@ -529,6 +583,140 @@ exit 1
     assert!(
         feature_b_body.contains("- → feature-b #11"),
         "feature-b body should still be updated after feature-a edit fails. Got:\n{}",
+        feature_b_body
+    );
+}
+
+#[test]
+fn pr_stack_sync_skips_inaccessible_historical_pr_entries() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    let start = "<!-- gits-stack:start -->";
+    let end = "<!-- gits-stack:end -->";
+    let stale_body = format!(
+        "Body with stale stack\n\n{}\n## Stack\n- [old-branch](https://github.com/test/repo/pull/999) #999\n- → feature-a #10\n{}\n",
+        start, end
+    );
+    let stale_body_for_bash = stale_body.replace('\n', "\\n").replace('"', "\\\"");
+
+    std::fs::write(
+        &gh_mock,
+        format!(
+            r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        if [[ "$5" == "number,baseRefName,state" ]]; then
+            echo '{{"number":10,"baseRefName":"main","state":"OPEN"}}'
+        else
+            echo '{{"number":10,"title":"PR A","body":"{}","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}}'
+        fi
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        if [[ "$5" == "number,baseRefName,state" ]]; then
+            echo '{{"number":11,"baseRefName":"feature-a","state":"OPEN"}}'
+        else
+            echo '{{"number":11,"title":"PR B","body":"Body B","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}}'
+        fi
+        exit 0
+    fi
+    if [[ "$3" == "999" ]]; then
+        echo "GraphQL: Could not resolve to a PullRequest with the number of 999." >&2
+        exit 1
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    pr_number="$3"
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--body" ]]; then
+            printf "%s" "$2" > "$MOCK_GH_BODY_DIR/pr_$pr_number.txt"
+            exit 0
+        fi
+        shift
+    done
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+            stale_body_for_bash
+        ),
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let captured_body_dir = dir.path().join("captured-bodies");
+    std::fs::create_dir_all(&captured_body_dir).unwrap();
+
+    let output = gits_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_BODY_DIR", &captured_body_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "gits pr failed: {:?}", output);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Skipping inaccessible historical PR #999"),
+        "Expected inaccessible historical PR warning. Got:\n{}",
+        stderr
+    );
+
+    let feature_a_body = fs::read_to_string(captured_body_dir.join("pr_10.txt")).unwrap();
+    assert!(
+        feature_a_body.contains("- → feature-a #10"),
+        "feature-a body should keep the active PR entry. Got:\n{}",
+        feature_a_body
+    );
+    assert!(
+        feature_a_body.contains("- [feature-b](https://github.com/test/repo/pull/11) #11"),
+        "feature-a body should still include the active sibling PR. Got:\n{}",
+        feature_a_body
+    );
+    assert!(
+        !feature_a_body.contains("old-branch"),
+        "feature-a body should drop inaccessible historical entries. Got:\n{}",
+        feature_a_body
+    );
+
+    let feature_b_body = fs::read_to_string(captured_body_dir.join("pr_11.txt")).unwrap();
+    assert!(
+        feature_b_body.contains("- [feature-a](https://github.com/test/repo/pull/10) #10"),
+        "feature-b body should still include feature-a after skipping the stale entry. Got:\n{}",
+        feature_b_body
+    );
+    assert!(
+        feature_b_body.contains("- → feature-b #11"),
+        "feature-b body should still be updated. Got:\n{}",
         feature_b_body
     );
 }
@@ -1389,7 +1577,7 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
     pr_number="$3"
     while [[ $# -gt 0 ]]; do
         if [[ "$1" == "--body" ]]; then
-            printf "%s" "$2" > "$MOCK_GH_BODY_DIR/pr_${pr_number}.txt"
+            printf "%s" "$2" > "$MOCK_GH_BODY_DIR/pr_$pr_number.txt"
             exit 0
         fi
         shift
@@ -1437,6 +1625,121 @@ exit 1
     assert!(
         body.contains("- [feature-b](https://github.com/test/repo/pull/11) #11"),
         "Other PR should remain linked in the stack block. Got:\n{}",
+        body
+    );
+}
+
+#[test]
+fn pr_edit_reorders_stack_section_using_live_stack_order() {
+    let (dir, _repo) = setup_review_merge_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &[
+            "push",
+            "-u",
+            "origin",
+            "main",
+            "sync-main",
+            "pr-review",
+            "pr-merge",
+        ],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "pr-merge"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    let start = "<!-- gits-stack:start -->";
+    let end = "<!-- gits-stack:end -->";
+    let stale_body = format!(
+        "Body with stale stack\n\n{}\n## Stack\n- ~[sync-main](https://github.com/test/repo/pull/24) #24~ (merged)\n- [pr-merge](https://github.com/test/repo/pull/26) #26\n- → pr-review #27\n{}\n",
+        start, end
+    );
+    let stale_body_for_bash = stale_body.replace('\n', "\\n").replace('"', "\\\"");
+
+    std::fs::write(
+        &gh_mock,
+        format!(
+            r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "24" ]]; then
+        echo '{{"state":"MERGED"}}'
+        exit 0
+    fi
+    if [[ "$3" == "pr-review" ]]; then
+        echo '{{"number":27,"title":"PR review","body":"{}","url":"https://github.com/test/repo/pull/27","state":"OPEN","labels":[],"reviewRequests":[]}}'
+        exit 0
+    fi
+    if [[ "$3" == "pr-merge" ]]; then
+        echo '{{"number":26,"title":"PR merge","body":"PR merge body","url":"https://github.com/test/repo/pull/26","state":"OPEN","labels":[],"reviewRequests":[]}}'
+        exit 0
+    fi
+    if [[ "$3" == "sync-main" ]]; then
+        echo "no pull requests found for branch" >&2
+        exit 1
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    pr_number="$3"
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--body" ]]; then
+            printf "%s" "$2" > "$MOCK_GH_BODY_DIR/pr_$pr_number.txt"
+            exit 0
+        fi
+        shift
+    done
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+            stale_body_for_bash
+        ),
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let captured_body_dir = dir.path().join("captured-bodies");
+    std::fs::create_dir_all(&captured_body_dir).unwrap();
+
+    let output = gits_cmd()
+        .args(["pr", "edit"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_BODY_DIR", &captured_body_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "gits pr edit failed: {:?}", output);
+
+    let body = fs::read_to_string(captured_body_dir.join("pr_27.txt")).unwrap();
+    let sync_main_idx = body.find("sync-main").unwrap();
+    let pr_review_idx = body.find("→ pr-review #27").unwrap();
+    let pr_merge_idx = body
+        .find("[pr-merge](https://github.com/test/repo/pull/26) #26")
+        .unwrap();
+
+    assert!(
+        sync_main_idx < pr_review_idx && pr_review_idx < pr_merge_idx,
+        "Expected merged sync-main, then pr-review, then pr-merge. Got:\n{}",
         body
     );
 }

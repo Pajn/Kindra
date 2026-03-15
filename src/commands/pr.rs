@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Args, Subcommand};
 use git2::{BranchType, Repository};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -825,42 +825,47 @@ fn merge_stack_lists(
     active_prs: &[StackPr],
     current_branch: &str,
 ) -> Result<Vec<RenderItem>> {
-    let mut items = Vec::new();
+    let active_by_number: HashMap<u64, &StackPr> =
+        active_prs.iter().map(|pr| (pr.pr.number, pr)).collect();
+    let mut merged_buckets = vec![Vec::new(); active_prs.len() + 1];
     let mut emitted_numbers = HashSet::new();
+    let mut seen_old_active = HashSet::new();
+    let mut old_active_rank = 0usize;
 
-    // Preserve original ordering from the existing description.
     for old in old_list {
-        if let Some(active) = active_prs.iter().find(|p| p.pr.number == old.number) {
-            items.push(RenderItem {
-                branch_name: active.branch_name.clone(),
-                url: active.pr.url.clone(),
-                number: active.pr.number,
-                is_current: active.branch_name == current_branch,
-                is_merged: false,
-            });
-            emitted_numbers.insert(active.pr.number);
-        } else {
-            // Check state for PRs not in the active local stack.
-            let state = gh::get_pr_state(old.number)
-                .with_context(|| format!("Failed to check state for PR #{}", old.number))?;
+        if active_by_number.contains_key(&old.number) {
+            if seen_old_active.insert(old.number) {
+                old_active_rank = (old_active_rank + 1).min(active_prs.len());
+            }
+            continue;
+        }
 
-            if state == "MERGED" {
-                items.push(RenderItem {
+        // Check state for PRs not in the active local stack.
+        match gh::get_pr_state(old.number) {
+            Ok(state) if state == "MERGED" && emitted_numbers.insert(old.number) => {
+                merged_buckets[old_active_rank].push(RenderItem {
                     branch_name: old.branch_name.clone(),
                     url: old.url.clone(),
                     number: old.number,
                     is_current: false,
                     is_merged: true,
                 });
-                emitted_numbers.insert(old.number);
             }
-            // else: skip (it was closed but not merged, or it's now inaccessible).
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!(
+                    "Skipping inaccessible historical PR #{} while reconciling stack: {}",
+                    old.number, err
+                );
+            }
         }
+        // else: skip (it was closed but not merged, or it's now inaccessible).
     }
 
-    // Append any new active PRs not already in the list.
-    for active in active_prs {
-        if !emitted_numbers.contains(&active.pr.number) {
+    let mut items = Vec::new();
+    for (idx, active) in active_prs.iter().enumerate() {
+        items.append(&mut merged_buckets[idx]);
+        if emitted_numbers.insert(active.pr.number) {
             items.push(RenderItem {
                 branch_name: active.branch_name.clone(),
                 url: active.pr.url.clone(),
@@ -871,6 +876,8 @@ fn merge_stack_lists(
             emitted_numbers.insert(active.pr.number);
         }
     }
+
+    items.append(&mut merged_buckets[active_prs.len()]);
 
     Ok(items)
 }
