@@ -138,6 +138,7 @@ pub fn commit(args: &[String]) -> Result<()> {
             in_progress_branch: None,
             parent_id_map,
             parent_name_map,
+            new_base_map: HashMap::new(),
             stash_ref,
             unstage_on_restore: switching_branches,
             autostash,

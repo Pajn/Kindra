@@ -32,6 +32,9 @@ pub struct RebaseState {
     /// branch_name -> original_parent_name (if it was a branch in the sub-stack)
     #[serde(default)]
     pub parent_name_map: HashMap<String, String>,
+    /// branch_name -> explicit new base (branch name or commit id) for reorder-like flows
+    #[serde(default)]
+    pub new_base_map: HashMap<String, String>,
     /// Optional stash token created by `gits commit --on` to preserve non-staged files.
     #[serde(default)]
     pub stash_ref: Option<String>,
@@ -214,7 +217,9 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
             .get(&current_name)
             .ok_or_else(|| anyhow!("Parent ID not found for branch '{}'", current_name))?;
 
-        let new_base = if current_name == state.original_branch {
+        let new_base = if let Some(explicit_base) = state.new_base_map.get(&current_name) {
+            explicit_base.clone()
+        } else if current_name == state.original_branch {
             state.target_branch.clone()
         } else {
             match state.parent_name_map.get(&current_name) {
