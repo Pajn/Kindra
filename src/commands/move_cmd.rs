@@ -1,9 +1,13 @@
 use crate::commands::{find_upstream, resolve_rebase_autostash};
 use crate::rebase_utils::{Operation, RebaseState, run_rebase_loop, save_state, state_path};
-use crate::stack::{collect_descendants, get_stack_branches_from_merge_base, visualize_stack};
+use crate::stack::{
+    collect_descendants, get_stack_branches_from_merge_base, plan_descendant_reorder,
+    visualize_stack,
+};
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
 use git2::Repository;
+use std::collections::HashMap;
 
 #[derive(Args)]
 pub struct MoveArgs {
@@ -125,23 +129,48 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
     let all_branches_in_stack =
         get_stack_branches_from_merge_base(repo, merge_base, head_id, upstream_id, &upstream_name)?;
 
-    let mut sub_stack = Vec::new();
-    collect_descendants(
+    let reorder_plan = plan_descendant_reorder(
         repo,
         &current_branch_name,
+        &selected_target_name,
         &all_branches_in_stack,
-        &mut sub_stack,
+        merge_base,
+        &upstream_name,
     )?;
 
-    // Reject move target if it lies inside the subtree being moved
-    if sub_stack.iter().any(|b| b.name == selected_target_name) {
-        return Err(anyhow!(
-            "Target branch '{}' is inside the subtree being moved.",
-            selected_target_name
-        ));
-    }
+    let (sub_stack, remaining_branches, new_base_map) = if let Some(plan) = reorder_plan {
+        (
+            plan.ordered_sub_stack,
+            plan.remaining_branches,
+            plan.new_base_map,
+        )
+    } else {
+        let mut sub_stack = Vec::new();
+        collect_descendants(
+            repo,
+            &current_branch_name,
+            &all_branches_in_stack,
+            &mut sub_stack,
+        )?;
 
-    crate::stack::sort_branches_topologically(repo, &mut sub_stack)?;
+        if sub_stack
+            .iter()
+            .any(|branch| branch.name == selected_target_name)
+        {
+            return Err(anyhow!(
+                "Target branch '{}' is inside the subtree being moved.",
+                selected_target_name
+            ));
+        }
+
+        crate::stack::sort_branches_topologically(repo, &mut sub_stack)?;
+        let remaining_branches = sub_stack
+            .iter()
+            .map(|sb| sb.name.clone())
+            .filter(|name| name != &selected_target_name)
+            .collect::<Vec<_>>();
+        (sub_stack, remaining_branches, HashMap::new())
+    };
 
     let autostash = resolve_rebase_autostash(
         repo,
@@ -153,12 +182,6 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
             None
         },
     )?;
-
-    let remaining_branches: Vec<String> = sub_stack
-        .iter()
-        .map(|sb| sb.name.clone())
-        .filter(|name| name != &selected_target_name)
-        .collect();
 
     crate::rebase_utils::check_worktrees(&remaining_branches, args.force)?;
 
@@ -180,6 +203,7 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         in_progress_branch: None,
         parent_id_map,
         parent_name_map,
+        new_base_map,
         stash_ref: None,
         unstage_on_restore: false,
         autostash,

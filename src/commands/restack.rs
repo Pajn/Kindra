@@ -77,6 +77,7 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
         in_progress_branch: None,
         parent_id_map,
         parent_name_map,
+        new_base_map: HashMap::new(),
         stash_ref: None,
         unstage_on_restore: false,
         autostash,

@@ -460,13 +460,217 @@ fn test_move_onto_descendant() {
     );
     let fa = repo.find_commit(fa_id).unwrap();
 
-    make_commit(
+    let fb_id = make_commit(
         &repo,
         "refs/heads/feature-b",
         "b.txt",
         "b",
         "b commit",
         &[&fa],
+    );
+    let fb = repo.find_commit(fb_id).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/feature-c",
+        "c.txt",
+        "c",
+        "c commit",
+        &[&fb],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_tree(
+        fa.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.arg("move")
+        .arg("--onto")
+        .arg("feature-b")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    let main = repo.find_branch("main", git2::BranchType::Local).unwrap();
+    let feature_a = repo
+        .find_branch("feature-a", git2::BranchType::Local)
+        .unwrap();
+    let feature_b = repo
+        .find_branch("feature-b", git2::BranchType::Local)
+        .unwrap();
+    let feature_c = repo
+        .find_branch("feature-c", git2::BranchType::Local)
+        .unwrap();
+    let feature_a_commit = repo.find_commit(feature_a.get().target().unwrap()).unwrap();
+    let feature_b_commit = repo.find_commit(feature_b.get().target().unwrap()).unwrap();
+    let feature_c_commit = repo.find_commit(feature_c.get().target().unwrap()).unwrap();
+
+    assert_eq!(
+        feature_b_commit.parent_id(0).unwrap(),
+        main.get().target().unwrap()
+    );
+    assert_eq!(
+        feature_a_commit.parent_id(0).unwrap(),
+        feature_c.get().target().unwrap()
+    );
+    assert_eq!(
+        feature_c_commit.parent_id(0).unwrap(),
+        feature_b.get().target().unwrap()
+    );
+}
+
+#[test]
+fn test_move_onto_descendant_reorders_target_descendants_too() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "initial", &[]);
+    let base = repo.find_commit(base_id).unwrap();
+
+    let fa_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "a commit",
+        &[&base],
+    );
+    let fa = repo.find_commit(fa_id).unwrap();
+
+    let fb_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "b commit",
+        &[&fa],
+    );
+    let fb = repo.find_commit(fb_id).unwrap();
+
+    let fc_id = make_commit(
+        &repo,
+        "refs/heads/feature-c",
+        "c.txt",
+        "c",
+        "c commit",
+        &[&fb],
+    );
+    let fc = repo.find_commit(fc_id).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/feature-d",
+        "d.txt",
+        "d",
+        "d commit",
+        &[&fc],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_tree(
+        fa.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.arg("move")
+        .arg("--onto")
+        .arg("feature-c")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    let main = repo.find_branch("main", git2::BranchType::Local).unwrap();
+    let feature_a = repo
+        .find_branch("feature-a", git2::BranchType::Local)
+        .unwrap();
+    let feature_b = repo
+        .find_branch("feature-b", git2::BranchType::Local)
+        .unwrap();
+    let feature_c = repo
+        .find_branch("feature-c", git2::BranchType::Local)
+        .unwrap();
+    let feature_d = repo
+        .find_branch("feature-d", git2::BranchType::Local)
+        .unwrap();
+    let feature_a_commit = repo.find_commit(feature_a.get().target().unwrap()).unwrap();
+    let feature_b_commit = repo.find_commit(feature_b.get().target().unwrap()).unwrap();
+    let feature_c_commit = repo.find_commit(feature_c.get().target().unwrap()).unwrap();
+    let feature_d_commit = repo.find_commit(feature_d.get().target().unwrap()).unwrap();
+
+    assert_eq!(
+        feature_c_commit.parent_id(0).unwrap(),
+        main.get().target().unwrap()
+    );
+    assert_eq!(
+        feature_d_commit.parent_id(0).unwrap(),
+        feature_c.get().target().unwrap()
+    );
+    assert_eq!(
+        feature_a_commit.parent_id(0).unwrap(),
+        feature_d.get().target().unwrap()
+    );
+    assert_eq!(
+        feature_b_commit.parent_id(0).unwrap(),
+        feature_a.get().target().unwrap()
+    );
+}
+
+#[test]
+fn test_move_onto_descendant_rejects_forked_subtree() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "initial", &[]);
+    let base = repo.find_commit(base_id).unwrap();
+
+    let fa_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "a commit",
+        &[&base],
+    );
+    let fa = repo.find_commit(fa_id).unwrap();
+
+    let fb_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "b commit",
+        &[&fa],
+    );
+    let fb = repo.find_commit(fb_id).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/feature-c",
+        "c.txt",
+        "c",
+        "c commit",
+        &[&fb],
+    );
+    make_commit(
+        &repo,
+        "refs/heads/feature-d",
+        "d.txt",
+        "d",
+        "d commit",
+        &[&fb],
     );
 
     repo.set_head("refs/heads/feature-a").unwrap();
@@ -487,9 +691,192 @@ fn test_move_onto_descendant() {
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
         .assert()
         .failure()
-        .stderr(predicates::str::contains(
-            "Target branch 'feature-b' is inside the subtree being moved.",
-        ));
+        .stderr(predicates::str::contains("affected subtree is forked"));
+}
+
+#[test]
+fn test_move_onto_descendant_rejects_fork_then_merge_subtree() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "initial", &[]);
+    let base = repo.find_commit(base_id).unwrap();
+
+    let fa_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "a commit",
+        &[&base],
+    );
+    let fa = repo.find_commit(fa_id).unwrap();
+
+    let fb_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "b commit",
+        &[&fa],
+    );
+    let fb = repo.find_commit(fb_id).unwrap();
+
+    let fc_id = make_commit(
+        &repo,
+        "refs/heads/feature-c",
+        "c.txt",
+        "c",
+        "c commit",
+        &[&fb],
+    );
+
+    repo.branch("feature-c-old", &repo.find_commit(fc_id).unwrap(), false)
+        .unwrap();
+    repo.branch("feature-d", &repo.find_commit(fb_id).unwrap(), false)
+        .unwrap();
+
+    run_ok("git", &["checkout", "-f", "feature-d"], dir.path());
+    fs::write(dir.path().join("d.txt"), "d").unwrap();
+    run_ok("git", &["add", "d.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "d commit"], dir.path());
+
+    run_ok("git", &["checkout", "-f", "feature-c"], dir.path());
+    run_ok(
+        "git",
+        &["merge", "--no-ff", "feature-d", "-m", "merge d"],
+        dir.path(),
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_tree(
+        fa.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.arg("move")
+        .arg("--onto")
+        .arg("feature-b")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("affected subtree is forked"));
+}
+
+#[test]
+fn test_move_onto_descendant_conflict_and_continue() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "1\n2\n3\n",
+        "base",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    let fa_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "file.txt",
+        "1\nfeature-a\n3\n",
+        "a commit",
+        &[&base],
+    );
+    let fa = repo.find_commit(fa_id).unwrap();
+
+    let fb_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "b commit",
+        &[&fa],
+    );
+    let fb = repo.find_commit(fb_id).unwrap();
+
+    let fc_id = make_commit(
+        &repo,
+        "refs/heads/feature-c",
+        "c.txt",
+        "c",
+        "c commit",
+        &[&fb],
+    );
+    let _fc = repo.find_commit(fc_id).unwrap();
+
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    fs::write(dir.path().join("file.txt"), "1\nmain\n3\n").unwrap();
+    run_ok("git", &["add", "file.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "main commit"], dir.path());
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_tree(
+        fa.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.arg("move")
+        .arg("--onto")
+        .arg("feature-c")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Resolve conflicts"));
+
+    fs::write(dir.path().join("file.txt"), "1\nresolved\n3\n").unwrap();
+    run_ok("git", &["add", "file.txt"], dir.path());
+
+    let mut cmd_cont = gits_cmd();
+    cmd_cont
+        .arg("continue")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let main = repo.find_branch("main", git2::BranchType::Local).unwrap();
+    let feature_a = repo
+        .find_branch("feature-a", git2::BranchType::Local)
+        .unwrap();
+    let feature_b = repo
+        .find_branch("feature-b", git2::BranchType::Local)
+        .unwrap();
+    let feature_c = repo
+        .find_branch("feature-c", git2::BranchType::Local)
+        .unwrap();
+    let feature_a_commit = repo.find_commit(feature_a.get().target().unwrap()).unwrap();
+    let feature_b_commit = repo.find_commit(feature_b.get().target().unwrap()).unwrap();
+    let feature_c_commit = repo.find_commit(feature_c.get().target().unwrap()).unwrap();
+
+    assert_eq!(
+        feature_c_commit.parent_id(0).unwrap(),
+        main.get().target().unwrap()
+    );
+    assert_eq!(
+        feature_a_commit.parent_id(0).unwrap(),
+        feature_c.get().target().unwrap()
+    );
+    assert_eq!(
+        feature_b_commit.parent_id(0).unwrap(),
+        feature_a.get().target().unwrap()
+    );
 }
 
 #[test]
