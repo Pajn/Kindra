@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use git2::{Commit, Oid, Repository};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::process::Command;
 use std::process::Stdio;
@@ -17,31 +17,55 @@ pub struct SyncBoundary {
     pub merged_branches: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ReorderPlan {
+    pub ordered_sub_stack: Vec<StackBranch>,
+    pub remaining_branches: Vec<String>,
+    pub new_base_map: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GraphReorderPlan {
+    pub remaining_branches: Vec<String>,
+    pub parent_id_map: HashMap<String, String>,
+    pub new_base_map: HashMap<String, String>,
+}
+
 pub fn find_sync_boundary(
     repo: &Repository,
     top_branch: &str,
     upstream_name: &str,
+    stack_branches: &[StackBranch],
 ) -> Result<SyncBoundary> {
     let top_id = repo.revparse_single(top_branch)?.id();
     let upstream_id = repo.revparse_single(upstream_name)?.id();
-    let merge_base = repo.merge_base(top_id, upstream_id)?;
+    let merge_base = resolve_merge_base(repo, top_id, upstream_id)?;
+    let lineage = ordered_stack_lineage(repo, top_id, stack_branches)?;
 
-    let first_parent_chain = collect_first_parent_chain(repo, merge_base, top_id)?;
-    let cherry_equivalent = cherry_equivalent_commits(repo, upstream_name, top_branch)?;
+    let mut merged_branches = HashSet::new();
+    let mut branch_cutoff = merge_base;
+    for branch in lineage.iter().take(lineage.len().saturating_sub(1)) {
+        if !branch_segment_integrated(repo, branch_cutoff, branch.id, upstream_id)? {
+            break;
+        }
 
+        merged_branches.insert(branch.name.clone());
+        branch_cutoff = branch.id;
+    }
+
+    let first_parent_chain = collect_first_parent_chain(repo, branch_cutoff, top_id)?;
     let mut prefix_end: isize = -1;
 
     for (idx, &commit_id) in first_parent_chain.iter().enumerate() {
         let merged_by_graph =
             repo.graph_descendant_of(upstream_id, commit_id)? || upstream_id == commit_id;
-        let merged_by_patch = cherry_equivalent.contains(&commit_id);
-        if merged_by_graph || merged_by_patch {
+        let merged_by_content =
+            range_changes_present_in_target(repo, branch_cutoff, commit_id, upstream_id)?;
+        if merged_by_graph || merged_by_content {
             prefix_end = idx as isize;
         }
     }
 
-    // Identify all local branches that are merged.
-    let mut merged_branches = Vec::new();
     let local_branches = repo.branches(Some(git2::BranchType::Local))?;
 
     let upstream_ref_name = repo
@@ -83,17 +107,18 @@ pub fn find_sync_boundary(
             continue;
         }
 
-        // Is it merged?
+        let merged_by_content = merged_branches.contains(&name);
         let merged_by_graph = repo.graph_descendant_of(upstream_id, id)? || upstream_id == id;
-        let merged_by_patch = cherry_equivalent.contains(&id);
 
-        if merged_by_graph || merged_by_patch {
-            merged_branches.push(name);
+        if merged_by_graph || merged_by_content {
+            merged_branches.insert(name);
         }
     }
 
     let first_unmerged_idx = (prefix_end + 1) as usize;
     if first_unmerged_idx >= first_parent_chain.len() {
+        let mut merged_branches = merged_branches.into_iter().collect::<Vec<_>>();
+        merged_branches.sort();
         return Ok(SyncBoundary {
             old_base: None,
             merged_branches,
@@ -109,13 +134,382 @@ pub fn find_sync_boundary(
         ));
     }
 
+    let mut merged_branches = merged_branches.into_iter().collect::<Vec<_>>();
+    merged_branches.sort();
+
     Ok(SyncBoundary {
         old_base: Some(first.parent_id(0)?),
         merged_branches,
     })
 }
 
-fn collect_first_parent_chain(
+pub fn plan_descendant_reorder(
+    repo: &Repository,
+    current_branch_name: &str,
+    target_branch_name: &str,
+    all_branches_in_stack: &[StackBranch],
+    merge_base: Oid,
+    upstream_name: &str,
+) -> Result<Option<ReorderPlan>> {
+    if current_branch_name == target_branch_name {
+        return Ok(None);
+    }
+
+    let mut sub_stack = Vec::new();
+    collect_descendants(
+        repo,
+        current_branch_name,
+        all_branches_in_stack,
+        &mut sub_stack,
+    )?;
+
+    if !sub_stack
+        .iter()
+        .any(|branch| branch.name == target_branch_name)
+    {
+        return Ok(None);
+    }
+
+    let tips = get_stack_tips(repo, &sub_stack)?;
+    if tips.len() > 1 {
+        return Err(anyhow!(
+            "Cannot reorder '{}' onto '{}' because the affected subtree is forked. Same-stack reordering only supports a single linear path.",
+            current_branch_name,
+            target_branch_name
+        ));
+    }
+
+    if !branches_are_linearly_ordered(repo, &sub_stack)? {
+        return Err(anyhow!(
+            "Cannot reorder '{}' onto '{}' because the affected subtree is forked. Same-stack reordering only supports a single linear path.",
+            current_branch_name,
+            target_branch_name
+        ));
+    }
+
+    sort_branches_topologically(repo, &mut sub_stack)?;
+    let target_index = sub_stack
+        .iter()
+        .position(|branch| branch.name == target_branch_name)
+        .ok_or_else(|| {
+            anyhow!(
+                "Target branch '{}' not found in subtree.",
+                target_branch_name
+            )
+        })?;
+
+    let reordered = sub_stack[target_index..]
+        .iter()
+        .chain(sub_stack[..target_index].iter())
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let current_parent_id =
+        find_parent_in_stack(repo, current_branch_name, all_branches_in_stack, merge_base)?;
+    let current_parent = if current_parent_id == merge_base {
+        upstream_name.to_string()
+    } else {
+        parent_base_spec(
+            current_parent_id,
+            current_branch_name,
+            all_branches_in_stack,
+        )
+    };
+
+    let mut remaining_branches = Vec::with_capacity(reordered.len());
+    let mut new_base_map = HashMap::new();
+    for (idx, branch) in reordered.iter().enumerate() {
+        remaining_branches.push(branch.name.clone());
+        let new_base = if idx == 0 {
+            current_parent.clone()
+        } else {
+            reordered[idx - 1].name.clone()
+        };
+        new_base_map.insert(branch.name.clone(), new_base);
+    }
+
+    Ok(Some(ReorderPlan {
+        ordered_sub_stack: sub_stack,
+        remaining_branches,
+        new_base_map,
+    }))
+}
+
+fn branches_are_linearly_ordered(repo: &Repository, branches: &[StackBranch]) -> Result<bool> {
+    for (idx, branch) in branches.iter().enumerate() {
+        for other in branches.iter().skip(idx + 1) {
+            let comparable = repo.graph_descendant_of(branch.id, other.id)?
+                || repo.graph_descendant_of(other.id, branch.id)?
+                || branch.id == other.id;
+            if !comparable {
+                return Ok(false);
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+fn parent_base_spec(parent_id: Oid, branch_name: &str, all_branches: &[StackBranch]) -> String {
+    all_branches
+        .iter()
+        .find(|branch| branch.id == parent_id && branch.name != branch_name)
+        .map(|branch| branch.name.clone())
+        .unwrap_or_else(|| parent_id.to_string())
+}
+
+pub fn collect_stack_component(
+    repo: &Repository,
+    current_branch_name: &str,
+    merge_base: Oid,
+    upstream_id: Oid,
+    upstream_name: &str,
+) -> Result<Vec<StackBranch>> {
+    let local_branches = repo.branches(Some(git2::BranchType::Local))?;
+    let mut candidates = Vec::new();
+
+    for branch_result in local_branches {
+        let (branch, _) = branch_result?;
+        let Some(name) = branch.name()? else {
+            continue;
+        };
+        if name == upstream_name {
+            continue;
+        }
+
+        let Some(id) = branch.get().target() else {
+            continue;
+        };
+
+        let is_descendant_of_merge_base =
+            repo.graph_descendant_of(id, merge_base)? || id == merge_base;
+        let is_on_upstream = repo.graph_descendant_of(upstream_id, id)? || upstream_id == id;
+        if is_descendant_of_merge_base && !is_on_upstream {
+            candidates.push(StackBranch {
+                name: name.to_string(),
+                id,
+            });
+        }
+    }
+
+    if !candidates
+        .iter()
+        .any(|branch| branch.name == current_branch_name)
+    {
+        return Err(anyhow!(
+            "Branch '{}' not found in the current stack component.",
+            current_branch_name
+        ));
+    }
+
+    let mut adjacency: HashMap<String, Vec<String>> = candidates
+        .iter()
+        .map(|branch| (branch.name.clone(), Vec::new()))
+        .collect();
+
+    for branch in &candidates {
+        let parent_id = find_parent_in_stack(repo, &branch.name, &candidates, merge_base)?;
+        if let Some(parent_branch) = candidates
+            .iter()
+            .find(|candidate| candidate.id == parent_id && candidate.name != branch.name)
+        {
+            adjacency
+                .get_mut(&branch.name)
+                .expect("branch adjacency entry must exist")
+                .push(parent_branch.name.clone());
+            adjacency
+                .get_mut(&parent_branch.name)
+                .expect("parent adjacency entry must exist")
+                .push(branch.name.clone());
+        }
+    }
+
+    let mut queue = VecDeque::from([current_branch_name.to_string()]);
+    let mut visited = HashSet::new();
+    while let Some(branch_name) = queue.pop_front() {
+        if !visited.insert(branch_name.clone()) {
+            continue;
+        }
+        if let Some(neighbors) = adjacency.get(&branch_name) {
+            for neighbor in neighbors {
+                if !visited.contains(neighbor) {
+                    queue.push_back(neighbor.clone());
+                }
+            }
+        }
+    }
+
+    let mut component = candidates
+        .into_iter()
+        .filter(|branch| visited.contains(&branch.name))
+        .collect::<Vec<_>>();
+    sort_branches_topologically(repo, &mut component)?;
+    Ok(component)
+}
+
+pub fn current_parent_name_map(
+    repo: &Repository,
+    branches: &[StackBranch],
+    merge_base: Oid,
+    upstream_name: &str,
+) -> Result<HashMap<String, String>> {
+    let mut parent_map = HashMap::new();
+
+    for branch in branches {
+        let parent_id = find_parent_in_stack(repo, &branch.name, branches, merge_base)?;
+        let parent_name = if parent_id == merge_base {
+            upstream_name.to_string()
+        } else {
+            branches
+                .iter()
+                .find(|candidate| candidate.id == parent_id && candidate.name != branch.name)
+                .map(|candidate| candidate.name.clone())
+                .ok_or_else(|| anyhow!("Failed to resolve parent branch for '{}'.", branch.name))?
+        };
+        parent_map.insert(branch.name.clone(), parent_name);
+    }
+
+    Ok(parent_map)
+}
+
+pub fn plan_graph_reorder(
+    repo: &Repository,
+    branches: &[StackBranch],
+    merge_base: Oid,
+    upstream_name: &str,
+    edited_parent_map: &HashMap<String, String>,
+) -> Result<GraphReorderPlan> {
+    let expected_names = branches
+        .iter()
+        .map(|branch| branch.name.clone())
+        .collect::<HashSet<_>>();
+
+    if edited_parent_map.len() != branches.len() {
+        return Err(anyhow!(
+            "Edited branch graph is incomplete. Every branch must appear exactly once."
+        ));
+    }
+
+    for branch in branches {
+        let Some(parent_name) = edited_parent_map.get(&branch.name) else {
+            return Err(anyhow!(
+                "Branch '{}' is missing from the edited graph.",
+                branch.name
+            ));
+        };
+
+        if parent_name == &branch.name {
+            return Err(anyhow!(
+                "Branch '{}' cannot list itself as its parent.",
+                branch.name
+            ));
+        }
+
+        if parent_name != upstream_name && !expected_names.contains(parent_name) {
+            return Err(anyhow!(
+                "Branch '{}' has unknown parent '{}'.",
+                branch.name,
+                parent_name
+            ));
+        }
+    }
+
+    let order_hint = branches
+        .iter()
+        .enumerate()
+        .map(|(idx, branch)| (branch.name.clone(), idx))
+        .collect::<HashMap<_, _>>();
+    let remaining_branches =
+        topologically_sort_edited_graph(edited_parent_map, upstream_name, &order_hint)?;
+
+    let mut parent_id_map = HashMap::new();
+    let mut new_base_map = HashMap::new();
+    for branch in branches {
+        let parent_id = find_parent_in_stack(repo, &branch.name, branches, merge_base)?;
+        parent_id_map.insert(branch.name.clone(), parent_id.to_string());
+        new_base_map.insert(
+            branch.name.clone(),
+            edited_parent_map
+                .get(&branch.name)
+                .expect("edited parent map already validated")
+                .clone(),
+        );
+    }
+
+    Ok(GraphReorderPlan {
+        remaining_branches,
+        parent_id_map,
+        new_base_map,
+    })
+}
+
+fn topologically_sort_edited_graph(
+    edited_parent_map: &HashMap<String, String>,
+    upstream_name: &str,
+    order_hint: &HashMap<String, usize>,
+) -> Result<Vec<String>> {
+    let mut indegree = edited_parent_map
+        .keys()
+        .map(|branch| (branch.clone(), 0usize))
+        .collect::<HashMap<_, _>>();
+    let mut children = edited_parent_map
+        .keys()
+        .map(|branch| (branch.clone(), Vec::new()))
+        .collect::<HashMap<_, Vec<String>>>();
+
+    for (branch, parent) in edited_parent_map {
+        if parent == upstream_name {
+            continue;
+        }
+        *indegree
+            .get_mut(branch)
+            .expect("indegree entry must exist for branch") += 1;
+        children
+            .get_mut(parent)
+            .expect("child list must exist for parent branch")
+            .push(branch.clone());
+    }
+
+    let mut ready = indegree
+        .iter()
+        .filter(|(_, degree)| **degree == 0)
+        .map(|(branch, _)| branch.clone())
+        .collect::<Vec<_>>();
+    ready.sort_by_key(|branch| order_hint.get(branch).copied().unwrap_or(usize::MAX));
+    let mut ready = VecDeque::from(ready);
+
+    let mut sorted = Vec::with_capacity(edited_parent_map.len());
+    while let Some(branch) = ready.pop_front() {
+        sorted.push(branch.clone());
+
+        if let Some(child_names) = children.get(&branch) {
+            for child in child_names {
+                let degree = indegree
+                    .get_mut(child)
+                    .expect("indegree entry must exist for child branch");
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.push_back(child.clone());
+                }
+            }
+            let mut ready_sorted = ready.into_iter().collect::<Vec<_>>();
+            ready_sorted
+                .sort_by_key(|candidate| order_hint.get(candidate).copied().unwrap_or(usize::MAX));
+            ready = VecDeque::from(ready_sorted);
+        }
+    }
+
+    if sorted.len() != edited_parent_map.len() {
+        return Err(anyhow!(
+            "Edited branch graph contains a cycle. Every branch must eventually trace back to '{}'.",
+            upstream_name
+        ));
+    }
+
+    Ok(sorted)
+}
+
+pub fn collect_first_parent_chain(
     repo: &Repository,
     ancestor_exclusive: Oid,
     tip: Oid,
@@ -140,77 +534,12 @@ fn collect_first_parent_chain(
     Ok(chain)
 }
 
-pub fn cherry_equivalent_commits(
-    repo: &Repository,
-    upstream_name: &str,
-    top_branch: &str,
-) -> Result<HashSet<Oid>> {
-    let output = Command::new("git")
-        .arg("cherry")
-        .arg(upstream_name)
-        .arg(top_branch)
-        .current_dir(repo_root(repo)?)
-        .output()?;
-
-    if !output.status.success() {
-        return Err(anyhow!(
-            "git cherry failed while computing sync boundary for '{}'.",
-            top_branch
-        ));
-    }
-
-    let mut result = HashSet::new();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let mut parts = line.split_whitespace();
-        let marker = parts.next().unwrap_or_default();
-        if marker != "-" {
-            continue;
-        }
-
-        if let Some(oid_text) = parts.next()
-            && let Ok(oid) = Oid::from_str(oid_text)
-        {
-            result.insert(oid);
-        }
-    }
-
-    Ok(result)
-}
-
-pub fn collect_reachable_patch_ids(repo: &Repository, ref_name: &str) -> Result<HashSet<String>> {
-    let target_id = repo.revparse_single(ref_name)?.id();
-    let mut walk = repo.revwalk()?;
-    walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
-    walk.push(target_id)?;
-
-    let mut commit_ids = Vec::new();
-    for id_res in walk {
-        commit_ids.push(id_res?);
-    }
-
-    let mut patch_id_cache = HashMap::new();
-    ensure_patch_ids(repo, &commit_ids, &mut patch_id_cache)?;
-    Ok(commit_ids
-        .into_iter()
-        .filter_map(|oid| patch_id_cache.remove(&oid).flatten())
-        .collect())
-}
-
-pub fn compute_patch_ids_for_commits(
-    repo: &Repository,
-    commit_ids: &[Oid],
-) -> Result<HashMap<Oid, String>> {
-    compute_patch_ids(repo, commit_ids)
-}
-
 pub fn collect_merged_local_branches(
     repo: &Repository,
     target_ref_name: &str,
     protected_branches: &[&str],
 ) -> Result<Vec<String>> {
     let target_id = repo.revparse_single(target_ref_name)?.id();
-    let target_patch_ids = collect_reachable_patch_ids(repo, target_ref_name)?;
     let full_target_ref_name = repo
         .resolve_reference_from_short_name(target_ref_name)
         .ok()
@@ -252,18 +581,15 @@ pub fn collect_merged_local_branches(
     for (name, branch_id) in branches {
         let merged_by_graph =
             target_id == branch_id || repo.graph_descendant_of(target_id, branch_id)?;
-        let merged_by_patch = if merged_by_graph {
+        let merged_by_content = if merged_by_graph {
             false
+        } else if let Ok(merge_base) = repo.merge_base(branch_id, target_id) {
+            range_changes_present_in_target(repo, merge_base, branch_id, target_id)?
         } else {
-            let exclusive_commit_ids = collect_exclusive_commits(repo, branch_id, target_id)?;
-            let exclusive_patch_ids = compute_patch_ids_for_commits(repo, &exclusive_commit_ids)?
-                .into_values()
-                .collect::<HashSet<_>>();
-
-            !exclusive_patch_ids.is_empty() && exclusive_patch_ids.is_subset(&target_patch_ids)
+            false
         };
 
-        if merged_by_graph || merged_by_patch {
+        if merged_by_graph || merged_by_content {
             merged_branches.push(name);
         }
     }
@@ -565,22 +891,178 @@ fn compute_patch_ids(repo: &Repository, commit_ids: &[Oid]) -> Result<HashMap<Oi
     Ok(result)
 }
 
-fn collect_exclusive_commits(
+fn range_changes_present_in_target(
     repo: &Repository,
-    branch_id: Oid,
-    target_id: Oid,
-) -> Result<Vec<Oid>> {
-    let mut walk = repo.revwalk()?;
-    walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
-    walk.push(branch_id)?;
-    walk.hide(target_id)?;
-
-    let mut commit_ids = Vec::new();
-    for id_res in walk {
-        commit_ids.push(id_res?);
+    base_id: Oid,
+    branch_tip: Oid,
+    target_tip: Oid,
+) -> Result<bool> {
+    if branch_tip == base_id {
+        return Ok(true);
     }
 
-    Ok(commit_ids)
+    let output = Command::new("git")
+        .arg("diff")
+        .arg("--name-only")
+        .arg("--no-renames")
+        .arg("--no-ext-diff")
+        .arg(base_id.to_string())
+        .arg(branch_tip.to_string())
+        .current_dir(repo_root(repo)?)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git diff failed while checking whether branch changes are present in target."
+        ));
+    }
+
+    let touched_paths = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+
+    if touched_paths.is_empty() {
+        return Ok(true);
+    }
+
+    let repo_root = repo_root(repo)?;
+    let branch_patch_id = compute_range_patch_id(
+        repo_root,
+        &format!("{base_id}..{branch_tip}"),
+        &touched_paths,
+    )?
+    .ok_or_else(|| anyhow!("Missing branch patch id while checking target containment."))?;
+    let target_patch_id = compute_range_patch_id(
+        repo_root,
+        &format!("{base_id}..{target_tip}"),
+        &touched_paths,
+    )?;
+
+    if target_patch_id.as_deref() == Some(branch_patch_id.as_str()) {
+        return Ok(true);
+    }
+
+    let Some(_) = target_patch_id else {
+        return Ok(false);
+    };
+
+    let mut log_child = Command::new("git")
+        .arg("log")
+        .arg("-p")
+        .arg("--format=%H")
+        .arg(target_tip.to_string())
+        .arg("--")
+        .args(&touched_paths)
+        .current_dir(repo_root)
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    let log_stdout = log_child.stdout.take().ok_or_else(|| {
+        anyhow!("Failed to capture git log output while checking target patch ids.")
+    })?;
+
+    let target_patch_output = Command::new("git")
+        .arg("patch-id")
+        .arg("--stable")
+        .current_dir(repo_root)
+        .stdin(Stdio::from(log_stdout))
+        .output()?;
+
+    let log_status = log_child.wait()?;
+    if !log_status.success() {
+        return Err(anyhow!(
+            "git log failed while checking whether branch changes are present in target."
+        ));
+    }
+    if !target_patch_output.status.success() {
+        return Err(anyhow!(
+            "git patch-id failed while checking whether branch changes are present in target."
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&target_patch_output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .any(|patch_id| patch_id == branch_patch_id))
+}
+
+fn compute_range_patch_id(
+    repo_root: &Path,
+    range_spec: &str,
+    touched_paths: &[String],
+) -> Result<Option<String>> {
+    let mut diff_child = Command::new("git")
+        .arg("diff")
+        .arg("-U0")
+        .arg("--no-ext-diff")
+        .arg(range_spec)
+        .arg("--")
+        .args(touched_paths)
+        .current_dir(repo_root)
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    let diff_stdout = diff_child.stdout.take().ok_or_else(|| {
+        anyhow!("Failed to capture git diff output while computing range patch id.")
+    })?;
+
+    let patch_output = Command::new("git")
+        .arg("patch-id")
+        .arg("--stable")
+        .current_dir(repo_root)
+        .stdin(Stdio::from(diff_stdout))
+        .output()?;
+
+    let diff_status = diff_child.wait()?;
+    if !diff_status.success() {
+        return Err(anyhow!(
+            "git diff failed while computing range patch id for target containment."
+        ));
+    }
+    if !patch_output.status.success() {
+        return Err(anyhow!(
+            "git patch-id failed while computing range patch id for target containment."
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&patch_output.stdout)
+        .lines()
+        .find_map(|line| {
+            line.split_whitespace()
+                .next()
+                .map(|patch_id| patch_id.to_string())
+        }))
+}
+
+fn ordered_stack_lineage(
+    repo: &Repository,
+    top_id: Oid,
+    stack_branches: &[StackBranch],
+) -> Result<Vec<StackBranch>> {
+    let mut lineage = Vec::new();
+    for branch in stack_branches {
+        if branch.id == top_id || repo.graph_descendant_of(top_id, branch.id)? {
+            lineage.push(branch.clone());
+        }
+    }
+
+    sort_branches_topologically(repo, &mut lineage)?;
+    Ok(lineage)
+}
+
+fn branch_segment_integrated(
+    repo: &Repository,
+    old_base: Oid,
+    branch_tip: Oid,
+    upstream_id: Oid,
+) -> Result<bool> {
+    if repo.graph_descendant_of(upstream_id, branch_tip)? {
+        return Ok(true);
+    }
+
+    range_changes_present_in_target(repo, old_base, branch_tip, upstream_id)
 }
 
 fn repo_root(repo: &Repository) -> Result<&Path> {
@@ -891,36 +1373,53 @@ fn is_descendant(repo: &Repository, a: Oid, b: Oid) -> Result<bool> {
 }
 
 pub fn sort_branches_topologically(repo: &Repository, branches: &mut [StackBranch]) -> Result<()> {
-    let mut sort_error = None;
-    branches.sort_by(|a, b| {
-        use std::cmp::Ordering;
-        if a.id == b.id {
-            return Ordering::Equal;
-        }
-        let a_desc_b = match is_descendant(repo, a.id, b.id) {
-            Ok(v) => v,
-            Err(e) => {
-                sort_error = Some(e);
-                return Ordering::Equal;
-            }
-        };
-        let b_desc_a = match is_descendant(repo, b.id, a.id) {
-            Ok(v) => v,
-            Err(e) => {
-                sort_error = Some(e);
-                return Ordering::Equal;
-            }
-        };
-        match (a_desc_b, b_desc_a) {
-            (true, false) => Ordering::Greater,
-            (false, true) => Ordering::Less,
-            _ => a.name.cmp(&b.name),
-        }
-    });
+    let original = branches.to_vec();
+    let mut outgoing = vec![Vec::new(); original.len()];
+    let mut indegree = vec![0usize; original.len()];
 
-    if let Some(e) = sort_error {
-        return Err(e);
+    for (idx, branch) in original.iter().enumerate() {
+        for (other_idx, other) in original.iter().enumerate() {
+            if idx == other_idx || branch.id == other.id {
+                continue;
+            }
+
+            if is_descendant(repo, branch.id, other.id)? {
+                outgoing[other_idx].push(idx);
+                indegree[idx] += 1;
+            }
+        }
     }
+
+    let mut ready = (0..original.len())
+        .filter(|&idx| indegree[idx] == 0)
+        .collect::<Vec<_>>();
+    ready.sort_by(|&a, &b| original[a].name.cmp(&original[b].name));
+    let mut ready = VecDeque::from(ready);
+
+    let mut ordered = Vec::with_capacity(original.len());
+    while let Some(idx) = ready.pop_front() {
+        ordered.push(idx);
+
+        for &child_idx in &outgoing[idx] {
+            indegree[child_idx] -= 1;
+            if indegree[child_idx] == 0 {
+                ready.push_back(child_idx);
+            }
+        }
+
+        let mut ready_sorted = ready.into_iter().collect::<Vec<_>>();
+        ready_sorted.sort_by(|&a, &b| original[a].name.cmp(&original[b].name));
+        ready = VecDeque::from(ready_sorted);
+    }
+
+    if ordered.len() != original.len() {
+        return Err(anyhow!("Failed to topologically sort stack branches."));
+    }
+
+    for (slot, idx) in ordered.into_iter().enumerate() {
+        branches[slot] = original[idx].clone();
+    }
+
     Ok(())
 }
 

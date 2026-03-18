@@ -194,6 +194,12 @@ fn sync_handles_squashed_lower_branch() {
     run_ok("git", &["commit", "-m", "squash feature-a"], dir.path());
 
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    let old_feature_a = repo
+        .find_branch("feature-a", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
 
     let mut cmd = gits_cmd();
     cmd.arg("sync")
@@ -218,6 +224,7 @@ fn sync_handles_squashed_lower_branch() {
         .get()
         .target()
         .unwrap();
+    let feature_b_commit = repo.find_commit(new_feature_b).unwrap();
     let main_tip = repo
         .find_branch("main", BranchType::Local)
         .unwrap()
@@ -225,16 +232,10 @@ fn sync_handles_squashed_lower_branch() {
         .target()
         .unwrap();
 
-    assert!(
-        repo.graph_descendant_of(new_feature_a, main_tip).unwrap() || new_feature_a == main_tip
-    );
-    assert!(
-        repo.graph_descendant_of(new_feature_b, new_feature_a)
-            .unwrap()
-            || new_feature_b == new_feature_a
-    );
+    assert_eq!(new_feature_a, old_feature_a);
     assert_ne!(new_feature_b, old_feature_b);
     assert!(repo.graph_descendant_of(new_feature_b, main_tip).unwrap());
+    assert_eq!(feature_b_commit.parent_id(0).unwrap(), main_tip);
 }
 
 #[test]
@@ -320,6 +321,337 @@ fn sync_handles_merged_lower_branch() {
     assert_eq!(new_feature_a, old_feature_a);
     assert_ne!(new_feature_b, old_feature_b);
     assert!(repo.graph_descendant_of(new_feature_b, main_tip).unwrap());
+}
+
+#[test]
+fn sync_skips_squashed_lower_branch_and_deletes_it() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "shared.txt",
+        "base\n",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "feature a part 1\n",
+        "feature a1",
+        &[&base],
+    );
+    let a1 = repo.find_commit(a1_id).unwrap();
+
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "feature a final\n",
+        "feature a2",
+        &[&a1],
+    );
+    let a2 = repo.find_commit(a2_id).unwrap();
+
+    let old_feature_b = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "branch b\n",
+        "feature b",
+        &[&a2],
+    );
+
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    let squash_range = format!("{}^..{}", a1_id, a2_id);
+    run_ok(
+        "git",
+        &["cherry-pick", "--no-commit", &squash_range],
+        dir.path(),
+    );
+    run_ok("git", &["commit", "-m", "squash feature-a"], dir.path());
+    fs::write(dir.path().join("main.txt"), "main advanced\n").unwrap();
+    run_ok("git", &["add", "main.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "main advanced"], dir.path());
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-b"));
+    assert!(repo.find_branch("feature-a", BranchType::Local).is_err());
+
+    let new_feature_b = repo
+        .find_branch("feature-b", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let main_tip = repo
+        .find_branch("main", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let feature_b_commit = repo.find_commit(new_feature_b).unwrap();
+
+    assert_ne!(new_feature_b, old_feature_b);
+    assert!(repo.graph_descendant_of(new_feature_b, main_tip).unwrap());
+    assert_eq!(feature_b_commit.parent_id(0).unwrap(), main_tip);
+}
+
+#[test]
+fn sync_skips_rewritten_lower_branch_on_main() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "shared.txt",
+        "base\n",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "feature a part 1\n",
+        "feature a1",
+        &[&base],
+    );
+    let a1 = repo.find_commit(a1_id).unwrap();
+
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "feature a final\n",
+        "feature a2",
+        &[&a1],
+    );
+    let a2 = repo.find_commit(a2_id).unwrap();
+
+    let old_feature_b = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "branch b\n",
+        "feature b",
+        &[&a2],
+    );
+
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    fs::write(dir.path().join("shared.txt"), "main rewrite temp\n").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "rewrite temp"], dir.path());
+    fs::write(dir.path().join("shared.txt"), "feature a final\n").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "rewrite final"], dir.path());
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync")
+        .arg("--no-delete")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-b"));
+
+    let new_feature_b = repo
+        .find_branch("feature-b", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let main_tip = repo
+        .find_branch("main", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let feature_b_commit = repo.find_commit(new_feature_b).unwrap();
+
+    assert_ne!(new_feature_b, old_feature_b);
+    assert!(repo.graph_descendant_of(new_feature_b, main_tip).unwrap());
+    assert_eq!(feature_b_commit.parent_id(0).unwrap(), main_tip);
+}
+
+#[test]
+fn sync_skips_integrated_lower_branch_and_cherry_equivalent_upper_commit() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "shared.txt",
+        "base\n",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "feature a part 1\n",
+        "feature a1",
+        &[&base],
+    );
+    let a1 = repo.find_commit(a1_id).unwrap();
+
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "feature a final\n",
+        "feature a2",
+        &[&a1],
+    );
+    let a2 = repo.find_commit(a2_id).unwrap();
+
+    let b1_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "shared-upper.txt",
+        "shared upper\n",
+        "feature b1",
+        &[&a2],
+    );
+    let b1 = repo.find_commit(b1_id).unwrap();
+
+    let old_feature_b = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "unique-upper.txt",
+        "unique upper\n",
+        "feature b2",
+        &[&b1],
+    );
+
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    let squash_range = format!("{}^..{}", a1_id, a2_id);
+    run_ok(
+        "git",
+        &["cherry-pick", "--no-commit", &squash_range],
+        dir.path(),
+    );
+    run_ok("git", &["commit", "-m", "squash feature-a"], dir.path());
+    run_ok("git", &["cherry-pick", &b1_id.to_string()], dir.path());
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync")
+        .arg("--no-delete")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let new_feature_b = repo
+        .find_branch("feature-b", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let main_tip = repo
+        .find_branch("main", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let feature_b_commit = repo.find_commit(new_feature_b).unwrap();
+
+    assert_ne!(new_feature_b, old_feature_b);
+    assert!(repo.graph_descendant_of(new_feature_b, main_tip).unwrap());
+    assert_eq!(feature_b_commit.parent_id(0).unwrap(), main_tip);
+}
+
+#[test]
+fn sync_does_not_skip_partially_integrated_lower_branch() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "shared.txt",
+        "base\n",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "feature a part 1\n",
+        "feature a1",
+        &[&base],
+    );
+    let a1 = repo.find_commit(a1_id).unwrap();
+
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "feature a final\n",
+        "feature a2",
+        &[&a1],
+    );
+    let a2 = repo.find_commit(a2_id).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "branch b\n",
+        "feature b",
+        &[&a2],
+    );
+
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    fs::write(
+        dir.path().join("shared.txt"),
+        "feature a part 1 plus main tweak\n",
+    )
+    .unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "partial integration"], dir.path());
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("rebase").or(predicate::str::contains("Resolve conflicts")),
+        );
+
+    assert!(
+        dir.path().join(".git/rebase-merge").exists()
+            || dir.path().join(".git/rebase-apply").exists(),
+        "Expected git rebase state to remain after partially integrated lower branch conflict"
+    );
 }
 
 #[test]
@@ -917,6 +1249,84 @@ fn sync_errors_when_git_too_old_for_update_refs() {
 
 #[cfg(unix)]
 #[test]
+fn sync_on_main_errors_when_git_too_old_for_reapply_cherry_picks() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let remote_dir = dir.path().join("remote.git");
+    fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    run_ok("git", &["push", "-u", "origin", "main:main"], dir.path());
+
+    let remote_worktree = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote_dir.to_str().unwrap(),
+            remote_worktree.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "main"], remote_worktree.path());
+    fs::write(remote_worktree.path().join("remote.txt"), "remote main").unwrap();
+    run_ok("git", &["add", "remote.txt"], remote_worktree.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "remote main advanced"],
+        remote_worktree.path(),
+    );
+    run_ok("git", &["push", "origin", "main"], remote_worktree.path());
+
+    let git_wrapper = dir.path().join("git");
+    let real_git = which::which("git").unwrap();
+    fs::write(
+        &git_wrapper,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"git version 2.33.0\"\n  exit 0\nfi\nexec \"{}\" \"$@\"\n",
+            real_git.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&git_wrapper).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&git_wrapper, perms).unwrap();
+
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", dir.path().display(), old_path);
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync")
+        .current_dir(dir.path())
+        .env("PATH", new_path)
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("operation requires Git >= 2.34.0").and(
+                predicate::str::contains("--reapply-cherry-picks")
+                    .and(predicate::str::contains("--empty=keep")),
+            ),
+        );
+}
+
+#[cfg(unix)]
+#[test]
 fn sync_checkout_error_includes_branch_name() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1126,6 +1536,88 @@ fn sync_on_main_rebases_to_latest_origin_main_and_deletes_merged_local_branches(
     assert!(repo.find_branch("feature-a", BranchType::Local).is_err());
     assert!(repo.find_branch("feature-b", BranchType::Local).is_ok());
     assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+}
+
+#[test]
+fn sync_preserves_state_on_prestart_rebase_failure_after_tip_checkout() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "shared.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feature a",
+        &[&base],
+    );
+    let a = repo.find_commit(a_id).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "feature b",
+        &[&a],
+    );
+
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    fs::write(dir.path().join("main.txt"), "main advanced").unwrap();
+    run_ok("git", &["add", "main.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "main advanced"], dir.path());
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    fs::write(dir.path().join("shared.txt"), "dirty").unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync")
+        .arg("--no-autostash")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "git rebase failed before sync could enter an in-progress state",
+        ));
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(repo.state(), git2::RepositoryState::Clean);
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-b"));
+    assert!(dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(!dir.path().join(".git/rebase-merge").exists());
+    assert!(!dir.path().join(".git/rebase-apply").exists());
+
+    let mut continue_cmd = gits_cmd();
+    continue_cmd
+        .arg("continue")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Sync did not complete"));
+
+    let mut abort_cmd = gits_cmd();
+    abort_cmd
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(repo.state(), git2::RepositoryState::Clean);
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-a"));
+    assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(!dir.path().join(".git/rebase-merge").exists());
+    assert!(!dir.path().join(".git/rebase-apply").exists());
 }
 
 #[test]
@@ -1421,16 +1913,14 @@ fn sync_on_main_does_not_delete_branch_when_only_tip_patch_matches() {
         &[&feature_first],
     );
 
-    make_commit(
-        &repo,
-        "refs/heads/main",
-        "shared.txt",
-        "tip patch",
-        "main matches only tip patch",
-        &[&base],
-    );
-
     run_ok("git", &["checkout", "-f", "main"], dir.path());
+    fs::write(dir.path().join("shared.txt"), "tip patch").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "main matches only tip patch"],
+        dir.path(),
+    );
 
     let mut cmd = gits_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().success();
@@ -1562,4 +2052,183 @@ fn sync_does_not_delete_branch_with_only_tree_match() {
     let repo = Repository::open(dir.path()).unwrap();
     // feature-a should NOT be deleted even though its tree matches main
     assert!(repo.find_branch("feature-a", BranchType::Local).is_ok());
+}
+
+#[test]
+fn sync_does_not_treat_historical_tree_match_as_merged() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-f", "-b", "feature-a", "main"],
+        dir.path(),
+    );
+    fs::write(dir.path().join("a.txt"), "a").unwrap();
+    run_ok("git", &["add", "a.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "feature a"], dir.path());
+
+    run_ok("git", &["checkout", "-f", "-b", "feature-b"], dir.path());
+    fs::write(dir.path().join("b.txt"), "b").unwrap();
+    run_ok("git", &["add", "b.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "feature b"], dir.path());
+    let old_feature_b = Repository::open(dir.path())
+        .unwrap()
+        .find_branch("feature-b", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    fs::write(dir.path().join("temp.txt"), "temp").unwrap();
+    run_ok("git", &["add", "temp.txt"], dir.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "temporary upstream change"],
+        dir.path(),
+    );
+    run_ok("git", &["rm", "temp.txt"], dir.path());
+    fs::write(dir.path().join("a.txt"), "a").unwrap();
+    run_ok("git", &["add", "a.txt"], dir.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "upstream briefly matches feature-a tree"],
+        dir.path(),
+    );
+    run_ok("git", &["rm", "a.txt"], dir.path());
+    fs::write(dir.path().join("main.txt"), "main").unwrap();
+    run_ok("git", &["add", "main.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "main moved on"], dir.path());
+
+    run_ok("git", &["checkout", "-f", "feature-b"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let new_feature_b = repo
+        .find_branch("feature-b", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+
+    assert_ne!(
+        new_feature_b, old_feature_b,
+        "feature-b should be rebased instead of dropping feature-a's reverted patch"
+    );
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-b"));
+    let show_a = std::process::Command::new("git")
+        .args(["show", "HEAD:a.txt"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        show_a.status.success(),
+        "feature-b should still contain a.txt after sync. stderr:\n{}",
+        String::from_utf8_lossy(&show_a.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&show_a.stdout).trim(), "a");
+}
+
+#[test]
+fn sync_skips_squashed_lower_branch_after_later_upstream_edits_on_same_path() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "shared.txt",
+        "base\n",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "feature a part 1\n",
+        "feature a1",
+        &[&base],
+    );
+    let a1 = repo.find_commit(a1_id).unwrap();
+
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "feature a final\n",
+        "feature a2",
+        &[&a1],
+    );
+    let a2 = repo.find_commit(a2_id).unwrap();
+
+    let old_feature_b = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "branch b\n",
+        "feature b",
+        &[&a2],
+    );
+
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    let squash_range = format!("{}^..{}", a1_id, a2_id);
+    run_ok(
+        "git",
+        &["cherry-pick", "--no-commit", &squash_range],
+        dir.path(),
+    );
+    run_ok("git", &["commit", "-m", "squash feature-a"], dir.path());
+    fs::write(
+        dir.path().join("shared.txt"),
+        "feature a final\nmain later edit\n",
+    )
+    .unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "main later edits shared path"],
+        dir.path(),
+    );
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-b"));
+    assert!(repo.find_branch("feature-a", BranchType::Local).is_err());
+
+    let new_feature_b = repo
+        .find_branch("feature-b", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let main_tip = repo
+        .find_branch("main", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let feature_b_commit = repo.find_commit(new_feature_b).unwrap();
+
+    assert_ne!(new_feature_b, old_feature_b);
+    assert!(repo.graph_descendant_of(new_feature_b, main_tip).unwrap());
+    assert_eq!(feature_b_commit.parent_id(0).unwrap(), main_tip);
 }
