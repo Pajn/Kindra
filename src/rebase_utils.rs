@@ -13,6 +13,7 @@ pub enum Operation {
     Move,
     Reorder,
     Commit,
+    Sync,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -53,6 +54,12 @@ pub struct RebaseState {
     /// Whether git rebase should use autostash for this operation.
     #[serde(default)]
     pub autostash: bool,
+    /// Branches to clean up after a sync rebase finishes.
+    #[serde(default)]
+    pub cleanup_merged_branches: Vec<String>,
+    /// Fallback branch to checkout before deleting the current branch after sync.
+    #[serde(default)]
+    pub cleanup_checkout_fallback: Option<String>,
 }
 
 pub fn state_path(repo: &Repository) -> PathBuf {
@@ -81,6 +88,18 @@ pub fn checkout_branch(branch_name: &str) -> Result<()> {
         .status()?;
     if !status.success() {
         return Err(anyhow!("git checkout failed for branch '{}'", branch_name));
+    }
+    Ok(())
+}
+
+pub fn git_rebase_in_progress(repo: &Repository) -> bool {
+    repo.path().join("rebase-merge").exists() || repo.path().join("rebase-apply").exists()
+}
+
+pub fn clear_state(repo: &Repository) -> Result<()> {
+    let path = state_path(repo);
+    if path.exists() {
+        fs::remove_file(path)?;
     }
     Ok(())
 }
@@ -274,11 +293,7 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
             }
         }
 
-        if is_done
-            && (is_resuming || started_any)
-            && !repo.path().join("rebase-merge").exists()
-            && !repo.path().join("rebase-apply").exists()
-        {
+        if is_done && (is_resuming || started_any) && !git_rebase_in_progress(repo) {
             println!("Branch {} already rebased.", current_name);
             state.remaining_branches.remove(0);
             if is_resuming {
@@ -317,9 +332,7 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
             save_state(repo, &state)?;
         } else {
             // Check if a rebase is in progress (meaning it started but hit conflicts)
-            if repo.path().join("rebase-merge").exists()
-                || repo.path().join("rebase-apply").exists()
-            {
+            if git_rebase_in_progress(repo) {
                 // Persist that this branch is in progress, but do NOT remove it from remaining_branches
                 save_state(repo, &state)?;
                 return Err(anyhow!(
@@ -367,10 +380,7 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         unstage_all()?;
     }
 
-    let path = state_path(repo);
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
+    clear_state(repo)?;
 
     Ok(())
 }

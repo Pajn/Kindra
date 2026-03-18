@@ -1,7 +1,10 @@
 use crate::rebase_utils::{
-    apply_stash, checkout_branch, drop_stash, load_state, save_state, state_path, unstage_all,
+    apply_stash, checkout_branch, drop_stash, git_rebase_in_progress, load_state, save_state,
+    state_path, unstage_all,
 };
 use anyhow::{Result, anyhow};
+use git2::Oid;
+use std::collections::HashMap;
 use std::process::Command;
 
 pub fn abort_cmd() -> Result<()> {
@@ -11,13 +14,15 @@ pub fn abort_cmd() -> Result<()> {
         let mut parsed_state = load_state(&repo)?;
 
         // Only try to abort a git rebase if we were actually in a gits operation
-        if repo.path().join("rebase-merge").exists() || repo.path().join("rebase-apply").exists() {
+        if git_rebase_in_progress(&repo) {
             println!("Aborting active git rebase...");
             let status = Command::new("git").arg("rebase").arg("--abort").status()?;
             if !status.success() {
                 return Err(anyhow!("Failed to abort git rebase."));
             }
         }
+
+        restore_original_branch_tips(&parsed_state.original_tip_map)?;
 
         let restore_branch = parsed_state
             .caller_branch
@@ -38,8 +43,36 @@ pub fn abort_cmd() -> Result<()> {
 
         std::fs::remove_file(path)?;
         println!("Operation aborted (state cleared).");
+    } else if git_rebase_in_progress(&repo) {
+        println!("A native git rebase is in progress. Use 'git rebase --abort'.");
     } else {
         println!("No operation in progress.");
+    }
+
+    Ok(())
+}
+
+fn restore_original_branch_tips(original_tip_map: &HashMap<String, String>) -> Result<()> {
+    for (branch_name, original_tip) in original_tip_map {
+        let oid = Oid::from_str(original_tip).map_err(|_| {
+            anyhow!(
+                "Saved original tip for branch '{}' is invalid: '{}'.",
+                branch_name,
+                original_tip
+            )
+        })?;
+
+        let status = Command::new("git")
+            .arg("update-ref")
+            .arg(format!("refs/heads/{branch_name}"))
+            .arg(oid.to_string())
+            .status()?;
+        if !status.success() {
+            return Err(anyhow!(
+                "Failed to restore branch '{}' to its original tip.",
+                branch_name
+            ));
+        }
     }
 
     Ok(())

@@ -14,6 +14,7 @@ pub fn status_cmd() -> Result<()> {
         Operation::Move => "Move",
         Operation::Reorder => "Reorder",
         Operation::Commit => "Commit",
+        Operation::Sync => "Sync",
     };
     if state.operation == Operation::Reorder {
         println!("{} in progress from {}", op_name, state.original_branch);

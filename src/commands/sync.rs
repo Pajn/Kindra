@@ -1,13 +1,17 @@
 use crate::commands::find_upstream;
 use crate::commands::resolve_rebase_autostash;
-use crate::rebase_utils::{checkout_branch, state_path};
+use crate::rebase_utils::{
+    Operation, RebaseState, checkout_branch, clear_state, git_rebase_in_progress, save_state,
+    state_path,
+};
 use crate::stack::{
     collect_merged_local_branches, find_sync_boundary, get_stack_branches_from_merge_base,
-    get_stack_tips,
+    get_stack_tips, resolve_merge_base,
 };
 use anyhow::{Result, anyhow};
 use clap::Args;
 use git2::BranchType;
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::process::Command;
 
@@ -60,7 +64,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
 
     let upstream_obj = repo.revparse_single(&rebase_onto_name)?;
     let upstream_id = upstream_obj.id();
-    let merge_base = repo.merge_base(upstream_id, head_id)?;
+    let merge_base = resolve_merge_base(&repo, upstream_id, head_id)?;
     let stack_branches = get_stack_branches_from_merge_base(
         &repo,
         merge_base,
@@ -91,9 +95,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
         }
     };
 
-    if current_branch_name.as_deref() != Some(top_branch.as_str()) {
-        checkout_branch(&top_branch)?;
-    }
+    let top_branch_tip = repo.revparse_single(&top_branch)?.id();
 
     let boundary = find_sync_boundary(&repo, &top_branch, &rebase_onto_name, &stack_branches)?;
 
@@ -127,7 +129,39 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
             },
         )?;
 
-        let status = Command::new("git")
+        let state = RebaseState {
+            operation: Operation::Sync,
+            original_branch: top_branch.clone(),
+            target_branch: rebase_onto_name.clone(),
+            caller_branch: current_branch_name
+                .clone()
+                .filter(|branch| branch != &top_branch),
+            remaining_branches: vec![top_branch.clone()],
+            in_progress_branch: None,
+            parent_id_map: HashMap::new(),
+            parent_name_map: HashMap::new(),
+            new_base_map: HashMap::new(),
+            original_commit_count_map: HashMap::new(),
+            original_tip_map: HashMap::from([(top_branch.clone(), top_branch_tip.to_string())]),
+            stash_ref: None,
+            unstage_on_restore: false,
+            autostash,
+            cleanup_merged_branches: if args.no_delete {
+                Vec::new()
+            } else {
+                boundary.merged_branches.clone()
+            },
+            cleanup_checkout_fallback: Some(local_upstream.clone()),
+        };
+
+        save_state(&repo, &state)?;
+
+        if current_branch_name.as_deref() != Some(top_branch.as_str()) {
+            checkout_branch(&top_branch)?;
+        }
+
+        let mut rebase = Command::new("git");
+        rebase
             .arg("rebase")
             .arg("--reapply-cherry-picks")
             .arg("--empty=keep")
@@ -140,14 +174,9 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
             .arg("--onto")
             .arg(&rebase_onto_name)
             .arg(old_base.to_string())
-            .arg(&top_branch)
-            .status()?;
+            .arg(&top_branch);
 
-        if !status.success() {
-            return Err(anyhow!(
-                "git rebase failed. Resolve conflicts and run 'git rebase --continue' or 'git rebase --abort'."
-            ));
-        }
+        return run_sync_rebase(&repo, state, rebase);
     } else {
         println!(
             "All commits in this stack appear to be integrated into {}.",
@@ -193,7 +222,27 @@ fn sync_upstream_branch(
             },
         )?;
 
-        let status = Command::new("git")
+        let state = RebaseState {
+            operation: Operation::Sync,
+            original_branch: upstream_name.to_string(),
+            target_branch: rebase_onto_name.to_string(),
+            caller_branch: None,
+            remaining_branches: vec![upstream_name.to_string()],
+            in_progress_branch: None,
+            parent_id_map: HashMap::new(),
+            parent_name_map: HashMap::new(),
+            new_base_map: HashMap::new(),
+            original_commit_count_map: HashMap::new(),
+            original_tip_map: HashMap::from([(upstream_name.to_string(), upstream_id.to_string())]),
+            stash_ref: None,
+            unstage_on_restore: false,
+            autostash,
+            cleanup_merged_branches: merged_branches.clone(),
+            cleanup_checkout_fallback: Some(upstream_name.to_string()),
+        };
+
+        let mut rebase = Command::new("git");
+        rebase
             .arg("rebase")
             .arg("--reapply-cherry-picks")
             .arg("--empty=keep")
@@ -202,14 +251,9 @@ fn sync_upstream_branch(
             } else {
                 "--no-autostash"
             })
-            .arg(rebase_onto_name)
-            .status()?;
+            .arg(rebase_onto_name);
 
-        if !status.success() {
-            return Err(anyhow!(
-                "git rebase failed. Resolve conflicts and run 'git rebase --continue' or 'git rebase --abort'."
-            ));
-        }
+        return run_sync_rebase(repo, state, rebase);
     } else {
         println!("{} is already up to date.", upstream_name);
     }
@@ -272,10 +316,64 @@ fn delete_merged_branches(
     Ok(())
 }
 
-fn ensure_no_native_git_operation(repo: &git2::Repository) -> Result<()> {
+fn run_sync_rebase(
+    repo: &git2::Repository,
+    mut state: RebaseState,
+    mut rebase: Command,
+) -> Result<()> {
+    state.in_progress_branch = Some(state.original_branch.clone());
+    save_state(repo, &state)?;
+
+    let status = rebase.status()?;
+    if status.success() {
+        return finish_sync_after_rebase(repo, state);
+    }
+
+    if git_rebase_in_progress(repo) {
+        save_state(repo, &state)?;
+        return Err(anyhow!(
+            "git rebase failed during sync. Resolve conflicts and run 'gits continue' or 'gits abort'."
+        ));
+    }
+
+    state.in_progress_branch = None;
+    save_state(repo, &state)?;
+    Err(anyhow!(
+        "git rebase failed before sync could enter an in-progress state. Run 'gits abort' to clear the saved state, then run 'gits sync' again (or otherwise fix the rebase)."
+    ))
+}
+
+pub(crate) fn finish_sync_after_rebase(repo: &git2::Repository, state: RebaseState) -> Result<()> {
+    ensure_sync_rebase_completed(repo, &state)?;
+    clear_state(repo)?;
+
+    let checkout_fallback = state
+        .cleanup_checkout_fallback
+        .as_deref()
+        .unwrap_or(state.target_branch.as_str());
+    delete_merged_branches(repo, &state.cleanup_merged_branches, checkout_fallback)
+}
+
+fn ensure_sync_rebase_completed(repo: &git2::Repository, state: &RebaseState) -> Result<()> {
+    let original_tip = repo.revparse_single(&state.original_branch)?.id();
+    let target_tip = repo.revparse_single(&state.target_branch)?.id();
+    let completed =
+        original_tip == target_tip || repo.graph_descendant_of(original_tip, target_tip)?;
+
+    if completed {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "Sync did not complete: '{}' is not rebased onto '{}'. If the Git rebase was aborted manually, run 'gits abort' to clear the saved sync state or rerun 'gits sync'.",
+        state.original_branch,
+        state.target_branch
+    ))
+}
+
+pub(crate) fn ensure_no_native_git_operation(repo: &git2::Repository) -> Result<()> {
     let git_dir = repo.path();
-    let rebase_in_progress =
-        git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists();
+    let rebase_in_progress = git_rebase_in_progress(repo);
     let merge_in_progress = git_dir.join("MERGE_HEAD").exists();
     let cherry_pick_in_progress = git_dir.join("CHERRY_PICK_HEAD").exists();
 
