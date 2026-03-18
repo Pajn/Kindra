@@ -6,9 +6,12 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::stack::collect_first_parent_chain;
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
     Move,
+    Reorder,
     Commit,
 }
 
@@ -35,6 +38,12 @@ pub struct RebaseState {
     /// branch_name -> explicit new base (branch name or commit id) for reorder-like flows
     #[serde(default)]
     pub new_base_map: HashMap<String, String>,
+    /// branch_name -> number of first-parent commits originally in the branch delta
+    #[serde(default)]
+    pub original_commit_count_map: HashMap<String, usize>,
+    /// branch_name -> original tip commit id before the operation started
+    #[serde(default)]
+    pub original_tip_map: HashMap<String, String>,
     /// Optional stash token created by `gits commit --on` to preserve non-staged files.
     #[serde(default)]
     pub stash_ref: Option<String>,
@@ -233,6 +242,17 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         let new_base_id = repo.revparse_single(&new_base)?.id();
         let mut is_done =
             repo.graph_descendant_of(current_id, new_base_id)? || current_id == new_base_id;
+
+        if is_done
+            && current_id != new_base_id
+            && let Some(original_commit_count) = state.original_commit_count_map.get(&current_name)
+        {
+            let current_first_parent_chain =
+                collect_first_parent_chain(repo, new_base_id, current_id)?;
+            if current_first_parent_chain.len() > *original_commit_count {
+                is_done = false;
+            }
+        }
 
         if is_done && current_id != new_base_id {
             // Stricter check: the first commit in the branch's delta (relative to its new base)
