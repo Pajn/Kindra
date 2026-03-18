@@ -901,6 +901,218 @@ fn test_restack_patch_id_matching_ignores_colored_git_show_output() {
 }
 
 #[test]
+fn test_restack_restricts_patch_id_matches_to_target_private_lineage() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = Repository::init(repo_path).unwrap();
+
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    let root_oid = make_commit(&repo, "HEAD", "root.txt", "root", "root", &[]);
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+
+    let main_base_oid = make_commit(
+        &repo,
+        "HEAD",
+        "base.txt",
+        "base",
+        "main base",
+        &[&repo.find_commit(root_oid).unwrap()],
+    );
+    let upstream_patch_oid = make_commit(
+        &repo,
+        "HEAD",
+        "shared.txt",
+        "shared",
+        "shared upstream",
+        &[&repo.find_commit(main_base_oid).unwrap()],
+    );
+
+    run_ok("git", &["checkout", "-b", "mobile"], repo_path);
+    let old_mobile_oid = make_commit(
+        &repo,
+        "HEAD",
+        "mobile.txt",
+        "mobile private v1",
+        "mobile private",
+        &[&repo.find_commit(upstream_patch_oid).unwrap()],
+    );
+
+    run_ok("git", &["checkout", "-b", "mobile-tests"], repo_path);
+    let old_mobile_tests_oid = make_commit(
+        &repo,
+        "HEAD",
+        "tests.txt",
+        "tests",
+        "mobile tests",
+        &[&repo.find_commit(old_mobile_oid).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "noise", &main_base_oid.to_string()],
+        repo_path,
+    );
+    let noise_unique_oid = make_commit(
+        &repo,
+        "HEAD",
+        "noise.txt",
+        "noise",
+        "noise unique",
+        &[&repo.find_commit(main_base_oid).unwrap()],
+    );
+    let noise_patch_oid = make_commit(
+        &repo,
+        "HEAD",
+        "shared.txt",
+        "shared",
+        "shared upstream",
+        &[&repo.find_commit(noise_unique_oid).unwrap()],
+    );
+
+    run_ok("git", &["checkout", "mobile"], repo_path);
+    std::fs::write(repo_path.join("mobile.txt"), "mobile private v2").unwrap();
+    run_ok("git", &["add", "mobile.txt"], repo_path);
+    run_ok(
+        "git",
+        &["commit", "--amend", "-m", "mobile private"],
+        repo_path,
+    );
+    let new_mobile_oid = repo
+        .find_reference("refs/heads/mobile")
+        .unwrap()
+        .target()
+        .unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.current_dir(repo_path).arg("restack").assert().success();
+
+    let new_mobile_tests_oid = repo
+        .find_reference("refs/heads/mobile-tests")
+        .unwrap()
+        .target()
+        .unwrap();
+    let new_mobile_tests_parent = repo
+        .find_commit(new_mobile_tests_oid)
+        .unwrap()
+        .parent_id(0)
+        .unwrap();
+    assert_ne!(
+        new_mobile_tests_oid, old_mobile_tests_oid,
+        "restack should still move real children of the rewritten branch"
+    );
+    assert_eq!(
+        new_mobile_tests_parent, new_mobile_oid,
+        "floating descendants should rebase onto the rewritten branch tip"
+    );
+
+    let noise_head = repo
+        .find_reference("refs/heads/noise")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_eq!(
+        noise_head, noise_patch_oid,
+        "patch-id matches against upstream commits must not restack unrelated branches"
+    );
+}
+
+#[test]
+fn test_restack_matches_rewritten_private_commit_by_patch_id_on_non_root_branch() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = Repository::init(repo_path).unwrap();
+
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    std::fs::write(repo_path.join("root.txt"), "root").unwrap();
+    run_ok("git", &["add", "root.txt"], repo_path);
+    run_ok("git", &["commit", "-m", "root"], repo_path);
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+
+    std::fs::write(repo_path.join("base.txt"), "base").unwrap();
+    run_ok("git", &["add", "base.txt"], repo_path);
+    run_ok("git", &["commit", "-m", "main base"], repo_path);
+
+    run_ok("git", &["checkout", "-b", "mobile"], repo_path);
+    std::fs::write(repo_path.join("mobile.txt"), "mobile private").unwrap();
+    run_ok("git", &["add", "mobile.txt"], repo_path);
+    run_ok("git", &["commit", "-m", "mobile private"], repo_path);
+    let old_mobile_oid = repo.head().unwrap().target().unwrap();
+
+    run_ok("git", &["checkout", "-b", "mobile-tests"], repo_path);
+    std::fs::write(repo_path.join("tests.txt"), "tests").unwrap();
+    run_ok("git", &["add", "tests.txt"], repo_path);
+    run_ok("git", &["commit", "-m", "mobile tests"], repo_path);
+    let old_mobile_tests_oid = repo.head().unwrap().target().unwrap();
+
+    run_ok("git", &["checkout", "main"], repo_path);
+    std::fs::write(repo_path.join("extra.txt"), "extra").unwrap();
+    run_ok("git", &["add", "extra.txt"], repo_path);
+    run_ok("git", &["commit", "-m", "main changed"], repo_path);
+    let new_main_oid = repo.head().unwrap().target().unwrap();
+
+    run_ok("git", &["checkout", "mobile"], repo_path);
+    run_ok(
+        "git",
+        &["reset", "--hard", &new_main_oid.to_string()],
+        repo_path,
+    );
+    std::fs::write(repo_path.join("mobile.txt"), "mobile private").unwrap();
+    run_ok("git", &["add", "mobile.txt"], repo_path);
+    run_ok("git", &["commit", "-m", "mobile private"], repo_path);
+    let rewritten_mobile_oid = repo
+        .find_reference("refs/heads/mobile")
+        .unwrap()
+        .target()
+        .unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.current_dir(repo_path).arg("restack").assert().success();
+
+    let new_mobile_tests_oid = repo
+        .find_reference("refs/heads/mobile-tests")
+        .unwrap()
+        .target()
+        .unwrap();
+    let new_mobile_tests_parent = repo
+        .find_commit(new_mobile_tests_oid)
+        .unwrap()
+        .parent_id(0)
+        .unwrap();
+
+    assert_ne!(
+        repo.find_commit(rewritten_mobile_oid)
+            .unwrap()
+            .parent_id(0)
+            .unwrap(),
+        repo.find_commit(old_mobile_oid)
+            .unwrap()
+            .parent_id(0)
+            .unwrap(),
+        "the rewritten target commit should only match the old base by patch-id"
+    );
+    assert_ne!(
+        new_mobile_tests_oid, old_mobile_tests_oid,
+        "restack should rewrite a child branch when its old base only matches by patch-id"
+    );
+    assert_eq!(
+        new_mobile_tests_parent, rewritten_mobile_oid,
+        "patch-id matching should still recognize rewritten private commits on non-root branches"
+    );
+}
+
+#[test]
 fn test_restack_conflict() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
