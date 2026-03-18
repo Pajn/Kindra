@@ -193,7 +193,7 @@ gits restack [--history-limit <n>] [--autostash|--no-autostash]
 ```
 
 **What it does:**
-- Scans all local branches for those whose history includes a commit that "matches" the current `HEAD` (by patch-id or tree-hash) but is not part of the current branch's ancestry.
+- Scans all local branches for those whose history includes a commit that "matches" the current `HEAD` but is not part of the current branch's ancestry. Patch-id fallback is limited to the current branch's private lineage so unrelated branches that only share upstream-equivalent patches are ignored.
 - These branches are considered "floating" because they are pointing to a commit that has been replaced.
 - `gits restack` will automatically rebase these floating branches onto the new `HEAD`.
 

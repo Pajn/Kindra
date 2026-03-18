@@ -605,6 +605,40 @@ struct FloatingTargetCandidate {
     parent_id: Option<Oid>,
 }
 
+fn floating_patch_id_boundary(
+    repo: &Repository,
+    target_id: Oid,
+    target_branch: &str,
+) -> Result<Option<Oid>> {
+    let upstream_name = match crate::commands::find_upstream(repo) {
+        Ok(name) => name,
+        Err(err) if err.to_string().contains("Could not find a base branch") => return Ok(None),
+        Err(err) => return Err(err),
+    };
+
+    if target_branch == upstream_name {
+        return Ok(None);
+    }
+
+    let upstream_id = repo.revparse_single(&upstream_name)?.id();
+    let merge_base = repo.merge_base(target_id, upstream_id)?;
+    let stack_branches = get_stack_branches(repo, target_id, upstream_id, &upstream_name)?;
+
+    if !stack_branches
+        .iter()
+        .any(|branch| branch.name == target_branch)
+    {
+        return Ok(Some(merge_base));
+    }
+
+    Ok(Some(find_parent_in_stack(
+        repo,
+        target_branch,
+        &stack_branches,
+        merge_base,
+    )?))
+}
+
 pub fn build_floating_target_context(
     repo: &Repository,
     target_commit: &Commit,
@@ -644,8 +678,21 @@ pub fn build_floating_target_context(
         }
     }
 
-    ensure_patch_ids(repo, &commit_ids, patch_id_cache)?;
-    let patch_ids = commit_ids
+    let patch_id_boundary = floating_patch_id_boundary(repo, target_commit.id(), target_branch)?;
+    let patch_commit_ids: Vec<Oid> = match patch_id_boundary {
+        Some(boundary) => commit_ids
+            .iter()
+            .copied()
+            .take_while(|oid| *oid != boundary)
+            .collect(),
+        None => commit_ids.clone(),
+    };
+
+    // Patch-id fallback should only compare against the target branch's private lineage.
+    // Matching against upstream commits causes unrelated branches with cherry-picked
+    // equivalents to look like floating children.
+    ensure_patch_ids(repo, &patch_commit_ids, patch_id_cache)?;
+    let patch_ids = patch_commit_ids
         .iter()
         .filter_map(|oid| patch_id_cache.get(oid).and_then(|v| v.as_ref()).cloned())
         .collect();
