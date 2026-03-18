@@ -235,6 +235,7 @@ pub fn plan_descendant_reorder(
     }))
 }
 
+<<<<<<< HEAD
 fn branches_are_linearly_ordered(repo: &Repository, branches: &[StackBranch]) -> Result<bool> {
     for (idx, branch) in branches.iter().enumerate() {
         for other in branches.iter().skip(idx + 1) {
@@ -250,6 +251,8 @@ fn branches_are_linearly_ordered(repo: &Repository, branches: &[StackBranch]) ->
     Ok(true)
 }
 
+=======
+>>>>>>> 4805d6a (Add reorder command)
 pub fn collect_stack_component(
     repo: &Repository,
     current_branch_name: &str,

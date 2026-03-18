@@ -13,6 +13,7 @@ use crate::commands::continue_cmd::continue_cmd;
 use crate::commands::move_cmd::{MoveArgs, move_cmd};
 use crate::commands::pr::{PrSubcommand, pr};
 use crate::commands::push::push;
+use crate::commands::reorder::{ReorderArgs, reorder};
 use crate::commands::restack::{RestackArgs, restack};
 use crate::commands::split::split;
 use crate::commands::status_cmd::status_cmd;
@@ -53,6 +54,8 @@ enum Commands {
     },
     /// Move current branch stack onto another branch
     Move(MoveArgs),
+    /// Reorder the current stack by editing branch parents
+    Reorder(ReorderArgs),
     /// Rebase the current stack onto the upstream branch in one pass
     Sync(SyncArgs),
     /// Repair stack dependencies by rebasing detached children onto the current branch
@@ -63,11 +66,11 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Continue an in-progress move or commit operation
+    /// Continue an in-progress gits operation
     Continue,
-    /// Abort an in-progress move or commit operation
+    /// Abort an in-progress gits operation
     Abort,
-    /// Show the status of an in-progress move or commit operation
+    /// Show the status of an in-progress gits operation
     Status,
     /// Generate shell completions
     Completions {
@@ -112,6 +115,7 @@ fn main() -> Result<()> {
         Commands::Pr { subcommand } => pr(subcommand)?,
         Commands::Checkout { subcommand, all } => checkout(subcommand, *all)?,
         Commands::Move(args) => move_cmd(args)?,
+        Commands::Reorder(args) => reorder(args)?,
         Commands::Sync(args) => sync(args)?,
         Commands::Restack(args) => restack(args)?,
         Commands::Commit { args } => commit(args)?,

@@ -36,7 +36,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
     let path = state_path(&repo);
     if path.exists() {
         return Err(anyhow!(
-            "A move or commit operation is already in progress. Use 'gits continue' or 'gits abort'."
+            "A gits operation is already in progress. Use 'gits continue' or 'gits abort'."
         ));
     }
     ensure_no_native_git_operation(&repo)?;

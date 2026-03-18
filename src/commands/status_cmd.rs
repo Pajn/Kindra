@@ -12,12 +12,17 @@ pub fn status_cmd() -> Result<()> {
     };
     let op_name = match state.operation {
         Operation::Move => "Move",
+        Operation::Reorder => "Reorder",
         Operation::Commit => "Commit",
     };
-    println!(
-        "{} in progress: {} onto {}",
-        op_name, state.original_branch, state.target_branch
-    );
+    if state.operation == Operation::Reorder {
+        println!("{} in progress from {}", op_name, state.original_branch);
+    } else {
+        println!(
+            "{} in progress: {} onto {}",
+            op_name, state.original_branch, state.target_branch
+        );
+    }
     println!(
         "Remaining branches: {}",
         state.remaining_branches.join(", ")

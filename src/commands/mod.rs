@@ -6,6 +6,7 @@ pub mod move_cmd;
 pub mod pr;
 pub(crate) mod pr_merge;
 pub mod push;
+pub mod reorder;
 pub mod restack;
 pub mod split;
 pub mod status_cmd;

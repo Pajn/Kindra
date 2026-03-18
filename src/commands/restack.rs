@@ -78,6 +78,8 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
         parent_id_map,
         parent_name_map,
         new_base_map: HashMap::new(),
+        original_commit_count_map: HashMap::new(),
+        original_tip_map,
         stash_ref: None,
         unstage_on_restore: false,
         autostash,
