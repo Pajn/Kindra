@@ -235,7 +235,6 @@ pub fn plan_descendant_reorder(
     }))
 }
 
-<<<<<<< HEAD
 fn branches_are_linearly_ordered(repo: &Repository, branches: &[StackBranch]) -> Result<bool> {
     for (idx, branch) in branches.iter().enumerate() {
         for other in branches.iter().skip(idx + 1) {
@@ -250,9 +249,6 @@ fn branches_are_linearly_ordered(repo: &Repository, branches: &[StackBranch]) ->
 
     Ok(true)
 }
-
-=======
->>>>>>> 4805d6a (Add reorder command)
 pub fn collect_stack_component(
     repo: &Repository,
     current_branch_name: &str,
@@ -1068,6 +1064,34 @@ fn repo_root(repo: &Repository) -> Result<&Path> {
     repo.path()
         .parent()
         .ok_or_else(|| anyhow!("Failed to resolve repository root path."))
+}
+
+pub fn resolve_merge_base(repo: &Repository, a: Oid, b: Oid) -> Result<Oid> {
+    match repo.merge_base(a, b) {
+        Ok(merge_base) => Ok(merge_base),
+        Err(err) if err.code() == git2::ErrorCode::NotFound => git_merge_base(repo, a, b),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn git_merge_base(repo: &Repository, a: Oid, b: Oid) -> Result<Oid> {
+    let output = Command::new("git")
+        .arg("merge-base")
+        .arg(a.to_string())
+        .arg(b.to_string())
+        .current_dir(repo_root(repo)?)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(anyhow!("no merge base found between {} and {}.", a, b));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let merge_base = stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| anyhow!("git merge-base produced no output."))?;
+    Oid::from_str(merge_base.trim()).map_err(|err| err.into())
 }
 
 pub fn get_stack_branches(

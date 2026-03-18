@@ -59,6 +59,7 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
     // Construct RebaseState
     let mut parent_id_map = HashMap::new();
     let mut parent_name_map = HashMap::new();
+    let mut original_tip_map = HashMap::new();
     let mut remaining = Vec::new();
 
     for (name, old_base) in children {
@@ -66,6 +67,8 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
         remaining.push(name.clone());
         parent_id_map.insert(name.clone(), old_base.to_string());
         parent_name_map.insert(name.clone(), current_branch_name.clone());
+        let tip_id = repo.revparse_single(&name)?.id();
+        original_tip_map.insert(name.clone(), tip_id.to_string());
     }
 
     let state = RebaseState {
@@ -83,6 +86,8 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
         stash_ref: None,
         unstage_on_restore: false,
         autostash,
+        cleanup_merged_branches: Vec::new(),
+        cleanup_checkout_fallback: None,
     };
 
     crate::rebase_utils::save_state(&repo, &state)?;

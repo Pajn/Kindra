@@ -178,7 +178,7 @@ gits sync [--force] [--no-delete] [--autostash|--no-autostash]
 
 **When to use it:** Use this after one or more lower PRs in your stack have already landed on the upstream branch, and you want to sync all remaining branches and clean up the merged ones in one pass.
 
-**Conflict handling:** If rebase conflicts occur, resolve them and continue with `git rebase --continue` (or cancel with `git rebase --abort`).
+**Conflict handling:** If a sync started by `gits` conflicts, resolve it and run `gits continue`, or abandon it with `gits abort`. If you are in a plain native Git rebase with no saved `gits` state, use `git rebase --continue` or `git rebase --abort`.
 
 ---
 
@@ -306,7 +306,7 @@ gits pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--review
 - `gits pr open`: Open a PR URL in the default browser (if multiple, choose one).
 - `gits pr edit`: Select a PR (if multiple), then edit title/body/labels/reviewers.
 - `gits pr merge`: Select an open PR in the current stack and merge it only when review/check state is ready, or prompt/error with the blocking reasons.
-- `gits pr status`: Show each stack PR's reviewer status, unresolved comments, and running/failed checks.
+- `gits pr status`: Show each stack PR's reviewer status, unresolved comments, and running/failed checks. It also reports any interrupted `gits commit`, `gits move`, `gits reorder`, `gits sync`, or `gits restack` operation in the current repo and points you to `gits continue`/`gits abort` or native Git rebase commands when there is no saved `gits` state.
 - `gits pr review`: Select an open PR in the current stack, fetch its review threads through `gh api graphql`, and render them as markdown.
 
 `gits pr merge` automatically merges when the PR has no unresolved review comments, no outstanding review state, no running/failed checks, and GitHub reports the PR as mergeable. If issues remain but GitHub would still allow merging, `gits` prints the outstanding reviews/checks and asks for confirmation. If GitHub/repository rules block the merge, `gits` exits with a clear reason instead of attempting it.
@@ -333,7 +333,8 @@ gits pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--review
 **Notes:**
 
 - These commands require authenticated GitHub CLI (`gh auth status` must succeed).
-- `gits pr status` is PR-focused and different from top-level `gits status` (which is for in-progress `move`/`commit` operations).
+- Both `gits status` and `gits pr status` report interrupted `gits commit`, `gits move`, `gits reorder`, `gits sync`, and `gits restack` operations.
+- When a saved `gits` state exists, continue with `gits continue` or clean up with `gits abort`. If there is no saved `gits` state and Git itself is mid-rebase, use `git rebase --continue` or `git rebase --abort`.
 
 ---
 
@@ -374,11 +375,12 @@ main -> [C1] -> (feature-part-1) -> [C2] -> (feature-part-2) -> [C3] -> (my-feat
 
 ### Status & Control
 
-If a `gits commit`, `gits move`, or `gits restack` operation is interrupted (e.g., due to a merge conflict), use these commands to manage it:
+If a `gits commit`, `gits move`, `gits reorder`, `gits sync`, or `gits restack` operation is interrupted (e.g., due to a merge conflict), both `gits status` and `gits pr status` report the interrupted operation and how to recover:
 
-- **`gits status`**: Shows the current state of an in-progress operation, including which branch is currently being rebased and which ones are remaining.
+- **`gits status`**: Shows the current state of the interrupted operation, including which branch is currently being rebased and which ones are remaining.
 - **`gits continue`**: Resumes the operation after you've resolved conflicts. It handles the underlying `git rebase --continue` and then proceeds with the remaining branches in the stack.
 - **`gits abort`**: Cancels the current operation and cleans up the state.
+- If there is no saved `gits` state and Git itself is in the middle of a native rebase, use `git rebase --continue` or `git rebase --abort`.
 
 ---
 

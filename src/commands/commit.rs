@@ -120,6 +120,13 @@ pub fn commit(args: &[String]) -> Result<()> {
         } else {
             (HashMap::new(), HashMap::new())
         };
+        let mut original_tip_map = HashMap::new();
+        original_tip_map.insert(target_branch.clone(), target_old_head_id.to_string());
+        original_tip_map.extend(
+            sub_stack
+                .iter()
+                .map(|branch| (branch.name.clone(), branch.id.to_string())),
+        );
 
         let state = RebaseState {
             operation: crate::rebase_utils::Operation::Commit,
@@ -144,6 +151,8 @@ pub fn commit(args: &[String]) -> Result<()> {
             stash_ref,
             unstage_on_restore: switching_branches,
             autostash,
+            cleanup_merged_branches: Vec::new(),
+            cleanup_checkout_fallback: None,
         };
 
         save_state(&repo, &state)?;

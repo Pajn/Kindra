@@ -128,6 +128,8 @@ pub fn reorder(args: &ReorderArgs) -> Result<()> {
         stash_ref: None,
         unstage_on_restore: false,
         autostash,
+        cleanup_merged_branches: Vec::new(),
+        cleanup_checkout_fallback: None,
     };
 
     save_state(&repo, &state)?;
