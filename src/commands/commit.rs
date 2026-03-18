@@ -15,7 +15,7 @@ pub fn commit(args: &[String]) -> Result<()> {
     let path = state_path(&repo);
     if path.exists() {
         return Err(anyhow!(
-            "A move or commit operation is already in progress. Use 'gits continue' or 'gits abort'."
+            "A gits operation is already in progress. Use 'gits continue' or 'gits abort'."
         ));
     }
 
@@ -139,6 +139,7 @@ pub fn commit(args: &[String]) -> Result<()> {
             parent_id_map,
             parent_name_map,
             new_base_map: HashMap::new(),
+            original_commit_count_map: HashMap::new(),
             stash_ref,
             unstage_on_restore: switching_branches,
             autostash,

@@ -8,6 +8,7 @@ This document provides a detailed overview of the commands available in `gits` a
 - [Command Reference](#command-reference)
   - [commit](#commit)
   - [move](#move)
+  - [reorder](#reorder)
   - [sync](#sync)
   - [restack](#restack)
   - [checkout (co)](#checkout-alias-co)
@@ -103,6 +104,44 @@ After gits move:
 main -> [M1] -> [A1'] -> (feature-A) -> [B1'] -> (feature-B)
       \-> [D1] -> (develop)
 ```
+
+---
+
+### `reorder`
+
+**Description:** Opens an editor so you can rewrite branch parent relationships for the current stack component, including forked stacks.
+
+**Usage:**
+
+```bash
+gits reorder [--force] [--autostash|--no-autostash]
+```
+
+- `--force`: Continue even if a branch that needs rebasing is checked out in another worktree.
+- `--autostash`: Allow the reorder rebase loop to use Git autostash.
+- `--no-autostash`: Disable Git autostash even if configured globally or for the repo.
+
+**Editor format:**
+
+```text
+branch feature-c parent main
+branch feature-a
+branch feature-b
+```
+
+- `branch <name> parent <parent>` sets an explicit parent.
+- `branch <name>` means the branch listed immediately above becomes the parent.
+- The first row must keep an explicit parent because there is no row above it.
+- Forks are created by assigning the same explicit parent to multiple branches.
+
+**What it does:**
+
+- Loads the current connected stack component around your checked-out branch.
+- Opens a temp file listing each branch and its current parent.
+- Validates the edited graph: every branch must appear once, parents must be valid, cycles are rejected, and the result must stay connected to the upstream.
+- Rebases branches in dependency order and restores your original checkout at the end.
+
+**When to use it:** Use this when `move` is too narrow and you want to freely reshape a stack, such as rotating a linear stack, moving a branch across a fork, or turning a linear stack into siblings.
 
 ---
 

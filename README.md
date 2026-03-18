@@ -6,6 +6,7 @@
 
 - **Stacked Commits**: Automatically rebase all descendant branches when you commit in the middle of a stack.
 - **Atomic Stack Moves**: Move a branch and all its descendants onto a new base branch in one pass using `--update-refs`.
+- **Fork-Aware Reordering**: Edit branch parent relationships in your `$EDITOR`, including creating or preserving forks.
 - **Smart Sync**: Rebase the current stack onto `main`/`master` in one pass using `--update-refs`, while skipping already-landed lower PRs.
 - **Auto-Restack**: Automatically identify and repair "floating" branches that were based on an old version of the current branch (e.g., after an `amend` or `rebase`).
 - **Interactive Navigation**: Quickly hop between branches in your stack with `up`, `down`, and `top` commands.
@@ -34,8 +35,9 @@ cargo install --path .
 3. **Watch the magic**: `gits` will automatically rebase all branches that depend on your change.
 4. **Move the stack**: Ready to target a different feature? `gits move --onto main` to relocate the entire stack.
 5. **Sync after merges**: If lower PRs landed, run `gits sync` to rebase the remaining stack onto latest `main`.
-6. **Repair broken stacks**: Amended a commit and left dependent branches "floating"? Run `gits restack` to fix them.
-7. **Manage PRs in stack**:
+6. **Reorder the stack**: Need to reshuffle or fork branches? Run `gits reorder` and edit the parent map in your editor.
+7. **Repair broken stacks**: Amended a commit and left dependent branches "floating"? Run `gits restack` to fix them.
+8. **Manage PRs in stack**:
    - `gits pr` to create/update PRs
    - `gits pr open` to open a PR from the stack
    - `gits pr edit` to edit title/body/labels/reviewers
@@ -44,6 +46,21 @@ cargo install --path .
    - `gits pr merge` to merge a stack PR only when reviews/checks are ready, or clearly explain/prompt when GitHub would still allow an override
 
 For a full list of commands and detailed examples, see the [CLI Reference](docs/cli_reference.md).
+
+### `gits reorder` editor format
+
+`gits reorder` opens a file with one row per branch:
+
+```text
+branch feature-c parent main
+branch feature-a
+branch feature-b
+```
+
+- `branch <name> parent <parent>` sets the branch parent explicitly.
+- `branch <name>` means "make the branch above this one the parent".
+- The first row still needs an explicit parent, usually your upstream branch.
+- Forks are created by repeating the same explicit parent on multiple rows.
 
 ## Upstream Branch Selection
 

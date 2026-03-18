@@ -9,6 +9,7 @@ use std::process::Command;
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
     Move,
+    Reorder,
     Commit,
 }
 
@@ -35,6 +36,9 @@ pub struct RebaseState {
     /// branch_name -> explicit new base (branch name or commit id) for reorder-like flows
     #[serde(default)]
     pub new_base_map: HashMap<String, String>,
+    /// branch_name -> number of first-parent commits originally in the branch delta
+    #[serde(default)]
+    pub original_commit_count_map: HashMap<String, usize>,
     /// Optional stash token created by `gits commit --on` to preserve non-staged files.
     #[serde(default)]
     pub stash_ref: Option<String>,
@@ -234,6 +238,17 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         let mut is_done =
             repo.graph_descendant_of(current_id, new_base_id)? || current_id == new_base_id;
 
+        if is_done
+            && current_id != new_base_id
+            && let Some(original_commit_count) = state.original_commit_count_map.get(&current_name)
+        {
+            let current_first_parent_chain =
+                collect_first_parent_chain(repo, new_base_id, current_id)?;
+            if current_first_parent_chain.len() > *original_commit_count {
+                is_done = false;
+            }
+        }
+
         if is_done && current_id != new_base_id {
             // Stricter check: the first commit in the branch's delta (relative to its new base)
             // must now be a child of new_base_id.
@@ -429,6 +444,31 @@ fn parse_git_semver(version_output: &str) -> Option<(u64, u64, u64)> {
     }
 
     Some((numbers[0], numbers[1], numbers[2]))
+}
+
+fn collect_first_parent_chain(
+    repo: &Repository,
+    ancestor_exclusive: Oid,
+    tip: Oid,
+) -> Result<Vec<Oid>> {
+    let mut chain = Vec::new();
+    let mut current = tip;
+
+    while current != ancestor_exclusive {
+        chain.push(current);
+        let commit = repo.find_commit(current)?;
+        if commit.parent_count() == 0 {
+            return Err(anyhow!(
+                "Failed to walk first-parent history from {} to ancestor {}.",
+                tip,
+                ancestor_exclusive
+            ));
+        }
+        current = commit.parent_id(0)?;
+    }
+
+    chain.reverse();
+    Ok(chain)
 }
 
 #[cfg(test)]

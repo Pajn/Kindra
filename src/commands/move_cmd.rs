@@ -37,7 +37,7 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
     let path = state_path(repo);
     if path.exists() {
         return Err(anyhow!(
-            "A move or commit operation is already in progress. Use 'gits continue' or 'gits abort'."
+            "A gits operation is already in progress. Use 'gits continue' or 'gits abort'."
         ));
     }
 
@@ -193,6 +193,20 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         head_id,
         &current_branch_name,
     )?;
+    let original_commit_count_map = sub_stack
+        .iter()
+        .map(|branch| {
+            let parent_id = parent_id_map
+                .get(&branch.name)
+                .ok_or_else(|| anyhow!("Missing parent id for '{}'.", branch.name))?;
+            let chain = crate::stack::collect_first_parent_chain(
+                repo,
+                git2::Oid::from_str(parent_id)?,
+                branch.id,
+            )?;
+            Ok((branch.name.clone(), chain.len()))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
 
     let state = RebaseState {
         operation: Operation::Move,
@@ -204,6 +218,7 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         parent_id_map,
         parent_name_map,
         new_base_map,
+        original_commit_count_map,
         stash_ref: None,
         unstage_on_restore: false,
         autostash,
