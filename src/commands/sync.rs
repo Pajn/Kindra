@@ -95,7 +95,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
         checkout_branch(&top_branch)?;
     }
 
-    let boundary = find_sync_boundary(&repo, &top_branch, &rebase_onto_name)?;
+    let boundary = find_sync_boundary(&repo, &top_branch, &rebase_onto_name, &stack_branches)?;
 
     let mut branches_to_check = stack_branches
         .iter()
@@ -129,6 +129,8 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
 
         let status = Command::new("git")
             .arg("rebase")
+            .arg("--reapply-cherry-picks")
+            .arg("--empty=keep")
             .arg(if autostash {
                 "--autostash"
             } else {
@@ -179,6 +181,7 @@ fn sync_upstream_branch(
     let upstream_id = repo.revparse_single(upstream_name)?.id();
     let rebase_onto_id = repo.revparse_single(rebase_onto_name)?.id();
     if upstream_id != rebase_onto_id {
+        crate::rebase_utils::ensure_git_supports_reapply_cherry_picks()?;
         let autostash = resolve_rebase_autostash(
             repo,
             if args.autostash {
@@ -192,6 +195,8 @@ fn sync_upstream_branch(
 
         let status = Command::new("git")
             .arg("rebase")
+            .arg("--reapply-cherry-picks")
+            .arg("--empty=keep")
             .arg(if autostash {
                 "--autostash"
             } else {
