@@ -171,6 +171,85 @@ fn test_move_aborts_when_branch_checked_out_in_other_worktree() {
 }
 
 #[test]
+fn test_move_reorder_aborts_when_descendant_checked_out_in_other_worktree() {
+    let dir = TempDir::new().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    let mut config = repo.config().unwrap();
+    config.set_str("user.name", "Test User").unwrap();
+    config.set_str("user.email", "test@example.com").unwrap();
+
+    let main_id = make_commit(&repo, "refs/heads/main", "main.txt", "main", "initial", &[]);
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feature-a",
+        &[&main_commit],
+    );
+    let a_commit = repo.find_commit(a_id).unwrap();
+
+    let b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "feature-b",
+        &[&a_commit],
+    );
+    let b_commit = repo.find_commit(b_id).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/feature-c",
+        "c.txt",
+        "c",
+        "feature-c",
+        &[&b_commit],
+    );
+
+    let wt_dir = TempDir::new().unwrap();
+    run_ok(
+        "git",
+        &[
+            "worktree",
+            "add",
+            wt_dir.path().to_str().unwrap(),
+            "feature-c",
+        ],
+        dir.path(),
+    );
+
+    run_ok("git", &["checkout", "feature-a"], dir.path());
+
+    let output = gits_cmd()
+        .arg("move")
+        .arg("--onto")
+        .arg("feature-c")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("feature-c is checked out in"));
+
+    let output = gits_cmd()
+        .arg("move")
+        .arg("--onto")
+        .arg("feature-c")
+        .arg("--force")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let stderr_force = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr_force.contains("aborting as a full rebase can not be completed"));
+}
+
+#[test]
 fn test_commit_on_aborts_when_branch_checked_out_in_other_worktree() {
     let dir = TempDir::new().unwrap();
     let repo = git2::Repository::init(dir.path()).unwrap();

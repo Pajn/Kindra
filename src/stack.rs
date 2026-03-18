@@ -250,14 +250,6 @@ fn branches_are_linearly_ordered(repo: &Repository, branches: &[StackBranch]) ->
     Ok(true)
 }
 
-fn parent_base_spec(parent_id: Oid, branch_name: &str, all_branches: &[StackBranch]) -> String {
-    all_branches
-        .iter()
-        .find(|branch| branch.id == parent_id && branch.name != branch_name)
-        .map(|branch| branch.name.clone())
-        .unwrap_or_else(|| parent_id.to_string())
-}
-
 pub fn collect_stack_component(
     repo: &Repository,
     current_branch_name: &str,
@@ -1276,6 +1268,14 @@ pub fn find_parent_in_stack(
         }
     }
     Ok(best_parent)
+}
+
+fn parent_base_spec(parent_id: Oid, branch_name: &str, all_branches: &[StackBranch]) -> String {
+    all_branches
+        .iter()
+        .find(|branch| branch.id == parent_id && branch.name != branch_name)
+        .map(|branch| branch.name.clone())
+        .unwrap_or_else(|| parent_id.to_string())
 }
 
 fn is_descendant(repo: &Repository, a: Oid, b: Oid) -> Result<bool> {
