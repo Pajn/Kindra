@@ -493,6 +493,173 @@ fn test_move_onto_descendant() {
 }
 
 #[test]
+fn test_move_onto_descendant_prestart_failure_retries_first_reordered_branch() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    let base_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "initial", &[]);
+    let base = repo.find_commit(base_id).unwrap();
+
+    let fa_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "a commit",
+        &[&base],
+    );
+    let fa = repo.find_commit(fa_id).unwrap();
+
+    let fb_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "b commit",
+        &[&fa],
+    );
+    let fb = repo.find_commit(fb_id).unwrap();
+
+    let fc_id = make_commit(
+        &repo,
+        "refs/heads/feature-c",
+        "c.txt",
+        "c",
+        "c commit",
+        &[&fb],
+    );
+    let fc = repo.find_commit(fc_id).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/feature-d",
+        "d.txt",
+        "d",
+        "d commit",
+        &[&fc],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_tree(
+        fa.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+
+    let git_path = which::which("git").expect("git not found");
+    let git_wrapper = dir.path().join("git");
+    let log_path = dir.path().join("git.log");
+    let fail_rebase_path = dir.path().join("fail_rebase");
+    fs::write(&log_path, "").unwrap();
+    fs::write(&fail_rebase_path, "").unwrap();
+    fs::write(
+        &git_wrapper,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "{}"
+if [ "$1" = "rebase" ] && [ "$2" = "--no-ff" ] && [ -f "{}" ]; then
+    rm "{}"
+    echo "Mock rebase failure" >&2
+    exit 1
+fi
+exec "{}" "$@"
+"#,
+            log_path.to_str().unwrap(),
+            fail_rebase_path.to_str().unwrap(),
+            fail_rebase_path.to_str().unwrap(),
+            git_path.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&git_wrapper).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&git_wrapper, perms).unwrap();
+    }
+
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut new_path = dir.path().to_path_buf().into_os_string();
+    new_path.push(":");
+    new_path.push(old_path);
+
+    let mut cmd = gits_cmd();
+    cmd.arg("move")
+        .arg("--onto")
+        .arg("feature-c")
+        .current_dir(dir.path())
+        .env("PATH", &new_path)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .failure();
+
+    let state_content = fs::read_to_string(dir.path().join(".git/gits_rebase_state.json")).unwrap();
+    assert!(
+        state_content.contains("\"in_progress_branch\": null"),
+        "Pre-start failure should clear in_progress_branch but got: {state_content}"
+    );
+
+    let mut cmd_cont = gits_cmd();
+    cmd_cont
+        .arg("continue")
+        .current_dir(dir.path())
+        .env("PATH", &new_path)
+        .assert()
+        .success();
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    let feature_c_rebase_calls = log
+        .lines()
+        .filter(|line| line.contains("rebase --no-ff") && line.ends_with(" feature-c"))
+        .count();
+    assert_eq!(
+        feature_c_rebase_calls, 2,
+        "feature-c should be retried after pre-start failure"
+    );
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let main = repo.find_branch("main", git2::BranchType::Local).unwrap();
+    let feature_a = repo
+        .find_branch("feature-a", git2::BranchType::Local)
+        .unwrap();
+    let feature_b = repo
+        .find_branch("feature-b", git2::BranchType::Local)
+        .unwrap();
+    let feature_c = repo
+        .find_branch("feature-c", git2::BranchType::Local)
+        .unwrap();
+    let feature_d = repo
+        .find_branch("feature-d", git2::BranchType::Local)
+        .unwrap();
+    let feature_a_commit = repo.find_commit(feature_a.get().target().unwrap()).unwrap();
+    let feature_b_commit = repo.find_commit(feature_b.get().target().unwrap()).unwrap();
+    let feature_c_commit = repo.find_commit(feature_c.get().target().unwrap()).unwrap();
+    let feature_d_commit = repo.find_commit(feature_d.get().target().unwrap()).unwrap();
+
+    assert_eq!(
+        feature_c_commit.parent_id(0).unwrap(),
+        main.get().target().unwrap()
+    );
+    assert_eq!(
+        feature_d_commit.parent_id(0).unwrap(),
+        feature_c.get().target().unwrap()
+    );
+    assert_eq!(
+        feature_a_commit.parent_id(0).unwrap(),
+        feature_d.get().target().unwrap()
+    );
+    assert_eq!(
+        feature_b_commit.parent_id(0).unwrap(),
+        feature_a.get().target().unwrap()
+    );
+}
+
+#[test]
 fn test_move_abort_cleans_up_git_rebase() {
     let dir = tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();

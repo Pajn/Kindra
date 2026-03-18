@@ -210,3 +210,80 @@ fn sync_onto_remote_tracking_ref_does_not_delete_local_base() {
             .unwrap()
     );
 }
+
+#[test]
+fn sync_does_not_treat_rename_only_branch_as_integrated_when_target_keeps_source_path() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    run_ok("git", &["config", "diff.renames", "true"], dir.path());
+
+    let remote_dir = dir.path().join("remote.git");
+    fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "old.txt",
+        "payload",
+        "base commit",
+        &[],
+    );
+    run_ok("git", &["push", "-u", "origin", "main:main"], dir.path());
+
+    run_ok("git", &["checkout", "-b", "feature-a"], dir.path());
+    run_ok("git", &["mv", "old.txt", "new.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "rename old to new"], dir.path());
+
+    let remote_worktree = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote_dir.to_str().unwrap(),
+            remote_worktree.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "main"], remote_worktree.path());
+    run_ok(
+        "git",
+        &["reset", "--hard", &base_id.to_string()],
+        remote_worktree.path(),
+    );
+    fs::write(remote_worktree.path().join("new.txt"), "payload").unwrap();
+    run_ok("git", &["add", "new.txt"], remote_worktree.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "add matching new path"],
+        remote_worktree.path(),
+    );
+    run_ok("git", &["push", "origin", "main"], remote_worktree.path());
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert!(
+        repo.find_branch("feature-a", BranchType::Local).is_ok(),
+        "rename-only branch should not be treated as integrated and deleted"
+    );
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    assert!(
+        !dir.path().join("old.txt").exists(),
+        "sync should preserve the source-path deletion from the rename commit"
+    );
+    assert!(
+        dir.path().join("new.txt").exists(),
+        "sync should preserve the destination path from the rename commit"
+    );
+}

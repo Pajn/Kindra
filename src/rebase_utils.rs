@@ -302,6 +302,8 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
                     current_name
                 ));
             } else {
+                state.in_progress_branch = None;
+                save_state(repo, &state)?;
                 return Err(anyhow!(
                     "Rebase failed for branch {}. It seems to have failed before starting (e.g., dirty working tree). Fix the issue and run 'gits continue'.",
                     current_name
@@ -349,24 +351,47 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
 }
 
 pub fn ensure_git_supports_update_refs() -> Result<()> {
+    ensure_git_version_at_least(
+        (2, 38, 0),
+        "This operation requires Git >= 2.38.0 because '--update-refs' is used during rebase.",
+        "This operation requires Git >= 2.38.0 because it uses '--update-refs'",
+    )
+}
+
+pub fn ensure_git_supports_reapply_cherry_picks() -> Result<()> {
+    ensure_git_version_at_least(
+        (2, 34, 0),
+        "This operation requires Git >= 2.34.0 because '--reapply-cherry-picks' and '--empty=keep' are used during rebase.",
+        "This operation requires Git >= 2.34.0 because it uses '--reapply-cherry-picks' and '--empty=keep'",
+    )
+}
+
+fn ensure_git_version_at_least(
+    minimum: (u64, u64, u64),
+    detected_message_prefix: &str,
+    generic_message_prefix: &str,
+) -> Result<()> {
     let output = Command::new("git").arg("--version").output()?;
     if !output.status.success() {
         return Err(anyhow!(
-            "This operation requires Git >= 2.38.0 because it uses '--update-refs', but 'git --version' failed."
+            "{}, but 'git --version' failed.",
+            generic_message_prefix
         ));
     }
 
     let version_output = String::from_utf8_lossy(&output.stdout);
     let version = parse_git_semver(&version_output).ok_or_else(|| {
         anyhow!(
-            "This operation requires Git >= 2.38.0 because it uses '--update-refs', but could not parse `git --version` output: {}",
+            "{}, but could not parse `git --version` output: {}",
+            generic_message_prefix,
             version_output.trim()
         )
     })?;
 
-    if version < (2, 38, 0) {
+    if version < minimum {
         return Err(anyhow!(
-            "This operation requires Git >= 2.38.0 because '--update-refs' is used during rebase. Detected Git {}.{}.{}.",
+            "{} Detected Git {}.{}.{}.",
+            detected_message_prefix,
             version.0,
             version.1,
             version.2
