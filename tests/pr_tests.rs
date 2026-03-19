@@ -1,7 +1,7 @@
 mod common;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use common::{gits_cmd, make_commit, run_ok};
+use common::{gits_cmd, make_commit, repo_init, run_ok};
 use git2::Repository;
 use std::fs;
 use tempfile::tempdir;
@@ -15,7 +15,7 @@ use tempfile::tempdir;
 /// ```
 fn setup_simple_stack() -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     // A – initial commit on main
     let a_id = make_commit(
@@ -51,7 +51,7 @@ fn setup_simple_stack() -> (tempfile::TempDir, Repository) {
 /// Three-level stack: main → feature-a → feature-b.
 fn setup_two_level_stack() -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let a_id = make_commit(
         &repo,
@@ -94,7 +94,7 @@ fn setup_two_level_stack() -> (tempfile::TempDir, Repository) {
 /// Four-level history: main -> sync-main -> pr-review -> pr-merge.
 fn setup_review_merge_stack() -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_id = make_commit(
         &repo,
@@ -727,7 +727,7 @@ exit 1
 #[test]
 fn multi_commit_branch_title_empty() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     // Create main with initial commit
     let a_id = make_commit(&repo, "refs/heads/main", "a.txt", "a", "initial", &[]);
@@ -932,7 +932,7 @@ exit 1
 #[test]
 fn slash_base_branch_uses_git_base_for_local_history() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_id = make_commit(&repo, "refs/heads/main", "main.txt", "main", "initial", &[]);
     let base_id = {

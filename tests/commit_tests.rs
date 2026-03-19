@@ -1,5 +1,5 @@
 mod common;
-use common::{gits_cmd, make_commit, run_ok};
+use common::{gits_cmd, make_commit, repo_init, run_ok};
 use git2::Repository;
 use std::fs;
 use std::path::Path;
@@ -7,7 +7,7 @@ use tempfile::tempdir;
 
 fn setup_repo() -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     // 1. Initial commit on main
     let main_commit_id = make_commit(
@@ -1147,7 +1147,7 @@ fn test_commit_on_requires_branch_when_followed_by_flag() {
 #[test]
 fn test_commit_on_other_stack_default_just_commits() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let root_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
     let root = repo.find_commit(root_id).unwrap();

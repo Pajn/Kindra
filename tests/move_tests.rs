@@ -1,12 +1,12 @@
 mod common;
-use common::{gits_cmd, make_commit, run_ok};
+use common::{gits_cmd, make_commit, repo_init, run_ok};
 use git2::Repository;
 use std::fs;
 use tempfile::tempdir;
 
 fn setup_repo() -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let mut parent_id = make_commit(
         &repo,
@@ -204,7 +204,7 @@ fn test_move_upstream_error() {
 #[test]
 fn test_move_conflict_and_continue() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(&repo, "refs/heads/main", "file.txt", "base", "initial", &[]);
     let base = repo.find_commit(base_id).unwrap();
@@ -366,7 +366,7 @@ fn test_move_all_from_main_error() {
 #[test]
 fn test_move_all_between_stacks() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
     let base = repo.find_commit(base_id).unwrap();
@@ -445,7 +445,7 @@ fn test_move_all_between_stacks() {
 #[test]
 fn test_move_onto_descendant() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "initial", &[]);
     let base = repo.find_commit(base_id).unwrap();
@@ -529,7 +529,7 @@ fn test_move_onto_descendant() {
 #[test]
 fn test_move_onto_descendant_reorders_target_descendants_too() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "initial", &[]);
     let base = repo.find_commit(base_id).unwrap();
@@ -631,7 +631,7 @@ fn test_move_onto_descendant_reorders_target_descendants_too() {
 #[test]
 fn test_move_onto_descendant_rejects_forked_subtree() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "initial", &[]);
     let base = repo.find_commit(base_id).unwrap();
@@ -697,7 +697,7 @@ fn test_move_onto_descendant_rejects_forked_subtree() {
 #[test]
 fn test_move_onto_descendant_rejects_fork_then_merge_subtree() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "initial", &[]);
     let base = repo.find_commit(base_id).unwrap();
@@ -772,7 +772,7 @@ fn test_move_onto_descendant_rejects_fork_then_merge_subtree() {
 #[test]
 fn test_move_onto_descendant_conflict_and_continue() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -882,7 +882,7 @@ fn test_move_onto_descendant_conflict_and_continue() {
 #[test]
 fn test_move_onto_descendant_prestart_failure_retries_first_reordered_branch() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "initial", &[]);
     let base = repo.find_commit(base_id).unwrap();
@@ -1049,7 +1049,7 @@ exec "{}" "$@"
 #[test]
 fn test_move_abort_cleans_up_git_rebase() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     // 1. Initial commit
     let base_id = make_commit(&repo, "refs/heads/main", "file.txt", "base", "initial", &[]);
@@ -1188,7 +1188,7 @@ exec {} "$@"
 #[test]
 fn test_move_conflict_and_continue_no_re_rebase() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     // setup: main (file.txt: base) -> feature (file.txt: feat)
     // setup: target (file.txt: target)
@@ -1325,7 +1325,7 @@ fn test_move_invalid_onto() {
 #[test]
 fn test_move_ignores_rebase_autostash_config() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(&repo, "refs/heads/main", "file.txt", "base\n", "base", &[]);
     let base = repo.find_commit(base_id).unwrap();
@@ -1381,7 +1381,7 @@ fn test_move_ignores_rebase_autostash_config() {
 #[test]
 fn test_move_repo_config_enables_autostash_and_persists_in_state() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(&repo, "refs/heads/main", "file.txt", "base\n", "base", &[]);
     let base = repo.find_commit(base_id).unwrap();
@@ -1546,7 +1546,7 @@ exec {} "$@"
 
 fn setup_abort_repo() -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     // Initial commit
     let main_commit_id = make_commit(

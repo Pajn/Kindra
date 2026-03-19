@@ -1,14 +1,14 @@
 //! Integration tests for gits push ensuring it pushes the whole stack.
 
 mod common;
-use common::{gits_cmd, make_commit, run_ok};
+use common::{gits_cmd, make_commit, repo_init, run_ok};
 use git2::Repository;
 use tempfile::tempdir;
 
 #[test]
 fn test_push_entire_stack() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     // 1. Initial commit on main
     let main_commit_id = make_commit(
@@ -122,7 +122,7 @@ fn test_push_entire_stack() {
 #[test]
 fn test_push_on_main_pushes_main() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_commit_id = make_commit(
         &repo,
@@ -191,7 +191,7 @@ fn test_push_on_main_pushes_main() {
 #[test]
 fn test_push_on_main_uses_tracked_remote() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_commit_id = make_commit(
         &repo,
@@ -277,7 +277,7 @@ fn test_push_on_main_uses_tracked_remote() {
 #[test]
 fn test_push_on_main_uses_tracked_remote_without_origin() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_commit_id = make_commit(
         &repo,
@@ -343,7 +343,7 @@ fn test_push_on_main_uses_tracked_remote_without_origin() {
 #[test]
 fn test_push_tracked_stack_uses_tracked_remote_without_origin() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_commit_id = make_commit(
         &repo,
@@ -446,7 +446,7 @@ fn test_push_tracked_stack_uses_tracked_remote_without_origin() {
 #[test]
 fn test_push_empty_stack_does_not_resolve_remote() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     make_commit(
         &repo,

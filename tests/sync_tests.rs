@@ -1,6 +1,6 @@
 mod common;
 
-use common::{gits_cmd, make_commit, run_ok};
+use common::{gits_cmd, make_commit, repo_init, run_ok};
 use git2::{BranchType, Repository};
 use predicates::prelude::*;
 use std::fs;
@@ -37,7 +37,7 @@ fn apply_global_config_env(cmd: &mut assert_cmd::Command, root: &std::path::Path
 #[test]
 fn sync_handles_rebased_lower_branch() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -143,7 +143,7 @@ fn sync_handles_rebased_lower_branch() {
 #[test]
 fn sync_handles_squashed_lower_branch() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -241,7 +241,7 @@ fn sync_handles_squashed_lower_branch() {
 #[test]
 fn sync_handles_merged_lower_branch() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -326,7 +326,7 @@ fn sync_handles_merged_lower_branch() {
 #[test]
 fn sync_skips_squashed_lower_branch_and_deletes_it() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -410,7 +410,7 @@ fn sync_skips_squashed_lower_branch_and_deletes_it() {
 #[test]
 fn sync_skips_rewritten_lower_branch_on_main() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -493,7 +493,7 @@ fn sync_skips_rewritten_lower_branch_on_main() {
 #[test]
 fn sync_skips_integrated_lower_branch_and_cherry_equivalent_upper_commit() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -586,7 +586,7 @@ fn sync_skips_integrated_lower_branch_and_cherry_equivalent_upper_commit() {
 #[test]
 fn sync_does_not_skip_partially_integrated_lower_branch() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -657,7 +657,7 @@ fn sync_does_not_skip_partially_integrated_lower_branch() {
 #[test]
 fn sync_rebases_onto_remote_tracking_base_when_local_base_is_stale() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let remote_dir = dir.path().join("remote.git");
     fs::create_dir_all(&remote_dir).unwrap();
@@ -751,7 +751,7 @@ fn sync_rebases_onto_remote_tracking_base_when_local_base_is_stale() {
 #[test]
 fn sync_treats_slashed_base_branch_name_as_local_before_remote() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let remote_dir = dir.path().join("upstream.git");
     fs::create_dir_all(&remote_dir).unwrap();
@@ -861,7 +861,7 @@ fn sync_treats_slashed_base_branch_name_as_local_before_remote() {
 #[test]
 fn sync_reports_rebase_conflict() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -926,7 +926,7 @@ fn sync_reports_rebase_conflict() {
 #[test]
 fn sync_abort_restores_original_branch_after_tip_switch_conflict() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -1009,7 +1009,7 @@ fn sync_abort_restores_original_branch_after_tip_switch_conflict() {
 #[test]
 fn sync_refuses_when_git_rebase_in_progress() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -1051,7 +1051,7 @@ fn sync_refuses_when_git_rebase_in_progress() {
 #[test]
 fn sync_refuses_to_auto_pick_tip_in_non_interactive_mode() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -1103,7 +1103,7 @@ fn sync_refuses_to_auto_pick_tip_in_non_interactive_mode() {
 #[test]
 fn sync_ignores_rebase_autostash_config() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -1154,7 +1154,7 @@ fn sync_ignores_rebase_autostash_config() {
 #[test]
 fn sync_cli_no_autostash_overrides_repo_config() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -1210,7 +1210,7 @@ fn sync_cli_no_autostash_overrides_repo_config() {
 #[test]
 fn sync_global_config_enables_autostash() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -1270,7 +1270,7 @@ fn sync_errors_when_git_too_old_for_update_refs() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -1340,7 +1340,7 @@ fn sync_on_main_errors_when_git_too_old_for_reapply_cherry_picks() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let remote_dir = dir.path().join("remote.git");
     fs::create_dir_all(&remote_dir).unwrap();
@@ -1418,7 +1418,7 @@ fn sync_checkout_error_includes_branch_name() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -1482,7 +1482,7 @@ fn sync_checkout_error_includes_branch_name() {
 #[test]
 fn sync_deletes_merged_branches() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -1535,7 +1535,7 @@ fn sync_deletes_merged_branches() {
 #[test]
 fn sync_on_main_rebases_to_latest_origin_main_and_deletes_merged_local_branches() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let remote_dir = dir.path().join("remote.git");
     fs::create_dir_all(&remote_dir).unwrap();
@@ -1628,7 +1628,7 @@ fn sync_on_main_rebases_to_latest_origin_main_and_deletes_merged_local_branches(
 #[test]
 fn sync_preserves_state_on_prestart_rebase_failure_after_tip_checkout() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -1710,7 +1710,7 @@ fn sync_preserves_state_on_prestart_rebase_failure_after_tip_checkout() {
 #[test]
 fn sync_on_main_handles_rebase_conflict_and_preserves_state() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let remote_dir = dir.path().join("remote.git");
     fs::create_dir_all(&remote_dir).unwrap();
@@ -1809,7 +1809,7 @@ fn sync_on_main_handles_rebase_conflict_and_preserves_state() {
 #[test]
 fn sync_on_main_conflict_can_continue_with_gits() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let remote_dir = dir.path().join("remote.git");
     fs::create_dir_all(&remote_dir).unwrap();
@@ -1902,7 +1902,7 @@ fn sync_on_main_conflict_can_continue_with_gits() {
 #[test]
 fn sync_on_main_conflict_continue_after_rebase() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let remote_dir = dir.path().join("remote.git");
     fs::create_dir_all(&remote_dir).unwrap();
@@ -1996,7 +1996,7 @@ fn sync_on_main_conflict_continue_after_rebase() {
 #[test]
 fn sync_on_main_manual_git_abort_does_not_finalize_or_delete_branches() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let remote_dir = dir.path().join("remote.git");
     fs::create_dir_all(&remote_dir).unwrap();
@@ -2097,7 +2097,7 @@ fn sync_on_main_manual_git_abort_does_not_finalize_or_delete_branches() {
 #[test]
 fn sync_deletes_current_branch_if_merged() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -2139,7 +2139,7 @@ fn sync_deletes_current_branch_if_merged() {
 #[test]
 fn sync_no_delete_flag_works() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -2184,7 +2184,7 @@ fn sync_no_delete_flag_works() {
 #[test]
 fn sync_refuses_to_delete_branch_checked_out_in_other_worktree() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -2262,7 +2262,7 @@ fn sync_refuses_to_delete_branch_checked_out_in_other_worktree() {
 #[test]
 fn sync_on_main_does_not_delete_branch_when_only_tip_patch_matches() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -2311,7 +2311,7 @@ fn sync_on_main_does_not_delete_branch_when_only_tip_patch_matches() {
 #[test]
 fn sync_falls_back_to_local_upstream_on_deletion() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let remote_dir = dir.path().join("remote.git");
     fs::create_dir_all(&remote_dir).unwrap();
@@ -2382,7 +2382,7 @@ fn sync_falls_back_to_local_upstream_on_deletion() {
 #[test]
 fn sync_does_not_delete_branch_with_only_tree_match() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -2436,7 +2436,7 @@ fn sync_does_not_delete_branch_with_only_tree_match() {
 #[test]
 fn sync_does_not_treat_historical_tree_match_as_merged() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     make_commit(
         &repo,
@@ -2523,7 +2523,7 @@ fn sync_does_not_treat_historical_tree_match_as_merged() {
 #[test]
 fn sync_skips_squashed_lower_branch_after_later_upstream_edits_on_same_path() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,

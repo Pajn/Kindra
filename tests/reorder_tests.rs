@@ -1,6 +1,6 @@
 mod common;
 
-use common::{gits_cmd, make_commit, run_ok};
+use common::{gits_cmd, make_commit, repo_init, run_ok};
 use git2::{BranchType, Repository};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -67,7 +67,7 @@ fn assert_direct_parent_id(repo: &Repository, branch_name: &str, expected_parent
 #[test]
 fn reorder_linear_stack() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
     let main = repo.find_commit(main_id).unwrap();
@@ -102,7 +102,7 @@ fn reorder_linear_stack() {
 #[test]
 fn reorder_creates_fork() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
     let main = repo.find_commit(main_id).unwrap();
@@ -137,7 +137,7 @@ fn reorder_creates_fork() {
 #[test]
 fn reorder_preserves_existing_fork() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
     let main = repo.find_commit(main_id).unwrap();
@@ -174,7 +174,7 @@ fn reorder_preserves_existing_fork() {
 #[test]
 fn reorder_restores_original_branch_when_run_from_middle() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
     let main = repo.find_commit(main_id).unwrap();
@@ -210,7 +210,7 @@ fn reorder_restores_original_branch_when_run_from_middle() {
 #[test]
 fn reorder_rejects_self_parent() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
     let main = repo.find_commit(main_id).unwrap();
@@ -234,7 +234,7 @@ fn reorder_rejects_self_parent() {
 #[test]
 fn reorder_rejects_shorthand_on_first_row() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
     let main = repo.find_commit(main_id).unwrap();
@@ -258,7 +258,7 @@ fn reorder_rejects_shorthand_on_first_row() {
 #[test]
 fn reorder_rejects_unknown_parent() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
     let main = repo.find_commit(main_id).unwrap();
@@ -280,7 +280,7 @@ fn reorder_rejects_unknown_parent() {
 #[test]
 fn reorder_rejects_cycle() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
     let main = repo.find_commit(main_id).unwrap();
@@ -308,7 +308,7 @@ fn reorder_rejects_cycle() {
 #[test]
 fn reorder_rejects_duplicate_or_missing_rows() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
     let main = repo.find_commit(main_id).unwrap();
@@ -345,7 +345,7 @@ fn reorder_rejects_duplicate_or_missing_rows() {
 #[test]
 fn reorder_conflict_and_continue() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_id = make_commit(
         &repo,
@@ -410,7 +410,7 @@ fn reorder_conflict_and_continue() {
 #[test]
 fn reorder_conflict_and_abort_restores_original_graph_and_cleans_up() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_id = make_commit(
         &repo,
@@ -477,7 +477,7 @@ fn reorder_conflict_and_abort_restores_original_graph_and_cleans_up() {
 #[test]
 fn reorder_checks_worktrees() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
     let main = repo.find_commit(main_id).unwrap();

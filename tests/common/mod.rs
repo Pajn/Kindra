@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use git2::{Repository, Signature};
 use std::fs;
+use std::path::Path;
 
 #[allow(dead_code)]
 pub fn gits_cmd() -> Command {
@@ -54,6 +55,7 @@ pub fn make_commit_at(
         .unwrap()
 }
 
+#[allow(dead_code)]
 pub fn make_commit(
     repo: &Repository,
     refname: &str,
@@ -71,4 +73,11 @@ pub fn make_commit(
     let tree = repo.find_tree(tree_oid).unwrap();
     repo.commit(Some(refname), &sig, &sig, message, &tree, parents)
         .unwrap()
+}
+
+#[allow(dead_code)]
+pub fn repo_init(path: &Path) -> Repository {
+    std::fs::create_dir_all(path).unwrap();
+    run_ok("git", &["init", "--initial-branch=main"], path);
+    Repository::open(path).unwrap()
 }

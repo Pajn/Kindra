@@ -1,6 +1,6 @@
 mod common;
 
-use common::{gits_cmd, make_commit, run_ok};
+use common::{gits_cmd, make_commit, repo_init, run_ok};
 use git2::{BranchType, Repository};
 use predicates::prelude::*;
 use std::fs;
@@ -9,7 +9,7 @@ use tempfile::tempdir;
 #[test]
 fn sync_aborts_deletions_if_fallback_checkout_is_blocked() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -73,7 +73,7 @@ fn sync_aborts_deletions_if_fallback_checkout_is_blocked() {
 #[test]
 fn sync_no_delete_with_open_worktree_does_not_fail() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let base_id = make_commit(
         &repo,
@@ -140,7 +140,7 @@ fn sync_no_delete_with_open_worktree_does_not_fail() {
 #[test]
 fn sync_onto_remote_tracking_ref_does_not_delete_local_base() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let remote_dir = dir.path().join("remote.git");
     fs::create_dir_all(&remote_dir).unwrap();
@@ -214,7 +214,7 @@ fn sync_onto_remote_tracking_ref_does_not_delete_local_base() {
 #[test]
 fn sync_does_not_treat_rename_only_branch_as_integrated_when_target_keeps_source_path() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     run_ok("git", &["config", "diff.renames", "true"], dir.path());
 
