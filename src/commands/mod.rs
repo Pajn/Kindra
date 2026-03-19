@@ -194,6 +194,11 @@ pub fn resolve_rebase_autostash(repo: &Repository, cli_override: Option<bool>) -
         return Ok(autostash);
     }
 
+    // Check git's native rebase.autostash config
+    if let Ok(autostash) = repo.config()?.get_bool("rebase.autostash") {
+        return Ok(autostash);
+    }
+
     Ok(false)
 }
 

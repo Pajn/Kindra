@@ -1323,7 +1323,7 @@ fn test_move_invalid_onto() {
 }
 
 #[test]
-fn test_move_ignores_rebase_autostash_config() {
+fn test_move_respects_git_rebase_autostash_config() {
     let dir = tempdir().unwrap();
     let repo = repo_init(dir.path());
 
@@ -1367,14 +1367,19 @@ fn test_move_ignores_rebase_autostash_config() {
         .assert()
         .failure();
 
+    // Verify autostash worked: rebase started (proving git config is respected)
     assert!(
-        !dir.path().join(".git/rebase-merge").exists()
-            && !dir.path().join(".git/rebase-apply").exists(),
-        "move should fail before starting a rebase when the worktree is dirty"
+        dir.path().join(".git/rebase-merge").exists()
+            || dir.path().join(".git/rebase-apply").exists(),
+        "git config rebase.autostash should allow move to start rebasing"
     );
+
+    // Clean up: abort the rebase so the test leaves a clean state
+    run_ok("git", &["rebase", "--abort"], dir.path());
     assert_eq!(
         fs::read_to_string(dir.path().join("file.txt")).unwrap(),
-        "base\nfeature\ndirty\n"
+        "base\nfeature\ndirty\n",
+        "dirty changes should be preserved after abort"
     );
 }
 
