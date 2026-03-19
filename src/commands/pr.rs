@@ -433,19 +433,50 @@ fn format_stack_pr_option(pr: &StackPr) -> String {
 pub(crate) fn discover_stack_branches_with_upstream(
     repo: &Repository,
 ) -> Result<(String, Vec<(StackBranch, String)>)> {
-    let upstream_name = crate::commands::find_upstream(repo)?;
-    let upstream_obj = repo.revparse_single(&upstream_name)?;
+    let upstream_name = crate::commands::find_upstream(repo)?.ok_or_else(|| {
+        anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
+    })?;
+
+    // If the upstream is a local branch, check if it has a remote upstream that
+    // it has diverged from. This can happen after `gits sync` rebases the stack
+    // onto origin/main while the local main branch remains behind. In such cases,
+    // we should use the remote tracking branch as the effective upstream so that
+    // PR creation uses the correct base.
+    let effective_upstream = if let Ok(branch) = repo.find_branch(&upstream_name, BranchType::Local)
+    {
+        if let Ok(upstream_branch) = branch.upstream() {
+            if let Ok(Some(upstream_ref)) = upstream_branch.name() {
+                let upstream_ref_str = upstream_ref.to_string();
+                let local_id = repo.revparse_single(&upstream_name)?.id();
+                let remote_id = repo.revparse_single(upstream_ref)?.id();
+                if local_id != remote_id {
+                    // Local is behind or diverged from remote - use remote tracking branch
+                    upstream_ref_str
+                } else {
+                    upstream_name.clone()
+                }
+            } else {
+                upstream_name.clone()
+            }
+        } else {
+            upstream_name.clone()
+        }
+    } else {
+        upstream_name.clone()
+    };
+
+    let upstream_obj = repo.revparse_single(&effective_upstream)?;
     let upstream_id = upstream_obj.id();
     let head_id = repo.head()?.peel_to_commit()?.id();
 
     // Collect all stack branches and sort bottom→top so base branches are
     // processed before the branches that depend on them.
-    let mut stack_branches = get_stack_branches(repo, head_id, upstream_id, &upstream_name)?;
+    let mut stack_branches = get_stack_branches(repo, head_id, upstream_id, &effective_upstream)?;
     sort_branches_topologically(repo, &mut stack_branches)?;
 
     if stack_branches.is_empty() {
         println!("No branches in stack.");
-        return Ok((upstream_name, Vec::new()));
+        return Ok((effective_upstream, Vec::new()));
     }
 
     // Only operate on branches that have a remote upstream configured.
@@ -459,7 +490,7 @@ pub(crate) fn discover_stack_branches_with_upstream(
         })
         .collect();
 
-    Ok((upstream_name, branches_with_upstream))
+    Ok((effective_upstream, branches_with_upstream))
 }
 
 fn render_review_markdown(threads: Vec<gh::PrReviewThread>, args: &PrReviewArgs) -> String {

@@ -27,7 +27,9 @@ pub fn commit(args: &[String]) -> Result<()> {
     }
     .ok_or_else(|| anyhow!("You must be on a branch to use 'commit'"))?;
 
-    let upstream_name = find_upstream(&repo)?;
+    let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
+        anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
+    })?;
     let upstream_obj = repo.revparse_single(&upstream_name)?;
     let upstream_id = upstream_obj.id();
     let head_id = head.peel_to_commit()?.id();

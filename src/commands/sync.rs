@@ -53,7 +53,9 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
         None
     };
 
-    let upstream_name = find_upstream(&repo)?;
+    let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
+        anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
+    })?;
     let local_upstream = upstream_name.clone();
     let (rebase_onto_name, fetch_remote) = resolve_sync_onto(&repo, &upstream_name)?;
     fetch_sync_remote(fetch_remote.as_deref())?;

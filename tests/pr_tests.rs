@@ -2,7 +2,7 @@ mod common;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use common::{gits_cmd, make_commit, repo_init, run_ok};
-use git2::Repository;
+use git2::{BranchType, Repository};
 use std::fs;
 use tempfile::tempdir;
 
@@ -275,6 +275,194 @@ exit 1
         combined.contains("add feature"),
         "Single commit branch should have prefilled title. Got:\n{}",
         combined
+    );
+}
+
+/// Test that after `gits sync`, `gits pr` uses the correct base (origin/main)
+/// even when the local main branch is behind origin/main.
+///
+/// Scenario:
+/// 1. main -> feature-a (stack)
+/// 2. Push to origin
+/// 3. origin/main advances (another worktree pushes new commits)
+/// 4. Run `gits sync` - rebases feature-a onto origin/main
+/// 5. local main is now behind origin/main
+/// 6. Run `gits pr` - should use origin/main as base, not local main
+#[test]
+fn pr_uses_origin_main_as_base_when_local_main_is_behind_after_sync() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    // Set up remote repo
+    let remote_dir = dir.path().join("remote.git");
+    fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+
+    // Create initial commit on main
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    // Create feature-a branch on top
+    make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "feature.txt",
+        "feature",
+        "add feature",
+        &[&base],
+    );
+
+    // Push main and feature-a to origin
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a"],
+        dir.path(),
+    );
+
+    // Simulate remote advancing - clone and push from another "worktree"
+    let remote_worktree = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote_dir.to_str().unwrap(),
+            remote_worktree.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "main"], remote_worktree.path());
+    fs::write(remote_worktree.path().join("remote.txt"), "remote main").unwrap();
+    run_ok("git", &["add", "remote.txt"], remote_worktree.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "remote main advanced"],
+        remote_worktree.path(),
+    );
+    run_ok("git", &["push", "origin", "main"], remote_worktree.path());
+
+    // Fetch the updated origin/main to see the divergence in our local repo
+    run_ok("git", &["fetch", "origin", "main"], dir.path());
+
+    // Now local main is behind origin/main, but feature-a is still based on local main
+    let local_main_id = repo
+        .find_branch("main", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let origin_main_id = repo.revparse_single("origin/main").unwrap().id();
+    assert_ne!(
+        local_main_id, origin_main_id,
+        "local main should be behind origin/main before sync"
+    );
+
+    // Run gits sync to rebase feature-a onto origin/main
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    let mut cmd = gits_cmd();
+    cmd.arg("sync")
+        .arg("--no-delete")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    // Verify feature-a is now based on origin/main
+    let repo = Repository::open(dir.path()).unwrap();
+    let origin_main_after = repo.revparse_single("origin/main").unwrap().id();
+    let feature_a_after = repo
+        .find_branch("feature-a", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let feature_a_commit = repo.find_commit(feature_a_after).unwrap();
+    assert_eq!(
+        feature_a_commit.parent_id(0).unwrap(),
+        origin_main_after,
+        "feature-a should be rebased onto origin/main"
+    );
+
+    // Verify local main is still behind origin/main
+    let local_main_after = repo
+        .find_branch("main", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    assert_eq!(
+        local_main_after, local_main_id,
+        "local main should not have moved"
+    );
+
+    // Create mock gh that captures the --base argument
+    let gh_mock = dir.path().join("gh");
+    let captured_base = dir.path().join("captured_base.txt");
+    std::fs::write(
+        &gh_mock,
+        format!(
+            r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo "no pull requests found for branch" >&2
+    exit 1
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
+    # Capture --base argument
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--base" ]]; then
+            printf "%s" "$2" > "{}"
+            break
+        fi
+        shift
+    done
+    echo "https://github.com/test/repo/pull/1"
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+            captured_base.display()
+        ),
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    gits_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .assert()
+        .success();
+
+    // Verify gh pr create was called with --base main (not origin/main)
+    let captured = fs::read_to_string(&captured_base).unwrap();
+    assert_eq!(
+        captured, "main",
+        "gh pr create should use 'main' as base (normalized from origin/main), but got: {}",
+        captured
     );
 }
 

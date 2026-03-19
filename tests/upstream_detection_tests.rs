@@ -134,7 +134,7 @@ fn upstream_detection_slash_default_branch_exists_only_remotely() {
     let mut cfg = repo.config().unwrap();
     cfg.set_str("init.defaultBranch", "feature/base").unwrap();
 
-    let upstream = find_upstream(&repo).unwrap();
+    let upstream = find_upstream(&repo).unwrap().unwrap();
     assert_eq!(upstream, "origin/feature/base");
 }
 
@@ -162,6 +162,6 @@ fn upstream_override_slash_branch_exists_only_remotely() {
     )
     .unwrap();
 
-    let upstream = find_upstream(&repo).unwrap();
+    let upstream = find_upstream(&repo).unwrap().unwrap();
     assert_eq!(upstream, "origin/feature/base");
 }

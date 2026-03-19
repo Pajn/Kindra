@@ -8,7 +8,9 @@ use std::process::Command;
 pub fn push() -> Result<()> {
     let repo = crate::open_repo()?;
 
-    let upstream_name = find_upstream(&repo)?;
+    let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
+        anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
+    })?;
     let current_branch_name = repo.head()?.shorthand().map(|name| name.to_string());
     if current_branch_name.as_deref() == Some(&upstream_name) {
         return push_upstream_branch(&repo, &upstream_name);

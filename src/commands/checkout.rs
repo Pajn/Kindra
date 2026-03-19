@@ -29,7 +29,9 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
         return perform_git_checkout(&selected_name);
     }
 
-    let upstream_name = find_upstream(&repo)?;
+    let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
+        anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
+    })?;
     let upstream_obj = repo.revparse_single(&upstream_name)?;
     let upstream_id = upstream_obj.id();
     let head = repo.head()?;
