@@ -51,7 +51,9 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
     }
     .ok_or_else(|| anyhow!("You must be on a branch to use 'move'"))?;
 
-    let upstream_name = find_upstream(repo)?;
+    let upstream_name = find_upstream(repo)?.ok_or_else(|| {
+        anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
+    })?;
     if current_branch_name == upstream_name {
         return Err(anyhow!(
             "Branch '{}' is the upstream branch. Cannot move the upstream branch itself.",
@@ -81,7 +83,9 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         crate::commands::prompt_select("Select target branch to move onto:", branch_names)?
     } else {
         // Only here we MUST have an upstream
-        let upstream_name = find_upstream(repo)?;
+        let upstream_name = find_upstream(repo)?.ok_or_else(|| {
+            anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
+        })?;
         let upstream_obj = repo.revparse_single(&upstream_name)?;
         let upstream_id = upstream_obj.id();
         let merge_base = repo.merge_base(upstream_id, head_id)?;
@@ -122,7 +126,9 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
 
     // Now we need the stack info to perform the rebase.
     // Even if we used --all to pick the target, we still need find_upstream to know the sub-stack.
-    let upstream_name = find_upstream(repo)?;
+    let upstream_name = find_upstream(repo)?.ok_or_else(|| {
+        anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
+    })?;
     let upstream_obj = repo.revparse_single(&upstream_name)?;
     let upstream_id = upstream_obj.id();
     let merge_base = repo.merge_base(upstream_id, head_id)?;

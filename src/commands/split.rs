@@ -10,7 +10,9 @@ use tempfile::NamedTempFile;
 pub fn split() -> Result<()> {
     let repo = crate::open_repo()?;
 
-    let upstream_name = find_upstream(&repo)?;
+    let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
+        anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
+    })?;
     let upstream_obj = repo.revparse_single(&upstream_name)?;
     let upstream_id = upstream_obj.id();
     let head_obj = repo.revparse_single("HEAD")?;

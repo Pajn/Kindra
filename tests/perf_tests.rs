@@ -15,13 +15,12 @@
 //! seconds because each unrelated branch triggers an exhaustive commit-graph walk.
 //! With the O(stack_depth) algorithm, it completes in <20ms.
 
+mod common;
 use common::repo_init;
 use git2::{Repository, Signature};
 use gits::stack::get_stack_branches_from_merge_base;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
-
-mod common;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers

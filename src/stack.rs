@@ -610,10 +610,9 @@ fn floating_patch_id_boundary(
     target_id: Oid,
     target_branch: &str,
 ) -> Result<Option<Oid>> {
-    let upstream_name = match crate::commands::find_upstream(repo) {
-        Ok(name) => name,
-        Err(err) if err.to_string().contains("Could not find a base branch") => return Ok(None),
-        Err(err) => return Err(err),
+    let upstream_name = match crate::commands::find_upstream(repo)? {
+        Some(name) => name,
+        None => return Ok(None),
     };
 
     if target_branch == upstream_name {

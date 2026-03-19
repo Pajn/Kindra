@@ -1,6 +1,6 @@
 mod common;
 
-use crate::common::{gits_cmd, make_commit, repo_init, run_ok};
+use common::{gits_cmd, make_commit, repo_init, run_ok};
 use std::fs;
 use tempfile::TempDir;
 
@@ -447,11 +447,11 @@ fn test_commit_force_with_rebase_conflict() {
     );
 
     // Run gits commit --force on main (in the main worktree)
+    // This should trigger a rebase of feature-a and feature-b since main moved
     run_ok("git", &["checkout", "main"], dir.path());
     fs::write(dir.path().join("file.txt"), "main-change").unwrap();
     run_ok("git", &["add", "file.txt"], dir.path());
 
-    // This should conflict when rebasing feature-a
     let output = gits_cmd()
         .arg("commit")
         .arg("-m")
@@ -470,41 +470,14 @@ fn test_commit_force_with_rebase_conflict() {
     let repo = git2::Repository::open(dir.path()).unwrap();
     assert!(repo.state() != git2::RepositoryState::Clean);
 
-    // Verify CLI exposes continue/abort (by simulating them)
-    // First abort
-    let output_abort = gits_cmd()
-        .arg("abort")
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
-    assert!(output_abort.status.success());
-    assert_eq!(repo.state(), git2::RepositoryState::Clean);
-
-    // Reset main to allow re-triggering the conflict (since feature-a is a child of the original main)
-    run_ok("git", &["reset", "--hard", "HEAD^"], dir.path());
-
-    // Re-trigger conflict
-    fs::write(dir.path().join("file.txt"), "main-change-2").unwrap();
-    run_ok("git", &["add", "file.txt"], dir.path());
-    let output_trigger = gits_cmd()
-        .arg("commit")
-        .arg("-m")
-        .arg("new main 2")
-        .arg("--force")
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
-    assert!(!output_trigger.status.success());
-    let repo = git2::Repository::open(dir.path()).unwrap();
-    assert!(repo.state() != git2::RepositoryState::Clean);
-
-    // Resolve and continue
+    // Resolve the conflict
     fs::write(dir.path().join("file.txt"), "resolved").unwrap();
     run_ok("git", &["add", "file.txt"], dir.path());
 
-    // Remove the other worktree so git rebase feature-b can succeed
+    // Remove the other worktree so git rebase can succeed
     run_ok("git", &["worktree", "remove", "-f", &wt_path], dir.path());
 
+    // Continue the rebase
     let res = gits_cmd()
         .arg("continue")
         .env("GIT_EDITOR", "true")

@@ -69,9 +69,9 @@ pub fn prompt_confirm(message: &str) -> Result<bool> {
         .context("Confirmation failed")
 }
 
-pub fn find_upstream(repo: &Repository) -> Result<String> {
+pub fn find_upstream(repo: &Repository) -> Result<Option<String>> {
     if let Some(upstream) = read_repo_upstream_override(repo)? {
-        return Ok(upstream);
+        return Ok(Some(upstream));
     }
 
     let mut candidates = Vec::new();
@@ -88,7 +88,7 @@ pub fn find_upstream(repo: &Repository) -> Result<String> {
 
     for name in &candidates {
         if repo.find_branch(name, BranchType::Local).is_ok() {
-            return Ok(name.clone());
+            return Ok(Some(name.clone()));
         }
     }
 
@@ -101,13 +101,11 @@ pub fn find_upstream(repo: &Repository) -> Result<String> {
 
     for name in remote_candidates {
         if branch_exists(repo, &name) {
-            return Ok(name);
+            return Ok(Some(name));
         }
     }
 
-    Err(anyhow!(
-        "Could not find a base branch (init.defaultBranch, main, master, or trunk)"
-    ))
+    Ok(None)
 }
 
 fn branch_exists(repo: &Repository, name: &str) -> bool {

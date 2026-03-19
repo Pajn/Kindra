@@ -34,7 +34,9 @@ pub fn reorder(args: &ReorderArgs) -> Result<()> {
         .ok_or_else(|| anyhow!("You must be on a branch to use 'reorder'"))?
         .to_string();
 
-    let upstream_name = find_upstream(&repo)?;
+    let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
+        anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
+    })?;
     if current_branch_name == upstream_name {
         return Err(anyhow!(
             "Branch '{}' is the upstream branch. Cannot reorder the upstream branch itself.",
