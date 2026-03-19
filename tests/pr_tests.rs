@@ -3,6 +3,7 @@ mod common;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use common::{gits_cmd, make_commit, repo_init, run_ok};
 use git2::{BranchType, Repository};
+use gits::commands::pr::resolve_stack_boundary_and_base;
 use std::fs;
 use tempfile::tempdir;
 
@@ -3375,4 +3376,172 @@ exit 1
     assert!(combined.contains("Merge prevented for PR #42"));
     assert!(!combined.contains("Merge anyway despite outstanding reviews/checks?"));
     assert!(!merge_args_path.exists());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests for resolve_stack_boundary_and_base
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn resolve_stack_boundary_falls_back_to_origin_when_no_tracking() {
+    // Setup: repo with origin/main but local main has no remote tracking
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let main_id = make_commit(&repo, "refs/heads/main", "file.txt", "base", "initial", &[]);
+    let main = repo.find_commit(main_id).unwrap();
+
+    // Create a remote tracking branch but no local tracking on main
+    repo.reference("refs/remotes/origin/main", main.id(), true, "origin/main")
+        .unwrap();
+
+    // Create a feature branch on main
+    make_commit(
+        &repo,
+        "refs/heads/feature",
+        "feature.txt",
+        "feat",
+        "feature",
+        &[&main],
+    );
+
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    // resolve_stack_boundary_and_base should return (origin/main, main)
+    // because main has no local tracking but origin/main exists
+    let (git_ref, gh_base) = resolve_stack_boundary_and_base(&repo, "main").unwrap();
+    assert_eq!(git_ref, "origin/main");
+    assert_eq!(gh_base, "main"); // normalized (origin/ stripped)
+}
+
+#[test]
+fn resolve_stack_boundary_uses_upstream_remote_when_no_origin() {
+    // Setup: repo with upstream remote (not origin) containing main
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let main_id = make_commit(&repo, "refs/heads/main", "file.txt", "base", "initial", &[]);
+    let main = repo.find_commit(main_id).unwrap();
+
+    // Add upstream remote and set its main to our commit
+    run_ok("git", &["remote", "add", "upstream", "."], dir.path());
+    repo.reference(
+        "refs/remotes/upstream/main",
+        main.id(),
+        true,
+        "upstream/main",
+    )
+    .unwrap();
+
+    // Create a feature branch on main
+    make_commit(
+        &repo,
+        "refs/heads/feature",
+        "feature.txt",
+        "feat",
+        "feature",
+        &[&main],
+    );
+
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    // resolve_stack_boundary_and_base should fall back to upstream/main when no origin exists
+    let (git_ref, gh_base) = resolve_stack_boundary_and_base(&repo, "main").unwrap();
+    assert_eq!(git_ref, "upstream/main");
+    assert_eq!(gh_base, "main"); // normalized (upstream/ stripped)
+}
+
+// Note: The single remote fallback is tested indirectly via
+// resolve_stack_boundary_uses_upstream_remote_when_no_origin which tests
+// the fallback to a non-origin remote when no tracking exists.
+
+#[test]
+fn resolve_stack_boundary_uses_remote_prefix_in_name() {
+    // Setup: upstream_name already has remote prefix (e.g., "upstream/main")
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let main_id = make_commit(
+        &repo,
+        "refs/heads/trunk",
+        "file.txt",
+        "base",
+        "initial",
+        &[],
+    );
+    let main = repo.find_commit(main_id).unwrap();
+
+    // Create upstream/trunk
+    repo.reference(
+        "refs/remotes/upstream/trunk",
+        main.id(),
+        true,
+        "upstream/trunk",
+    )
+    .unwrap();
+
+    // Create a feature branch on trunk
+    make_commit(
+        &repo,
+        "refs/heads/feature",
+        "feature.txt",
+        "feat",
+        "feature",
+        &[&main],
+    );
+
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    // When upstream_name already has a remote prefix that's valid, should use it directly
+    let (git_ref, gh_base) = resolve_stack_boundary_and_base(&repo, "upstream/trunk").unwrap();
+    assert_eq!(git_ref, "upstream/trunk");
+    assert_eq!(gh_base, "trunk"); // normalized
+}
+
+#[test]
+fn resolve_stack_boundary_uses_tracking_branch_when_diverged() {
+    // Setup: local main is behind its remote tracking branch
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    // Create initial main commit
+    let main_id = make_commit(&repo, "refs/heads/main", "file.txt", "base", "initial", &[]);
+    let main = repo.find_commit(main_id).unwrap();
+
+    // Create origin/main pointing to a NEWER commit (main was rebased)
+    let new_main_id = make_commit(
+        &repo,
+        "refs/heads/main2",
+        "file.txt",
+        "newbase",
+        "newer",
+        &[],
+    );
+    repo.reference("refs/remotes/origin/main", new_main_id, true, "origin/main")
+        .unwrap();
+
+    // Create a feature branch on main
+    make_commit(
+        &repo,
+        "refs/heads/feature",
+        "feature.txt",
+        "feat",
+        "feature",
+        &[&main],
+    );
+
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    // When local main has diverged from origin/main, should use origin/main
+    let (git_ref, gh_base) = resolve_stack_boundary_and_base(&repo, "main").unwrap();
+    assert_eq!(git_ref, "origin/main");
+    assert_eq!(gh_base, "main");
 }
