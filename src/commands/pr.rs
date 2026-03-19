@@ -437,46 +437,22 @@ pub(crate) fn discover_stack_branches_with_upstream(
         anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
     })?;
 
-    // If the upstream is a local branch, check if it has a remote upstream that
-    // it has diverged from. This can happen after `gits sync` rebases the stack
-    // onto origin/main while the local main branch remains behind. In such cases,
-    // we should use the remote tracking branch as the effective upstream so that
-    // PR creation uses the correct base.
-    let effective_upstream = if let Ok(branch) = repo.find_branch(&upstream_name, BranchType::Local)
-    {
-        if let Ok(upstream_branch) = branch.upstream() {
-            if let Ok(Some(upstream_ref)) = upstream_branch.name() {
-                let upstream_ref_str = upstream_ref.to_string();
-                let local_id = repo.revparse_single(&upstream_name)?.id();
-                let remote_id = repo.revparse_single(upstream_ref)?.id();
-                if local_id != remote_id {
-                    // Local is behind or diverged from remote - use remote tracking branch
-                    upstream_ref_str
-                } else {
-                    upstream_name.clone()
-                }
-            } else {
-                upstream_name.clone()
-            }
-        } else {
-            upstream_name.clone()
-        }
-    } else {
-        upstream_name.clone()
-    };
+    // Resolve the stack boundary (git ref for stack detection) and PR base
+    let (git_boundary_ref, _logical_pr_base) =
+        resolve_stack_boundary_and_base(repo, &upstream_name)?;
 
-    let upstream_obj = repo.revparse_single(&effective_upstream)?;
+    let upstream_obj = repo.revparse_single(&git_boundary_ref)?;
     let upstream_id = upstream_obj.id();
     let head_id = repo.head()?.peel_to_commit()?.id();
 
     // Collect all stack branches and sort bottom→top so base branches are
     // processed before the branches that depend on them.
-    let mut stack_branches = get_stack_branches(repo, head_id, upstream_id, &effective_upstream)?;
+    let mut stack_branches = get_stack_branches(repo, head_id, upstream_id, &git_boundary_ref)?;
     sort_branches_topologically(repo, &mut stack_branches)?;
 
     if stack_branches.is_empty() {
         println!("No branches in stack.");
-        return Ok((effective_upstream, Vec::new()));
+        return Ok((git_boundary_ref, Vec::new()));
     }
 
     // Only operate on branches that have a remote upstream configured.
@@ -490,7 +466,7 @@ pub(crate) fn discover_stack_branches_with_upstream(
         })
         .collect();
 
-    Ok((effective_upstream, branches_with_upstream))
+    Ok((git_boundary_ref, branches_with_upstream))
 }
 
 fn render_review_markdown(threads: Vec<gh::PrReviewThread>, args: &PrReviewArgs) -> String {
@@ -641,6 +617,68 @@ fn strip_html_comments(text: &str) -> String {
 
 fn trim_trailing_newlines(text: &str) -> &str {
     text.trim_end_matches('\n')
+}
+
+/// Resolves the stack boundary reference and the logical PR base for a given upstream.
+///
+/// Returns `(git_boundary_ref, logical_pr_base)` where:
+/// - `git_boundary_ref` is the Git reference to use for stack boundary detection
+/// - `logical_pr_base` is the base branch name to use for GitHub PRs (normalized)
+///
+/// This function implements the same fallback behavior as `resolve_sync_onto`:
+/// - First tries to use the remote tracking branch if the local branch has diverged
+/// - Falls back to `origin/{upstream}` if no local tracking exists
+/// - Falls back to `{only_remote}/{upstream}` if only one remote exists
+pub fn resolve_stack_boundary_and_base(
+    repo: &Repository,
+    upstream_name: &str,
+) -> Result<(String, String)> {
+    // First try: check if local branch has a remote tracking branch that diverged
+    if let Ok(branch) = repo.find_branch(upstream_name, BranchType::Local)
+        && let Ok(upstream_branch) = branch.upstream()
+        && let Ok(Some(upstream_ref)) = upstream_branch.name()
+    {
+        let upstream_ref_str = upstream_ref.to_string();
+        let local_id = repo.revparse_single(upstream_name)?.id();
+        let remote_id = repo.revparse_single(upstream_ref)?.id();
+        if local_id != remote_id {
+            // Local is behind or diverged from remote - use remote tracking branch
+            let gh_base = normalize_base_for_gh(&upstream_ref_str);
+            return Ok((upstream_ref_str, gh_base));
+        }
+    }
+
+    // Fallback behavior from resolve_sync_onto
+    let remotes = repo.remotes()?;
+    let remote_names: Vec<String> = remotes.iter().flatten().map(|s| s.to_string()).collect();
+
+    // Check if upstream_name has a remote prefix (e.g., "origin/main")
+    if let Some((prefix, _)) = upstream_name.split_once('/')
+        && remote_names.iter().any(|remote| remote == prefix)
+    {
+        let gh_base = normalize_base_for_gh(upstream_name);
+        return Ok((upstream_name.to_string(), gh_base));
+    }
+
+    // Try origin/{upstream}
+    let origin_candidate = format!("origin/{upstream_name}");
+    if repo.revparse_single(&origin_candidate).is_ok() {
+        let gh_base = normalize_base_for_gh(&origin_candidate);
+        return Ok((origin_candidate, gh_base));
+    }
+
+    // Try {only_remote}/{upstream} if only one remote
+    if remote_names.len() == 1 {
+        let only_remote_candidate = format!("{}/{}", remote_names[0], upstream_name);
+        if repo.revparse_single(&only_remote_candidate).is_ok() {
+            let gh_base = normalize_base_for_gh(&only_remote_candidate);
+            return Ok((only_remote_candidate, gh_base));
+        }
+    }
+
+    // Fallback: use upstream_name as-is
+    let gh_base = normalize_base_for_gh(upstream_name);
+    Ok((upstream_name.to_string(), gh_base))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
