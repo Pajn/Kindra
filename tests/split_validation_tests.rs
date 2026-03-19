@@ -1,13 +1,13 @@
 mod common;
 
-use common::{gits_cmd, make_commit};
+use common::{gits_cmd, make_commit, repo_init};
 use git2::Repository;
 use std::fs;
 use tempfile::tempdir;
 
 fn setup_repo() -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
     repo.set_head("refs/heads/main").unwrap();
 
     let parent_id = make_commit(

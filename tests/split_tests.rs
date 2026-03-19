@@ -1,13 +1,13 @@
 mod common;
 
-use common::{gits_cmd, make_commit};
+use common::{gits_cmd, make_commit, repo_init};
 use git2::{Repository, Signature};
 use std::fs;
 use tempfile::tempdir;
 
 fn setup_repo() -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
     repo.set_head("refs/heads/main").unwrap();
 
     let parent_id = make_commit(
@@ -491,7 +491,7 @@ exit 0
 #[test]
 fn test_checkout_all_works_without_main() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
     let signature = Signature::now("Test User", "test@example.com").unwrap();
 
     fs::write(dir.path().join("file.txt"), "initial").unwrap();
@@ -528,7 +528,7 @@ fn test_checkout_all_works_without_main() {
 #[test]
 fn test_checkout_all_detached_no_main() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
     let signature = Signature::now("Test User", "test@example.com").unwrap();
 
     fs::write(dir.path().join("file.txt"), "initial").unwrap();

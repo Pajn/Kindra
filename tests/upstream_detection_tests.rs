@@ -1,6 +1,6 @@
 mod common;
 
-use common::{gits_cmd, make_commit};
+use common::{gits_cmd, make_commit, repo_init};
 use git2::Repository;
 use gits::commands::find_upstream;
 use predicates::str::contains;
@@ -9,7 +9,7 @@ use tempfile::tempdir;
 
 fn setup_repo_with_base(base_branch: &str) -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let refname = format!("refs/heads/{base_branch}");
     make_commit(&repo, &refname, "file.txt", "initial", "initial", &[]);

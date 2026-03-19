@@ -1,13 +1,13 @@
 mod common;
 
-use crate::common::{gits_cmd, make_commit, run_ok};
+use crate::common::{gits_cmd, make_commit, repo_init, run_ok};
 use std::fs;
 use tempfile::TempDir;
 
 #[test]
 fn test_sync_aborts_when_branch_checked_out_in_other_worktree() {
     let dir = TempDir::new().unwrap();
-    let repo = git2::Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
     let mut config = repo.config().unwrap();
     config.set_str("user.name", "Test User").unwrap();
     config.set_str("user.email", "test@example.com").unwrap();
@@ -89,7 +89,7 @@ fn test_sync_aborts_when_branch_checked_out_in_other_worktree() {
 #[test]
 fn test_move_aborts_when_branch_checked_out_in_other_worktree() {
     let dir = TempDir::new().unwrap();
-    let repo = git2::Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
     let mut config = repo.config().unwrap();
     config.set_str("user.name", "Test User").unwrap();
     config.set_str("user.email", "test@example.com").unwrap();
@@ -173,7 +173,7 @@ fn test_move_aborts_when_branch_checked_out_in_other_worktree() {
 #[test]
 fn test_move_onto_descendant_aborts_when_checked_out_in_other_worktree() {
     let dir = TempDir::new().unwrap();
-    let repo = git2::Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
     let mut config = repo.config().unwrap();
     config.set_str("user.name", "Test User").unwrap();
     config.set_str("user.email", "test@example.com").unwrap();
@@ -252,7 +252,7 @@ fn test_move_onto_descendant_aborts_when_checked_out_in_other_worktree() {
 #[test]
 fn test_commit_on_aborts_when_branch_checked_out_in_other_worktree() {
     let dir = TempDir::new().unwrap();
-    let repo = git2::Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
     let mut config = repo.config().unwrap();
     config.set_str("user.name", "Test User").unwrap();
     config.set_str("user.email", "test@example.com").unwrap();
@@ -327,7 +327,7 @@ fn test_commit_on_aborts_when_branch_checked_out_in_other_worktree() {
 #[test]
 fn test_commit_on_with_branch_switch_aborts_due_to_worktree_and_restores() {
     let dir = TempDir::new().unwrap();
-    let repo = git2::Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
     let mut config = repo.config().unwrap();
     config.set_str("user.name", "Test User").unwrap();
     config.set_str("user.email", "test@example.com").unwrap();
@@ -414,7 +414,7 @@ fn test_commit_on_with_branch_switch_aborts_due_to_worktree_and_restores() {
 #[test]
 fn test_commit_force_with_rebase_conflict() {
     let dir = TempDir::new().unwrap();
-    let repo = git2::Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
     let mut config = repo.config().unwrap();
     config.set_str("user.name", "Test User").unwrap();
     config.set_str("user.email", "test@example.com").unwrap();

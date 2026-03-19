@@ -1,8 +1,7 @@
 //! Integration tests for stack filtering - ensuring merged branches are excluded.
 
 mod common;
-use common::{gits_cmd, make_commit, make_commit_at, run_ok};
-use git2::Repository;
+use common::{gits_cmd, make_commit, make_commit_at, repo_init, run_ok};
 use std::fs;
 use tempfile::tempdir;
 
@@ -20,7 +19,7 @@ use tempfile::tempdir;
 #[test]
 fn pr_after_branch_merged_into_main() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     // 1. Initial commit on main
     let main_commit = make_commit(
@@ -171,7 +170,7 @@ exit 1
 #[test]
 fn pr_unmerged_branches_work() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     let main_commit = make_commit(&repo, "refs/heads/main", "main.txt", "m", "initial", &[]);
 
@@ -307,7 +306,7 @@ exit 1
 #[test]
 fn get_stack_branches_excludes_fork_siblings() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     // 1. Initial commit on main
     let main_commit_id = make_commit(
@@ -392,7 +391,7 @@ fn get_stack_branches_excludes_fork_siblings() {
 #[test]
 fn get_stack_branches_handles_non_monotonic_timestamps() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     // 1. Initial commit on main (t=10)
     let main_commit_id = make_commit_at(
@@ -474,7 +473,7 @@ fn get_stack_branches_handles_non_monotonic_timestamps() {
 #[test]
 fn get_stack_branches_handles_skewed_merged_exclusion() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     // 1. Initial commit on main (t=10)
     let m0_id = make_commit_at(

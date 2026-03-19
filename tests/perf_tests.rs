@@ -15,10 +15,13 @@
 //! seconds because each unrelated branch triggers an exhaustive commit-graph walk.
 //! With the O(stack_depth) algorithm, it completes in <20ms.
 
+use common::repo_init;
 use git2::{Repository, Signature};
 use gits::stack::get_stack_branches_from_merge_base;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
+
+mod common;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -139,7 +142,7 @@ fn pack_objects(dir: &std::path::Path) {
 #[test]
 fn stack_discovery_is_proportional_to_stack_size_not_history() {
     let dir = tempdir().unwrap();
-    let repo = Repository::init(dir.path()).unwrap();
+    let repo = repo_init(dir.path());
 
     // ── 1. Build main history (900 commits before stack, 100 after) ──────────
     let _pre_stack_tip = append_commits(&repo, "refs/heads/main", 900);

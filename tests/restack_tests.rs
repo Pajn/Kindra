@@ -2,13 +2,13 @@ use git2::Repository;
 use tempfile::TempDir;
 
 mod common;
-use common::{gits_cmd, make_commit, run_ok};
+use common::{gits_cmd, make_commit, repo_init, run_ok};
 
 #[test]
 fn test_restack_basic() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
-    let repo = Repository::init(repo_path).unwrap();
+    let repo = repo_init(repo_path);
 
     // Setup git config
     run_ok("git", &["config", "user.name", "Test User"], repo_path);
@@ -62,7 +62,7 @@ fn test_restack_basic() {
 fn test_restack_unrelated() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
-    let repo = Repository::init(repo_path).unwrap();
+    let repo = repo_init(repo_path);
 
     run_ok("git", &["config", "user.name", "Test User"], repo_path);
     run_ok(
@@ -120,7 +120,7 @@ fn test_restack_unrelated() {
 fn test_restack_multiple_children() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
-    let repo = Repository::init(repo_path).unwrap();
+    let repo = repo_init(repo_path);
 
     run_ok("git", &["config", "user.name", "Test User"], repo_path);
     run_ok(
@@ -184,7 +184,7 @@ fn test_restack_multiple_children() {
 fn test_restack_ignores_stale_branch_pointing_at_old_base() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
-    let repo = Repository::init(repo_path).unwrap();
+    let repo = repo_init(repo_path);
 
     run_ok("git", &["config", "user.name", "Test User"], repo_path);
     run_ok(
@@ -222,7 +222,7 @@ fn test_restack_ignores_stale_branch_pointing_at_old_base() {
 fn test_restack_continues_past_tip_tree_match() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
-    let repo = Repository::init(repo_path).unwrap();
+    let repo = repo_init(repo_path);
 
     run_ok("git", &["config", "user.name", "Test User"], repo_path);
     run_ok(
@@ -265,7 +265,7 @@ fn test_restack_continues_past_tip_tree_match() {
 fn test_restack_ignores_metadata_match_on_other_lineage() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
-    let repo = Repository::init(repo_path).unwrap();
+    let repo = repo_init(repo_path);
 
     run_ok("git", &["config", "user.name", "Test User"], repo_path);
     run_ok(
@@ -340,7 +340,7 @@ fn test_restack_ignores_metadata_match_on_other_lineage() {
 fn test_restack_ignores_metadata_only_match_on_sibling_commit() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
-    let repo = Repository::init(repo_path).unwrap();
+    let repo = repo_init(repo_path);
 
     run_ok("git", &["config", "user.name", "Test User"], repo_path);
     run_ok(
@@ -427,7 +427,7 @@ fn test_restack_ignores_metadata_only_match_on_sibling_commit() {
 fn test_restack_matches_earlier_rewritten_commit_in_target_history() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
-    let repo = Repository::init(repo_path).unwrap();
+    let repo = repo_init(repo_path);
 
     run_ok("git", &["config", "user.name", "Test User"], repo_path);
     run_ok(
@@ -504,7 +504,7 @@ fn test_restack_matches_earlier_rewritten_commit_in_target_history() {
 fn setup_deep_rewritten_base_scenario() -> (TempDir, Repository, git2::Oid, git2::Oid) {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
-    let repo = Repository::init(repo_path).unwrap();
+    let repo = repo_init(repo_path);
 
     run_ok("git", &["config", "user.name", "Test User"], repo_path);
     run_ok(
@@ -735,7 +735,7 @@ fn test_restack_cli_override_takes_precedence_over_repo_and_global_config() {
 fn test_restack_continues_past_tip_patch_id_match() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
-    let repo = Repository::init(repo_path).unwrap();
+    let repo = repo_init(repo_path);
 
     run_ok("git", &["config", "user.name", "Test User"], repo_path);
     run_ok(
@@ -819,7 +819,7 @@ fn test_restack_continues_past_tip_patch_id_match() {
 fn test_restack_patch_id_matching_ignores_colored_git_show_output() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
-    let repo = Repository::init(repo_path).unwrap();
+    let repo = repo_init(repo_path);
 
     run_ok("git", &["config", "user.name", "Test User"], repo_path);
     run_ok(
@@ -904,7 +904,7 @@ fn test_restack_patch_id_matching_ignores_colored_git_show_output() {
 fn test_restack_restricts_patch_id_matches_to_target_private_lineage() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
-    let repo = Repository::init(repo_path).unwrap();
+    let repo = repo_init(repo_path);
 
     run_ok("git", &["config", "user.name", "Test User"], repo_path);
     run_ok(
@@ -1026,7 +1026,7 @@ fn test_restack_restricts_patch_id_matches_to_target_private_lineage() {
 fn test_restack_matches_rewritten_private_commit_by_patch_id_on_non_root_branch() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
-    let repo = Repository::init(repo_path).unwrap();
+    let repo = repo_init(repo_path);
 
     run_ok("git", &["config", "user.name", "Test User"], repo_path);
     run_ok(
@@ -1116,7 +1116,7 @@ fn test_restack_matches_rewritten_private_commit_by_patch_id_on_non_root_branch(
 fn test_restack_conflict() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
-    let repo = Repository::init(repo_path).unwrap();
+    let repo = repo_init(repo_path);
 
     run_ok("git", &["config", "user.name", "Test User"], repo_path);
     run_ok(
@@ -1162,7 +1162,7 @@ fn test_restack_conflict() {
 fn test_restack_continue() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
-    let repo = Repository::init(repo_path).unwrap();
+    let repo = repo_init(repo_path);
 
     run_ok("git", &["config", "user.name", "Test User"], repo_path);
     run_ok(
@@ -1220,7 +1220,7 @@ fn test_restack_continue() {
 fn test_restack_abort() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
-    let repo = Repository::init(repo_path).unwrap();
+    let repo = repo_init(repo_path);
 
     run_ok("git", &["config", "user.name", "Test User"], repo_path);
     run_ok(
