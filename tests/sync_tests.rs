@@ -1101,7 +1101,7 @@ fn sync_refuses_to_auto_pick_tip_in_non_interactive_mode() {
 }
 
 #[test]
-fn sync_ignores_rebase_autostash_config() {
+fn sync_respects_git_rebase_autostash_config() {
     let dir = tempdir().unwrap();
     let repo = repo_init(dir.path());
 
@@ -1140,10 +1140,70 @@ fn sync_ignores_rebase_autostash_config() {
     let mut cmd = gits_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().failure();
 
+    // Verify autostash worked: rebase started (proving git config is respected)
+    assert!(
+        dir.path().join(".git/rebase-merge").exists()
+            || dir.path().join(".git/rebase-apply").exists(),
+        "git config rebase.autostash should allow sync to start rebasing with autostash"
+    );
+
+    // Clean up: abort the rebase so the test leaves a clean state
+    run_ok("git", &["rebase", "--abort"], dir.path());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "base\nfeature\ndirty\n",
+        "dirty changes should be preserved after abort"
+    );
+}
+
+#[test]
+fn sync_no_autostash_overrides_git_config() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "base\n",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "file.txt",
+        "base\nfeature\n",
+        "feature a",
+        &[&base],
+    );
+
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "base\nmain\n",
+        "main change",
+        &[&base],
+    );
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    run_ok("git", &["config", "rebase.autostash", "true"], dir.path());
+    fs::write(dir.path().join("file.txt"), "base\nfeature\ndirty\n").unwrap();
+
+    let mut cmd = gits_cmd();
+    cmd.arg("sync")
+        .arg("--no-autostash")
+        .current_dir(dir.path())
+        .assert()
+        .failure();
+
     assert!(
         !dir.path().join(".git/rebase-merge").exists()
             && !dir.path().join(".git/rebase-apply").exists(),
-        "sync should fail before starting a rebase when the worktree is dirty"
+        "CLI --no-autostash should override git config rebase.autostash"
     );
     assert_eq!(
         fs::read_to_string(dir.path().join("file.txt")).unwrap(),
