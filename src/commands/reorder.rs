@@ -23,7 +23,7 @@ pub fn reorder(args: &ReorderArgs) -> Result<()> {
     let repo = crate::open_repo()?;
     if state_path(&repo).exists() {
         return Err(anyhow!(
-            "A gits operation is already in progress. Use 'gits continue' or 'gits abort'."
+            "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));
     }
     crate::commands::sync::ensure_no_native_git_operation(&repo)?;
@@ -184,7 +184,7 @@ fn render_parent_map_buffer(
         previous_branch_name = Some(&branch.name);
     }
 
-    buffer.push_str("\n# gits reorder\n");
+    buffer.push_str("\n# kin reorder\n");
     buffer.push_str("# Edit only the parent target for each branch.\n");
     buffer.push_str("# Keep exactly one row per branch.\n");
     buffer.push_str(&format!(

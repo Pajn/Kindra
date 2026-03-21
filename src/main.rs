@@ -26,7 +26,7 @@ use clap_complete::{Shell, generate};
 use commands::CheckoutSubcommand;
 
 #[derive(Parser)]
-#[command(name = "gits")]
+#[command(name = "kin")]
 #[command(about = "A wrapper around git to aid certain workflows", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -67,11 +67,11 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Continue an in-progress gits operation
+    /// Continue an in-progress Kindra operation
     Continue,
-    /// Abort an in-progress gits operation
+    /// Abort an in-progress Kindra operation
     Abort,
-    /// Show the status of an in-progress gits operation
+    /// Show the status of an in-progress Kindra operation
     Status,
     /// Visualize the stack tree
     #[command(alias = "t")]
@@ -130,23 +130,19 @@ fn main() -> Result<()> {
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             match shell {
-                ShellChoice::Bash => {
-                    generate(Shell::Bash, &mut cmd, "gits", &mut std::io::stdout())
-                }
-                ShellChoice::Zsh => generate(Shell::Zsh, &mut cmd, "gits", &mut std::io::stdout()),
-                ShellChoice::Fish => {
-                    generate(Shell::Fish, &mut cmd, "gits", &mut std::io::stdout())
-                }
+                ShellChoice::Bash => generate(Shell::Bash, &mut cmd, "kin", &mut std::io::stdout()),
+                ShellChoice::Zsh => generate(Shell::Zsh, &mut cmd, "kin", &mut std::io::stdout()),
+                ShellChoice::Fish => generate(Shell::Fish, &mut cmd, "kin", &mut std::io::stdout()),
                 ShellChoice::PowerShell => {
-                    generate(Shell::PowerShell, &mut cmd, "gits", &mut std::io::stdout())
+                    generate(Shell::PowerShell, &mut cmd, "kin", &mut std::io::stdout())
                 }
                 ShellChoice::Elvish => {
-                    generate(Shell::Elvish, &mut cmd, "gits", &mut std::io::stdout())
+                    generate(Shell::Elvish, &mut cmd, "kin", &mut std::io::stdout())
                 }
                 ShellChoice::Nu => generate(
                     clap_complete_nushell::Nushell,
                     &mut cmd,
-                    "gits",
+                    "kin",
                     &mut std::io::stdout(),
                 ),
             }

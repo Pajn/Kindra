@@ -2,7 +2,7 @@ use git2::Repository;
 use tempfile::TempDir;
 
 mod common;
-use common::{gits_cmd, make_commit, repo_init, run_ok};
+use common::{kin_cmd, make_commit, repo_init, run_ok};
 
 #[test]
 fn test_restack_basic() {
@@ -43,7 +43,7 @@ fn test_restack_basic() {
     assert_ne!(head_oid, new_head_oid);
 
     // 4. Run restack
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.current_dir(repo_path).arg("restack").assert().success();
 
     // 5. Verify feat
@@ -107,7 +107,7 @@ fn test_restack_unrelated() {
     run_ok("git", &["commit", "--amend", "-m", "feat: A"], repo_path);
 
     // Run restack
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.current_dir(repo_path).arg("restack").assert().success();
 
     // Verify other did NOT move
@@ -164,7 +164,7 @@ fn test_restack_multiple_children() {
     let new_head_oid = repo.head().unwrap().target().unwrap();
 
     // Run restack
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.current_dir(repo_path).arg("restack").assert().success();
 
     // Verify feat1
@@ -203,7 +203,7 @@ fn test_restack_ignores_stale_branch_pointing_at_old_base() {
     run_ok("git", &["add", "a.txt"], repo_path);
     run_ok("git", &["commit", "--amend", "-m", "feat: A"], repo_path);
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.current_dir(repo_path).arg("restack").assert().success();
 
     let stale_oid = repo
@@ -249,7 +249,7 @@ fn test_restack_continues_past_tip_tree_match() {
     );
     let new_main_oid = repo.head().unwrap().target().unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.current_dir(repo_path).arg("restack").assert().success();
 
     run_ok("git", &["checkout", "feat"], repo_path);
@@ -320,7 +320,7 @@ fn test_restack_ignores_metadata_match_on_other_lineage() {
     );
     let new_main_oid = repo.head().unwrap().target().unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.current_dir(repo_path).arg("restack").assert().success();
 
     run_ok("git", &["checkout", "feat"], repo_path);
@@ -401,7 +401,7 @@ fn test_restack_ignores_metadata_only_match_on_sibling_commit() {
         &[&repo.find_commit(shared_parent_oid).unwrap()],
     );
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.current_dir(repo_path).arg("restack").assert().success();
 
     let feat_oid = repo
@@ -480,7 +480,7 @@ fn test_restack_matches_earlier_rewritten_commit_in_target_history() {
     run_ok("git", &["cherry-pick", &b_oid.to_string()], repo_path);
     let rewritten_main_oid = repo.head().unwrap().target().unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.current_dir(repo_path).arg("restack").assert().success();
 
     run_ok("git", &["checkout", "feat"], repo_path);
@@ -570,13 +570,13 @@ fn test_global_config_dir(root: &std::path::Path) -> std::path::PathBuf {
         return root
             .join("Library")
             .join("Application Support")
-            .join("gits");
+            .join("kindra");
     }
     if cfg!(target_os = "windows") {
-        return root.join("AppData").join("Roaming").join("gits");
+        return root.join("AppData").join("Roaming").join("kindra");
     }
 
-    root.join(".config").join("gits")
+    root.join(".config").join("kindra")
 }
 
 fn apply_global_config_env(cmd: &mut assert_cmd::Command, root: &std::path::Path) {
@@ -597,7 +597,7 @@ fn test_restack_default_history_limit_skips_deep_rewritten_base() {
     let (temp, repo, old_feat_oid, _rewritten_main_oid) = setup_deep_rewritten_base_scenario();
     let repo_path = temp.path();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.current_dir(repo_path).arg("restack").assert().success();
 
     run_ok("git", &["checkout", "feat"], repo_path);
@@ -613,7 +613,7 @@ fn test_restack_matches_base_beyond_one_hundred_rewritten_commits_with_cli_overr
     let (temp, repo, old_feat_oid, rewritten_main_oid) = setup_deep_rewritten_base_scenario();
     let repo_path = temp.path();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.current_dir(repo_path)
         .arg("restack")
         .arg("--history-limit")
@@ -642,12 +642,12 @@ fn test_restack_repo_config_overrides_default_history_limit() {
     let repo_path = temp.path();
 
     std::fs::write(
-        repo.path().join("gits.toml"),
+        repo.path().join("kindra.toml"),
         "[restack]\nhistory_limit = 300\n",
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.current_dir(repo_path).arg("restack").assert().success();
 
     run_ok("git", &["checkout", "feat"], repo_path);
@@ -675,7 +675,7 @@ fn test_restack_global_config_overrides_default_history_limit() {
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.current_dir(repo_path);
     apply_global_config_env(&mut cmd, global_config_root.path());
     cmd.arg("restack").assert().success();
@@ -705,12 +705,12 @@ fn test_restack_cli_override_takes_precedence_over_repo_and_global_config() {
     )
     .unwrap();
     std::fs::write(
-        repo.path().join("gits.toml"),
+        repo.path().join("kindra.toml"),
         "[restack]\nhistory_limit = 75\n",
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.current_dir(repo_path);
     apply_global_config_env(&mut cmd, global_config_root.path());
     cmd.arg("restack")
@@ -798,7 +798,7 @@ fn test_restack_continues_past_tip_patch_id_match() {
     run_ok("git", &["cherry-pick", &d_oid.to_string()], repo_path);
     let rewritten_main_oid = repo.head().unwrap().target().unwrap();
 
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.current_dir(repo_path).arg("restack").assert().success();
 
     run_ok("git", &["checkout", "feat"], repo_path);
@@ -883,7 +883,7 @@ fn test_restack_patch_id_matching_ignores_colored_git_show_output() {
     run_ok("git", &["cherry-pick", &d_oid.to_string()], repo_path);
     let rewritten_main_oid = repo.head().unwrap().target().unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.current_dir(repo_path).arg("restack").assert().success();
 
     run_ok("git", &["checkout", "feat"], repo_path);
@@ -989,7 +989,7 @@ fn test_restack_restricts_patch_id_matches_to_target_private_lineage() {
         .target()
         .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.current_dir(repo_path).arg("restack").assert().success();
 
     let new_mobile_tests_oid = repo
@@ -1077,7 +1077,7 @@ fn test_restack_matches_rewritten_private_commit_by_patch_id_on_non_root_branch(
         .target()
         .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.current_dir(repo_path).arg("restack").assert().success();
 
     let new_mobile_tests_oid = repo
@@ -1147,7 +1147,7 @@ fn test_restack_conflict() {
     run_ok("git", &["commit", "--amend", "-m", "feat: A"], repo_path);
 
     // 4. Run restack - should fail due to conflict
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.current_dir(repo_path).arg("restack").assert().failure();
 
     // 5. Assert we are in a rebase state
@@ -1189,15 +1189,15 @@ fn test_restack_continue() {
     run_ok("git", &["commit", "--amend", "-m", "feat: A"], repo_path);
 
     // Run restack
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.current_dir(repo_path).arg("restack").assert().failure();
 
     // Resolve conflict
     std::fs::write(repo_path.join("conflict.txt"), "Resolved").unwrap();
     run_ok("git", &["add", "conflict.txt"], repo_path);
 
-    // Run gits continue
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    // Run kin continue
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.current_dir(repo_path)
         .env("GIT_EDITOR", "cat")
         .arg("continue")
@@ -1247,11 +1247,11 @@ fn test_restack_abort() {
     run_ok("git", &["commit", "--amend", "-m", "feat: A"], repo_path);
 
     // Run restack
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.current_dir(repo_path).arg("restack").assert().failure();
 
-    // Run gits abort
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+    // Run kin abort
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.current_dir(repo_path).arg("abort").assert().success();
 
     // Verify feat is back to b_oid

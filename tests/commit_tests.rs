@@ -1,5 +1,5 @@
 mod common;
-use common::{gits_cmd, make_commit, repo_init, run_ok};
+use common::{kin_cmd, make_commit, repo_init, run_ok};
 use git2::Repository;
 use std::fs;
 use std::path::Path;
@@ -122,8 +122,8 @@ fn test_commit_rebases_descendants() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Run gits commit
-    let mut cmd = gits_cmd();
+    // Run kin commit
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("new a")
@@ -189,7 +189,7 @@ fn test_commit_amend_rebases_descendants() {
     repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
         .unwrap();
 
-    // Run gits commit --amend
+    // Run kin commit --amend
     fs::write(dir.path().join("a.txt"), "amended a").unwrap();
     let out = std::process::Command::new("git")
         .arg("add")
@@ -203,7 +203,7 @@ fn test_commit_amend_rebases_descendants() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("--amend")
         .arg("--no-edit")
@@ -258,8 +258,8 @@ fn test_commit_no_changes() {
     repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
         .unwrap();
 
-    // Run gits commit without staging anything
-    let mut cmd = gits_cmd();
+    // Run kin commit without staging anything
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("nothing")
@@ -322,7 +322,7 @@ fn test_commit_forked_stack() {
     repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
         .unwrap();
 
-    // Run gits commit
+    // Run kin commit
     fs::write(dir.path().join("a2.txt"), "a2").unwrap();
     let mut git_add = std::process::Command::new("git");
     let out = git_add
@@ -337,7 +337,7 @@ fn test_commit_forked_stack() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("new a")
@@ -386,7 +386,7 @@ fn test_commit_on_main() {
     repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
         .unwrap();
 
-    // Run gits commit
+    // Run kin commit
     fs::write(dir.path().join("main2.txt"), "main2").unwrap();
     let out = std::process::Command::new("git")
         .arg("add")
@@ -400,7 +400,7 @@ fn test_commit_on_main() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("on main")
@@ -465,7 +465,7 @@ fn test_commit_conflict_and_continue() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("conflicting a")
@@ -495,8 +495,8 @@ fn test_commit_conflict_and_continue() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Continue with gits (which will run git rebase --continue for us)
-    let mut cmd_cont = gits_cmd();
+    // Continue with kin (which will run git rebase --continue for us)
+    let mut cmd_cont = kin_cmd();
     cmd_cont
         .arg("continue")
         .current_dir(dir.path())
@@ -575,7 +575,7 @@ fn test_commit_abort() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("conflict")
@@ -590,7 +590,7 @@ fn test_commit_abort() {
     assert!(dir.path().join(".git/gits_rebase_state.json").exists());
 
     // Abort
-    let mut cmd_abort = gits_cmd();
+    let mut cmd_abort = kin_cmd();
     cmd_abort
         .arg("abort")
         .current_dir(dir.path())
@@ -631,7 +631,7 @@ fn test_abort_malformed_state() {
     fs::write(dir.path().join("shared.txt"), "conflict").unwrap();
     run_ok("git", &["add", "shared.txt"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("conflict")
@@ -647,7 +647,7 @@ fn test_abort_malformed_state() {
     assert!(state_path.exists());
     fs::write(&state_path, "{ malformed json").unwrap();
 
-    let mut cmd_abort = gits_cmd();
+    let mut cmd_abort = kin_cmd();
     cmd_abort
         .arg("abort")
         .current_dir(dir.path())
@@ -669,14 +669,14 @@ fn test_abort_uses_exact_stash_message_match() {
     fs::write(dir.path().join("file.txt"), "stash one").unwrap();
     run_ok(
         "git",
-        &["stash", "push", "-m", "gits-commit-on-1-1"],
+        &["stash", "push", "-m", "kin-commit-on-1-1"],
         dir.path(),
     );
 
     fs::write(dir.path().join("file.txt"), "stash ten").unwrap();
     run_ok(
         "git",
-        &["stash", "push", "-m", "gits-commit-on-1-10"],
+        &["stash", "push", "-m", "kin-commit-on-1-10"],
         dir.path(),
     );
 
@@ -691,13 +691,13 @@ fn test_abort_uses_exact_stash_message_match() {
   "in_progress_branch": null,
   "parent_id_map": {},
   "parent_name_map": {},
-  "stash_ref": "gits-commit-on-1-1",
+  "stash_ref": "kin-commit-on-1-1",
   "unstage_on_restore": false
 }"#,
     )
     .unwrap();
 
-    let mut cmd_abort = gits_cmd();
+    let mut cmd_abort = kin_cmd();
     cmd_abort
         .arg("abort")
         .current_dir(dir.path())
@@ -710,12 +710,12 @@ fn test_abort_uses_exact_stash_message_match() {
         .filter_map(|line| line.rsplit_once(": ").map(|(_, message)| message.trim()))
         .collect();
     assert!(
-        messages.contains(&"gits-commit-on-1-10"),
+        messages.contains(&"kin-commit-on-1-10"),
         "Expected later stash to remain, got:\n{}",
         stash_list
     );
     assert!(
-        !messages.contains(&"gits-commit-on-1-1"),
+        !messages.contains(&"kin-commit-on-1-1"),
         "Expected exact stash to be removed, got:\n{}",
         stash_list
     );
@@ -729,8 +729,8 @@ fn test_commit_reentry_guard() {
     // Create the state file to simulate an ongoing operation
     fs::write(&state_path, "{}").unwrap();
 
-    // Attempt to run gits commit
-    let mut cmd = gits_cmd();
+    // Attempt to run kin commit
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("test")
@@ -763,7 +763,7 @@ fn test_commit_on_main_rebases_descendant() {
 
     assert!(repo.graph_descendant_of(feature_id, main_id).unwrap());
 
-    // Run gits commit on main
+    // Run kin commit on main
     repo.set_head("refs/heads/main").unwrap();
     repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
         .unwrap();
@@ -781,7 +781,7 @@ fn test_commit_on_main_rebases_descendant() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("new main commit")
@@ -855,7 +855,7 @@ fn test_commit_on_main_rebases_multi_level_stack() {
     repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
         .unwrap();
 
-    // 2. Run gits commit on main
+    // 2. Run kin commit on main
     fs::write(dir.path().join("main_new_2.txt"), "new content 2").unwrap();
     let out = std::process::Command::new("git")
         .arg("add")
@@ -869,7 +869,7 @@ fn test_commit_on_main_rebases_multi_level_stack() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("new main commit 2")
@@ -909,8 +909,8 @@ fn test_commit_on_main_rebases_multi_level_stack() {
 fn test_commit_failure_is_propagated() {
     let (dir, _repo) = setup_repo();
 
-    // Run gits commit with nothing staged - it should fail and show why
-    let mut cmd = gits_cmd();
+    // Run kin commit with nothing staged - it should fail and show why
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("-m")
         .arg("no changes")
@@ -952,7 +952,7 @@ fn test_commit_on_branch_in_stack_restores_original_and_unstages() {
     run_ok("git", &["add", "shared.txt"], dir.path());
     fs::write(dir.path().join("scratch.txt"), "keep me unstaged").unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("--on")
         .arg("feature")
@@ -1030,7 +1030,7 @@ fn test_commit_on_branch_in_stack_three_level_restores_original_and_unstages() {
     run_ok("git", &["add", "shared.txt"], dir.path());
     fs::write(dir.path().join("scratch.txt"), "keep me unstaged").unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("--on")
         .arg("feature")
@@ -1097,7 +1097,7 @@ fn test_commit_on_without_argument_uses_interactive_selection() {
     fs::write(dir.path().join("interactive.txt"), "interactive").unwrap();
     run_ok("git", &["add", "interactive.txt"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("--on=")
         .arg("-m")
@@ -1127,7 +1127,7 @@ fn test_commit_on_requires_branch_when_followed_by_flag() {
     fs::write(dir.path().join("interactive-error.txt"), "interactive").unwrap();
     run_ok("git", &["add", "interactive-error.txt"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("--on")
         .arg("-m")
@@ -1172,7 +1172,7 @@ fn test_commit_on_other_stack_default_just_commits() {
     run_ok("git", &["add", "cross.txt"], dir.path());
     fs::write(dir.path().join("scratch.txt"), "scratch").unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("--on")
         .arg("s2-a")
@@ -1248,7 +1248,7 @@ fn test_commit_on_conflict_and_continue_restores_original_context() {
     .unwrap();
     run_ok("git", &["add", "shared.txt"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("--on")
         .arg("feature-a")
@@ -1268,7 +1268,7 @@ fn test_commit_on_conflict_and_continue_restores_original_context() {
     fs::write(dir.path().join("shared.txt"), "resolved").unwrap();
     run_ok("git", &["add", "shared.txt"], dir.path());
 
-    let mut cmd_cont = gits_cmd();
+    let mut cmd_cont = kin_cmd();
     cmd_cont
         .arg("continue")
         .current_dir(dir.path())
@@ -1317,7 +1317,7 @@ fn test_commit_on_conflict_and_abort_restores_original_context() {
     .unwrap();
     run_ok("git", &["add", "shared.txt"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("--on")
         .arg("feature-a")
@@ -1333,7 +1333,7 @@ fn test_commit_on_conflict_and_abort_restores_original_context() {
 
     assert!(dir.path().join(".git/gits_rebase_state.json").exists());
 
-    let mut cmd_abort = gits_cmd();
+    let mut cmd_abort = kin_cmd();
     cmd_abort
         .arg("abort")
         .current_dir(dir.path())
@@ -1432,7 +1432,7 @@ fn test_rebase_loop_skips_resumed_and_subsequent_done_branches() {
     // Its new_base is "feature-a" (new_a_id).
     // Is b_id a descendant of new_a_id? NO.
     // So b should be rebased.
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("continue")
         .current_dir(dir.path())
         .env("GIT_AUTHOR_NAME", "Test")
@@ -1487,7 +1487,7 @@ fn test_commit_on_checkout_conflict_restores_original_context() {
     run_ok("git", &["add", "shared.txt"], dir.path());
     fs::write(dir.path().join("scratch.txt"), "scratch").unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("--on")
         .arg("feature-a")
@@ -1508,7 +1508,7 @@ fn test_commit_on_checkout_conflict_restores_original_context() {
     assert!(dir.path().join(".git/gits_rebase_state.json").exists());
 
     // Abort should clean up the state and restore context
-    let mut abort_cmd = gits_cmd();
+    let mut abort_cmd = kin_cmd();
     abort_cmd
         .arg("abort")
         .current_dir(dir.path())

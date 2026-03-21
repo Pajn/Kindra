@@ -15,7 +15,7 @@ pub fn commit(args: &[String]) -> Result<()> {
     let path = state_path(&repo);
     if path.exists() {
         return Err(anyhow!(
-            "A gits operation is already in progress. Use 'gits continue' or 'gits abort'."
+            "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));
     }
 
@@ -161,7 +161,7 @@ pub fn commit(args: &[String]) -> Result<()> {
 
         if switching_branches && let Err(err) = checkout_branch(&target_branch) {
             return Err(err.context(
-                "Failed to checkout target branch. Use 'gits abort' to restore original state.",
+                "Failed to checkout target branch. Use 'kin abort' to restore original state.",
             ));
         }
 
@@ -172,7 +172,7 @@ pub fn commit(args: &[String]) -> Result<()> {
             .status()?;
         if !status.success() {
             return Err(anyhow!(
-                "git commit failed. Resolve and run 'gits continue', or run 'gits abort'."
+                "git commit failed. Resolve and run 'kin continue', or run 'kin abort'."
             ));
         }
 
@@ -395,7 +395,7 @@ fn stash_head_ref() -> Result<Option<String>> {
 fn stash_non_staged_changes() -> Result<Option<String>> {
     let before = stash_head_ref()?;
     let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let message = format!("gits-commit-on-{}-{}", std::process::id(), ts);
+    let message = format!("kin-commit-on-{}-{}", std::process::id(), ts);
     let status = Command::new("git")
         .arg("stash")
         .arg("push")

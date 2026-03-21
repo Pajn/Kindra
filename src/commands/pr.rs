@@ -69,8 +69,10 @@ pub fn pr(subcommand: &Option<PrSubcommand>) -> Result<()> {
     }
 }
 
-const STACK_SECTION_START: &str = "<!-- gits-stack:start -->";
-const STACK_SECTION_END: &str = "<!-- gits-stack:end -->";
+const STACK_SECTION_START: &str = "<!-- kindra-stack:start -->";
+const STACK_SECTION_END: &str = "<!-- kindra-stack:end -->";
+const LEGACY_STACK_SECTION_START: &str = "<!-- gits-stack:start -->";
+const LEGACY_STACK_SECTION_END: &str = "<!-- gits-stack:end -->";
 
 #[derive(Clone)]
 pub(crate) struct StackPr {
@@ -102,7 +104,7 @@ fn pr_create_or_update() -> Result<()> {
 
     if branches_with_upstream.is_empty() {
         println!("No branches with a remote upstream to create PRs for.");
-        println!("Run `gits push` first to set upstreams.");
+        println!("Run `kin push` first to set upstreams.");
         return Ok(());
     }
 
@@ -148,7 +150,7 @@ fn pr_open() -> Result<()> {
 
     if branches_with_upstream.is_empty() {
         println!("No branches with a remote upstream in stack.");
-        println!("Run `gits push` first to set upstreams.");
+        println!("Run `kin push` first to set upstreams.");
         return Ok(());
     }
 
@@ -196,7 +198,7 @@ fn pr_edit() -> Result<()> {
 
     if branches_with_upstream.is_empty() {
         println!("No branches with a remote upstream in stack.");
-        println!("Run `gits push` first to set upstreams.");
+        println!("Run `kin push` first to set upstreams.");
         return Ok(());
     }
 
@@ -284,7 +286,7 @@ fn pr_review(args: &PrReviewArgs) -> Result<()> {
 
     if branches_with_upstream.is_empty() {
         println!("No branches with a remote upstream in stack.");
-        println!("Run `gits push` first to set upstreams.");
+        println!("Run `kin push` first to set upstreams.");
         return Ok(());
     }
 
@@ -333,7 +335,7 @@ fn pr_status() -> Result<()> {
 
     if branches_with_upstream.is_empty() {
         println!("No branches with a remote upstream in stack.");
-        println!("Run `gits push` first to set upstreams.");
+        println!("Run `kin push` first to set upstreams.");
         return Ok(());
     }
 
@@ -819,13 +821,8 @@ fn sync_stack_descriptions(prs: &[StackPr]) -> Result<()> {
 
 fn parse_stack_section(body: &str) -> Vec<StoredPr> {
     let mut prs = Vec::new();
-    let start_idx = body.find(STACK_SECTION_START);
-    let end_idx = body.find(STACK_SECTION_END);
-
-    if let (Some(start), Some(end)) = (start_idx, end_idx)
-        && start < end
-    {
-        let section_start = start + STACK_SECTION_START.len();
+    if let Some((start, end, marker_len)) = find_first_stack_section(body) {
+        let section_start = start + marker_len;
         let section = &body[section_start..end];
         for line in section.lines() {
             let line = line.trim();
@@ -996,34 +993,65 @@ fn update_stack_section(body: &str, stack_section: Option<String>) -> String {
     }
 }
 
+fn find_first_stack_section(body: &str) -> Option<(usize, usize, usize)> {
+    stack_section_markers()
+        .iter()
+        .filter_map(|(start_marker, end_marker)| {
+            let start = body.find(start_marker)?;
+            let search_after_start = start + start_marker.len();
+            let end_offset = body[search_after_start..].find(end_marker)?;
+            let end = search_after_start + end_offset;
+            Some((start, end, start_marker.len()))
+        })
+        .min_by_key(|(start, _, _)| *start)
+}
+
 fn remove_existing_stack_section(body: &str) -> (String, bool) {
     let mut current_body = body.to_string();
     let mut any_removed = false;
 
     loop {
-        if let Some(start_idx) = current_body.find(STACK_SECTION_START) {
-            let search_after_start = start_idx + STACK_SECTION_START.len();
-            if let Some(end_offset) = current_body[search_after_start..].find(STACK_SECTION_END) {
-                let end_idx = search_after_start + end_offset;
-                let slice_end = end_idx + STACK_SECTION_END.len();
+        let Some((start_idx, end_idx, _start_marker, end_marker)) =
+            find_removable_stack_section(&current_body)
+        else {
+            break;
+        };
+        let slice_end = end_idx + end_marker.len();
 
-                let before = current_body[..start_idx].trim_end();
-                let after = current_body[slice_end..].trim_start();
+        let before = current_body[..start_idx].trim_end();
+        let after = current_body[slice_end..].trim_start();
 
-                current_body = match (before.is_empty(), after.is_empty()) {
-                    (true, true) => String::new(),
-                    (false, true) => before.to_string(),
-                    (true, false) => after.to_string(),
-                    (false, false) => format!("{before}\n\n{after}"),
-                };
-                any_removed = true;
-                continue;
-            }
-        }
-        break;
+        current_body = match (before.is_empty(), after.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => before.to_string(),
+            (true, false) => after.to_string(),
+            (false, false) => format!("{before}\n\n{after}"),
+        };
+        any_removed = true;
+        continue;
     }
 
     (current_body, any_removed)
+}
+
+fn find_removable_stack_section(body: &str) -> Option<(usize, usize, &'static str, &'static str)> {
+    stack_section_markers()
+        .iter()
+        .filter_map(|(start_marker, end_marker)| {
+            let start = body.find(start_marker)?;
+            let search_after_start = start + start_marker.len();
+            let end_offset = body[search_after_start..].find(end_marker)?;
+            let end = search_after_start + end_offset;
+            Some((start, end, *start_marker, *end_marker))
+        })
+        .min_by_key(|(start, _, _, _)| *start)
+}
+
+fn stack_section_markers() -> [(&'static str, &'static str); 2] {
+    [
+        (STACK_SECTION_START, STACK_SECTION_END),
+        (LEGACY_STACK_SECTION_START, LEGACY_STACK_SECTION_END),
+    ]
 }
 
 fn parse_pr_number_from_url(url: &str) -> Result<u64> {
@@ -1474,6 +1502,20 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_stack_section_accepts_legacy_markers() {
+        let body = format!(
+            "Check out my stack:\n\n{}\n## Stack\n- [current](url2) #222\n- → next #333\n{}\nFooter",
+            LEGACY_STACK_SECTION_START, LEGACY_STACK_SECTION_END
+        );
+        let prs = parse_stack_section(&body);
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].branch_name, "current");
+        assert_eq!(prs[1].branch_name, "next");
+        assert_eq!(prs[0].number, 222);
+        assert_eq!(prs[1].number, 333);
+    }
+
+    #[test]
     fn test_normalize_base_for_gh() {
         assert_eq!(normalize_base_for_gh("main"), "main");
         assert_eq!(normalize_base_for_gh("origin/main"), "main");
@@ -1516,6 +1558,20 @@ mod tests {
         let body = format!("{}Hello\n{}\nWorld", end, start);
         let (cleaned, _removed) = remove_existing_stack_section(&body);
         assert_eq!(cleaned, body);
+    }
+
+    #[test]
+    fn test_remove_existing_stack_section_removes_legacy_and_new_sections() {
+        let body = format!(
+            "Hello\n\n{}\nLegacy stack\n{}\nMid\n\n{}\nNew stack\n{}\nWorld",
+            LEGACY_STACK_SECTION_START,
+            LEGACY_STACK_SECTION_END,
+            STACK_SECTION_START,
+            STACK_SECTION_END
+        );
+        let (cleaned, removed) = remove_existing_stack_section(&body);
+        assert!(removed);
+        assert_eq!(cleaned, "Hello\n\nMid\n\nWorld");
     }
 
     #[test]

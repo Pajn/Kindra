@@ -4,8 +4,8 @@ use std::fs;
 use std::path::Path;
 
 #[allow(dead_code)]
-pub fn gits_cmd() -> Command {
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("gits");
+pub fn kin_cmd() -> Command {
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.env("GIT_AUTHOR_NAME", "Test User")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test User")

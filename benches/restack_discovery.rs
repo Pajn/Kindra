@@ -1,7 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use git2::{Oid, Repository, Signature, build::CheckoutBuilder};
-use gits::commands::DEFAULT_RESTACK_HISTORY_LIMIT;
-use gits::stack::{build_floating_target_context, find_floating_base};
+use kindra::commands::DEFAULT_RESTACK_HISTORY_LIMIT;
+use kindra::stack::{build_floating_target_context, find_floating_base};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};

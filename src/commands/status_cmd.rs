@@ -6,7 +6,7 @@ pub fn status_cmd() -> Result<()> {
     let state = match load_state(&repo) {
         Ok(state) => state,
         Err(_) => {
-            println!("No gits operation active.");
+            println!("No Kindra operation active.");
             return Ok(());
         }
     };

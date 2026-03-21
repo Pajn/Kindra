@@ -13,7 +13,7 @@ pub fn abort_cmd() -> Result<()> {
     if path.exists() {
         let mut parsed_state = load_state(&repo)?;
 
-        // Only try to abort a git rebase if we were actually in a gits operation
+        // Only try to abort a git rebase if we were actually in a kindra operation
         if git_rebase_in_progress(&repo) {
             println!("Aborting active git rebase...");
             let status = Command::new("git").arg("rebase").arg("--abort").status()?;
