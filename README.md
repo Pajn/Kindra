@@ -17,7 +17,19 @@
 
 ## Installation
 
-Currently, `gits` can be installed from source:
+`gits` can be installed directly from GitHub:
+
+```bash
+cargo install --git https://github.com/Pajn/gits.git gits
+```
+
+If you already use `cargo-binstall`, the git-based install works there too:
+
+```bash
+cargo binstall --git https://github.com/Pajn/gits.git gits
+```
+
+You can also install it from source:
 
 ```bash
 # Clone the repository
