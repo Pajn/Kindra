@@ -3,6 +3,8 @@ name = "gits"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+repository = "https://github.com/Pajn/gits"
+readme = "README.md"
 
 [dependencies]
 base64 = "0.22"
@@ -36,3 +38,11 @@ harness = false
 [[bench]]
 name = "restack_discovery"
 harness = false
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.'cfg(target_os = "windows")']
+pkg-fmt = "zip"
