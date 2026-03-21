@@ -21,12 +21,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            archive: kindra-x86_64-unknown-linux-musl.tgz
           - os: macos-26
             target: aarch64-apple-darwin
-            archive: gits-aarch64-apple-darwin.tgz
+            archive: kindra-aarch64-apple-darwin.tgz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            archive: gits-x86_64-pc-windows-msvc.zip
+            archive: kindra-x86_64-pc-windows-msvc.zip
 
     steps:
       - uses: actions/checkout@v4
@@ -49,8 +50,8 @@ jobs:
           ARCHIVE: ${{ matrix.archive }}
         run: |
           mkdir dist
-          cp target/${{ matrix.target }}/release/gits dist/gits
-          tar -C dist -czf "$ARCHIVE" gits
+          cp target/${{ matrix.target }}/release/kin dist/kin
+          tar -C dist -czf "$ARCHIVE" kin
 
       - name: Package archive
         if: runner.os == 'Windows'
@@ -59,9 +60,9 @@ jobs:
           ARCHIVE: ${{ matrix.archive }}
         run: |
           New-Item -ItemType Directory -Path dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/gits.exe" "dist/gits.exe"
+          Copy-Item "target/${{ matrix.target }}/release/kin.exe" "dist/kin.exe"
           Push-Location dist
-          Compress-Archive -Path gits.exe -DestinationPath "../$env:ARCHIVE"
+          Compress-Archive -Path kin.exe -DestinationPath "../$env:ARCHIVE"
           Pop-Location
 
       - name: Upload workflow artifact

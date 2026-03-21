@@ -1,5 +1,5 @@
 mod common;
-use common::{gits_cmd, make_commit, repo_init, run_ok};
+use common::{kin_cmd, make_commit, repo_init, run_ok};
 use git2::Repository;
 use std::fs;
 use tempfile::tempdir;
@@ -79,7 +79,7 @@ fn test_move_stack() {
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.env("TERM", "xterm");
     cmd.arg("move")
         .arg("--onto")
@@ -158,7 +158,7 @@ exec {} "$@"
         fs::set_permissions(&git_mock, perms).unwrap();
     }
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.env("TERM", "xterm");
 
     let old_path = std::env::var_os("PATH").unwrap_or_default();
@@ -189,7 +189,7 @@ fn test_move_upstream_error() {
 
     run_ok("git", &["checkout", "main"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("some-branch")
@@ -236,7 +236,7 @@ fn test_move_conflict_and_continue() {
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -252,7 +252,7 @@ fn test_move_conflict_and_continue() {
     fs::write(dir.path().join("file.txt"), "resolved content").unwrap();
     run_ok("git", &["add", "file.txt"], dir.path());
 
-    let mut cmd_cont = gits_cmd();
+    let mut cmd_cont = kin_cmd();
     cmd_cont
         .arg("continue")
         .current_dir(dir.path())
@@ -287,7 +287,7 @@ fn test_move_abort() {
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -295,7 +295,7 @@ fn test_move_abort() {
         .assert()
         .success();
 
-    let mut cmd_abort = gits_cmd();
+    let mut cmd_abort = kin_cmd();
     cmd_abort
         .arg("abort")
         .current_dir(dir.path())
@@ -318,7 +318,7 @@ fn test_move_all_onto_main() {
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--all")
         .arg("--onto")
@@ -350,7 +350,7 @@ fn test_move_all_from_main_error() {
 
     run_ok("git", &["checkout", "main"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--all")
         .arg("--onto")
@@ -408,7 +408,7 @@ fn test_move_all_between_stacks() {
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--all")
         .arg("--onto")
@@ -486,7 +486,7 @@ fn test_move_onto_descendant() {
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("feature-b")
@@ -580,7 +580,7 @@ fn test_move_onto_descendant_reorders_target_descendants_too() {
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("feature-c")
@@ -680,7 +680,7 @@ fn test_move_onto_descendant_rejects_forked_subtree() {
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("feature-b")
@@ -755,7 +755,7 @@ fn test_move_onto_descendant_rejects_fork_then_merge_subtree() {
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("feature-b")
@@ -826,7 +826,7 @@ fn test_move_onto_descendant_conflict_and_continue() {
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("feature-c")
@@ -842,7 +842,7 @@ fn test_move_onto_descendant_conflict_and_continue() {
     fs::write(dir.path().join("file.txt"), "1\nresolved\n3\n").unwrap();
     run_ok("git", &["add", "file.txt"], dir.path());
 
-    let mut cmd_cont = gits_cmd();
+    let mut cmd_cont = kin_cmd();
     cmd_cont
         .arg("continue")
         .current_dir(dir.path())
@@ -972,7 +972,7 @@ exec "{}" "$@"
     new_path.push(":");
     new_path.push(old_path);
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("feature-c")
@@ -991,7 +991,7 @@ exec "{}" "$@"
         "Pre-start failure should clear in_progress_branch but got: {state_content}"
     );
 
-    let mut cmd_cont = gits_cmd();
+    let mut cmd_cont = kin_cmd();
     cmd_cont
         .arg("continue")
         .current_dir(dir.path())
@@ -1085,7 +1085,7 @@ fn test_move_abort_cleans_up_git_rebase() {
     .unwrap();
 
     // 4. Start move and hit conflict
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -1104,7 +1104,7 @@ fn test_move_abort_cleans_up_git_rebase() {
     );
 
     // 5. Abort move
-    let mut cmd_abort = gits_cmd();
+    let mut cmd_abort = kin_cmd();
     cmd_abort
         .arg("abort")
         .current_dir(dir.path())
@@ -1120,7 +1120,7 @@ fn test_move_abort_cleans_up_git_rebase() {
 fn test_move_abort_preserves_state_on_rebase_abort_failure() {
     let (dir, _repo) = setup_abort_repo();
 
-    // 1. Manually create a gits move state file
+    // 1. Manually create a kin move state file
     let state_path = dir.path().join(".git/gits_rebase_state.json");
     fs::write(
         &state_path,
@@ -1170,8 +1170,8 @@ exec {} "$@"
     new_path.push(":");
     new_path.push(old_path);
 
-    // 4. Run gits move abort - it should fail because rebase --abort failed
-    let mut cmd = gits_cmd();
+    // 4. Run kin move abort - it should fail because rebase --abort failed
+    let mut cmd = kin_cmd();
     cmd.arg("abort")
         .current_dir(dir.path())
         .env("PATH", &new_path)
@@ -1249,7 +1249,7 @@ fn test_move_conflict_and_continue_no_re_rebase() {
     new_path.push(old_path);
 
     // 1. Start move -> should fail with conflict
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -1277,7 +1277,7 @@ fn test_move_conflict_and_continue_no_re_rebase() {
     );
 
     // 3. Continue move
-    let mut cmd_cont = gits_cmd();
+    let mut cmd_cont = kin_cmd();
     cmd_cont
         .arg("continue")
         .current_dir(dir.path())
@@ -1307,7 +1307,7 @@ fn test_move_invalid_onto() {
     repo.branch("feature", &head, false).unwrap();
     repo.set_head("refs/heads/feature").unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("non-existent-branch")
@@ -1359,7 +1359,7 @@ fn test_move_respects_git_rebase_autostash_config() {
     run_ok("git", &["config", "rebase.autostash", "true"], dir.path());
     fs::write(dir.path().join("file.txt"), "base\nfeature\ndirty\n").unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -1418,13 +1418,13 @@ fn test_move_repo_config_enables_autostash_and_persists_in_state() {
     .unwrap();
 
     std::fs::write(
-        repo.path().join("gits.toml"),
+        repo.path().join("kindra.toml"),
         "[rebase]\nautostash = true\n",
     )
     .unwrap();
     fs::write(dir.path().join("file.txt"), "base\nfeature\ndirty\n").unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -1499,7 +1499,7 @@ exec {} "$@"
     // Create the failure trigger file
     fs::write(dir.path().join("fail_rebase"), "").unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("move")
         .arg("--onto")
         .arg("target")
@@ -1527,7 +1527,7 @@ exec {} "$@"
     fs::remove_file(dir.path().join("fail_rebase")).unwrap();
 
     // Continue move
-    let mut cmd_cont = gits_cmd();
+    let mut cmd_cont = kin_cmd();
     cmd_cont
         .arg("continue")
         .current_dir(dir.path())
@@ -1640,15 +1640,15 @@ fn test_move_abort_does_not_abort_manual_rebase() {
             || dir.path().join(".git/rebase-apply").exists()
     );
 
-    // Run gits move abort
-    let mut cmd = gits_cmd();
+    // Run kin move abort
+    let mut cmd = kin_cmd();
     cmd.arg("abort").current_dir(dir.path()).assert().success();
 
     // Verify rebase is STILL in progress
     assert!(
         dir.path().join(".git/rebase-merge").exists()
             || dir.path().join(".git/rebase-apply").exists(),
-        "Manual rebase should NOT have been aborted by 'gits move abort'"
+        "Manual rebase should NOT have been aborted by 'kin move abort'"
     );
 }
 
@@ -1682,7 +1682,7 @@ fn test_move_abort_cleans_up_rebase_when_state_exists() {
         "rebase should have failed with conflict"
     );
 
-    // Manually create a gits move state file
+    // Manually create a kin move state file
     let state_path = dir.path().join(".git/gits_rebase_state.json");
     fs::write(
         &state_path,
@@ -1698,8 +1698,8 @@ fn test_move_abort_cleans_up_rebase_when_state_exists() {
     )
     .unwrap();
 
-    // Run gits move abort
-    let mut cmd = gits_cmd();
+    // Run kin move abort
+    let mut cmd = kin_cmd();
     cmd.arg("abort").current_dir(dir.path()).assert().success();
 
     // Verify state file is gone

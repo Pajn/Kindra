@@ -1,6 +1,6 @@
 mod common;
 
-use common::{gits_cmd, make_commit, repo_init, run_ok};
+use common::{kin_cmd, make_commit, repo_init, run_ok};
 use git2::{BranchType, Repository};
 use predicates::prelude::*;
 use std::fs;
@@ -54,11 +54,11 @@ fn sync_aborts_deletions_if_fallback_checkout_is_blocked() {
     // Create a dirty worktree by adding an untracked file that conflicts with the one in 'main'
     fs::write(dir.path().join("main_only.txt"), "dirty content").unwrap();
 
-    // Now 'gits sync' will try to delete 'feature-a', which is the current branch.
+    // Now 'kin sync' will try to delete 'feature-a', which is the current branch.
     // It should first try to checkout 'main'.
     // 'git checkout main' should fail because main_only.txt would be overwritten.
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
@@ -124,9 +124,9 @@ fn sync_no_delete_with_open_worktree_does_not_fail() {
     // Checkout feature-b in the main worktree
     run_ok("git", &["checkout", "-f", "feature-b"], dir.path());
 
-    // 'gits sync --no-delete' should NOT fail even though feature-a is checked out elsewhere,
+    // 'kin sync --no-delete' should NOT fail even though feature-a is checked out elsewhere,
     // because we are not going to delete it.
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .arg("--no-delete")
         .current_dir(dir.path())
@@ -194,9 +194,9 @@ fn sync_onto_remote_tracking_ref_does_not_delete_local_base() {
     // Local 'main' is still at base_id. 'origin/main' is ahead.
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
-    // 'gits sync' should rebase feature-a onto origin/main.
+    // 'kin sync' should rebase feature-a onto origin/main.
     // It should NOT delete local 'main' branch, even though 'main' is an ancestor of 'origin/main'.
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
@@ -268,7 +268,7 @@ fn sync_does_not_treat_rename_only_branch_as_integrated_when_target_keeps_source
 
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();

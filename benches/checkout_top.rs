@@ -223,18 +223,18 @@ fn run_checkout_command(gits_bin: &Path, repo_path: &Path, args: &[&str]) {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
-        .expect("failed to execute gits checkout command");
+        .expect("failed to execute kin checkout command");
 
     assert!(
         output.status.success(),
-        "gits {:?} failed\nstderr:\n{}",
+        "kin {:?} failed\nstderr:\n{}",
         args,
         String::from_utf8_lossy(&output.stderr),
     );
 }
 
 fn bench_checkout_navigation(c: &mut Criterion) {
-    let gits_bin = assert_cmd::cargo::cargo_bin!("gits");
+    let gits_bin = assert_cmd::cargo::cargo_bin!("kin");
 
     for scenario in SCENARIOS {
         let repo = setup_repo(scenario);

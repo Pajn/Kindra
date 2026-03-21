@@ -1,6 +1,6 @@
 mod common;
 
-use common::{gits_cmd, make_commit, repo_init};
+use common::{kin_cmd, make_commit, repo_init};
 use git2::Repository;
 use std::fs;
 use tempfile::tempdir;
@@ -95,7 +95,7 @@ branch inv..alid/' "$file"
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     let output = cmd
         .arg("split")
         .current_dir(dir.path())
@@ -156,7 +156,7 @@ perl -i -pe 's/branch in-stack/branch outside/' "$file"
     }
 
     // Run in non-interactive mode (should auto-deny and skip)
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)

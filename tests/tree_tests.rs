@@ -1,5 +1,5 @@
 mod common;
-use common::{gits_cmd, make_commit, repo_init};
+use common::{kin_cmd, make_commit, repo_init};
 use git2::Repository;
 use regex::Regex;
 use tempfile::tempdir;
@@ -125,19 +125,19 @@ fn setup_fork_stack() -> (tempfile::TempDir, Repository) {
     (dir, repo)
 }
 
-/// Helper to run gits tree command and get output
+/// Helper to run kin tree command and get output
 fn run_tree_command(dir: &std::path::Path, args: &[&str]) -> String {
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("tree");
     for arg in args {
         cmd.arg(arg);
     }
     cmd.current_dir(dir);
 
-    let output = cmd.output().expect("Failed to execute gits tree");
+    let output = cmd.output().expect("Failed to execute kin tree");
     assert!(
         output.status.success(),
-        "gits tree failed: {}",
+        "kin tree failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).to_string()

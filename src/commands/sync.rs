@@ -40,7 +40,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
     let path = state_path(&repo);
     if path.exists() {
         return Err(anyhow!(
-            "A gits operation is already in progress. Use 'gits continue' or 'gits abort'."
+            "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));
     }
     ensure_no_native_git_operation(&repo)?;
@@ -90,7 +90,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
         _ => {
             if !std::io::stdin().is_terminal() {
                 return Err(anyhow!(
-                    "Multiple stack tips found. Run 'gits sync' interactively to choose one, or checkout the desired tip branch and rerun."
+                    "Multiple stack tips found. Run 'kin sync' interactively to choose one, or checkout the desired tip branch and rerun."
                 ));
             }
             crate::commands::prompt_select("Multiple stack tips found. Select one:", tips)?
@@ -334,14 +334,14 @@ fn run_sync_rebase(
     if git_rebase_in_progress(repo) {
         save_state(repo, &state)?;
         return Err(anyhow!(
-            "git rebase failed during sync. Resolve conflicts and run 'gits continue' or 'gits abort'."
+            "git rebase failed during sync. Resolve conflicts and run 'kin continue' or 'kin abort'."
         ));
     }
 
     state.in_progress_branch = None;
     save_state(repo, &state)?;
     Err(anyhow!(
-        "git rebase failed before sync could enter an in-progress state. Run 'gits abort' to clear the saved state, then run 'gits sync' again (or otherwise fix the rebase)."
+        "git rebase failed before sync could enter an in-progress state. Run 'kin abort' to clear the saved state, then run 'kin sync' again (or otherwise fix the rebase)."
     ))
 }
 
@@ -367,7 +367,7 @@ fn ensure_sync_rebase_completed(repo: &git2::Repository, state: &RebaseState) ->
     }
 
     Err(anyhow!(
-        "Sync did not complete: '{}' is not rebased onto '{}'. If the Git rebase was aborted manually, run 'gits abort' to clear the saved sync state or rerun 'gits sync'.",
+        "Sync did not complete: '{}' is not rebased onto '{}'. If the Git rebase was aborted manually, run 'kin abort' to clear the saved sync state or rerun 'kin sync'.",
         state.original_branch,
         state.target_branch
     ))
@@ -381,7 +381,7 @@ pub(crate) fn ensure_no_native_git_operation(repo: &git2::Repository) -> Result<
 
     if rebase_in_progress || merge_in_progress || cherry_pick_in_progress {
         return Err(anyhow!(
-            "A native git operation is in progress. Resolve it first with 'git rebase --continue'/'git rebase --abort', 'git merge --abort', or 'git cherry-pick --continue'/'git cherry-pick --abort'. If this came from a gits-managed rebase, use 'gits continue' or 'gits abort'."
+            "A native git operation is in progress. Resolve it first with 'git rebase --continue'/'git rebase --abort', 'git merge --abort', or 'git cherry-pick --continue'/'git cherry-pick --abort'. If this came from a Kindra-managed rebase, use 'kin continue' or 'kin abort'."
         ));
     }
 

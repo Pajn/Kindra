@@ -1,6 +1,6 @@
 mod common;
 
-use common::{gits_cmd, make_commit, repo_init};
+use common::{kin_cmd, make_commit, repo_init};
 use git2::{Repository, Signature};
 use std::fs;
 use tempfile::tempdir;
@@ -82,7 +82,7 @@ perl -i -pe 's/(commit 2)/$1\nbranch feature-x/' "$file"
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -120,7 +120,7 @@ perl -i -pe 's/(commit 3)/$1\nbranch another-feat/' "$file"
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -146,7 +146,7 @@ perl -i -pe 's/.*branch new-feat.*\n?//g' "$file"
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -184,7 +184,7 @@ perl -i -pe 's/^[0-9a-f]{7}/deadbee/' "$file"
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -220,7 +220,7 @@ perl -i -pe 's/.*branch current.*\n?//g' "$file"
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -242,7 +242,7 @@ fn test_push_multiple_remotes_no_origin_when_stack_empty() {
     repo.remote("remote1", "http://example.com/r1.git").unwrap();
     repo.remote("remote2", "http://example.com/r2.git").unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("push")
         .current_dir(dir.path())
         .assert()
@@ -255,7 +255,7 @@ fn test_push_no_remotes_when_stack_empty() {
     let (dir, _repo) = setup_repo();
     // No remotes by default from setup_repo (except if we added any)
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("push")
         .current_dir(dir.path())
         .assert()
@@ -300,7 +300,7 @@ fn test_checkout_up_fork() {
     repo.set_head("refs/heads/base").unwrap();
     fs::remove_file(dir.path().join("file.txt")).unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("checkout")
         .arg("up")
         .current_dir(dir.path())
@@ -352,7 +352,7 @@ fn test_checkout_top_fork() {
     repo.set_head("refs/heads/base").unwrap();
     fs::remove_file(dir.path().join("file.txt")).unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("checkout")
         .arg("top")
         .current_dir(dir.path())
@@ -389,7 +389,7 @@ fn test_checkout_down_moves_to_immediate_parent_branch() {
     repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
         .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("checkout")
         .arg("down")
         .current_dir(dir.path())
@@ -420,7 +420,7 @@ fn test_checkout_down_from_bottom_branch_goes_to_upstream() {
     repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
         .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("checkout")
         .arg("down")
         .current_dir(dir.path())
@@ -478,7 +478,7 @@ exit 0
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
@@ -512,7 +512,7 @@ fn test_checkout_all_works_without_main() {
     repo.set_head("refs/heads/trunk").unwrap();
     fs::remove_file(dir.path().join("file.txt")).unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("checkout")
         .arg("--all")
         .current_dir(dir.path())
@@ -551,7 +551,7 @@ fn test_checkout_all_detached_no_main() {
     repo.set_head_detached(commit_id).unwrap();
     fs::remove_file(dir.path().join("file.txt")).unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("checkout")
         .arg("--all")
         .current_dir(dir.path())
@@ -588,7 +588,7 @@ mv "$file.tmp" "$file"
         fs::set_permissions(&editor_script, perms).unwrap();
     }
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)

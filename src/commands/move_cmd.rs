@@ -37,7 +37,7 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
     let path = state_path(repo);
     if path.exists() {
         return Err(anyhow!(
-            "A gits operation is already in progress. Use 'gits continue' or 'gits abort'."
+            "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));
     }
 

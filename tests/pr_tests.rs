@@ -1,9 +1,9 @@
 mod common;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use common::{gits_cmd, make_commit, repo_init, run_ok};
+use common::{kin_cmd, make_commit, repo_init, run_ok};
 use git2::{BranchType, Repository};
-use gits::commands::pr::resolve_stack_boundary_and_base;
+use kindra::commands::pr::resolve_stack_boundary_and_base;
 use std::fs;
 use tempfile::tempdir;
 
@@ -158,7 +158,7 @@ fn pr_fails_without_gh() {
     //   b) exits with "No branches with a remote upstream" (gh auth passed
     //      but nothing to do)
     // The important thing is it does NOT panic.
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("pr").current_dir(dir.path());
 
     // The command is allowed to succeed (exit 0) only with the "nothing to do"
@@ -166,13 +166,13 @@ fn pr_fails_without_gh() {
     let output = cmd.output().unwrap();
     let code = output.status.code().unwrap_or_else(|| {
         panic!(
-            "gits pr was terminated by a signal. stderr: {}",
+            "kin pr was terminated by a signal. stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     });
     assert!(
         code != 101,
-        "gits pr panicked (exit 101). stderr: {}",
+        "kin pr panicked (exit 101). stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -183,7 +183,7 @@ fn pr_no_upstreams_message() {
     // check. We skip the assertion in that case.
     let (dir, _repo) = setup_simple_stack();
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .output()
@@ -199,11 +199,7 @@ fn pr_no_upstreams_message() {
         || combined.contains("authenticated")
         || combined.contains("not found");
 
-    assert!(
-        acceptable,
-        "Unexpected output from `gits pr`:\n{}",
-        combined
-    );
+    assert!(acceptable, "Unexpected output from `kin pr`:\n{}", combined);
 }
 
 #[test]
@@ -254,7 +250,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .env(
@@ -279,16 +275,16 @@ exit 1
     );
 }
 
-/// Test that after `gits sync`, `gits pr` uses the correct base (origin/main)
+/// Test that after `kin sync`, `kin pr` uses the correct base (origin/main)
 /// even when the local main branch is behind origin/main.
 ///
 /// Scenario:
 /// 1. main -> feature-a (stack)
 /// 2. Push to origin
 /// 3. origin/main advances (another worktree pushes new commits)
-/// 4. Run `gits sync` - rebases feature-a onto origin/main
+/// 4. Run `kin sync` - rebases feature-a onto origin/main
 /// 5. local main is now behind origin/main
-/// 6. Run `gits pr` - should use origin/main as base, not local main
+/// 6. Run `kin pr` - should use origin/main as base, not local main
 #[test]
 fn pr_uses_origin_main_as_base_when_local_main_is_behind_after_sync() {
     let dir = tempdir().unwrap();
@@ -369,9 +365,9 @@ fn pr_uses_origin_main_as_base_when_local_main_is_behind_after_sync() {
         "local main should be behind origin/main before sync"
     );
 
-    // Run gits sync to rebase feature-a onto origin/main
+    // Run kin sync to rebase feature-a onto origin/main
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .arg("--no-delete")
         .current_dir(dir.path())
@@ -444,7 +440,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    gits_cmd()
+    kin_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .env(
@@ -531,7 +527,7 @@ exit 1
 
     let captured_body_path = dir.path().join("captured_body.txt");
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .env(
@@ -546,7 +542,7 @@ exit 1
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "gits pr failed: {:?}", output);
+    assert!(output.status.success(), "kin pr failed: {:?}", output);
     let captured_body = fs::read_to_string(&captured_body_path).unwrap();
     assert!(
         captured_body.contains(template_content),
@@ -624,7 +620,7 @@ exit 1
     let captured_body_dir = dir.path().join("captured-bodies");
     std::fs::create_dir_all(&captured_body_dir).unwrap();
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .env(
@@ -639,7 +635,7 @@ exit 1
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "gits pr failed: {:?}", output);
+    assert!(output.status.success(), "kin pr failed: {:?}", output);
 
     let feature_a_body = fs::read_to_string(captured_body_dir.join("pr_10.txt")).unwrap();
     assert!(
@@ -744,7 +740,7 @@ exit 1
     let captured_body_dir = dir.path().join("captured-bodies");
     std::fs::create_dir_all(&captured_body_dir).unwrap();
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .env(
@@ -759,7 +755,7 @@ exit 1
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "gits pr failed: {:?}", output);
+    assert!(output.status.success(), "kin pr failed: {:?}", output);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -796,8 +792,8 @@ fn pr_stack_sync_skips_inaccessible_historical_pr_entries() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    let start = "<!-- gits-stack:start -->";
-    let end = "<!-- gits-stack:end -->";
+    let start = "<!-- kindra-stack:start -->";
+    let end = "<!-- kindra-stack:end -->";
     let stale_body = format!(
         "Body with stale stack\n\n{}\n## Stack\n- [old-branch](https://github.com/test/repo/pull/999) #999\n- → feature-a #10\n{}\n",
         start, end
@@ -856,7 +852,7 @@ exit 1
     let captured_body_dir = dir.path().join("captured-bodies");
     std::fs::create_dir_all(&captured_body_dir).unwrap();
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .env(
@@ -871,7 +867,7 @@ exit 1
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "gits pr failed: {:?}", output);
+    assert!(output.status.success(), "kin pr failed: {:?}", output);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -992,7 +988,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .env(
@@ -1081,8 +1077,8 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    // Run gits pr with the mock gh in PATH
-    let output = gits_cmd()
+    // Run kin pr with the mock gh in PATH
+    let output = kin_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .env(
@@ -1201,7 +1197,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .env(
@@ -1215,7 +1211,7 @@ exit 1
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "gits pr failed: {:?}", output);
+    assert!(output.status.success(), "kin pr failed: {:?}", output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{}{}", stdout, stderr);
@@ -1282,7 +1278,7 @@ exit 0
     run_ok("chmod", &["+x", open_mock.to_str().unwrap()], dir.path());
     let opened_url_path = dir.path().join("opened_url.txt");
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "open"])
         .current_dir(dir.path())
         .env(
@@ -1298,7 +1294,7 @@ exit 0
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "gits pr open failed: {:?}", output);
+    assert!(output.status.success(), "kin pr open failed: {:?}", output);
     let opened_url = fs::read_to_string(&opened_url_path).unwrap();
     assert_eq!(opened_url, "https://github.com/test/repo/pull/42");
 }
@@ -1358,7 +1354,7 @@ exit 0
     run_ok("chmod", &["+x", open_mock.to_str().unwrap()], dir.path());
     let opened_url_path = dir.path().join("opened_url.txt");
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "open"])
         .current_dir(dir.path())
         .env(
@@ -1374,7 +1370,7 @@ exit 0
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "gits pr open failed: {:?}", output);
+    assert!(output.status.success(), "kin pr open failed: {:?}", output);
     let opened_url = fs::read_to_string(&opened_url_path).unwrap();
     // Non-interactive tests auto-select the first option.
     assert_eq!(opened_url, "https://github.com/test/repo/pull/10");
@@ -1435,7 +1431,7 @@ exit 1
 
     let edit_args_path = dir.path().join("edit_args.txt");
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "edit"])
         .current_dir(dir.path())
         .env(
@@ -1450,7 +1446,7 @@ exit 1
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "gits pr edit failed: {:?}", output);
+    assert!(output.status.success(), "kin pr edit failed: {:?}", output);
     let args = fs::read_to_string(&edit_args_path).unwrap();
 
     // Verify that the body was updated to include the stack section
@@ -1491,8 +1487,8 @@ fn pr_edit_cleans_duplicate_stack_blocks() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    let start = "<!-- gits-stack:start -->";
-    let end = "<!-- gits-stack:end -->";
+    let start = "<!-- kindra-stack:start -->";
+    let end = "<!-- kindra-stack:end -->";
     let body_with_duplicates = format!(
         "Original Body\n\n{}\nOld Stack 1\n{}\n\nMiddle Text\n\n{}\nOld Stack 2\n{}",
         start, end, start, end
@@ -1532,7 +1528,7 @@ exit 1
 
     let edit_args_path = dir.path().join("edit_args.txt");
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "edit"])
         .current_dir(dir.path())
         .env(
@@ -1547,7 +1543,7 @@ exit 1
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "gits pr edit failed: {:?}", output);
+    assert!(output.status.success(), "kin pr edit failed: {:?}", output);
     let args = fs::read_to_string(&edit_args_path).unwrap();
 
     // Verify it contains exactly one ## Stack header
@@ -1573,6 +1569,115 @@ exit 1
         "Should contain Original Body"
     );
     assert!(args.contains("Middle Text"), "Should contain Middle Text");
+}
+
+#[test]
+fn pr_edit_migrates_legacy_stack_markers_without_duplicates() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    let legacy_start = "<!-- gits-stack:start -->";
+    let legacy_end = "<!-- gits-stack:end -->";
+    let body_with_legacy = format!(
+        "Original Body\n\n{}\n## Stack\n- [feature-a](https://github.com/test/repo/pull/10) #10\n- → feature-b #11\n{}\n\nFooter",
+        legacy_start, legacy_end
+    );
+
+    let body_for_bash = body_with_legacy.replace('\n', "\\n").replace('"', "\\\"");
+
+    std::fs::write(
+        &gh_mock,
+        format!(
+            r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{{"number":10,"title":"PR A","body":"{}","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}}'
+    elif [[ "$3" == "feature-b" ]]; then
+        echo '{{"number":11,"title":"PR B","body":"Body B","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}}'
+    fi
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    pr_number="$3"
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--body" ]]; then
+            printf "%s" "$2" > "$MOCK_GH_BODY_DIR/pr_$pr_number.txt"
+            exit 0
+        fi
+        shift
+    done
+    exit 0
+fi
+exit 1
+"#,
+            body_for_bash
+        ),
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let captured_body_dir = dir.path().join("captured-bodies");
+    std::fs::create_dir_all(&captured_body_dir).unwrap();
+
+    let output = kin_cmd()
+        .args(["pr", "edit"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_BODY_DIR", &captured_body_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "kin pr edit failed: {:?}", output);
+
+    let body = fs::read_to_string(captured_body_dir.join("pr_10.txt")).unwrap();
+    assert_eq!(body.matches("## Stack").count(), 1, "Got:\n{}", body);
+    assert!(
+        body.contains("<!-- kindra-stack:start -->"),
+        "Expected new sentinels to be written. Got:\n{}",
+        body
+    );
+    assert!(
+        body.contains("<!-- kindra-stack:end -->"),
+        "Expected new sentinels to be written. Got:\n{}",
+        body
+    );
+    assert!(
+        !body.contains("<!-- gits-stack:start -->"),
+        "Legacy start sentinel should be removed. Got:\n{}",
+        body
+    );
+    assert!(
+        !body.contains("<!-- gits-stack:end -->"),
+        "Legacy end sentinel should be removed. Got:\n{}",
+        body
+    );
+    assert!(body.contains("Original Body"), "Got:\n{}", body);
+    assert!(body.contains("Footer"), "Got:\n{}", body);
 }
 
 #[test]
@@ -1618,7 +1723,7 @@ exit 1
 
     let edit_args_path = dir.path().join("edit_args.txt");
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "edit"])
         .current_dir(dir.path())
         .env(
@@ -1633,7 +1738,7 @@ exit 1
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "gits pr edit failed: {:?}", output);
+    assert!(output.status.success(), "kin pr edit failed: {:?}", output);
     let args = fs::read_to_string(&edit_args_path).unwrap();
     assert!(
         args.contains("predit42--titleCurrent title"),
@@ -1696,7 +1801,7 @@ exit 1
 
     let edit_args_path = dir.path().join("edit_args.txt");
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "edit"])
         .current_dir(dir.path())
         .env(
@@ -1711,7 +1816,7 @@ exit 1
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "gits pr edit failed: {:?}", output);
+    assert!(output.status.success(), "kin pr edit failed: {:?}", output);
     let args = fs::read_to_string(&edit_args_path).unwrap();
     assert!(
         args.contains("predit10--titleA title"),
@@ -1783,7 +1888,7 @@ exit 1
     let captured_body_dir = dir.path().join("captured-bodies");
     std::fs::create_dir_all(&captured_body_dir).unwrap();
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "edit"])
         .current_dir(dir.path())
         .env(
@@ -1798,11 +1903,11 @@ exit 1
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "gits pr edit failed: {:?}", output);
+    assert!(output.status.success(), "kin pr edit failed: {:?}", output);
 
     let body = fs::read_to_string(captured_body_dir.join("pr_10.txt")).unwrap();
     assert!(
-        body.contains("<!-- gits-stack:start -->"),
+        body.contains("<!-- kindra-stack:start -->"),
         "Expected stack block to be reinserted. Got:\n{}",
         body
     );
@@ -1846,8 +1951,8 @@ fn pr_edit_reorders_stack_section_using_live_stack_order() {
     run_ok("git", &["checkout", "pr-merge"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    let start = "<!-- gits-stack:start -->";
-    let end = "<!-- gits-stack:end -->";
+    let start = "<!-- kindra-stack:start -->";
+    let end = "<!-- kindra-stack:end -->";
     let stale_body = format!(
         "Body with stale stack\n\n{}\n## Stack\n- ~[sync-main](https://github.com/test/repo/pull/24) #24~ (merged)\n- [pr-merge](https://github.com/test/repo/pull/26) #26\n- → pr-review #27\n{}\n",
         start, end
@@ -1902,7 +2007,7 @@ exit 1
     let captured_body_dir = dir.path().join("captured-bodies");
     std::fs::create_dir_all(&captured_body_dir).unwrap();
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "edit"])
         .current_dir(dir.path())
         .env(
@@ -1917,7 +2022,7 @@ exit 1
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "gits pr edit failed: {:?}", output);
+    assert!(output.status.success(), "kin pr edit failed: {:?}", output);
 
     let body = fs::read_to_string(captured_body_dir.join("pr_27.txt")).unwrap();
     let sync_main_idx = body.find("sync-main").unwrap();
@@ -1974,7 +2079,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "status"])
         .current_dir(dir.path())
         .env(
@@ -1990,7 +2095,7 @@ exit 1
 
     assert!(
         output.status.success(),
-        "gits pr status failed: {:?}",
+        "kin pr status failed: {:?}",
         output
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2067,7 +2172,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "status"])
         .current_dir(dir.path())
         .env(
@@ -2083,7 +2188,7 @@ exit 1
 
     assert!(
         output.status.success(),
-        "gits pr status failed: {:?}",
+        "kin pr status failed: {:?}",
         output
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2135,7 +2240,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "review"])
         .current_dir(dir.path())
         .env(
@@ -2151,7 +2256,7 @@ exit 1
 
     assert!(
         output.status.success(),
-        "gits pr review failed: {:?}",
+        "kin pr review failed: {:?}",
         output
     );
 
@@ -2217,7 +2322,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "review"])
         .current_dir(dir.path())
         .env(
@@ -2233,7 +2338,7 @@ exit 1
 
     assert!(
         output.status.success(),
-        "gits pr review failed: {:?}",
+        "kin pr review failed: {:?}",
         output
     );
 
@@ -2306,7 +2411,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "review"])
         .current_dir(dir.path())
         .env(
@@ -2322,7 +2427,7 @@ exit 1
 
     assert!(
         output.status.success(),
-        "gits pr review failed: {:?}",
+        "kin pr review failed: {:?}",
         output
     );
 
@@ -2373,7 +2478,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args([
             "pr",
             "review",
@@ -2397,7 +2502,7 @@ exit 1
 
     assert!(
         output.status.success(),
-        "gits pr review failed: {:?}",
+        "kin pr review failed: {:?}",
         output
     );
 
@@ -2451,7 +2556,7 @@ exit 1
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
     let output_path = dir.path().join("review.md");
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args([
             "pr",
             "review",
@@ -2473,7 +2578,7 @@ exit 1
 
     assert!(
         output.status.success(),
-        "gits pr review failed: {:?}",
+        "kin pr review failed: {:?}",
         output
     );
 
@@ -2531,7 +2636,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "review"])
         .current_dir(dir.path())
         .env(
@@ -2547,7 +2652,7 @@ exit 1
 
     assert!(
         output.status.success(),
-        "gits pr review failed: {:?}",
+        "kin pr review failed: {:?}",
         output
     );
 
@@ -2614,7 +2719,7 @@ exit 1
 
     let merge_args_path = dir.path().join("merge_args.txt");
     let edit_args_path = dir.path().join("edit_args.txt");
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "merge"])
         .current_dir(dir.path())
         .env(
@@ -2630,11 +2735,7 @@ exit 1
         .output()
         .unwrap();
 
-    assert!(
-        output.status.success(),
-        "gits pr merge failed: {:?}",
-        output
-    );
+    assert!(output.status.success(), "kin pr merge failed: {:?}", output);
     let merge_args = fs::read_to_string(&merge_args_path).unwrap();
     assert!(merge_args.contains("pr\nmerge\n42"));
     assert!(merge_args.contains("--match-head-commit\ndeadbeef42"));
@@ -2721,7 +2822,7 @@ exit 1
 
     let merge_args_path = dir.path().join("merge_args.txt");
     let edit_args_path = dir.path().join("edit_args.txt");
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "merge"])
         .current_dir(dir.path())
         .env(
@@ -2737,11 +2838,7 @@ exit 1
         .output()
         .unwrap();
 
-    assert!(
-        output.status.success(),
-        "gits pr merge failed: {:?}",
-        output
-    );
+    assert!(output.status.success(), "kin pr merge failed: {:?}", output);
     let merge_args = fs::read_to_string(&merge_args_path).unwrap();
     assert!(merge_args.contains("pr\nmerge\n10"));
     let edit_args = fs::read_to_string(&edit_args_path).unwrap();
@@ -2801,7 +2898,7 @@ exit 1
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
     let merge_args_path = dir.path().join("merge_args.txt");
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "merge"])
         .current_dir(dir.path())
         .env(
@@ -2816,11 +2913,7 @@ exit 1
         .output()
         .unwrap();
 
-    assert!(
-        output.status.success(),
-        "gits pr merge failed: {:?}",
-        output
-    );
+    assert!(output.status.success(), "kin pr merge failed: {:?}", output);
     let merge_args = fs::read_to_string(&merge_args_path).unwrap();
     assert!(merge_args.contains("pr\nmerge\n42"));
 
@@ -2902,7 +2995,7 @@ exit 1
 
     let merge_args_path = dir.path().join("merge_args.txt");
     let edit_args_path = dir.path().join("edit_args.txt");
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "merge"])
         .current_dir(dir.path())
         .env(
@@ -2918,11 +3011,7 @@ exit 1
         .output()
         .unwrap();
 
-    assert!(
-        output.status.success(),
-        "gits pr merge failed: {:?}",
-        output
-    );
+    assert!(output.status.success(), "kin pr merge failed: {:?}", output);
 
     let edit_args = fs::read_to_string(&edit_args_path).unwrap();
     assert!(edit_args.contains("pr\nedit\n11\n--base\nmain"));
@@ -3006,7 +3095,7 @@ exit 1
 
     let merge_args_path = dir.path().join("merge_args.txt");
     let edit_args_path = dir.path().join("edit_args.txt");
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "merge"])
         .current_dir(dir.path())
         .env(
@@ -3024,7 +3113,7 @@ exit 1
 
     assert!(
         !output.status.success(),
-        "gits pr merge unexpectedly succeeded: {:?}",
+        "kin pr merge unexpectedly succeeded: {:?}",
         output
     );
 
@@ -3108,7 +3197,7 @@ exit 1
 
     let merge_args_path = dir.path().join("merge_args.txt");
     let edit_args_path = dir.path().join("edit_args.txt");
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "merge"])
         .current_dir(dir.path())
         .env(
@@ -3124,11 +3213,7 @@ exit 1
         .output()
         .unwrap();
 
-    assert!(
-        output.status.success(),
-        "gits pr merge failed: {:?}",
-        output
-    );
+    assert!(output.status.success(), "kin pr merge failed: {:?}", output);
 
     let merge_args = fs::read_to_string(&merge_args_path).unwrap();
     assert!(merge_args.contains("pr\nmerge\n10"));
@@ -3188,7 +3273,7 @@ exit 1
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
     let merge_args_path = dir.path().join("merge_args.txt");
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "merge"])
         .current_dir(dir.path())
         .env(
@@ -3205,7 +3290,7 @@ exit 1
 
     assert!(
         !output.status.success(),
-        "gits pr merge unexpectedly succeeded: {:?}",
+        "kin pr merge unexpectedly succeeded: {:?}",
         output
     );
 
@@ -3270,7 +3355,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "merge"])
         .current_dir(dir.path())
         .env(
@@ -3286,7 +3371,7 @@ exit 1
 
     assert!(
         !output.status.success(),
-        "gits pr merge unexpectedly succeeded: {:?}",
+        "kin pr merge unexpectedly succeeded: {:?}",
         output
     );
 
@@ -3346,7 +3431,7 @@ exit 1
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
     let merge_args_path = dir.path().join("merge_args.txt");
-    let output = gits_cmd()
+    let output = kin_cmd()
         .args(["pr", "merge"])
         .current_dir(dir.path())
         .env(
@@ -3363,7 +3448,7 @@ exit 1
 
     assert!(
         !output.status.success(),
-        "gits pr merge unexpectedly succeeded: {:?}",
+        "kin pr merge unexpectedly succeeded: {:?}",
         output
     );
 

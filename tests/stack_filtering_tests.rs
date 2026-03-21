@@ -1,7 +1,7 @@
 //! Integration tests for stack filtering - ensuring merged branches are excluded.
 
 mod common;
-use common::{gits_cmd, make_commit, make_commit_at, repo_init, run_ok};
+use common::{kin_cmd, make_commit, make_commit_at, repo_init, run_ok};
 use std::fs;
 use tempfile::tempdir;
 
@@ -15,7 +15,7 @@ use tempfile::tempdir;
 /// 3. Update main to point to A's commit (simulating merge)
 /// 4. Create branch B from main
 ///
-/// When running `gits pr`, B should target main (not A, which is now on main)
+/// When running `kin pr`, B should target main (not A, which is now on main)
 #[test]
 fn pr_after_branch_merged_into_main() {
     let dir = tempdir().unwrap();
@@ -118,7 +118,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .env(
@@ -134,7 +134,7 @@ exit 1
 
     assert!(
         output.status.success(),
-        "gits pr failed!\nSTDOUT:\n{}\nSTDERR:\n{}",
+        "kin pr failed!\nSTDOUT:\n{}\nSTDERR:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -247,7 +247,7 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("pr")
         .current_dir(dir.path())
         .env(
@@ -263,7 +263,7 @@ exit 1
 
     assert!(
         output.status.success(),
-        "gits pr failed!\nSTDOUT:\n{}\nSTDERR:\n{}",
+        "kin pr failed!\nSTDOUT:\n{}\nSTDERR:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -358,7 +358,7 @@ fn get_stack_branches_excludes_fork_siblings() {
 
     // Get stack branches
     let merge_base_for_test = repo.merge_base(head_id, upstream_id).unwrap();
-    let branches = gits::stack::get_stack_branches_from_merge_base(
+    let branches = kindra::stack::get_stack_branches_from_merge_base(
         &repo,
         merge_base_for_test,
         head_id,
@@ -436,7 +436,7 @@ fn get_stack_branches_handles_non_monotonic_timestamps() {
 
     // Get stack branches
     let merge_base_for_test = repo.merge_base(head_id, upstream_id).unwrap();
-    let branches = gits::stack::get_stack_branches_from_merge_base(
+    let branches = kindra::stack::get_stack_branches_from_merge_base(
         &repo,
         merge_base_for_test,
         head_id,
@@ -535,7 +535,7 @@ fn get_stack_branches_handles_skewed_merged_exclusion() {
 
     // Get stack branches
     let merge_base_for_test = repo.merge_base(head_id, upstream_id).unwrap();
-    let branches = gits::stack::get_stack_branches_from_merge_base(
+    let branches = kindra::stack::get_stack_branches_from_merge_base(
         &repo,
         merge_base_for_test,
         head_id,

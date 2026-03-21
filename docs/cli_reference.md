@@ -1,6 +1,6 @@
-# gits CLI Reference
+# Kindra CLI Reference
 
-This document provides a detailed overview of the commands available in `gits` and how to use them effectively for managing stacked git branches.
+This document provides a detailed overview of the commands available in Kindra via the `kin` CLI and how to use them effectively for managing stacked git branches.
 
 ## Table of Contents
 
@@ -22,9 +22,9 @@ This document provides a detailed overview of the commands available in `gits` a
 
 ## Core Concepts
 
-`gits` is built around the idea of a **stack** of branches. A stack is a linear sequence of branches where each branch builds on top of the previous one, ultimately originating from a "base" branch (like `main` or `master`).
+Kindra is built around the idea of a **stack** of branches. A stack is a linear sequence of branches where each branch builds on top of the previous one, ultimately originating from a "base" branch (like `main` or `master`).
 
-`gits` automatically identifies your stack by looking for local branches that are descendants of the merge base between your current branch and the base branch.
+Kindra automatically identifies your stack by looking for local branches that are descendants of the merge base between your current branch and the base branch.
 
 ---
 
@@ -37,11 +37,11 @@ This document provides a detailed overview of the commands available in `gits` a
 **Usage:**
 
 ```bash
-gits commit [git-commit-args]
-gits commit --on [<branch>] [git-commit-args]
+kin commit [git-commit-args]
+kin commit --on [<branch>] [git-commit-args]
 ```
 
-Any arguments you pass to `gits commit` (e.g., `-m "my message"`) are passed directly to `git commit`.
+Any arguments you pass to `kin commit` (e.g., `-m "my message"`) are passed directly to `git commit`.
 
 - `--on <branch>`: Commit onto another branch instead of the current one. The next token is consumed as the branch name.
 - `--on=`: Open an interactive branch picker for the current stack.
@@ -50,11 +50,11 @@ Any arguments you pass to `gits commit` (e.g., `-m "my message"`) are passed dir
 - `--no-autostash`: Disable Git autostash even if configured globally or for the repo.
 
 Parser behavior:
-- `gits commit --on feature-a -m "msg"`: valid (`feature-a` is the target branch).
-- `gits commit --on -m "msg"`: invalid, because `--on` expects a branch unless used as the final token.
-- Use `gits commit --on= -m "msg"` (or `gits commit --on` as the last token) for interactive selection.
+- `kin commit --on feature-a -m "msg"`: valid (`feature-a` is the target branch).
+- `kin commit --on -m "msg"`: invalid, because `--on` expects a branch unless used as the final token.
+- Use `kin commit --on= -m "msg"` (or `kin commit --on` as the last token) for interactive selection.
 
-When committing onto another branch, `gits` stashes non-staged files, switches to the target branch, commits, rebases dependents (unless you choose not to for an external stack), then returns to your original branch and unstages.
+When committing onto another branch, Kindra stashes non-staged files, switches to the target branch, commits, rebases dependents (unless you choose not to for an external stack), then returns to your original branch and unstages.
 
 **When to use it:** Use this instead of `git commit` when you are working on a branch that has other branches building on top of it. It saves you from having to manually rebase each dependent branch.
 
@@ -64,9 +64,9 @@ When committing onto another branch, `gits` stashes non-staged files, switches t
 Before commit on 'feature-A':
 main -> [A1] -> (feature-A) -> [B1] -> (feature-B) -> [C1] -> (feature-C)
 
-$ gits commit -m "update A"
+$ kin commit -m "update A"
 
-After gits commit:
+After kin commit:
 main -> [A1] -> [A2] -> (feature-A) -> [B1'] -> (feature-B) -> [C1'] -> (feature-C)
 ```
 
@@ -81,7 +81,7 @@ main -> [A1] -> [A2] -> (feature-A) -> [B1'] -> (feature-B) -> [C1'] -> (feature
 **Usage:**
 
 ```bash
-gits move [--onto <target>] [--all] [--autostash|--no-autostash]
+kin move [--onto <target>] [--all] [--autostash|--no-autostash]
 ```
 
 - `--onto <target>`: The branch to move the current stack onto.
@@ -98,9 +98,9 @@ Before moving 'feature-A' onto 'main':
 main -> [M1]
       \-> [D1] -> (develop) -> [A1] -> (feature-A) -> [B1] -> (feature-B)
 
-$ gits move --onto main
+$ kin move --onto main
 
-After gits move:
+After kin move:
 main -> [M1] -> [A1'] -> (feature-A) -> [B1'] -> (feature-B)
       \-> [D1] -> (develop)
 ```
@@ -114,7 +114,7 @@ main -> [M1] -> [A1'] -> (feature-A) -> [B1'] -> (feature-B)
 **Usage:**
 
 ```bash
-gits reorder [--force] [--autostash|--no-autostash]
+kin reorder [--force] [--autostash|--no-autostash]
 ```
 
 - `--force`: Continue even if a branch that needs rebasing is checked out in another worktree.
@@ -143,9 +143,9 @@ branch feature-b
 
 **Recovery:**
 
-- If a reorder started by `gits` stops on conflicts, resolve them and run `gits continue`.
-- To abandon an in-progress reorder and restore the saved state, run `gits abort`.
-- If you are in a plain native Git rebase with no saved `gits` state, use `git rebase --continue` or `git rebase --abort`.
+- If a reorder started by Kindra stops on conflicts, resolve them and run `kin continue`.
+- To abandon an in-progress reorder and restore the saved state, run `kin abort`.
+- If you are in a plain native Git rebase with no saved Kindra state, use `git rebase --continue` or `git rebase --abort`.
 
 **When to use it:** Use this when `move` is too narrow and you want to freely reshape a stack, such as rotating a linear stack, moving a branch across a fork, or turning a linear stack into siblings.
 
@@ -158,7 +158,7 @@ branch feature-b
 **Usage:**
 
 ```bash
-gits sync [--force] [--no-delete] [--autostash|--no-autostash]
+kin sync [--force] [--no-delete] [--autostash|--no-autostash]
 ```
 
 **Arguments:**
@@ -169,16 +169,16 @@ gits sync [--force] [--no-delete] [--autostash|--no-autostash]
 
 **What it does:**
 
-- Finds the resolved upstream/base branch using `find_upstream()` logic. This detection covers `.git/gits.toml`, `init.defaultBranch`, common names like `main`/`master`/`trunk`, and remote-qualified bases.
+- Finds the resolved upstream/base branch using `find_upstream()` logic. This detection covers `.git/kindra.toml`, `init.defaultBranch`, common names like `main`/`master`/`trunk`, and remote-qualified bases.
 - Finds the top branch in your current stack.
 - Detects the first commit that still needs replaying (while handling lower PRs already landed via merge, rebase/cherry-pick, or squash).
 - Checks out the top branch and runs one `git rebase --update-refs --onto <upstream> <old-base> <top>`.
 - **Automatically deletes local branches** in the stack that are already merged into the upstream branch (unless `--no-delete` is used).
-- If your current branch is deleted because it was merged, `gits` automatically switches you to the upstream branch.
+- If your current branch is deleted because it was merged, Kindra automatically switches you to the upstream branch.
 
 **When to use it:** Use this after one or more lower PRs in your stack have already landed on the upstream branch, and you want to sync all remaining branches and clean up the merged ones in one pass.
 
-**Conflict handling:** If a sync started by `gits` conflicts, resolve it and run `gits continue`, or abandon it with `gits abort`. If you are in a plain native Git rebase with no saved `gits` state, use `git rebase --continue` or `git rebase --abort`.
+**Conflict handling:** If a sync started by Kindra conflicts, resolve it and run `kin continue`, or abandon it with `kin abort`. If you are in a plain native Git rebase with no saved Kindra state, use `git rebase --continue` or `git rebase --abort`.
 
 ---
 
@@ -189,13 +189,13 @@ gits sync [--force] [--no-delete] [--autostash|--no-autostash]
 **Usage:**
 
 ```bash
-gits restack [--history-limit <n>] [--autostash|--no-autostash]
+kin restack [--history-limit <n>] [--autostash|--no-autostash]
 ```
 
 **What it does:**
 - Scans all local branches for those whose history includes a commit that "matches" the current `HEAD` but is not part of the current branch's ancestry. Patch-id fallback is limited to the current branch's private lineage so unrelated branches that only share upstream-equivalent patches are ignored.
 - These branches are considered "floating" because they are pointing to a commit that has been replaced.
-- `gits restack` will automatically rebase these floating branches onto the new `HEAD`.
+- `kin restack` will automatically rebase these floating branches onto the new `HEAD`.
 
 **Arguments:**
 - `--history-limit <n>`: Maximum first-parent history depth to scan while detecting floating branches. `0` disables the limit and scans the full history.
@@ -204,8 +204,8 @@ gits restack [--history-limit <n>] [--autostash|--no-autostash]
 
 **History limit resolution order:**
 - CLI override: `--history-limit <n>`
-- Repository config: `.git/gits.toml`
-- Global config: the standard platform config directory as `gits/config.toml`
+- Repository config: `.git/kindra.toml`
+- Global config: the standard platform config directory as `kindra/config.toml`
 - Default: `100`
 
 Example config:
@@ -217,8 +217,8 @@ history_limit = 250
 
 **Rebase autostash resolution order:**
 - CLI override: `--autostash` or `--no-autostash`
-- Repository config: `.git/gits.toml`
-- Global config: the standard platform config directory as `gits/config.toml`
+- Repository config: `.git/kindra.toml`
+- Global config: the standard platform config directory as `kindra/config.toml`
 - Default: `false`
 
 Example config:
@@ -228,7 +228,7 @@ Example config:
 autostash = true
 ```
 
-**When to use it:** Use this after you've amended a commit or rebased a branch that has other branches building on top of it. Instead of manually rebasing each dependent branch, `gits restack` will find and fix them for you.
+**When to use it:** Use this after you've amended a commit or rebased a branch that has other branches building on top of it. Instead of manually rebasing each dependent branch, `kin restack` will find and fix them for you.
 
 **ASCII-Art Visualization:**
 
@@ -242,9 +242,9 @@ After 'amend' (feature-B is now floating on old A1):
 main -> [A1'] -> (feature-A)
       \-> [A1] -> [B1] -> (feature-B)
 
-$ gits restack
+$ kin restack
 
-After gits restack:
+After kin restack:
 main -> [A1'] -> (feature-A) -> [B1'] -> (feature-B)
 ```
 
@@ -257,15 +257,15 @@ main -> [A1'] -> (feature-A) -> [B1'] -> (feature-B)
 **Usage:**
 
 ```bash
-gits checkout [--all]
-gits checkout [subcommand]
+kin checkout [--all]
+kin checkout [subcommand]
 ```
 
-- `gits co`: Opens an interactive selection menu for branches in the current stack.
-- `gits co --all`: Opens an interactive selection menu for all local branches.
-- `gits co up`: Checkout the branch immediately "above" the current one in the stack.
-- `gits co down`: Checkout the branch immediately "below" the current one in the stack.
-- `gits co top`: Checkout the branch at the very top of the current stack.
+- `kin co`: Opens an interactive selection menu for branches in the current stack.
+- `kin co --all`: Opens an interactive selection menu for all local branches.
+- `kin co up`: Checkout the branch immediately "above" the current one in the stack.
+- `kin co down`: Checkout the branch immediately "below" the current one in the stack.
+- `kin co top`: Checkout the branch at the very top of the current stack.
 
 **When to use it:** Use this for fast, ergonomic navigation without needing to remember branch names.
 
@@ -278,12 +278,12 @@ gits checkout [subcommand]
 **Usage:**
 
 ```bash
-gits push
+kin push
 ```
 
 This command performs an atomic push of all branches in the stack using `force-with-lease` to ensure safety.
 
-**When to use it:** Use this when you've updated multiple branches in your stack (e.g., after a `gits commit` or `gits move`) and want to sync them all to the remote in one go.
+**When to use it:** Use this when you've updated multiple branches in your stack (e.g., after a `kin commit` or `kin move`) and want to sync them all to the remote in one go.
 
 ---
 
@@ -294,24 +294,24 @@ This command performs an atomic push of all branches in the stack using `force-w
 **Usage:**
 
 ```bash
-gits pr
-gits pr open
-gits pr edit
-gits pr merge
-gits pr status
-gits pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--reviewer <login>] [--bots|--no-bots]
+kin pr
+kin pr open
+kin pr edit
+kin pr merge
+kin pr status
+kin pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--reviewer <login>] [--bots|--no-bots]
 ```
 
-- `gits pr`: Create/update PRs for stack branches with upstreams.
-- `gits pr open`: Open a PR URL in the default browser (if multiple, choose one).
-- `gits pr edit`: Select a PR (if multiple), then edit title/body/labels/reviewers.
-- `gits pr merge`: Select an open PR in the current stack and merge it only when review/check state is ready, or prompt/error with the blocking reasons.
-- `gits pr status`: Show each stack PR's reviewer status, unresolved comments, and running/failed checks. It also reports any interrupted `gits commit`, `gits move`, `gits reorder`, `gits sync`, or `gits restack` operation in the current repo and points you to `gits continue`/`gits abort` or native Git rebase commands when there is no saved `gits` state.
-- `gits pr review`: Select an open PR in the current stack, fetch its review threads through `gh api graphql`, and render them as markdown.
+- `kin pr`: Create/update PRs for stack branches with upstreams.
+- `kin pr open`: Open a PR URL in the default browser (if multiple, choose one).
+- `kin pr edit`: Select a PR (if multiple), then edit title/body/labels/reviewers.
+- `kin pr merge`: Select an open PR in the current stack and merge it only when review/check state is ready, or prompt/error with the blocking reasons.
+- `kin pr status`: Show each stack PR's reviewer status, unresolved comments, and running/failed checks. It also reports any interrupted `kin commit`, `kin move`, `kin reorder`, `kin sync`, or `kin restack` operation in the current repo and points you to `kin continue`/`kin abort` or native Git rebase commands when there is no saved Kindra state.
+- `kin pr review`: Select an open PR in the current stack, fetch its review threads through `gh api graphql`, and render them as markdown.
 
-`gits pr merge` automatically merges when the PR has no unresolved review comments, no outstanding review state, no running/failed checks, and GitHub reports the PR as mergeable. If issues remain but GitHub would still allow merging, `gits` prints the outstanding reviews/checks and asks for confirmation. If GitHub/repository rules block the merge, `gits` exits with a clear reason instead of attempting it.
+`kin pr merge` automatically merges when the PR has no unresolved review comments, no outstanding review state, no running/failed checks, and GitHub reports the PR as mergeable. If issues remain but GitHub would still allow merging, Kindra prints the outstanding reviews/checks and asks for confirmation. If GitHub/repository rules block the merge, Kindra exits with a clear reason instead of attempting it.
 
-`gits pr review` defaults to unresolved threads only, includes both human and bot comments, and keeps outdated comments unless you opt out.
+`kin pr review` defaults to unresolved threads only, includes both human and bot comments, and keeps outdated comments unless you opt out.
 
 **Arguments:**
 
@@ -333,8 +333,8 @@ gits pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--review
 **Notes:**
 
 - These commands require authenticated GitHub CLI (`gh auth status` must succeed).
-- Both `gits status` and `gits pr status` report interrupted `gits commit`, `gits move`, `gits reorder`, `gits sync`, and `gits restack` operations.
-- When a saved `gits` state exists, continue with `gits continue` or clean up with `gits abort`. If there is no saved `gits` state and Git itself is mid-rebase, use `git rebase --continue` or `git rebase --abort`.
+- Both `kin status` and `kin pr status` report interrupted `kin commit`, `kin move`, `kin reorder`, `kin sync`, and `kin restack` operations.
+- When a saved Kindra state exists, continue with `kin continue` or clean up with `kin abort`. If there is no saved Kindra state and Git itself is mid-rebase, use `git rebase --continue` or `git rebase --abort`.
 
 ---
 
@@ -345,7 +345,7 @@ gits pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--review
 **Usage:**
 
 ```bash
-gits split
+kin split
 ```
 
 It generates a list of commits and branches. You can move the `branch <name>` lines to reassign branches to different commits, or add/remove them to create/delete branches.
@@ -358,7 +358,7 @@ It generates a list of commits and branches. You can move the `branch <name>` li
 Before split (one branch, multiple commits):
 main -> [C1] -> [C2] -> [C3] -> (my-feature)
 
-$ gits split
+$ kin split
 # In $EDITOR:
 [C1] Initial work
 branch feature-part-1
@@ -375,12 +375,12 @@ main -> [C1] -> (feature-part-1) -> [C2] -> (feature-part-2) -> [C3] -> (my-feat
 
 ### Status & Control
 
-If a `gits commit`, `gits move`, `gits reorder`, `gits sync`, or `gits restack` operation is interrupted (e.g., due to a merge conflict), both `gits status` and `gits pr status` report the interrupted operation and how to recover:
+If a `kin commit`, `kin move`, `kin reorder`, `kin sync`, or `kin restack` operation is interrupted (e.g., due to a merge conflict), both `kin status` and `kin pr status` report the interrupted operation and how to recover:
 
-- **`gits status`**: Shows the current state of the interrupted operation, including which branch is currently being rebased and which ones are remaining.
-- **`gits continue`**: Resumes the operation after you've resolved conflicts. It handles the underlying `git rebase --continue` and then proceeds with the remaining branches in the stack.
-- **`gits abort`**: Cancels the current operation and cleans up the state.
-- If there is no saved `gits` state and Git itself is in the middle of a native rebase, use `git rebase --continue` or `git rebase --abort`.
+- **`kin status`**: Shows the current state of the interrupted operation, including which branch is currently being rebased and which ones are remaining.
+- **`kin continue`**: Resumes the operation after you've resolved conflicts. It handles the underlying `git rebase --continue` and then proceeds with the remaining branches in the stack.
+- **`kin abort`**: Cancels the current operation and cleans up the state.
+- If there is no saved Kindra state and Git itself is in the middle of a native rebase, use `git rebase --continue` or `git rebase --abort`.
 
 ---
 
@@ -391,7 +391,7 @@ If a `gits commit`, `gits move`, `gits reorder`, `gits sync`, or `gits restack` 
 **Usage:**
 
 ```bash
-gits completions <shell>
+kin completions <shell>
 ```
 
 Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`, `nu`.
@@ -400,7 +400,7 @@ Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`, `nu`.
 
 ```bash
 mkdir -p ~/.zsh/completions
-gits completions zsh > ~/.zsh/completions/_gits
+kin completions zsh > ~/.zsh/completions/_kin
 fpath=(~/.zsh/completions $fpath)
 autoload -Uz compinit && compinit
 ```

@@ -45,7 +45,7 @@ pub struct RebaseState {
     /// branch_name -> original tip commit id before the operation started
     #[serde(default)]
     pub original_tip_map: HashMap<String, String>,
-    /// Optional stash token created by `gits commit --on` to preserve non-staged files.
+    /// Optional stash token created by `kin commit --on` to preserve non-staged files.
     #[serde(default)]
     pub stash_ref: Option<String>,
     /// Whether to run `git reset` when returning to the original branch.
@@ -170,7 +170,7 @@ pub fn apply_stash(stash_ref: &str) -> Result<()> {
         .status()?;
     if !status.success() {
         return Err(anyhow!(
-            "Failed to apply stashed changes from '{}'. Resolve conflicts and run 'gits continue' or 'gits abort'.",
+            "Failed to apply stashed changes from '{}'. Resolve conflicts and run 'kin continue' or 'kin abort'.",
             stash_ref
         ));
     }
@@ -336,14 +336,14 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
                 // Persist that this branch is in progress, but do NOT remove it from remaining_branches
                 save_state(repo, &state)?;
                 return Err(anyhow!(
-                    "Rebase failed for branch {}. Resolve conflicts and run 'gits continue'.",
+                    "Rebase failed for branch {}. Resolve conflicts and run 'kin continue'.",
                     current_name
                 ));
             } else {
                 state.in_progress_branch = None;
                 save_state(repo, &state)?;
                 return Err(anyhow!(
-                    "Rebase failed for branch {}. It seems to have failed before starting (e.g., dirty working tree). Fix the issue and run 'gits continue'.",
+                    "Rebase failed for branch {}. It seems to have failed before starting (e.g., dirty working tree). Fix the issue and run 'kin continue'.",
                     current_name
                 ));
             }

@@ -18,7 +18,7 @@
 mod common;
 use common::repo_init;
 use git2::{Repository, Signature};
-use gits::stack::get_stack_branches_from_merge_base;
+use kindra::stack::get_stack_branches_from_merge_base;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 

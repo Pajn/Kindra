@@ -214,7 +214,7 @@ fn read_repo_upstream_override(repo: &Repository) -> Result<Option<String>> {
             .map(Some)
             .ok_or_else(|| {
                 anyhow!(
-                    "Configured upstream branch '{}' in .git/gits.toml was not found",
+                    "Configured upstream branch '{}' in .git/kindra.toml was not found",
                     upstream
                 )
             }),
@@ -223,7 +223,7 @@ fn read_repo_upstream_override(repo: &Repository) -> Result<Option<String>> {
 }
 
 fn read_repo_config(repo: &Repository) -> Result<RepoConfig> {
-    read_toml_config(repo.path().join("gits.toml"), "repository")?.map_or_else(
+    read_toml_config(repo.path().join("kindra.toml"), "repository")?.map_or_else(
         || {
             Ok(RepoConfig {
                 upstream_branch: None,
@@ -266,5 +266,5 @@ fn read_toml_config<T: for<'de> Deserialize<'de>>(
 }
 
 fn global_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("gits").join("config.toml"))
+    dirs::config_dir().map(|dir| dir.join("kindra").join("config.toml"))
 }

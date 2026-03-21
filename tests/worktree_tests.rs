@@ -1,6 +1,6 @@
 mod common;
 
-use common::{gits_cmd, make_commit, repo_init, run_ok};
+use common::{kin_cmd, make_commit, repo_init, run_ok};
 use std::fs;
 use tempfile::TempDir;
 
@@ -48,10 +48,10 @@ fn test_sync_aborts_when_branch_checked_out_in_other_worktree() {
         dir.path(),
     );
 
-    // Run gits sync on feature-b (in the main worktree)
+    // Run kin sync on feature-b (in the main worktree)
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("sync")
         .current_dir(dir.path())
         .output()
@@ -65,7 +65,7 @@ fn test_sync_aborts_when_branch_checked_out_in_other_worktree() {
     ));
 
     // Verify it passes with --force
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("sync")
         .arg("--force")
         .current_dir(dir.path())
@@ -74,12 +74,12 @@ fn test_sync_aborts_when_branch_checked_out_in_other_worktree() {
 
     // It might still fail if git rebase itself fails due to worktree, but the GITS check should be bypassed.
     // Actually, git rebase --update-refs might not care if it's not checking out feature-a,
-    // but gits sync might try to checkout tips.
+    // but kin sync might try to checkout tips.
 
-    // In this case, gits sync will try to checkout feature-b (already on it).
+    // In this case, kin sync will try to checkout feature-b (already on it).
     // Then it runs git rebase --update-refs.
 
-    // If it passed the gits check, it means --force worked.
+    // If it passed the kin check, it means --force worked.
     assert!(
         !String::from_utf8_lossy(&output.stderr)
             .contains("aborting as a full rebase can not be completed")
@@ -140,10 +140,10 @@ fn test_move_aborts_when_branch_checked_out_in_other_worktree() {
         dir.path(),
     );
 
-    // Run gits move on feature-a (in the main worktree)
+    // Run kin move on feature-a (in the main worktree)
     run_ok("git", &["checkout", "feature-a"], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("move")
         .arg("--onto")
         .arg("target")
@@ -156,7 +156,7 @@ fn test_move_aborts_when_branch_checked_out_in_other_worktree() {
     assert!(stderr.contains("feature-b is checked out in"));
 
     // Verify it passes with --force
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("move")
         .arg("--onto")
         .arg("target")
@@ -224,7 +224,7 @@ fn test_move_onto_descendant_aborts_when_checked_out_in_other_worktree() {
 
     run_ok("git", &["checkout", "feature-a"], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("move")
         .arg("--onto")
         .arg("feature-c")
@@ -236,7 +236,7 @@ fn test_move_onto_descendant_aborts_when_checked_out_in_other_worktree() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("feature-c is checked out in"));
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("move")
         .arg("--onto")
         .arg("feature-c")
@@ -293,12 +293,12 @@ fn test_commit_on_aborts_when_branch_checked_out_in_other_worktree() {
         dir.path(),
     );
 
-    // Run gits commit --on feature-a (in the main worktree)
+    // Run kin commit --on feature-a (in the main worktree)
     run_ok("git", &["checkout", "feature-a"], dir.path());
     fs::write(dir.path().join("a.txt"), "modified a").unwrap();
     run_ok("git", &["add", "a.txt"], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("commit")
         .arg("-m")
         .arg("msg")
@@ -311,7 +311,7 @@ fn test_commit_on_aborts_when_branch_checked_out_in_other_worktree() {
     assert!(stderr.contains("feature-b is checked out in"));
 
     // Verify it passes with --force
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("commit")
         .arg("--force")
         .arg("-m")
@@ -384,9 +384,9 @@ fn test_commit_on_with_branch_switch_aborts_due_to_worktree_and_restores() {
     // Make an unstaged change
     fs::write(dir.path().join("unstaged.txt"), "unstaged content").unwrap();
 
-    // Run gits commit --on feature-b
+    // Run kin commit --on feature-b
     // This should trigger check_worktrees because feature-b has dependent feature-c in another worktree
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("commit")
         .arg("--on")
         .arg("feature-b")
@@ -446,13 +446,13 @@ fn test_commit_force_with_rebase_conflict() {
         dir.path(),
     );
 
-    // Run gits commit --force on main (in the main worktree)
+    // Run kin commit --force on main (in the main worktree)
     // This should trigger a rebase of feature-a and feature-b since main moved
     run_ok("git", &["checkout", "main"], dir.path());
     fs::write(dir.path().join("file.txt"), "main-change").unwrap();
     run_ok("git", &["add", "file.txt"], dir.path());
 
-    let output = gits_cmd()
+    let output = kin_cmd()
         .arg("commit")
         .arg("-m")
         .arg("new main")
@@ -461,7 +461,7 @@ fn test_commit_force_with_rebase_conflict() {
         .output()
         .unwrap();
 
-    // The gits check should be bypassed, but git rebase should fail due to conflict
+    // The kin check should be bypassed, but git rebase should fail due to conflict
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("aborting as a full rebase can not be completed"));
@@ -478,28 +478,28 @@ fn test_commit_force_with_rebase_conflict() {
     run_ok("git", &["worktree", "remove", "-f", &wt_path], dir.path());
 
     // Continue the rebase
-    let res = gits_cmd()
+    let res = kin_cmd()
         .arg("continue")
         .env("GIT_EDITOR", "true")
         .current_dir(dir.path())
         .output()
         .unwrap();
     if !res.status.success() {
-        eprintln!("gits continue failed!");
+        eprintln!("kin continue failed!");
         eprintln!("STDOUT: {}", String::from_utf8_lossy(&res.stdout));
         eprintln!("STDERR: {}", String::from_utf8_lossy(&res.stderr));
     }
     assert!(res.status.success());
 
-    // Verify postcondition: repo is clean and gits status shows no operation in progress
-    let status_output = gits_cmd()
+    // Verify postcondition: repo is clean and kin status shows no operation in progress
+    let status_output = kin_cmd()
         .arg("status")
         .current_dir(dir.path())
         .output()
         .unwrap();
     assert!(
         status_output.status.success(),
-        "gits status failed!\nSTDOUT: {}\nSTDERR: {}",
+        "kin status failed!\nSTDOUT: {}\nSTDERR: {}",
         String::from_utf8_lossy(&status_output.stdout),
         String::from_utf8_lossy(&status_output.stderr)
     );

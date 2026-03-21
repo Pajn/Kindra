@@ -1,6 +1,6 @@
-# Agent Guidelines for `gits`
+# Agent Guidelines for `Kindra`
 
-This document outlines the engineering standards and workflows for agents contributing to the `gits` project.
+This document outlines the engineering standards and workflows for agents contributing to the `Kindra` project.
 
 ## 1. Quality Standards
 

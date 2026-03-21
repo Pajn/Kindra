@@ -1,6 +1,6 @@
 mod common;
 
-use common::{gits_cmd, make_commit, repo_init, run_ok};
+use common::{kin_cmd, make_commit, repo_init, run_ok};
 use git2::{BranchType, Repository};
 use predicates::prelude::*;
 use std::fs;
@@ -12,13 +12,13 @@ fn test_global_config_dir(root: &std::path::Path) -> std::path::PathBuf {
         return root
             .join("Library")
             .join("Application Support")
-            .join("gits");
+            .join("kindra");
     }
     if cfg!(target_os = "windows") {
-        return root.join("AppData").join("Roaming").join("gits");
+        return root.join("AppData").join("Roaming").join("kindra");
     }
 
-    root.join(".config").join("gits")
+    root.join(".config").join("kindra")
 }
 
 fn apply_global_config_env(cmd: &mut assert_cmd::Command, root: &std::path::Path) {
@@ -95,7 +95,7 @@ fn sync_handles_rebased_lower_branch() {
         .target()
         .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .arg("--no-delete")
         .current_dir(dir.path())
@@ -201,7 +201,7 @@ fn sync_handles_squashed_lower_branch() {
         .target()
         .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .arg("--no-delete")
         .current_dir(dir.path())
@@ -288,7 +288,7 @@ fn sync_handles_merged_lower_branch() {
         .target()
         .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .arg("--no-delete")
         .current_dir(dir.path())
@@ -381,7 +381,7 @@ fn sync_skips_squashed_lower_branch_and_deletes_it() {
 
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
@@ -461,7 +461,7 @@ fn sync_skips_rewritten_lower_branch_on_main() {
 
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .arg("--no-delete")
         .current_dir(dir.path())
@@ -556,7 +556,7 @@ fn sync_skips_integrated_lower_branch_and_cherry_equivalent_upper_commit() {
 
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .arg("--no-delete")
         .current_dir(dir.path())
@@ -638,7 +638,7 @@ fn sync_does_not_skip_partially_integrated_lower_branch() {
 
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
@@ -719,7 +719,7 @@ fn sync_rebases_onto_remote_tracking_base_when_local_base_is_stale() {
     let origin_main_before = repo.revparse_single("origin/main").unwrap().id();
     assert_eq!(local_main_before, origin_main_before);
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .arg("--no-delete")
         .current_dir(dir.path())
@@ -777,7 +777,7 @@ fn sync_treats_slashed_base_branch_name_as_local_before_remote() {
         dir.path(),
     );
     fs::write(
-        repo.path().join("gits.toml"),
+        repo.path().join("kindra.toml"),
         r#"upstream_branch = "release/2026.03""#,
     )
     .unwrap();
@@ -833,7 +833,7 @@ fn sync_treats_slashed_base_branch_name_as_local_before_remote() {
         .unwrap();
     assert_eq!(upstream_before, local_release_before);
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .arg("--no-delete")
         .current_dir(dir.path())
@@ -903,7 +903,7 @@ fn sync_reports_rebase_conflict() {
 
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
@@ -919,7 +919,7 @@ fn sync_reports_rebase_conflict() {
     );
     assert!(
         dir.path().join(".git/gits_rebase_state.json").exists(),
-        "Expected gits state to remain after conflict"
+        "Expected kindra state to remain after conflict"
     );
 }
 
@@ -968,7 +968,7 @@ fn sync_abort_restores_original_branch_after_tip_switch_conflict() {
 
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
@@ -983,7 +983,7 @@ fn sync_abort_restores_original_branch_after_tip_switch_conflict() {
     assert_ne!(repo.state(), git2::RepositoryState::Clean);
     assert!(repo.head_detached().unwrap());
 
-    let mut abort_cmd = gits_cmd();
+    let mut abort_cmd = kin_cmd();
     abort_cmd
         .arg("abort")
         .current_dir(dir.path())
@@ -1040,7 +1040,7 @@ fn sync_refuses_when_git_rebase_in_progress() {
 
     std::fs::create_dir_all(dir.path().join(".git/rebase-merge")).unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
@@ -1092,7 +1092,7 @@ fn sync_refuses_to_auto_pick_tip_in_non_interactive_mode() {
 
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
@@ -1137,7 +1137,7 @@ fn sync_respects_git_rebase_autostash_config() {
     run_ok("git", &["config", "rebase.autostash", "true"], dir.path());
     fs::write(dir.path().join("file.txt"), "base\nfeature\ndirty\n").unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().failure();
 
     // Verify autostash worked: rebase started (proving git config is respected)
@@ -1193,7 +1193,7 @@ fn sync_no_autostash_overrides_git_config() {
     run_ok("git", &["config", "rebase.autostash", "true"], dir.path());
     fs::write(dir.path().join("file.txt"), "base\nfeature\ndirty\n").unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .arg("--no-autostash")
         .current_dir(dir.path())
@@ -1245,7 +1245,7 @@ fn sync_cli_no_autostash_overrides_repo_config() {
     );
 
     std::fs::write(
-        repo.path().join("gits.toml"),
+        repo.path().join("kindra.toml"),
         "[rebase]\nautostash = true\n",
     )
     .unwrap();
@@ -1253,7 +1253,7 @@ fn sync_cli_no_autostash_overrides_repo_config() {
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
     fs::write(dir.path().join("file.txt"), "base\nfeature\ndirty\n").unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .arg("--no-autostash")
         .current_dir(dir.path())
@@ -1312,7 +1312,7 @@ fn sync_global_config_enables_autostash() {
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.current_dir(dir.path());
     apply_global_config_env(&mut cmd, global_config_root.path());
     cmd.arg("sync").assert().failure();
@@ -1382,7 +1382,7 @@ fn sync_errors_when_git_too_old_for_update_refs() {
     let old_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", dir.path().display(), old_path);
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .current_dir(dir.path())
         .env("PATH", new_path)
@@ -1458,7 +1458,7 @@ fn sync_on_main_errors_when_git_too_old_for_reapply_cherry_picks() {
     let old_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", dir.path().display(), old_path);
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .current_dir(dir.path())
         .env("PATH", new_path)
@@ -1528,7 +1528,7 @@ fn sync_checkout_error_includes_branch_name() {
     let old_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", dir.path().display(), old_path);
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .current_dir(dir.path())
         .env("PATH", new_path)
@@ -1579,7 +1579,7 @@ fn sync_deletes_merged_branches() {
 
     run_ok("git", &["checkout", "-f", "feature-b"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
@@ -1666,7 +1666,7 @@ fn sync_on_main_rebases_to_latest_origin_main_and_deletes_merged_local_branches(
         .target()
         .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
@@ -1727,7 +1727,7 @@ fn sync_preserves_state_on_prestart_rebase_failure_after_tip_checkout() {
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
     fs::write(dir.path().join("shared.txt"), "dirty").unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .arg("--no-autostash")
         .current_dir(dir.path())
@@ -1744,7 +1744,7 @@ fn sync_preserves_state_on_prestart_rebase_failure_after_tip_checkout() {
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
 
-    let mut continue_cmd = gits_cmd();
+    let mut continue_cmd = kin_cmd();
     continue_cmd
         .arg("continue")
         .current_dir(dir.path())
@@ -1752,7 +1752,7 @@ fn sync_preserves_state_on_prestart_rebase_failure_after_tip_checkout() {
         .failure()
         .stderr(predicate::str::contains("Sync did not complete"));
 
-    let mut abort_cmd = gits_cmd();
+    let mut abort_cmd = kin_cmd();
     abort_cmd
         .arg("abort")
         .current_dir(dir.path())
@@ -1841,7 +1841,7 @@ fn sync_on_main_handles_rebase_conflict_and_preserves_state() {
     );
     run_ok("git", &["push", "origin", "main"], remote_worktree.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
@@ -1859,7 +1859,7 @@ fn sync_on_main_handles_rebase_conflict_and_preserves_state() {
     );
     assert!(
         dir.path().join(".git/gits_rebase_state.json").exists(),
-        "Expected gits state to remain after main sync conflict"
+        "Expected kindra state to remain after main sync conflict"
     );
     assert!(repo.find_branch("feature-a", BranchType::Local).is_ok());
     assert!(repo.head_detached().unwrap());
@@ -1924,7 +1924,7 @@ fn sync_on_main_conflict_can_continue_with_gits() {
     );
     run_ok("git", &["push", "origin", "main"], remote_worktree.path());
 
-    let mut sync_cmd = gits_cmd();
+    let mut sync_cmd = kin_cmd();
     sync_cmd
         .arg("sync")
         .current_dir(dir.path())
@@ -1939,7 +1939,7 @@ fn sync_on_main_conflict_can_continue_with_gits() {
     fs::write(dir.path().join("shared.txt"), "resolved main").unwrap();
     run_ok("git", &["add", "shared.txt"], dir.path());
 
-    let mut continue_cmd = gits_cmd();
+    let mut continue_cmd = kin_cmd();
     continue_cmd
         .arg("continue")
         .env("GIT_EDITOR", "true")
@@ -2033,7 +2033,7 @@ fn sync_on_main_conflict_continue_after_rebase() {
     )
     .unwrap();
 
-    let mut continue_cmd = gits_cmd();
+    let mut continue_cmd = kin_cmd();
     continue_cmd
         .arg("continue")
         .current_dir(dir.path())
@@ -2127,7 +2127,7 @@ fn sync_on_main_manual_git_abort_does_not_finalize_or_delete_branches() {
     );
     run_ok("git", &["push", "origin", "main"], remote_worktree.path());
 
-    let mut sync_cmd = gits_cmd();
+    let mut sync_cmd = kin_cmd();
     sync_cmd
         .arg("sync")
         .current_dir(dir.path())
@@ -2140,7 +2140,7 @@ fn sync_on_main_manual_git_abort_does_not_finalize_or_delete_branches() {
     assert!(dir.path().join(".git/gits_rebase_state.json").exists());
     run_ok("git", &["rebase", "--abort"], dir.path());
 
-    let mut continue_cmd = gits_cmd();
+    let mut continue_cmd = kin_cmd();
     continue_cmd
         .arg("continue")
         .current_dir(dir.path())
@@ -2188,7 +2188,7 @@ fn sync_deletes_current_branch_if_merged() {
 
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
@@ -2230,7 +2230,7 @@ fn sync_no_delete_flag_works() {
 
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .arg("--no-delete")
         .current_dir(dir.path())
@@ -2293,7 +2293,7 @@ fn sync_refuses_to_delete_branch_checked_out_in_other_worktree() {
 
     run_ok("git", &["checkout", "-f", "feature-b"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
@@ -2304,7 +2304,7 @@ fn sync_refuses_to_delete_branch_checked_out_in_other_worktree() {
     assert!(repo.find_branch("feature-a", BranchType::Local).is_ok());
 
     // Force should proceed but git branch -D will still warn and skip deletion
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .arg("--force")
         .current_dir(dir.path())
@@ -2361,7 +2361,7 @@ fn sync_on_main_does_not_delete_branch_when_only_tip_patch_matches() {
         dir.path(),
     );
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
@@ -2429,7 +2429,7 @@ fn sync_falls_back_to_local_upstream_on_deletion() {
     // Local main is still at base_id, origin/main is advanced.
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
@@ -2485,7 +2485,7 @@ fn sync_does_not_delete_branch_with_only_tree_match() {
 
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
@@ -2551,7 +2551,7 @@ fn sync_does_not_treat_historical_tree_match_as_merged() {
 
     run_ok("git", &["checkout", "-f", "feature-b"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
@@ -2646,7 +2646,7 @@ fn sync_skips_squashed_lower_branch_after_later_upstream_edits_on_same_path() {
 
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();

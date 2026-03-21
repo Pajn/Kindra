@@ -94,7 +94,7 @@ pub fn split() -> Result<()> {
         }
     }
 
-    buffer.push_str("\n# gits split\n");
+    buffer.push_str("\n# kin split\n");
     buffer.push_str("# Move 'branch <name>' rows to reassign branches to commits.\n");
     buffer.push_str("# Add new 'branch <name>' rows to create branches.\n");
     buffer.push_str("# Remove 'branch <name>' rows to delete branches.\n");
@@ -146,14 +146,14 @@ pub fn split() -> Result<()> {
     // Validate commits (order and content must match exactly)
     if new_commits_short.len() != commits.len() {
         return Err(anyhow!(
-            "Commit list was modified (count changed). gits split only supports branch management."
+            "Commit list was modified (count changed). kin split only supports branch management."
         ));
     }
 
     for (original, new_short) in commits.iter().zip(new_commits_short.iter()) {
         if !original.id.starts_with(new_short) {
             return Err(anyhow!(
-                "Commit '{}' was modified or moved. gits split only supports branch management.",
+                "Commit '{}' was modified or moved. kin split only supports branch management.",
                 new_short
             ));
         }

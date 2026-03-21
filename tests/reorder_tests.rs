@@ -1,6 +1,6 @@
 mod common;
 
-use common::{gits_cmd, make_commit, repo_init, run_ok};
+use common::{kin_cmd, make_commit, repo_init, run_ok};
 use git2::{BranchType, Repository};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -86,7 +86,7 @@ fn reorder_linear_stack() {
         "branch feature-c parent main\nbranch feature-a\nbranch feature-b\n",
     );
 
-    gits_cmd()
+    kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
         .env("EDITOR", &editor)
@@ -121,7 +121,7 @@ fn reorder_creates_fork() {
         "branch feature-a parent main\nbranch feature-b\nbranch feature-c parent feature-a\n",
     );
 
-    gits_cmd()
+    kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
         .env("EDITOR", &editor)
@@ -157,7 +157,7 @@ fn reorder_preserves_existing_fork() {
         "branch feature-a parent main\nbranch feature-b\nbranch feature-c parent main\nbranch feature-d parent feature-b\n",
     );
 
-    gits_cmd()
+    kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
         .env("EDITOR", &editor)
@@ -193,7 +193,7 @@ fn reorder_restores_original_branch_when_run_from_middle() {
         "branch feature-c parent main\nbranch feature-a\nbranch feature-b\n",
     );
 
-    gits_cmd()
+    kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
         .env("EDITOR", &editor)
@@ -220,7 +220,7 @@ fn reorder_rejects_self_parent() {
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
     let editor = write_editor_script(dir.path(), "branch feature-a parent feature-a\n");
 
-    gits_cmd()
+    kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
         .env("EDITOR", &editor)
@@ -244,7 +244,7 @@ fn reorder_rejects_shorthand_on_first_row() {
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
     let editor = write_editor_script(dir.path(), "branch feature-a\n");
 
-    gits_cmd()
+    kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
         .env("EDITOR", &editor)
@@ -268,7 +268,7 @@ fn reorder_rejects_unknown_parent() {
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
     let editor = write_editor_script(dir.path(), "branch feature-a parent nope\n");
 
-    gits_cmd()
+    kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
         .env("EDITOR", &editor)
@@ -296,7 +296,7 @@ fn reorder_rejects_cycle() {
         "branch feature-a parent feature-b\nbranch feature-b parent feature-a\n",
     );
 
-    gits_cmd()
+    kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
         .env("EDITOR", &editor)
@@ -324,7 +324,7 @@ fn reorder_rejects_duplicate_or_missing_rows() {
         dir.path(),
         "branch feature-a parent main\nbranch feature-a parent main\n",
     );
-    gits_cmd()
+    kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
         .env("EDITOR", &duplicate_editor)
@@ -333,7 +333,7 @@ fn reorder_rejects_duplicate_or_missing_rows() {
         .stderr(predicates::str::contains("Duplicate branch row"));
 
     let missing_editor = write_editor_script(dir.path(), "branch feature-a parent main\n");
-    gits_cmd()
+    kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
         .env("EDITOR", &missing_editor)
@@ -383,7 +383,7 @@ fn reorder_conflict_and_continue() {
         "branch feature-c parent main\nbranch feature-a\nbranch feature-b\n",
     );
 
-    gits_cmd()
+    kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
         .env("EDITOR", &editor)
@@ -394,7 +394,7 @@ fn reorder_conflict_and_continue() {
     fs::write(dir.path().join("file.txt"), "1\nresolved\n3\n").unwrap();
     run_ok("git", &["add", "file.txt"], dir.path());
 
-    gits_cmd()
+    kin_cmd()
         .arg("continue")
         .current_dir(dir.path())
         .env("GIT_EDITOR", "true")
@@ -451,7 +451,7 @@ fn reorder_conflict_and_abort_restores_original_graph_and_cleans_up() {
         "branch feature-c parent main\nbranch feature-a\nbranch feature-b\n",
     );
 
-    gits_cmd()
+    kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
         .env("EDITOR", &editor)
@@ -459,7 +459,7 @@ fn reorder_conflict_and_abort_restores_original_graph_and_cleans_up() {
         .failure()
         .stderr(predicates::str::contains("Resolve conflicts"));
 
-    gits_cmd()
+    kin_cmd()
         .arg("abort")
         .current_dir(dir.path())
         .assert()
@@ -508,7 +508,7 @@ fn reorder_checks_worktrees() {
         "branch feature-a parent feature-c\nbranch feature-b parent feature-a\nbranch feature-c parent main\n",
     );
 
-    gits_cmd()
+    kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
         .env("EDITOR", &editor)

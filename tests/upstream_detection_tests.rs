@@ -1,8 +1,8 @@
 mod common;
 
-use common::{gits_cmd, make_commit, repo_init};
+use common::{kin_cmd, make_commit, repo_init};
 use git2::Repository;
-use gits::commands::find_upstream;
+use kindra::commands::find_upstream;
 use predicates::str::contains;
 use std::fs;
 use tempfile::tempdir;
@@ -23,7 +23,7 @@ fn sync_allows_trunk_when_main_master_missing() {
     let (dir, repo) = setup_repo_with_base("trunk");
     repo.set_head("refs/heads/trunk").unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 }
 
@@ -41,7 +41,7 @@ fn sync_allows_init_default_branch_when_checked_out() {
     let mut cfg = repo.config().unwrap();
     cfg.set_str("init.defaultBranch", "trunk").unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 }
 
@@ -57,12 +57,12 @@ fn sync_allows_repo_override_from_git_dir_config() {
     repo.set_head("refs/heads/develop").unwrap();
 
     fs::write(
-        repo.path().join("gits.toml"),
+        repo.path().join("kindra.toml"),
         r#"upstream_branch = "develop""#,
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 }
 
@@ -71,18 +71,18 @@ fn sync_errors_when_repo_override_branch_missing() {
     let (dir, repo) = setup_repo_with_base("main");
 
     fs::write(
-        repo.path().join("gits.toml"),
+        repo.path().join("kindra.toml"),
         r#"upstream_branch = "nonexistent""#,
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
         .failure()
         .stderr(contains(
-            "Configured upstream branch 'nonexistent' in .git/gits.toml was not found",
+            "Configured upstream branch 'nonexistent' in .git/kindra.toml was not found",
         ));
 }
 
@@ -98,18 +98,18 @@ fn sync_errors_when_repo_override_is_not_a_branch() {
         .unwrap();
 
     fs::write(
-        repo.path().join("gits.toml"),
+        repo.path().join("kindra.toml"),
         r#"upstream_branch = "not-a-branch""#,
     )
     .unwrap();
 
-    let mut cmd = gits_cmd();
+    let mut cmd = kin_cmd();
     cmd.arg("sync")
         .current_dir(dir.path())
         .assert()
         .failure()
         .stderr(contains(
-            "Configured upstream branch 'not-a-branch' in .git/gits.toml was not found",
+            "Configured upstream branch 'not-a-branch' in .git/kindra.toml was not found",
         ));
 }
 
@@ -157,7 +157,7 @@ fn upstream_override_slash_branch_exists_only_remotely() {
     .unwrap();
 
     fs::write(
-        repo.path().join("gits.toml"),
+        repo.path().join("kindra.toml"),
         r#"upstream_branch = "feature/base""#,
     )
     .unwrap();

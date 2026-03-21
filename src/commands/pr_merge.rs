@@ -129,7 +129,7 @@ pub(crate) fn pr_merge() -> Result<()> {
 
     if branches_with_upstream.is_empty() {
         println!("No branches with a remote upstream in stack.");
-        println!("Run `gits push` first to set upstreams.");
+        println!("Run `kin push` first to set upstreams.");
         return Ok(());
     }
 

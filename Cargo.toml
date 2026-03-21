@@ -1,10 +1,17 @@
 [package]
-name = "gits"
+name = "kindra"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-repository = "https://github.com/Pajn/gits"
+repository = "https://github.com/Pajn/kindra"
 readme = "README.md"
+
+[lib]
+name = "kindra"
+
+[[bin]]
+name = "kin"
+path = "src/main.rs"
 
 [dependencies]
 base64 = "0.22"
