@@ -11,6 +11,7 @@ pub mod restack;
 pub mod split;
 pub mod status_cmd;
 pub mod sync;
+pub mod tree;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Subcommand;

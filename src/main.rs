@@ -18,6 +18,7 @@ use crate::commands::restack::{RestackArgs, restack};
 use crate::commands::split::split;
 use crate::commands::status_cmd::status_cmd;
 use crate::commands::sync::{SyncArgs, sync};
+use crate::commands::tree::{TreeArgs, tree};
 pub use crate::repository::open_repo;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -72,6 +73,9 @@ enum Commands {
     Abort,
     /// Show the status of an in-progress gits operation
     Status,
+    /// Visualize the stack tree
+    #[command(alias = "t")]
+    Tree(TreeArgs),
     /// Generate shell completions
     Completions {
         /// The shell to generate completions for
@@ -122,6 +126,7 @@ fn main() -> Result<()> {
         Commands::Continue => continue_cmd()?,
         Commands::Abort => abort_cmd()?,
         Commands::Status => status_cmd()?,
+        Commands::Tree(args) => tree(args)?,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             match shell {

@@ -27,6 +27,7 @@ pub fn check_gh() -> Result<()> {
 pub struct ExistingPr {
     pub number: u64,
     pub base_branch: String,
+    pub is_draft: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -93,13 +94,21 @@ pub fn find_open_pr(branch: &str) -> Result<Option<ExistingPr>> {
     #[derive(Deserialize)]
     struct PrView {
         number: u64,
-        #[serde(rename = "baseRefName")]
+        #[serde(rename = "baseRefName", default)]
         base_ref_name: String,
         state: String,
+        #[serde(rename = "isDraft", default)]
+        is_draft: bool,
     }
 
     let output = Command::new("gh")
-        .args(["pr", "view", branch, "--json", "number,baseRefName,state"])
+        .args([
+            "pr",
+            "view",
+            branch,
+            "--json",
+            "number,baseRefName,state,isDraft",
+        ])
         .output()
         .context("Failed to run `gh pr view`")?;
 
@@ -118,6 +127,7 @@ pub fn find_open_pr(branch: &str) -> Result<Option<ExistingPr>> {
         Ok(Some(ExistingPr {
             number: pr.number,
             base_branch: pr.base_ref_name,
+            is_draft: pr.is_draft,
         }))
     } else {
         Ok(None)
