@@ -96,6 +96,84 @@ Commands that need an upstream/base branch (for example `sync`, `split`, `push`,
 3. Built-in defaults: `main`, `master`, `trunk`
 4. Remote fallbacks: `origin/<branch>`
 
+## Managed Worktrees
+
+Kindra now includes an opinionated `kin wt` workflow for managed git worktrees:
+
+- `kin wt main` ensures a stable trunk worktree exists.
+- `kin wt review [branch]` creates or reuses a fixed review worktree and repoints it safely.
+- `kin wt temp [branch]` creates or reuses a branch-scoped disposable worktree.
+- `kin wt list` shows all Kindra-managed worktrees and their current state.
+- `kin wt path <target>` prints just the managed path for shell/editor integrations.
+- `kin wt remove <target>` removes an explicit managed worktree with confirmation by default.
+- `kin wt cleanup` removes merged or stale Kindra-managed temp worktrees.
+
+By default Kindra stores managed worktrees under:
+
+```text
+.git/kindra-worktrees/
+```
+
+That keeps extra working trees out of the repo root while still making them easy to find and clean up.
+
+### Examples
+
+```bash
+# Ensure a persistent trunk worktree exists
+kin wt main
+
+# Reuse a stable review workspace for the current branch
+kin wt review
+
+# Switch the review workspace to another branch
+kin wt review feature/auth
+
+# Create or reuse a temp worktree for a branch
+kin wt temp feature/auth
+
+# Use the resolved path in shell tooling
+cd "$(kin wt path review)"
+
+# Remove a single managed temp worktree
+kin wt remove feature/auth
+
+# Clean up merged temp worktrees
+kin wt cleanup
+```
+
+### Worktree config
+
+Managed worktrees use repo-local config in `.git/kindra.toml`:
+
+```toml
+[worktrees]
+trunk = "main"
+
+[worktrees.hooks]
+on_create = []
+on_checkout = []
+on_remove = []
+
+[worktrees.main]
+path = ".git/kindra-worktrees/main"
+
+[worktrees.review]
+path = ".git/kindra-worktrees/review"
+
+[worktrees.temp]
+path_template = ".git/kindra-worktrees/temp/{branch}"
+delete_merged = true
+```
+
+Notes:
+
+- `main` is pinned to the configured trunk branch.
+- `review` reuses a fixed path and refuses to discard local changes unless you confirm or pass `--force`.
+- `cleanup` only targets Kindra-managed `temp` worktrees, never `main` or `review`.
+- `kin wt path` is the script-friendly command: it prints only the resolved path on success.
+- Use `branch:<name>` with `kin wt path` or `kin wt remove` to target a temp branch literally named `main` or `review`.
+- Hooks run in the managed worktree directory and stop the action if they fail.
+
 ## Restack History Limit
 
 `kin restack` bounds floating-branch discovery by default so very deep repositories do not pay for an unbounded first-parent scan.

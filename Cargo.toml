@@ -1,10 +1,16 @@
 [package]
 name = "kindra"
 version = "0.1.0"
+description = "CLI for managing stacked Git branches and related review workflows"
+license = "MIT"
 edition = "2024"
 rust-version = "1.88"
 repository = "https://github.com/Pajn/kindra"
+homepage = "https://github.com/Pajn/kindra"
+documentation = "https://docs.rs/kindra/0.1.0/kindra/"
 readme = "README.md"
+keywords = ["git", "cli", "stacked-branches", "workflow", "pull-request"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "kindra"
@@ -27,6 +33,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 dirs = "6.0"
+fs2 = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["process"] }

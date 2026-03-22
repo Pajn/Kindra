@@ -5,6 +5,7 @@ mod rebase_utils;
 mod repository;
 mod runtime;
 mod stack;
+mod worktree;
 
 use crate::commands::abort_cmd::abort_cmd;
 use crate::commands::checkout::checkout;
@@ -19,6 +20,7 @@ use crate::commands::split::split;
 use crate::commands::status_cmd::status_cmd;
 use crate::commands::sync::{SyncArgs, sync};
 use crate::commands::tree::{TreeArgs, tree};
+use crate::commands::worktree::{WorktreeSubcommand, worktree};
 pub use crate::repository::open_repo;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -76,6 +78,12 @@ enum Commands {
     /// Visualize the stack tree
     #[command(alias = "t")]
     Tree(TreeArgs),
+    /// Manage Kindra worktrees
+    #[command(alias = "wt")]
+    Worktree {
+        #[command(subcommand)]
+        subcommand: Option<WorktreeSubcommand>,
+    },
     /// Generate shell completions
     Completions {
         /// The shell to generate completions for
@@ -127,6 +135,7 @@ fn main() -> Result<()> {
         Commands::Abort => abort_cmd()?,
         Commands::Status => status_cmd()?,
         Commands::Tree(args) => tree(args)?,
+        Commands::Worktree { subcommand } => worktree(subcommand)?,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             match shell {
