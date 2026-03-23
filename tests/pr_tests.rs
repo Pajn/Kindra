@@ -3630,3 +3630,140 @@ fn resolve_stack_boundary_uses_tracking_branch_when_diverged() {
     assert_eq!(git_ref, "origin/main");
     assert_eq!(gh_base, "main");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Integration tests for PR command - upstream branch exclusion
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reproduces bug: when user has local commits on main, checks out a feature branch,
+/// and runs kin push followed by kin pr, the upstream branch (main) should NOT be
+/// mentioned as a branch to create a PR for.
+#[test]
+fn pr_command_excludes_upstream_branch() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    // Create initial commit on main
+    let main_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "base",
+        "initial commit",
+        &[],
+    );
+    let main = repo.find_commit(main_id).unwrap();
+
+    // Create a feature branch on main
+    make_commit(
+        &repo,
+        "refs/heads/feature",
+        "feature.txt",
+        "feat",
+        "add feature",
+        &[&main],
+    );
+
+    // Set up remote
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+
+    // Push and set upstreams
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+
+    // Checkout feature branch so stack detection finds it
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    // Create mock gh
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo "no pull requests found for branch" >&2
+    exit 1
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
+    # Echo which branch we're creating PR for (to stderr so it's visible in debug)
+    echo "Creating PR for base: $BASE head: $HEAD" >&2
+    echo "https://github.com/test/repo/pull/1"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = kin_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
+
+    // The output should mention "feature" as the branch being processed
+    // It should NOT mention "main" as a branch to create PR for
+    // (main is the upstream, so it shouldn't be suggested for a PR)
+
+    // Verify feature is mentioned (it should be)
+    assert!(
+        combined.contains("feature"),
+        "Output should mention 'feature' branch. Got:\n{}",
+        combined
+    );
+
+    // The key check: main should NOT appear as a branch needing a PR
+    // (it's the upstream/base, not a branch that needs its own PR)
+    // Locate the "Processing PRs" section and verify main doesn't appear there
+    let lines: Vec<&str> = combined.lines().collect();
+    let processing_prs_idx = lines
+        .iter()
+        .position(|l| l.contains("Processing PRs") || l.contains("Processing PR"));
+    let main_in_pr_section = if let Some(idx) = processing_prs_idx {
+        lines[idx..].iter().any(|l| l.contains("main"))
+    } else {
+        // Fallback: check all lines with any PR/branch processing indicators
+        lines.iter().any(|l| {
+            let l = l.to_lowercase();
+            l.contains("main")
+                && (l.contains("processing")
+                    || l.contains("branch")
+                    || l.contains("creating")
+                    || l.contains("create")
+                    || l.contains("pr "))
+        })
+    };
+
+    // If main appears in PR-processing output, it would be a bug
+    assert!(
+        !main_in_pr_section,
+        "main should NOT be suggested for PR, but found it in PR-processing output:\n{}",
+        combined
+    );
+}
