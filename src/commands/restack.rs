@@ -136,8 +136,32 @@ fn find_floating_children(
             history_limit,
             &mut patch_id_cache,
         )? {
+            // If another branch still points at the detected old base, this branch is
+            // part of an intact alternate stack rather than floating off the current one.
+            if has_other_local_branch_at_tip(repo, &name, old_base)? {
+                continue;
+            }
             results.push((name, old_base));
         }
     }
     Ok(results)
+}
+
+fn has_other_local_branch_at_tip(repo: &Repository, branch_name: &str, tip: Oid) -> Result<bool> {
+    let branches = repo.branches(Some(BranchType::Local))?;
+    for branch_res in branches {
+        let (branch, _) = branch_res?;
+        let name = match branch.name() {
+            Ok(Some(name)) => name,
+            _ => continue,
+        };
+        if name == branch_name {
+            continue;
+        }
+
+        if branch.get().target() == Some(tip) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

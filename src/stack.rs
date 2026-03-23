@@ -781,6 +781,73 @@ pub fn find_floating_base(
             continue;
         }
 
+        // Check if metadata matches a target commit but trees differ.
+        // This indicates the target was modified (e.g., fixup during rebase)
+        // and this commit is the original version - fork point found.
+        // This handles the case where:
+        // - cli-tree has: main -> old_pty -> old_cli
+        // - pty-alive was rebased to: main -> new_pty (modified) -> ...
+        // - old_pty and new_pty have same metadata but different trees
+        // - old_pty is NOT in candidate_ids (it's the old version)
+        //
+        // BUT we must verify there's an actual rebase relationship.
+        // In the embers case, old_pty was rebased to create new_pty, so:
+        //   - old_pty.parent IS in pty-alive's history
+        //   - new_pty.parent (which is old_pty) is NOT in pty-alive's history
+        //
+        // In the sibling case (old_base and rewritten_main):
+        //   - Both share the same parent (shared_parent) which IS in main's history
+        //   - Neither is a rebased version of the other
+        //
+        // So we check: if the corresponding target commit's parent is in target history,
+        // they are siblings, not a rebase pair.
+        if oid != branch_tip {
+            let parent_id = if commit.parent_count() > 0 {
+                Some(commit.parent_id(0)?)
+            } else {
+                None
+            };
+            let summary = commit.summary().unwrap_or("").trim().to_string();
+            let author = commit.author();
+            let email = author.email().unwrap_or("").to_string();
+
+            // Look for a target commit with matching summary, author, email but DIFFERENT tree.
+            // We don't require parent_id to match because after a rebase, the parent changes.
+            // We check parent ancestry to distinguish rebase from sibling:
+            // - Rebase: OLD.parent is NOT an ancestor of ANY candidate in the target chain
+            //   (because OLD.parent was rebased and is now "orphaned")
+            // - Sibling: OLD.parent IS an ancestor of some candidate in target chain
+            //   (because OLD.parent is on the main lineage which target is built on)
+            // Tree-mismatch matching is only reliable against the current target tip.
+            // Matching lower-history commits by summary/email is too ambiguous and can
+            // falsely classify unrelated side branches as floating.
+            let corresponding_target = target.candidates.iter().find(|c| {
+                c.id == target_id
+                    && c.summary == summary
+                    && c.email == email
+                    && c.tree_id != commit.tree_id()
+            });
+
+            if let Some(_target_candidate) = corresponding_target {
+                // Check if OLD.parent is an ancestor of ANY candidate in target chain.
+                // In rebase: old_pty_1 is not an ancestor of any new pty candidate (orphaned).
+                // In sibling: A is an ancestor of main' (through main), so it IS an ancestor of candidates.
+                let old_parent_ancestor_of_any_candidate = parent_id
+                    .map(|pid| {
+                        target
+                            .candidate_ids
+                            .iter()
+                            .any(|cid| repo.graph_descendant_of(*cid, pid).unwrap_or(false))
+                    })
+                    .unwrap_or(false);
+
+                if !old_parent_ancestor_of_any_candidate {
+                    // OLD.parent is NOT an ancestor of any candidate - it's orphaned, rebase fork
+                    return Ok(Some(oid));
+                }
+            }
+        }
+
         patch_candidates.push(oid);
     }
 
