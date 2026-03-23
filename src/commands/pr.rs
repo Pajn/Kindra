@@ -466,6 +466,10 @@ pub(crate) fn discover_stack_branches_with_upstream(
             let up_name = up.name().ok()??.to_string();
             Some((sb, up_name))
         })
+        .filter(|(sb, _up_name)| {
+            // Exclude the upstream branch itself (e.g., "main") from PR suggestions.
+            sb.name != upstream_name
+        })
         .collect();
 
     Ok((git_boundary_ref, branches_with_upstream))
