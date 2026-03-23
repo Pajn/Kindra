@@ -152,3 +152,27 @@ pub fn canonical_output_path(output: &[u8], cwd: &Path) -> PathBuf {
     };
     fs::canonicalize(absolute).unwrap()
 }
+
+#[allow(dead_code)]
+pub fn assert_no_rebase_in_progress(repo_path: &Path) {
+    let git_dir = repo_path.join(".git");
+    let rebase_merge = git_dir.join("rebase-merge");
+    let rebase_apply = git_dir.join("rebase-apply");
+    let rebase_head = git_dir.join("REBASE_HEAD");
+
+    assert!(
+        !rebase_merge.exists(),
+        "Rebase merge in progress at {:?}",
+        rebase_merge
+    );
+    assert!(
+        !rebase_apply.exists(),
+        "Rebase apply in progress at {:?}",
+        rebase_apply
+    );
+    assert!(
+        !rebase_head.exists(),
+        "Rebase head exists at {:?}",
+        rebase_head
+    );
+}

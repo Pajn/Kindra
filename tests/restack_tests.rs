@@ -1,8 +1,10 @@
 use git2::Repository;
+use kindra::stack::{build_floating_target_context, find_floating_base};
+use std::collections::HashMap;
 use tempfile::TempDir;
 
 mod common;
-use common::{kin_cmd, make_commit, repo_init, run_ok};
+use common::{assert_no_rebase_in_progress, kin_cmd, make_commit, repo_init, run_ok};
 
 #[test]
 fn test_restack_basic() {
@@ -45,6 +47,8 @@ fn test_restack_basic() {
     // 4. Run restack
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.current_dir(repo_path).arg("restack").assert().success();
+
+    assert_no_rebase_in_progress(repo_path);
 
     // 5. Verify feat
     run_ok("git", &["checkout", "feat"], repo_path);
@@ -166,6 +170,8 @@ fn test_restack_multiple_children() {
     // Run restack
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.current_dir(repo_path).arg("restack").assert().success();
+
+    assert_no_rebase_in_progress(repo_path);
 
     // Verify feat1
     run_ok("git", &["checkout", "feat1"], repo_path);
@@ -421,6 +427,172 @@ fn test_restack_ignores_metadata_only_match_on_sibling_commit() {
         .unwrap();
     assert_eq!(old_base_head, old_base_oid);
     assert_eq!(repo.head().unwrap().target().unwrap(), rewritten_main_oid);
+}
+
+#[test]
+fn test_find_floating_base_ignores_metadata_only_sibling_with_truncated_target_history() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = repo_init(repo_path);
+
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    let root_oid = make_commit(&repo, "HEAD", "root.txt", "root", "root", &[]);
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+
+    let shared_parent_oid = make_commit(
+        &repo,
+        "HEAD",
+        "shared.txt",
+        "shared",
+        "shared",
+        &[&repo.find_commit(root_oid).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "old-base", &shared_parent_oid.to_string()],
+        repo_path,
+    );
+    let old_base_oid = make_commit(
+        &repo,
+        "HEAD",
+        "base.txt",
+        "branch one",
+        "fixup",
+        &[&repo.find_commit(shared_parent_oid).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "feat", &old_base_oid.to_string()],
+        repo_path,
+    );
+    let old_feat_oid = make_commit(
+        &repo,
+        "HEAD",
+        "feat.txt",
+        "feat child",
+        "feat child",
+        &[&repo.find_commit(old_base_oid).unwrap()],
+    );
+
+    run_ok("git", &["checkout", "main"], repo_path);
+    let rewritten_main_oid = make_commit(
+        &repo,
+        "HEAD",
+        "base.txt",
+        "branch two",
+        "fixup",
+        &[&repo.find_commit(shared_parent_oid).unwrap()],
+    );
+
+    let repo = git2::Repository::open(repo_path).unwrap();
+    let target_commit = repo.find_commit(rewritten_main_oid).unwrap();
+    let mut patch_id_cache = HashMap::new();
+    let target =
+        build_floating_target_context(&repo, &target_commit, "main", 1, &mut patch_id_cache)
+            .unwrap();
+
+    let floating_base =
+        find_floating_base(&repo, old_feat_oid, &target, 0, &mut patch_id_cache).unwrap();
+    assert_eq!(
+        floating_base, None,
+        "metadata-only sibling matches must stay ignored when the shared parent is outside the truncated target candidates",
+    );
+}
+
+#[test]
+fn test_find_floating_base_ignores_unrelated_tree_mismatch_below_target_tip() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = repo_init(repo_path);
+
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    let root_oid = make_commit(&repo, "HEAD", "root.txt", "root", "root", &[]);
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+
+    let target_base_oid = make_commit(
+        &repo,
+        "HEAD",
+        "main-base.txt",
+        "main base",
+        "main base",
+        &[&repo.find_commit(root_oid).unwrap()],
+    );
+    let target_fixup_oid = make_commit(
+        &repo,
+        "HEAD",
+        "main-fixup.txt",
+        "main fixup",
+        "fixup",
+        &[&repo.find_commit(target_base_oid).unwrap()],
+    );
+    let target_tip_oid = make_commit(
+        &repo,
+        "HEAD",
+        "main-tip.txt",
+        "main tip",
+        "main tip",
+        &[&repo.find_commit(target_fixup_oid).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "side", &root_oid.to_string()],
+        repo_path,
+    );
+    let side_base_oid = make_commit(
+        &repo,
+        "HEAD",
+        "side-base.txt",
+        "side base",
+        "side base",
+        &[&repo.find_commit(root_oid).unwrap()],
+    );
+    let _side_fixup_oid = make_commit(
+        &repo,
+        "HEAD",
+        "side-fixup.txt",
+        "side branch fixup",
+        "fixup",
+        &[&repo.find_commit(side_base_oid).unwrap()],
+    );
+    let side_child_oid = make_commit(
+        &repo,
+        "HEAD",
+        "side-child.txt",
+        "side child",
+        "child",
+        &[&repo
+            .find_commit(repo.head().unwrap().target().unwrap())
+            .unwrap()],
+    );
+
+    let repo = git2::Repository::open(repo_path).unwrap();
+    let target_commit = repo.find_commit(target_tip_oid).unwrap();
+    let mut patch_id_cache = HashMap::new();
+    let target =
+        build_floating_target_context(&repo, &target_commit, "main", 0, &mut patch_id_cache)
+            .unwrap();
+
+    let floating_base =
+        find_floating_base(&repo, side_child_oid, &target, 0, &mut patch_id_cache).unwrap();
+    assert_eq!(
+        floating_base, None,
+        "a side-branch fixup that only matches an unrelated lower target commit must not be treated as a floating base",
+    );
 }
 
 #[test]
@@ -731,8 +903,16 @@ fn test_restack_cli_override_takes_precedence_over_repo_and_global_config() {
     assert_eq!(new_feat_parent, rewritten_main_oid);
 }
 
+/// Negative test: kin restack should NOT rebase branches that share no common
+/// history with the target, even if their patch-ids match.
+///
+/// Scenario:
+/// - feat branch has commits cherry-picked from main that happen to produce
+///   identical patch-ids
+/// - But feat never shared history with main's stack
+/// - kin should NOT rebase feat onto main
 #[test]
-fn test_restack_continues_past_tip_patch_id_match() {
+fn test_restack_does_not_rebase_unrelated_history_with_patch_id_match() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
     let repo = repo_init(repo_path);
@@ -764,6 +944,7 @@ fn test_restack_continues_past_tip_patch_id_match() {
         &[&repo.find_commit(a_oid).unwrap()],
     );
 
+    // Create feat branch from A with unique commits and cherry-picked equivalent of D
     run_ok(
         "git",
         &["checkout", "-b", "feat", &a_oid.to_string()],
@@ -777,17 +958,18 @@ fn test_restack_continues_past_tip_patch_id_match() {
         "unique commit",
         &[&repo.find_commit(a_oid).unwrap()],
     );
-    let old_feat_oid = make_commit(
+    let _feat_tip_oid = make_commit(
         &repo,
         "HEAD",
         "d.txt",
         "D",
-        "commit D",
+        "commit D", // Same message and content as D on main
         &[&repo
             .find_commit(repo.head().unwrap().target().unwrap())
             .unwrap()],
     );
 
+    // Main gets reset and rebuilt via cherry-pick (same content, new commit IDs)
     run_ok("git", &["checkout", "main"], repo_path);
     run_ok(
         "git",
@@ -796,22 +978,23 @@ fn test_restack_continues_past_tip_patch_id_match() {
     );
     run_ok("git", &["cherry-pick", &a_oid.to_string()], repo_path);
     run_ok("git", &["cherry-pick", &d_oid.to_string()], repo_path);
-    let rewritten_main_oid = repo.head().unwrap().target().unwrap();
+    let _rewritten_main_oid = repo.head().unwrap().target().unwrap();
 
+    // Record the original feat tip for comparison
+    run_ok("git", &["checkout", "feat"], repo_path);
+    let feat_head_before = repo.head().unwrap().target().unwrap();
+
+    // Run kin restack - should succeed but NOT rebase feat
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
     cmd.current_dir(repo_path).arg("restack").assert().success();
 
+    // Verify feat was NOT moved
     run_ok("git", &["checkout", "feat"], repo_path);
-    let new_feat_oid = repo.head().unwrap().target().unwrap();
+    let feat_head_after = repo.head().unwrap().target().unwrap();
 
-    assert_ne!(
-        new_feat_oid, old_feat_oid,
-        "restack should not treat a tip-level patch-id match as proof the branch is integrated"
-    );
-    assert!(
-        repo.graph_descendant_of(new_feat_oid, rewritten_main_oid)
-            .unwrap(),
-        "restack should still move the branch onto the rewritten target history"
+    assert_eq!(
+        feat_head_before, feat_head_after,
+        "kin restack should NOT rebase feat since it shares no common history with main"
     );
 }
 
@@ -1265,4 +1448,437 @@ fn test_restack_abort() {
     // Verify we are back on main
     let head_name = repo.head().unwrap().shorthand().unwrap().to_string();
     assert_eq!(head_name, "main");
+}
+
+#[test]
+fn test_restack_detects_floating_branch_after_upstream_rebase() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = repo_init(repo_path);
+
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    let root_oid = make_commit(&repo, "HEAD", "root.txt", "root", "root", &[]);
+    let shared_base_oid = make_commit(
+        &repo,
+        "HEAD",
+        "shared.txt",
+        "shared",
+        "shared base",
+        &[&repo.find_commit(root_oid).unwrap()],
+    );
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+
+    run_ok("git", &["checkout", "-b", "pty-alive"], repo_path);
+    let pty_commit_1 = make_commit(
+        &repo,
+        "HEAD",
+        "pty1.txt",
+        "pty1 content",
+        "first pty commit",
+        &[&repo.find_commit(shared_base_oid).unwrap()],
+    );
+    let pty_commit_2 = make_commit(
+        &repo,
+        "HEAD",
+        "pty2.txt",
+        "pty2 content",
+        "second pty commit",
+        &[&repo.find_commit(pty_commit_1).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "cli-tree", &pty_commit_2.to_string()],
+        repo_path,
+    );
+    let cli_unique_1 = make_commit(
+        &repo,
+        "HEAD",
+        "cli.txt",
+        "CLI content here",
+        "cli unique commit 1",
+        &[&repo.find_commit(pty_commit_2).unwrap()],
+    );
+    let _cli_unique_2 = make_commit(
+        &repo,
+        "HEAD",
+        "cli2.txt",
+        "CLI content v2",
+        "cli unique commit 2",
+        &[&repo.find_commit(cli_unique_1).unwrap()],
+    );
+
+    run_ok("git", &["checkout", "main"], repo_path);
+    std::fs::write(repo_path.join("shared.txt"), "shared modified\n").unwrap();
+    run_ok("git", &["add", "shared.txt"], repo_path);
+    run_ok("git", &["commit", "-m", "shared base modified"], repo_path);
+
+    run_ok("git", &["checkout", "pty-alive"], repo_path);
+    run_ok("git", &["rebase", "main"], repo_path);
+
+    let repo = git2::Repository::open(repo_path).unwrap();
+    let old_pty_commit_1 = repo.find_commit(pty_commit_1).unwrap();
+    let old_pty_commit_2 = repo.find_commit(pty_commit_2).unwrap();
+    let main_tip = repo.revparse_single("main").unwrap().id();
+
+    run_ok(
+        "git",
+        &["reset", "--hard", &main_tip.to_string()],
+        repo_path,
+    );
+
+    let repo = git2::Repository::open(repo_path).unwrap();
+    let rewritten_pty_commit_1 = make_commit(
+        &repo,
+        "HEAD",
+        "pty1.txt",
+        "pty1 content rewritten",
+        "first pty commit",
+        &[&repo.find_commit(main_tip).unwrap()],
+    );
+    let _rewritten_pty_commit_2 = make_commit(
+        &repo,
+        "HEAD",
+        "pty2.txt",
+        "pty2 content rewritten",
+        "second pty commit",
+        &[&repo.find_commit(rewritten_pty_commit_1).unwrap()],
+    );
+
+    let repo = git2::Repository::open(repo_path).unwrap();
+    let new_pty_tip = repo.revparse_single("pty-alive").unwrap().id();
+    let old_cli_tree_tip = repo.revparse_single("cli-tree").unwrap().id();
+
+    let new_pty_commit = repo.find_commit(new_pty_tip).unwrap();
+    let new_pty_commit_1 = repo
+        .find_commit(new_pty_commit.parent_id(0).unwrap())
+        .unwrap();
+    assert_eq!(new_pty_commit.summary().unwrap(), "second pty commit");
+    assert_eq!(new_pty_commit_1.summary().unwrap(), "first pty commit");
+    assert_ne!(
+        new_pty_commit_1.tree().unwrap().id(),
+        old_pty_commit_1.tree().unwrap().id()
+    );
+    assert_ne!(
+        new_pty_commit.tree().unwrap().id(),
+        old_pty_commit_2.tree().unwrap().id()
+    );
+
+    let mut cmd = kin_cmd();
+    let output = cmd.current_dir(repo_path).arg("restack").output().unwrap();
+    assert!(output.status.success());
+
+    assert_no_rebase_in_progress(repo_path);
+
+    let repo = git2::Repository::open(repo_path).unwrap();
+    let cli_head = repo.revparse_single("cli-tree").unwrap();
+    let cli_commit_2 = repo.find_commit(cli_head.id()).unwrap();
+    let cli_commit_1 = repo
+        .find_commit(cli_commit_2.parent_id(0).unwrap())
+        .unwrap();
+    let new_pty_tip_after_restack = repo.revparse_single("pty-alive").unwrap();
+
+    assert_eq!(
+        cli_commit_1.parent_id(0).unwrap(),
+        new_pty_tip_after_restack.id()
+    );
+
+    let cli_tree = cli_commit_2.tree().unwrap();
+    assert!(cli_tree.get_name("pty1.txt").is_some());
+    assert!(cli_tree.get_name("pty2.txt").is_some());
+    assert!(cli_tree.get_name("cli.txt").is_some());
+    assert!(cli_tree.get_name("cli2.txt").is_some());
+
+    assert!(cli_head.id() != old_cli_tree_tip);
+}
+
+#[test]
+fn test_restack_chain_rebase_preserves_stack_relationship() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = repo_init(repo_path);
+
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    let root_oid = make_commit(&repo, "HEAD", "root.txt", "root", "root", &[]);
+    let main_oid = make_commit(
+        &repo,
+        "HEAD",
+        "main.txt",
+        "main content",
+        "main commit",
+        &[&repo.find_commit(root_oid).unwrap()],
+    );
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+
+    run_ok("git", &["checkout", "-b", "feature-A"], repo_path);
+    let commit_a = make_commit(
+        &repo,
+        "HEAD",
+        "a.txt",
+        "A content",
+        "Add feature A",
+        &[&repo.find_commit(main_oid).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "feature-B", &commit_a.to_string()],
+        repo_path,
+    );
+    let commit_b = make_commit(
+        &repo,
+        "HEAD",
+        "b.txt",
+        "B content",
+        "Add feature B",
+        &[&repo.find_commit(commit_a).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "feature-C", &commit_b.to_string()],
+        repo_path,
+    );
+    let commit_c = make_commit(
+        &repo,
+        "HEAD",
+        "c.txt",
+        "C content",
+        "Add feature C",
+        &[&repo.find_commit(commit_b).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "feature-D", &commit_c.to_string()],
+        repo_path,
+    );
+    let _commit_d = make_commit(
+        &repo,
+        "HEAD",
+        "d.txt",
+        "D content",
+        "Add feature D",
+        &[&repo.find_commit(commit_c).unwrap()],
+    );
+
+    run_ok("git", &["checkout", "main"], repo_path);
+    let main_prime = make_commit(
+        &repo,
+        "HEAD",
+        "main.txt",
+        "main content v2",
+        "main commit v2",
+        &[&repo.find_commit(main_oid).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "stack-A", &main_prime.to_string()],
+        repo_path,
+    );
+    let new_a = make_commit(
+        &repo,
+        "HEAD",
+        "a.txt",
+        "A content",
+        "Add feature A",
+        &[&repo.find_commit(main_prime).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "stack-B", &new_a.to_string()],
+        repo_path,
+    );
+    let new_b = make_commit(
+        &repo,
+        "HEAD",
+        "b.txt",
+        "B content",
+        "Add feature B",
+        &[&repo.find_commit(new_a).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "stack-C", &new_b.to_string()],
+        repo_path,
+    );
+    let new_c = make_commit(
+        &repo,
+        "HEAD",
+        "c.txt",
+        "C content",
+        "Add feature C",
+        &[&repo.find_commit(new_b).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "stack-D", &new_c.to_string()],
+        repo_path,
+    );
+    let _new_d = make_commit(
+        &repo,
+        "HEAD",
+        "d.txt",
+        "D content",
+        "Add feature D",
+        &[&repo.find_commit(new_c).unwrap()],
+    );
+
+    let refs_before = std::process::Command::new("git")
+        .args(["show-ref", "--heads"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    assert!(
+        refs_before.status.success(),
+        "git show-ref --heads failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&refs_before.stdout),
+        String::from_utf8_lossy(&refs_before.stderr),
+    );
+    let refs_before_stdout = String::from_utf8_lossy(&refs_before.stdout).into_owned();
+
+    let mut cmd = kin_cmd();
+    let output = cmd.current_dir(repo_path).arg("restack").output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "restack failed\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_no_rebase_in_progress(repo_path);
+    assert!(
+        !stdout.contains("matches old base"),
+        "restack unexpectedly reported floating children\nstdout:\n{}",
+        stdout,
+    );
+
+    let refs_after = std::process::Command::new("git")
+        .args(["show-ref", "--heads"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    assert!(
+        refs_after.status.success(),
+        "git show-ref --heads failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&refs_after.stdout),
+        String::from_utf8_lossy(&refs_after.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&refs_after.stdout),
+        refs_before_stdout,
+        "restack should not move any branch tips when no floating children exist",
+    );
+}
+
+#[test]
+fn test_restack_preserves_alternate_stack_when_anchor_branch_tip_is_descendant_of_old_base() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    repo_init(repo_path);
+
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    let commit_with_git = |filename: &str, content: &str, message: &str| -> git2::Oid {
+        std::fs::write(repo_path.join(filename), content).unwrap();
+        run_ok("git", &["add", filename], repo_path);
+        run_ok("git", &["commit", "-m", message], repo_path);
+        git2::Repository::open(repo_path)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+    };
+
+    let _root_oid = commit_with_git("root.txt", "root", "root");
+    let _main_oid = commit_with_git("main.txt", "main content", "main commit");
+
+    run_ok("git", &["checkout", "-b", "preserved-stack"], repo_path);
+    let _old_base_oid = commit_with_git("base.txt", "legacy base", "stack base");
+    let preserved_tip_oid =
+        commit_with_git("preserved.txt", "preserved ancestor", "preserved ancestor");
+
+    run_ok(
+        "git",
+        &[
+            "checkout",
+            "-b",
+            "descendant-stack",
+            &preserved_tip_oid.to_string(),
+        ],
+        repo_path,
+    );
+    let _old_descendant_tip_oid =
+        commit_with_git("descendant.txt", "descendant child", "descendant child");
+
+    run_ok("git", &["checkout", "main"], repo_path);
+    run_ok("git", &["checkout", "-b", "stack-root"], repo_path);
+    let rewritten_base_oid = commit_with_git("base.txt", "legacy base", "stack base rewritten");
+
+    let mut cmd = kin_cmd();
+    let output = cmd.current_dir(repo_path).arg("restack").output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "restack failed\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_no_rebase_in_progress(repo_path);
+
+    let refs_after = std::process::Command::new("git")
+        .args(["show-ref", "--heads"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    let refs_after_stdout = String::from_utf8_lossy(&refs_after.stdout).into_owned();
+
+    let repo = git2::Repository::open(repo_path).unwrap();
+    let preserved_after = repo.revparse_single("preserved-stack").unwrap().id();
+    let descendant_after = repo.revparse_single("descendant-stack").unwrap().id();
+
+    let preserved_commit = repo.find_commit(preserved_after).unwrap();
+    assert_eq!(
+        preserved_commit.parent_id(0).unwrap(),
+        rewritten_base_oid,
+        "preserved-stack should rebase onto stack-root\nstdout:\n{}\nrefs:\n{}",
+        stdout,
+        refs_after_stdout,
+    );
+
+    let descendant_commit = repo.find_commit(descendant_after).unwrap();
+    assert_eq!(
+        descendant_commit.parent_id(0).unwrap(),
+        preserved_after,
+        "descendant-stack should remain a child of preserved-stack\nstdout:\n{}\nrefs:\n{}",
+        stdout,
+        refs_after_stdout,
+    );
+    assert!(
+        stdout.contains("matches old base"),
+        "expected restack to detect and rebase the alternate stack\nstdout:\n{}",
+        stdout,
+    );
 }
