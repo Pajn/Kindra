@@ -1686,6 +1686,120 @@ fn sync_on_main_rebases_to_latest_origin_main_and_deletes_merged_local_branches(
 }
 
 #[test]
+fn sync_does_not_delete_local_main_when_syncing_from_stack_branch() {
+    // Regression test: when syncing from a stack branch (not main), local main
+    // should NOT be deleted even if origin/main has advanced.
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let remote_dir = dir.path().join("remote.git");
+    fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+
+    // Create initial commit on main and push to origin
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+    run_ok("git", &["push", "-u", "origin", "main:main"], dir.path());
+
+    // Create a stack branch (cli-tree) based on main
+    let cli_tree_id = make_commit(
+        &repo,
+        "refs/heads/cli-tree",
+        "cli.txt",
+        "cli",
+        "cli tree commit",
+        &[&base],
+    );
+    let _cli_tree = repo.find_commit(cli_tree_id).unwrap();
+
+    // Simulate origin/main advancing (someone else pushed to main)
+    let remote_worktree = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote_dir.to_str().unwrap(),
+            remote_worktree.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "main"], remote_worktree.path());
+    fs::write(remote_worktree.path().join("remote.txt"), "remote main").unwrap();
+    run_ok("git", &["add", "remote.txt"], remote_worktree.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "remote main advanced"],
+        remote_worktree.path(),
+    );
+    run_ok("git", &["push", "origin", "main"], remote_worktree.path());
+    let origin_main_before = repo.revparse_single("origin/main").unwrap().id();
+
+    // Verify local main exists before sync
+    let local_main_before = repo
+        .find_branch("main", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+
+    // Checkout the stack branch and run sync (without --no-delete to test deletion code path)
+    run_ok("git", &["checkout", "-f", "cli-tree"], dir.path());
+    let mut cmd = kin_cmd();
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
+
+    // Verify local main still exists after sync (should NOT be deleted!)
+    // This is the key regression test: syncing from a stack branch should NOT delete local main
+    let repo = Repository::open(dir.path()).unwrap();
+    assert!(
+        repo.find_branch("main", BranchType::Local).is_ok(),
+        "local main branch should not be deleted when syncing from stack branch"
+    );
+
+    // Note: Merged branches (like feature-a) are only deleted when syncing from main directly,
+    // not when syncing from a stack branch. The deletion only affects branches in the stack lineage.
+    let local_main_after = repo
+        .find_branch("main", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+
+    // Local main should be unchanged (not rebased)
+    assert_eq!(local_main_before, local_main_after);
+
+    // Stack branch should be rebased onto origin/main
+    let cli_tree_after = repo
+        .find_branch("cli-tree", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let origin_main_after = repo.revparse_single("origin/main").unwrap().id();
+    assert_ne!(
+        origin_main_after, origin_main_before,
+        "origin/main should have advanced during the test"
+    );
+    let cli_tree_commit = repo.find_commit(cli_tree_after).unwrap();
+    assert_eq!(
+        cli_tree_commit.parent_id(0).unwrap(),
+        origin_main_after,
+        "cli-tree should be rebased onto origin/main"
+    );
+}
+
+#[test]
 fn sync_preserves_state_on_prestart_rebase_failure_after_tip_checkout() {
     let dir = tempdir().unwrap();
     let repo = repo_init(dir.path());

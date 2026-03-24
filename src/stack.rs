@@ -535,6 +535,11 @@ pub fn collect_merged_local_branches(
         .resolve_reference_from_short_name(target_ref_name)
         .ok()
         .and_then(|reference| reference.name().map(|name| name.to_string()));
+    let target_name_for_comparison = full_target_ref_name.as_deref().unwrap_or(target_ref_name);
+    let target_short_name = target_name_for_comparison
+        .strip_prefix("refs/heads/")
+        .or_else(|| target_name_for_comparison.strip_prefix("refs/remotes/"))
+        .unwrap_or(target_name_for_comparison);
     let protected_branches = protected_branches
         .iter()
         .map(|name| name.to_string())
@@ -550,14 +555,18 @@ pub fn collect_merged_local_branches(
             continue;
         }
 
-        if let Some(ref full_target_ref_name) = full_target_ref_name {
-            if branch.get().name() == Some(full_target_ref_name.as_str()) {
-                continue;
-            }
+        if branch.get().shorthand() == Some(target_short_name) {
+            continue;
+        }
 
-            if let Ok(upstream_branch) = branch.upstream()
-                && upstream_branch.get().name() == Some(full_target_ref_name.as_str())
-            {
+        if let Ok(upstream_branch) = branch.upstream()
+            && let Some(upstream_name) = upstream_branch.name()?
+        {
+            // Get the short name of the upstream branch
+            let upstream_short = upstream_name
+                .strip_prefix("refs/remotes/")
+                .unwrap_or(upstream_name);
+            if upstream_short == target_short_name {
                 continue;
             }
         }
