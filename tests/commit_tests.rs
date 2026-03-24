@@ -128,6 +128,7 @@ fn test_commit_rebases_descendants() {
         .arg("-m")
         .arg("new a")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -208,6 +209,7 @@ fn test_commit_amend_rebases_descendants() {
         .arg("--amend")
         .arg("--no-edit")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -238,6 +240,100 @@ fn test_commit_amend_rebases_descendants() {
 }
 
 #[test]
+fn test_commit_short_i_is_forwarded_to_git() {
+    let (dir, repo) = setup_repo();
+    let feature_before = repo
+        .find_branch("feature", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("feature.txt"), "updated feature").unwrap();
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("-i")
+        .arg("feature.txt")
+        .arg("-m")
+        .arg("include tracked change")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    let feature_after = repo
+        .find_branch("feature", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    assert_ne!(feature_after, feature_before);
+    let feature_commit = repo.find_commit(feature_after).unwrap();
+    assert_eq!(feature_commit.summary().unwrap(), "include tracked change");
+    assert_eq!(feature_commit.parent_id(0).unwrap(), feature_before);
+}
+
+#[test]
+fn test_commit_interactive_with_forwarded_short_i_uses_git_include() {
+    let (dir, repo) = setup_repo();
+    let feature_before = repo
+        .find_branch("feature", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(
+        dir.path().join("feature.txt"),
+        "updated feature via interactive -i",
+    )
+    .unwrap();
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("--interactive")
+        .arg("-i")
+        .arg("feature.txt")
+        .arg("-m")
+        .arg("interactive include tracked change")
+        .current_dir(dir.path())
+        .env("KIN_TEST_SELECTION", "0")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    let feature_after = repo
+        .find_branch("feature", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    assert_ne!(feature_after, feature_before);
+    let feature_commit = repo.find_commit(feature_after).unwrap();
+    assert_eq!(
+        feature_commit.summary().unwrap(),
+        "interactive include tracked change"
+    );
+}
+
+#[test]
 fn test_commit_no_changes() {
     let (dir, repo) = setup_repo();
     let main_id = repo.revparse_single("main").unwrap().id();
@@ -264,6 +360,7 @@ fn test_commit_no_changes() {
         .arg("-m")
         .arg("nothing")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -342,6 +439,7 @@ fn test_commit_forked_stack() {
         .arg("-m")
         .arg("new a")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -405,6 +503,7 @@ fn test_commit_on_main() {
         .arg("-m")
         .arg("on main")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -470,6 +569,7 @@ fn test_commit_conflict_and_continue() {
         .arg("-m")
         .arg("conflicting a")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -580,6 +680,7 @@ fn test_commit_abort() {
         .arg("-m")
         .arg("conflict")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -636,6 +737,7 @@ fn test_abort_malformed_state() {
         .arg("-m")
         .arg("conflict")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -735,6 +837,7 @@ fn test_commit_reentry_guard() {
         .arg("-m")
         .arg("test")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -786,6 +889,7 @@ fn test_commit_on_main_rebases_descendant() {
         .arg("-m")
         .arg("new main commit")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -874,6 +978,7 @@ fn test_commit_on_main_rebases_multi_level_stack() {
         .arg("-m")
         .arg("new main commit 2")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -915,6 +1020,7 @@ fn test_commit_failure_is_propagated() {
         .arg("-m")
         .arg("no changes")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -959,6 +1065,7 @@ fn test_commit_on_branch_in_stack_restores_original_and_unstages() {
         .arg("-m")
         .arg("commit on feature")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -1037,6 +1144,7 @@ fn test_commit_on_branch_in_stack_three_level_restores_original_and_unstages() {
         .arg("-m")
         .arg("commit on feature")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -1103,6 +1211,7 @@ fn test_commit_on_without_argument_uses_interactive_selection() {
         .arg("-m")
         .arg("interactive target")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -1133,6 +1242,7 @@ fn test_commit_on_requires_branch_when_followed_by_flag() {
         .arg("-m")
         .arg("should fail")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -1179,6 +1289,7 @@ fn test_commit_on_other_stack_default_just_commits() {
         .arg("-m")
         .arg("cross stack commit")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -1255,6 +1366,7 @@ fn test_commit_on_conflict_and_continue_restores_original_context() {
         .arg("-m")
         .arg("feature-a conflict")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -1324,6 +1436,7 @@ fn test_commit_on_conflict_and_abort_restores_original_context() {
         .arg("-m")
         .arg("feature-a conflict")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -1435,6 +1548,7 @@ fn test_rebase_loop_skips_resumed_and_subsequent_done_branches() {
     let mut cmd = kin_cmd();
     cmd.arg("continue")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -1494,6 +1608,7 @@ fn test_commit_on_checkout_conflict_restores_original_context() {
         .arg("-m")
         .arg("should fail before commit")
         .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -1522,4 +1637,924 @@ fn test_commit_on_checkout_conflict_restores_original_context() {
     );
     assert_has_unstaged_file(dir.path(), "scratch.txt");
     assert_no_staged_changes(dir.path());
+}
+
+#[test]
+fn test_commit_on_branch_amend() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "commit a",
+        &[&main_commit],
+    );
+    let a_commit = repo.find_commit(a_id).unwrap();
+    let b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "commit b",
+        &[&a_commit],
+    );
+
+    repo.set_head("refs/heads/feature-b").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("a.txt"), "amended a").unwrap();
+    run_ok("git", &["add", "a.txt"], dir.path());
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("--on=feature-a")
+        .arg("--amend")
+        .arg("--no-edit")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    let new_a_id = repo
+        .find_reference("refs/heads/feature-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_ne!(new_a_id, a_id);
+    let new_b_id = repo
+        .find_reference("refs/heads/feature-b")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_ne!(new_b_id, b_id);
+    let new_b_commit = repo.find_commit(new_b_id).unwrap();
+    assert_eq!(new_b_commit.parent_id(0).unwrap(), new_a_id);
+}
+
+#[test]
+fn test_commit_interactive_amend_tip() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a1.txt",
+        "a1",
+        "commit a1",
+        &[&main_commit],
+    );
+    let a1_commit = repo.find_commit(a1_id).unwrap();
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2.txt",
+        "a2",
+        "commit a2",
+        &[&a1_commit],
+    );
+    let a2_commit = repo.find_commit(a2_id).unwrap();
+    let a3_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a3.txt",
+        "a3",
+        "commit a3",
+        &[&a2_commit],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("a3.txt"), "amended a3").unwrap();
+    run_ok("git", &["add", "a3.txt"], dir.path());
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("--interactive")
+        .current_dir(dir.path())
+        .env("KIN_TEST_SELECTION", "0")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    let new_a_id = repo
+        .find_reference("refs/heads/feature-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_ne!(new_a_id, a3_id);
+    let new_a_commit = repo.find_commit(new_a_id).unwrap();
+    assert_eq!(new_a_commit.message().unwrap(), "commit a3\n");
+    assert_eq!(new_a_commit.parent_id(0).unwrap(), a2_id);
+}
+
+#[test]
+fn test_commit_interactive_amend_tip_no_staged_changes() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a1.txt",
+        "a1",
+        "commit a1",
+        &[&main_commit],
+    );
+    let a1_commit = repo.find_commit(a1_id).unwrap();
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2.txt",
+        "a2",
+        "commit a2",
+        &[&a1_commit],
+    );
+    let a2_commit = repo.find_commit(a2_id).unwrap();
+    let a3_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a3.txt",
+        "a3",
+        "commit a3",
+        &[&a2_commit],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("--interactive")
+        .arg("-m")
+        .arg("new subject")
+        .current_dir(dir.path())
+        .env("KIN_TEST_SELECTION", "0")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    let new_a_id = repo
+        .find_reference("refs/heads/feature-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_ne!(new_a_id, a3_id);
+    let new_a_commit = repo.find_commit(new_a_id).unwrap();
+    assert_eq!(new_a_commit.summary().unwrap(), "new subject");
+    assert_eq!(new_a_commit.parent_id(0).unwrap(), a2_id);
+}
+
+#[test]
+fn test_commit_interactive_amend_tip_with_pathspec_separator() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a1.txt",
+        "a1",
+        "commit a1",
+        &[&main_commit],
+    );
+    let a1_commit = repo.find_commit(a1_id).unwrap();
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2.txt",
+        "a2",
+        "commit a2",
+        &[&a1_commit],
+    );
+    let a2_commit = repo.find_commit(a2_id).unwrap();
+    let a3_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a3.txt",
+        "a3",
+        "commit a3",
+        &[&a2_commit],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("a3.txt"), "amended a3").unwrap();
+    run_ok("git", &["add", "a3.txt"], dir.path());
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("--interactive")
+        .arg("--")
+        .arg("a3.txt")
+        .current_dir(dir.path())
+        .env("KIN_TEST_SELECTION", "0")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    let new_a_id = repo
+        .find_reference("refs/heads/feature-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_ne!(new_a_id, a3_id);
+    let new_a_commit = repo.find_commit(new_a_id).unwrap();
+    assert_eq!(new_a_commit.message().unwrap(), "commit a3\n");
+    assert_eq!(new_a_commit.parent_id(0).unwrap(), a2_id);
+}
+
+#[test]
+fn test_commit_interactive_fixup_no_autostash_preserves_recovery_state() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a1.txt",
+        "a1",
+        "commit a1",
+        &[&main_commit],
+    );
+    let a1_commit = repo.find_commit(a1_id).unwrap();
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2.txt",
+        "a2",
+        "commit a2",
+        &[&a1_commit],
+    );
+    let a2_commit = repo.find_commit(a2_id).unwrap();
+    let _a3_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a3.txt",
+        "a3",
+        "commit a3",
+        &[&a2_commit],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("a2.txt"), "fixed a2").unwrap();
+    run_ok("git", &["add", "a2.txt"], dir.path());
+    fs::write(dir.path().join("file.txt"), "dirty tracked change").unwrap();
+    assert_has_unstaged_file(dir.path(), "file.txt");
+
+    let pre_rebase_hook = dir.path().join(".git/hooks/pre-rebase");
+    fs::write(&pre_rebase_hook, "#!/bin/sh\nexit 1\n").unwrap();
+    run_ok("chmod", &["+x", ".git/hooks/pre-rebase"], dir.path());
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("--interactive")
+        .arg("--no-autostash")
+        .arg("-m")
+        .arg("fix a2")
+        .current_dir(dir.path())
+        .env("KIN_TEST_SELECTION", "1")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("rebase --autosquash failed"));
+
+    assert!(dir.path().join(".git/gits_rebase_state.json").exists());
+
+    let mut abort_cmd = kin_cmd();
+    abort_cmd
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "dirty tracked change"
+    );
+    assert_has_unstaged_file(dir.path(), "file.txt");
+}
+
+#[test]
+fn test_commit_interactive_fixup_intermediate() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a1.txt",
+        "a1",
+        "commit a1",
+        &[&main_commit],
+    );
+    let a1_commit = repo.find_commit(a1_id).unwrap();
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2.txt",
+        "a2",
+        "commit a2",
+        &[&a1_commit],
+    );
+    let a2_commit = repo.find_commit(a2_id).unwrap();
+    let _a3_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a3.txt",
+        "a3",
+        "commit a3",
+        &[&a2_commit],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("a2.txt"), "fixed a2").unwrap();
+    run_ok("git", &["add", "a2.txt"], dir.path());
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("--interactive")
+        .current_dir(dir.path())
+        .env("KIN_TEST_SELECTION", "1") // select a2 (index 1 if newest is 0)
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    let new_a_id = repo
+        .find_reference("refs/heads/feature-a")
+        .unwrap()
+        .target()
+        .unwrap();
+
+    // Check if the intermediate was fixed up by verifying the messages of the 3 commits
+    let tip_commit = repo.find_commit(new_a_id).unwrap();
+    assert_eq!(tip_commit.summary().unwrap(), "commit a3");
+
+    let a2_new_commit = tip_commit.parent(0).unwrap();
+    assert_eq!(a2_new_commit.summary().unwrap(), "commit a2"); // Autosquash squashes fixup into a2
+
+    let a1_new_commit = a2_new_commit.parent(0).unwrap();
+    assert_eq!(a1_new_commit.summary().unwrap(), "commit a1");
+    assert_eq!(a1_new_commit.id(), a1_id); // a1 should be unchanged
+}
+
+#[test]
+fn test_commit_interactive_fixup_commit_failure_does_not_persist_state() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a1.txt",
+        "a1",
+        "commit a1",
+        &[&main_commit],
+    );
+    let a1_commit = repo.find_commit(a1_id).unwrap();
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2.txt",
+        "a2",
+        "commit a2",
+        &[&a1_commit],
+    );
+    let a2_commit = repo.find_commit(a2_id).unwrap();
+    let _a3_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a3.txt",
+        "a3",
+        "commit a3",
+        &[&a2_commit],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("a2.txt"), "fixed a2").unwrap();
+    run_ok("git", &["add", "a2.txt"], dir.path());
+
+    let hook_path = dir.path().join(".git/hooks/pre-commit");
+    fs::write(&hook_path, "#!/bin/sh\nexit 1\n").unwrap();
+    run_ok("chmod", &["+x", ".git/hooks/pre-commit"], dir.path());
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("--interactive")
+        .current_dir(dir.path())
+        .env("KIN_TEST_SELECTION", "1")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("git commit failed"));
+
+    assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
+}
+
+#[test]
+fn test_commit_interactive_fixup_conflict_and_continue() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    // Create a branch with commits a1, a2, a3
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "a1 content",
+        "commit a1",
+        &[&main_commit],
+    );
+    let a1_commit = repo.find_commit(a1_id).unwrap();
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2.txt",
+        "a2",
+        "commit a2",
+        &[&a1_commit],
+    );
+    let a2_commit = repo.find_commit(a2_id).unwrap();
+    let _a3_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a3.txt",
+        "a3",
+        "commit a3",
+        &[&a2_commit],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    // Create a conflicting change to a1's file that will conflict during autosquash rebase
+    // First, modify a1 on main to create a conflict
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    fs::write(dir.path().join("shared.txt"), "conflicting main change").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "conflicting main commit"],
+        dir.path(),
+    );
+
+    // Rebase feature-a onto new main to propagate the conflict state
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    let rebase_result = std::process::Command::new("git")
+        .args(["rebase", "main"])
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .unwrap();
+
+    // Resolve the rebase conflict
+    if !rebase_result.status.success() {
+        fs::write(dir.path().join("shared.txt"), "resolved content").unwrap();
+        run_ok("git", &["add", "shared.txt"], dir.path());
+        let continue_status = std::process::Command::new("git")
+            .args(["rebase", "--continue"])
+            .current_dir(dir.path())
+            .env("GIT_EDITOR", "true")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .status()
+            .unwrap();
+        assert!(continue_status.success());
+    }
+
+    // Now create a fixup for a2 using interactive selection
+    fs::write(dir.path().join("a2.txt"), "fixed a2").unwrap();
+    run_ok("git", &["add", "a2.txt"], dir.path());
+
+    // Make another conflicting change that will trigger during autosquash
+    let old_a2_id = repo.revparse_single("feature-a~1").unwrap().id();
+    let old_a2_commit = repo.find_commit(old_a2_id).unwrap();
+
+    // Modify the file that a2 touches to ensure autosquash rebase will have a conflict
+    run_ok(
+        "git",
+        &["checkout", "-f", &old_a2_commit.id().to_string()],
+        dir.path(),
+    );
+    fs::write(dir.path().join("a2_v2.txt"), "conflicting a2 change").unwrap();
+    run_ok("git", &["add", "a2_v2.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "conflict commit"], dir.path());
+    let conflict_id = repo.revparse_single("HEAD").unwrap().id();
+
+    // Force update a1 to include this conflict
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    run_ok(
+        "git",
+        &["reset", "--hard", &conflict_id.to_string()],
+        dir.path(),
+    );
+
+    // Re-add a2 and a3
+    let new_a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2_v2.txt",
+        "a2",
+        "commit a2",
+        &[&repo.find_commit(conflict_id).unwrap()],
+    );
+    let new_a2_commit = repo.find_commit(new_a2_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2_v2.txt",
+        "a2 after a3",
+        "commit a3",
+        &[&new_a2_commit],
+    );
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    // Stage a change and create a fixup for a2
+    fs::write(dir.path().join("a2_v2.txt"), "fixed a2 v2").unwrap();
+    run_ok("git", &["add", "a2_v2.txt"], dir.path());
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("--interactive")
+        .current_dir(dir.path())
+        .env("KIN_TEST_SELECTION", "1") // select a2
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("rebase --autosquash failed"));
+
+    // Verify the repo is in an interactive rebase state
+    assert!(dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(
+        dir.path().join(".git/rebase-merge").exists()
+            || dir.path().join(".git/rebase-apply").exists()
+    );
+
+    // Resolve the conflict
+    // The conflict file will vary based on git's rebase, so we just resolve generically
+    let conflict_files = git_stdout(dir.path(), &["diff", "--name-only", "--diff-filter=U"]);
+    for file in conflict_files.lines() {
+        let file = file.trim();
+        if !file.is_empty() {
+            let resolved = if file == "a2_v2.txt" {
+                "fixed a2 v2 after a3"
+            } else {
+                "resolved autosquash conflict"
+            };
+            fs::write(dir.path().join(file), resolved).unwrap();
+            run_ok("git", &["add", file], dir.path());
+        }
+    }
+
+    // Continue the rebase, resolving any follow-up conflicts introduced by autosquash replay.
+    let mut continued = false;
+    for _ in 0..3 {
+        let output = kin_cmd()
+            .arg("continue")
+            .current_dir(dir.path())
+            .env("GIT_EDITOR", "true")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        if output.status.success() {
+            continued = true;
+            break;
+        }
+
+        let conflict_files = git_stdout(dir.path(), &["diff", "--name-only", "--diff-filter=U"]);
+        assert!(
+            !conflict_files.trim().is_empty(),
+            "kin continue failed without unresolved conflicts.\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        for file in conflict_files.lines() {
+            let file = file.trim();
+            if !file.is_empty() {
+                let resolved = if file == "a2_v2.txt" {
+                    "fixed a2 v2 after a3"
+                } else {
+                    "resolved autosquash conflict"
+                };
+                fs::write(dir.path().join(file), resolved).unwrap();
+                run_ok("git", &["add", file], dir.path());
+            }
+        }
+    }
+    assert!(
+        continued,
+        "kin continue did not finish the autosquash rebase"
+    );
+
+    // Verify state cleared
+    assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(!dir.path().join(".git/rebase-merge").exists());
+    assert!(!dir.path().join(".git/rebase-apply").exists());
+
+    // Verify the autosquash completed and no standalone fixup commit remains.
+    let final_tip = repo.revparse_single("feature-a").unwrap().id();
+    let mut commit = repo.find_commit(final_tip).unwrap();
+    let mut summaries = vec![commit.summary().unwrap_or("").to_string()];
+    while commit.parent_count() > 0 {
+        commit = commit.parent(0).unwrap();
+        summaries.push(commit.summary().unwrap_or("").to_string());
+    }
+    assert!(summaries.iter().any(|summary| summary == "commit a2"));
+    assert!(
+        !summaries
+            .iter()
+            .any(|summary| summary.starts_with("fixup! "))
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a2_v2.txt")).unwrap(),
+        "fixed a2 v2 after a3"
+    );
+}
+
+#[test]
+fn test_commit_interactive_stack_multiple_branches() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a1.txt",
+        "a1",
+        "commit a1",
+        &[&main_commit],
+    );
+    let a1_commit = repo.find_commit(a1_id).unwrap();
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2.txt",
+        "a2",
+        "commit a2",
+        &[&a1_commit],
+    );
+    let a2_commit = repo.find_commit(a2_id).unwrap();
+    let b1_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b1.txt",
+        "b1",
+        "commit b1",
+        &[&a2_commit],
+    );
+
+    repo.set_head("refs/heads/feature-b").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("b1.txt"), "amended b1").unwrap();
+    run_ok("git", &["add", "b1.txt"], dir.path());
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("--interactive")
+        .current_dir(dir.path())
+        .env("KIN_TEST_SELECTION", "0") // b1
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    let new_b_id = repo
+        .find_reference("refs/heads/feature-b")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_ne!(new_b_id, b1_id);
+    let new_b_commit = repo.find_commit(new_b_id).unwrap();
+    assert_eq!(new_b_commit.message().unwrap(), "commit b1\n");
+    assert_eq!(new_b_commit.parent_id(0).unwrap(), a2_id); // parent is still a2
+}
+
+#[test]
+fn test_commit_interactive_picker_keeps_shared_head_tips_selectable() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let shared_tip_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "shared",
+        "shared tip",
+        &[&main_commit],
+    );
+
+    repo.reference("refs/heads/feature-b", shared_tip_id, true, "test")
+        .unwrap();
+
+    repo.set_head("refs/heads/feature-b").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let feature_a_before = repo
+        .find_reference("refs/heads/feature-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    let feature_b_before = repo
+        .find_reference("refs/heads/feature-b")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_eq!(feature_a_before, feature_b_before);
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("--interactive")
+        .arg("-m")
+        .arg("shared tip amended")
+        .current_dir(dir.path())
+        .env("KIN_TEST_SELECTION", "1")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    let feature_a_after = repo
+        .find_reference("refs/heads/feature-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    let feature_b_after = repo
+        .find_reference("refs/heads/feature-b")
+        .unwrap()
+        .target()
+        .unwrap();
+
+    // Selecting index 1 should pick the second shared-head tip entry (feature-a).
+    assert_ne!(feature_a_after, feature_a_before);
+    assert_eq!(feature_b_after, feature_b_before);
+    let feature_a_commit = repo.find_commit(feature_a_after).unwrap();
+    assert_eq!(feature_a_commit.summary().unwrap(), "shared tip amended");
+}
+
+#[test]
+fn test_commit_interactive_stack_select_intermediate_from_child() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a1.txt",
+        "a1",
+        "commit a1",
+        &[&main_commit],
+    );
+    let a1_commit = repo.find_commit(a1_id).unwrap();
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2.txt",
+        "a2",
+        "commit a2",
+        &[&a1_commit],
+    );
+    let a2_commit = repo.find_commit(a2_id).unwrap();
+
+    let b1_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b1.txt",
+        "b1",
+        "commit b1",
+        &[&a2_commit],
+    );
+    let b1_commit = repo.find_commit(b1_id).unwrap();
+    let _b2_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b2.txt",
+        "b2",
+        "commit b2",
+        &[&b1_commit],
+    );
+
+    repo.set_head("refs/heads/feature-b").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("a2.txt"), "fixed a2").unwrap();
+    run_ok("git", &["add", "a2.txt"], dir.path());
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("--interactive")
+        .current_dir(dir.path())
+        .env("KIN_TEST_SELECTION", "2") // a2
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    let new_a_id = repo
+        .find_reference("refs/heads/feature-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    let new_b_id = repo
+        .find_reference("refs/heads/feature-b")
+        .unwrap()
+        .target()
+        .unwrap();
+
+    // Feature-a should be updated
+    assert_ne!(new_a_id, a2_id);
+    let new_a2_commit = repo.find_commit(new_a_id).unwrap();
+    assert_eq!(new_a2_commit.message().unwrap(), "commit a2\n");
+    assert_eq!(new_a2_commit.parent_id(0).unwrap(), a1_id);
+
+    // Feature-b should be rebased on top of new Feature-a
+    let tip_commit = repo.find_commit(new_b_id).unwrap();
+    assert_eq!(tip_commit.summary().unwrap(), "commit b2");
+
+    let new_b1_commit = tip_commit.parent(0).unwrap();
+    assert_eq!(new_b1_commit.summary().unwrap(), "commit b1");
+    assert_eq!(new_b1_commit.parent_id(0).unwrap(), new_a_id);
 }

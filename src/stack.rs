@@ -12,6 +12,15 @@ pub struct StackBranch {
 }
 
 #[derive(Clone, Debug)]
+pub struct StackCommit {
+    pub commit_id: Oid,
+    pub branch_name: String,
+    pub position: (usize, usize),
+    pub message: String,
+    pub is_tip: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct SyncBoundary {
     pub old_base: Option<Oid>,
     pub merged_branches: Vec<String>,
@@ -1371,6 +1380,76 @@ pub fn get_stack_branches(
     }
 
     Ok(branches)
+}
+
+/// Enumerates stack commits for interactive selection.
+///
+/// Final ordering is newest branch first, and within each branch commits are tip first.
+/// Commits that appear in multiple branches are emitted once via a global `seen` set, except
+/// each branch tip is always included so branches that share a head still appear in the picker.
+pub fn enumerate_stack_commits(
+    repo: &Repository,
+    stack_branches: &[StackBranch],
+    upstream_name: &str,
+) -> Result<Vec<StackCommit>> {
+    let mut ordered_branches = stack_branches.to_vec();
+    sort_branches_topologically(repo, &mut ordered_branches)?;
+
+    let upstream_id = repo.revparse_single(upstream_name)?.peel_to_commit()?.id();
+    let mut seen = HashSet::new();
+    let mut branch_chunks = Vec::new();
+
+    for branch in ordered_branches {
+        let merge_base = repo.merge_base(upstream_id, branch.id)?;
+
+        let mut revwalk = repo.revwalk()?;
+        revwalk.push(branch.id)?;
+        revwalk.hide(merge_base)?;
+        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
+
+        let mut branch_commits = Vec::new();
+        // Walk each branch once and de-dupe globally so commits shared with an older branch
+        // are not shown multiple times in the picker, while always retaining this branch tip.
+        for oid in revwalk {
+            let id = oid?;
+            if id == branch.id {
+                branch_commits.push(id);
+                seen.insert(id);
+                continue;
+            }
+
+            if seen.insert(id) {
+                branch_commits.push(id);
+            }
+        }
+
+        let total = branch_commits.len();
+        // Reverse to tip-first so is_tip/position are computed from newest commit downward.
+        branch_commits.reverse();
+
+        let mut chunk = Vec::new();
+        for (index, oid) in branch_commits.iter().enumerate() {
+            let commit = repo.find_commit(*oid)?;
+            chunk.push(StackCommit {
+                commit_id: *oid,
+                branch_name: branch.name.clone(),
+                position: (total - index, total),
+                message: commit.summary().unwrap_or("").to_string(),
+                is_tip: index == 0,
+            });
+        }
+        branch_chunks.push(chunk);
+    }
+
+    // Reverse chunks so branches are presented in stack order from newest to oldest.
+    branch_chunks.reverse();
+
+    let mut commits = Vec::new();
+    for mut chunk in branch_chunks {
+        commits.append(&mut chunk);
+    }
+
+    Ok(commits)
 }
 
 pub fn get_stack_branches_from_merge_base(

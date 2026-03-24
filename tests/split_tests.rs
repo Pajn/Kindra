@@ -565,6 +565,47 @@ fn test_checkout_all_detached_no_main() {
 }
 
 #[test]
+fn test_checkout_all_ignores_kin_test_selection_override() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let signature = Signature::now("Test User", "test@example.com").unwrap();
+
+    fs::write(dir.path().join("file.txt"), "initial").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("file.txt")).unwrap();
+    let oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(oid).unwrap();
+    let trunk_id = repo
+        .commit(
+            Some("refs/heads/trunk"),
+            &signature,
+            &signature,
+            "initial commit",
+            &tree,
+            &[],
+        )
+        .unwrap();
+    let trunk_commit = repo.find_commit(trunk_id).unwrap();
+    repo.branch("zzz-side", &trunk_commit, false).unwrap();
+
+    repo.set_head("refs/heads/trunk").unwrap();
+    fs::remove_file(dir.path().join("file.txt")).unwrap();
+
+    let mut cmd = kin_cmd();
+    cmd.arg("checkout")
+        .arg("--all")
+        .current_dir(dir.path())
+        .env("KIN_TEST_SELECTION", "1")
+        .env("TERM", "dumb")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("auto-selecting first option"));
+
+    let new_head = repo.head().unwrap().shorthand().unwrap().to_string();
+    assert_eq!(new_head, "trunk");
+}
+
+#[test]
 fn test_split_invalid_edit_validation() {
     let (dir, _repo) = setup_repo();
 
