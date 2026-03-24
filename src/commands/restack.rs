@@ -1,9 +1,12 @@
-use crate::commands::{resolve_rebase_autostash, resolve_restack_history_limit};
+use crate::commands::{
+    prompt_multi_select, resolve_rebase_autostash, resolve_restack_history_limit,
+};
 use crate::rebase_utils::{Operation, RebaseState, run_rebase_loop, state_path};
 use anyhow::{Result, anyhow};
 use clap::Args;
 use git2::{BranchType, Commit, Oid, Repository};
 use std::collections::HashMap;
+use std::io::IsTerminal;
 
 #[derive(Args)]
 pub struct RestackArgs {
@@ -16,6 +19,9 @@ pub struct RestackArgs {
     /// Disable git rebase autostash even if configured
     #[arg(long, overrides_with = "autostash")]
     pub no_autostash: bool,
+    /// Show interactive picker to select which branches to restack
+    #[arg(long)]
+    pub pick: bool,
 }
 
 pub fn restack(args: &RestackArgs) -> Result<()> {
@@ -55,6 +61,28 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
         println!("No floating children found.");
         return Ok(());
     }
+
+    let children = if args.pick {
+        if !std::io::stdin().is_terminal() {
+            return Err(anyhow!("--pick requires an interactive terminal"));
+        }
+        let branch_names: Vec<String> = children.iter().map(|(name, _)| name.clone()).collect();
+        let selected = prompt_multi_select(
+            "Select branches to restack (Space to toggle, Enter to confirm):",
+            branch_names,
+        )?;
+        if selected.is_empty() {
+            println!("No branches selected.");
+            return Ok(());
+        }
+        let selected_set: std::collections::HashSet<_> = selected.into_iter().collect();
+        children
+            .into_iter()
+            .filter(|(name, _)| selected_set.contains(name))
+            .collect()
+    } else {
+        children
+    };
 
     // Construct RebaseState
     let mut parent_id_map = HashMap::new();

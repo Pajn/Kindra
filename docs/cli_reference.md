@@ -190,7 +190,7 @@ kin sync [--force] [--no-delete] [--autostash|--no-autostash]
 **Usage:**
 
 ```bash
-kin restack [--history-limit <n>] [--autostash|--no-autostash]
+kin restack [--history-limit <n>] [--autostash|--no-autostash] [--pick]
 ```
 
 **What it does:**
@@ -202,6 +202,7 @@ kin restack [--history-limit <n>] [--autostash|--no-autostash]
 - `--history-limit <n>`: Maximum first-parent history depth to scan while detecting floating branches. `0` disables the limit and scans the full history.
 - `--autostash`: Allow the rebase loop to use Git autostash.
 - `--no-autostash`: Disable Git autostash even if configured globally or for the repo.
+- `--pick`: Show an interactive picker to select which branches to restack. Requires an interactive terminal. If no branches are selected, the command exits without performing any rebases.
 
 **History limit resolution order:**
 - CLI override: `--history-limit <n>`
