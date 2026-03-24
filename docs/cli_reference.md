@@ -41,6 +41,7 @@ Kindra automatically identifies your stack by looking for local branches that ar
 ```bash
 kin commit [git-commit-args]
 kin commit --on [<branch>] [git-commit-args]
+kin commit --interactive [git-commit-args]
 ```
 
 Any arguments you pass to `kin commit` (e.g., `-m "my message"`) are passed directly to `git commit`.
@@ -48,8 +49,22 @@ Any arguments you pass to `kin commit` (e.g., `-m "my message"`) are passed dire
 - `--on <branch>`: Commit onto another branch instead of the current one. The next token is consumed as the branch name.
 - `--on=`: Open an interactive branch picker for the current stack.
 - `--on`: Open the interactive branch picker only when `--on` is the final token.
+- `--interactive`: Open an interactive commit picker showing all commits in the stack. Select a tip commit to amend, or an intermediate commit to fixup.
 - `--autostash`: Allow the descendant rebase phase to use Git autostash.
 - `--no-autostash`: Disable Git autostash even if configured globally or for the repo.
+
+**Interactive mode behavior:**
+
+When using `--interactive`:
+- All commits across the stack are enumerated with their position (e.g., `feature-a 2/3`)
+- Selecting a tip commit amends it and rebases any dependent branches
+- Selecting an intermediate commit creates a fixup that is auto-squashed into the target
+- Conflicts during the rebase enter the continue/abort workflow
+- `--interactive` accepts and forwards trailing `git commit` args (including `-m` and pathspecs after `--`).
+
+Examples:
+- `kin commit --interactive -m "new subject"`
+- `kin commit --interactive -- a3.txt`
 
 Parser behavior:
 - `kin commit --on feature-a -m "msg"`: valid (`feature-a` is the target branch).
