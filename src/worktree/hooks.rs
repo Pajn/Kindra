@@ -3,6 +3,7 @@ use crate::worktree::config::{HookListConfig, WorktreeConfig};
 use anyhow::{Result, anyhow};
 use std::path::Path;
 use std::process::Command;
+use std::process::Stdio;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HookEvent {
@@ -44,37 +45,27 @@ pub fn run_hooks(
     branch: &str,
 ) -> Result<()> {
     for hook in hooks_for_role(config, role, event) {
-        let output = shell_command(&hook)
+        eprintln!("Running {} hook: {}...", event.as_str(), hook);
+        let status = shell_command(&hook)
             .current_dir(worktree_path)
             .env("KINDRA_WORKTREE_ROLE", role.as_str())
             .env("KINDRA_WORKTREE_BRANCH", branch)
             .env("KINDRA_WORKTREE_PATH", worktree_path)
-            .output()?;
-        if !output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let exit_code = output
-                .status
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()?;
+        if !status.success() {
+            let exit_code = status
                 .code()
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "<no exit code>".to_string());
             return Err(anyhow!(
-                "Worktree {} hook failed for role '{}' at '{}': {}\nexit code: {}\nstdout: {}\nstderr: {}",
+                "Worktree {} hook failed for role '{}' at '{}': {}\nexit code: {}",
                 event.as_str(),
                 role,
                 worktree_path.display(),
                 hook,
                 exit_code,
-                if stdout.is_empty() {
-                    "<empty>"
-                } else {
-                    &stdout
-                },
-                if stderr.is_empty() {
-                    "<empty>"
-                } else {
-                    &stderr
-                },
             ));
         }
     }
@@ -183,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn hook_failures_include_command_output() {
+    fn hook_failures_include_exit_code() {
         let dir = TempDir::new().unwrap();
         let hook = if cfg!(windows) {
             "echo hook failed 1>&2 && exit /b 1".to_string()
@@ -202,7 +193,8 @@ mod tests {
         .unwrap_err();
 
         let rendered = err.to_string();
+        // Output is now piped to terminal, so error message only includes exit code
+        assert!(rendered.contains("exit code: 1"));
         assert!(rendered.contains("hook failed"));
-        assert!(rendered.contains("stderr: hook failed"));
     }
 }
