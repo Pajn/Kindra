@@ -8,6 +8,7 @@ pub(crate) mod pr_merge;
 pub mod push;
 pub mod reorder;
 pub mod restack;
+pub mod run;
 pub mod split;
 pub mod status_cmd;
 pub mod sync;

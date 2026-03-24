@@ -10,7 +10,16 @@ use std::process::Command;
 pub fn abort_cmd() -> Result<()> {
     let repo = crate::open_repo()?;
     let path = state_path(&repo);
-    if path.exists() {
+    let has_rebase_state = path.exists();
+    let has_run_state = crate::commands::run::run_state_exists(&repo);
+
+    if has_rebase_state && has_run_state {
+        return Err(anyhow!(
+            "Multiple Kindra operations are persisted. Resolve state manually before aborting."
+        ));
+    }
+
+    if has_rebase_state {
         let mut parsed_state = load_state(&repo)?;
 
         // Only try to abort a git rebase if we were actually in a kindra operation
@@ -43,6 +52,8 @@ pub fn abort_cmd() -> Result<()> {
 
         std::fs::remove_file(path)?;
         println!("Operation aborted (state cleared).");
+    } else if has_run_state {
+        crate::commands::run::abort_run(&repo)?;
     } else if git_rebase_in_progress(&repo) {
         println!("A native git rebase is in progress. Use 'git rebase --abort'.");
     } else {

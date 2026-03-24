@@ -3,6 +3,32 @@ use anyhow::Result;
 
 pub fn status_cmd() -> Result<()> {
     let repo = crate::open_repo()?;
+    if crate::commands::run::run_state_exists(&repo) {
+        let run_state = crate::commands::run::load_run_state(&repo)?;
+        let processed = run_state.current_index.min(run_state.target_branches.len());
+        let status_name = match run_state.status {
+            crate::commands::run::RunStatus::InProgress => "in progress",
+            crate::commands::run::RunStatus::Failed => "failed",
+            crate::commands::run::RunStatus::Aborted => "aborted",
+        };
+        println!(
+            "Run {}: {} of {} branch(es) processed",
+            status_name,
+            processed,
+            run_state.target_branches.len()
+        );
+        if processed < run_state.target_branches.len() {
+            println!("Next branch: {}", run_state.target_branches[processed]);
+        }
+        if !run_state.failed_branches.is_empty() {
+            println!("Failed branches: {}", run_state.failed_branches.join(", "));
+        }
+        if let Some(error) = run_state.last_error {
+            println!("Last error: {}", error);
+        }
+        return Ok(());
+    }
+
     let state = match load_state(&repo) {
         Ok(state) => state,
         Err(_) => {
