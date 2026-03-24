@@ -999,6 +999,180 @@ fn test_restack_does_not_rebase_unrelated_history_with_patch_id_match() {
 }
 
 #[test]
+fn test_restack_ignores_isolated_patch_and_tree_matches_on_side_branches() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    repo_init(repo_path);
+
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    let head_oid = || {
+        Repository::open(repo_path)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+    };
+    let commit_with_git = |filename: &str, content: &str, message: &str| -> git2::Oid {
+        std::fs::write(repo_path.join(filename), content).unwrap();
+        run_ok("git", &["add", filename], repo_path);
+        run_ok("git", &["commit", "-m", message], repo_path);
+        head_oid()
+    };
+    let commit_with_git_env =
+        |filename: &str, content: &str, message: &str, timestamp: &str| -> git2::Oid {
+            std::fs::write(repo_path.join(filename), content).unwrap();
+
+            let add = std::process::Command::new("git")
+                .args(["add", filename])
+                .current_dir(repo_path)
+                .env("GIT_AUTHOR_NAME", "Test User")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test User")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .unwrap();
+            assert!(
+                add.status.success(),
+                "git add failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&add.stdout),
+                String::from_utf8_lossy(&add.stderr),
+            );
+
+            let commit = std::process::Command::new("git")
+                .args(["commit", "-m", message])
+                .current_dir(repo_path)
+                .env("GIT_AUTHOR_NAME", "Test User")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test User")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .env("GIT_AUTHOR_DATE", timestamp)
+                .env("GIT_COMMITTER_DATE", timestamp)
+                .output()
+                .unwrap();
+            assert!(
+                commit.status.success(),
+                "git commit failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&commit.stdout),
+                String::from_utf8_lossy(&commit.stderr),
+            );
+
+            head_oid()
+        };
+
+    let _root_oid = commit_with_git("root.txt", "root", "root");
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+    let main_base_oid = commit_with_git("main.txt", "main base", "main base");
+
+    run_ok("git", &["checkout", "-b", "target"], repo_path);
+    let _old_a_oid = commit_with_git("a.txt", "A1", "target A");
+    let old_b_oid = commit_with_git("b.txt", "B1", "target B");
+
+    run_ok("git", &["checkout", "-b", "true-child"], repo_path);
+    let true_child_tip_before = commit_with_git("child.txt", "true child", "true child");
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "noise-patch", &main_base_oid.to_string()],
+        repo_path,
+    );
+    commit_with_git("noise.txt", "noise", "noise root");
+    commit_with_git("a.txt", "A1", "target A");
+    let noise_patch_tip_before = commit_with_git("noise-tip.txt", "noise tip", "noise patch tip");
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "noise-tree", &main_base_oid.to_string()],
+        repo_path,
+    );
+    commit_with_git("temp.txt", "temp", "tree root");
+    std::fs::remove_file(repo_path.join("temp.txt")).unwrap();
+    std::fs::write(repo_path.join("a.txt"), "A1").unwrap();
+    std::fs::write(repo_path.join("b.txt"), "B1").unwrap();
+    run_ok("git", &["rm", "temp.txt"], repo_path);
+    run_ok("git", &["add", "a.txt", "b.txt"], repo_path);
+    run_ok("git", &["commit", "-m", "tree match"], repo_path);
+    let noise_tree_tip_before = commit_with_git("tree-tip.txt", "tree tip", "noise tree tip");
+
+    run_ok("git", &["checkout", "target"], repo_path);
+    run_ok(
+        "git",
+        &["reset", "--hard", &main_base_oid.to_string()],
+        repo_path,
+    );
+    let _rewritten_a_oid = commit_with_git_env("a.txt", "A1", "target A", "@1000000 +0000");
+    let rewritten_target_tip = commit_with_git_env("b.txt", "B1", "target B", "@1000001 +0000");
+    assert_ne!(
+        rewritten_target_tip, old_b_oid,
+        "the rewritten target tip must receive a new commit id"
+    );
+
+    let output = kin_cmd()
+        .current_dir(repo_path)
+        .arg("restack")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "restack failed\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_no_rebase_in_progress(repo_path);
+
+    let repo = Repository::open(repo_path).unwrap();
+
+    let true_child_tip_after = repo
+        .find_reference("refs/heads/true-child")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_ne!(
+        true_child_tip_after, true_child_tip_before,
+        "true-child should rebase onto rewritten target branch"
+    );
+
+    let noise_patch_tip_after = repo
+        .find_reference("refs/heads/noise-patch")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_eq!(
+        noise_patch_tip_after, noise_patch_tip_before,
+        "an isolated patch-id match on a side branch must not trigger restack\nstdout:\n{}",
+        stdout,
+    );
+
+    let noise_tree_tip_after = repo
+        .find_reference("refs/heads/noise-tree")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_eq!(
+        noise_tree_tip_after, noise_tree_tip_before,
+        "an isolated tree match on a side branch must not trigger restack\nstdout:\n{}",
+        stdout,
+    );
+    assert!(
+        !stdout.contains("noise-patch"),
+        "restack should not report the patch-only side branch\nstdout:\n{}",
+        stdout,
+    );
+    assert!(
+        !stdout.contains("noise-tree"),
+        "restack should not report the tree-only side branch\nstdout:\n{}",
+        stdout,
+    );
+}
+
+#[test]
 fn test_restack_patch_id_matching_ignores_colored_git_show_output() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();

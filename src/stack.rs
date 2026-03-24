@@ -745,11 +745,8 @@ pub fn find_floating_base(
         }
 
         let commit = repo.find_commit(oid)?;
-        current = if commit.parent_count() > 0 {
-            Some(commit.parent_id(0)?)
-        } else {
-            None
-        };
+        let parent_id = first_parent_id(&commit)?;
+        current = parent_id;
         if history_limit != 0 {
             remaining -= 1;
         }
@@ -761,16 +758,25 @@ pub fn find_floating_base(
             continue;
         }
 
-        // Match by tree-hash against rewritten target commits.
-        if target
-            .candidates
-            .iter()
-            .any(|candidate| candidate.tree_id == commit.tree_id())
-        {
-            if oid != branch_tip {
-                return Ok(Some(oid));
+        // Match by tree-hash against rewritten target commits, but only if the
+        // surrounding parent commit also lines up with the rewritten lineage.
+        let mut has_tree_match = false;
+        for candidate in &target.candidates {
+            if candidate.tree_id != commit.tree_id() {
+                continue;
             }
-            continue;
+            if floating_parent_matches_candidate(
+                repo,
+                parent_id,
+                candidate.parent_id,
+                patch_id_cache,
+            )? {
+                has_tree_match = true;
+                break;
+            }
+        }
+        if has_tree_match && oid != branch_tip {
+            return Ok(Some(oid));
         }
 
         // Metadata matches narrow the patch-id fallback, but are not sufficient on their own.
@@ -802,11 +808,6 @@ pub fn find_floating_base(
         // So we check: if the corresponding target commit's parent is in target history,
         // they are siblings, not a rebase pair.
         if oid != branch_tip {
-            let parent_id = if commit.parent_count() > 0 {
-                Some(commit.parent_id(0)?)
-            } else {
-                None
-            };
             let summary = commit.summary().unwrap_or("").trim().to_string();
             let author = commit.author();
             let email = author.email().unwrap_or("").to_string();
@@ -856,14 +857,132 @@ pub fn find_floating_base(
         if oid == branch_tip {
             continue;
         }
-        if let Some(patch_id) = patch_id_cache.get(&oid).and_then(|v| v.as_ref())
-            && target.patch_ids.contains(patch_id)
-        {
+        let Some(patch_id) = patch_id_cache.get(&oid).and_then(|v| v.as_ref()).cloned() else {
+            continue;
+        };
+        if !target.patch_ids.contains(&patch_id) {
+            continue;
+        }
+
+        let commit = repo.find_commit(oid)?;
+        let parent_id = first_parent_id(&commit)?;
+        let mut has_patch_match = false;
+        for candidate in &target.candidates {
+            let Some(candidate_patch_id) =
+                patch_id_cache.get(&candidate.id).and_then(|v| v.as_ref())
+            else {
+                continue;
+            };
+            if candidate_patch_id != &patch_id {
+                continue;
+            }
+            if floating_parent_matches_candidate(
+                repo,
+                parent_id,
+                candidate.parent_id,
+                patch_id_cache,
+            )? || is_tip_patch_rewrite(&commit, candidate, target_id)
+            {
+                has_patch_match = true;
+                break;
+            }
+        }
+        if has_patch_match {
             return Ok(Some(oid));
         }
     }
 
     Ok(None)
+}
+
+/// Returns the first parent's OID if the commit has at least one parent.
+///
+/// Returns `Ok(None)` for root commits (commits with no parents).
+/// Propagates errors from `parent_id()` via the `?` operator.
+fn first_parent_id(commit: &Commit) -> Result<Option<Oid>> {
+    if commit.parent_count() > 0 {
+        Ok(Some(commit.parent_id(0)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Checks whether the floating branch's parent commit aligns with a target
+/// candidate's parent.
+///
+/// Returns `true` if parents match by OID, tree-id, or patch-id—indicating
+/// the commits share the same logical lineage despite potential rewrites.
+///
+/// Comparison strategy:
+/// 1. OID equality (fastest)
+/// 2. Tree-ID equality (fallback when commit was amended but patch is intact)
+/// 3. Patch-ID equality via `patch_id_cache` (handles content-preserving rewrites)
+///
+/// When both `branch_parent_id` and `candidate_parent_id` are `None` (both
+/// root commits), returns `true`.
+///
+/// Calls `ensure_patch_ids` to populate the cache before patch comparison.
+/// Returns `Result<bool>` due to repository lookup errors (`find_commit`).
+fn floating_parent_matches_candidate(
+    repo: &Repository,
+    branch_parent_id: Option<Oid>,
+    candidate_parent_id: Option<Oid>,
+    patch_id_cache: &mut HashMap<Oid, Option<String>>,
+) -> Result<bool> {
+    let (Some(branch_parent_id), Some(candidate_parent_id)) =
+        (branch_parent_id, candidate_parent_id)
+    else {
+        return Ok(branch_parent_id.is_none() && candidate_parent_id.is_none());
+    };
+
+    if branch_parent_id == candidate_parent_id {
+        return Ok(true);
+    }
+
+    if repo.find_commit(branch_parent_id)?.tree_id()
+        == repo.find_commit(candidate_parent_id)?.tree_id()
+    {
+        return Ok(true);
+    }
+
+    ensure_patch_ids(
+        repo,
+        &[branch_parent_id, candidate_parent_id],
+        patch_id_cache,
+    )?;
+    let branch_patch_id = patch_id_cache
+        .get(&branch_parent_id)
+        .and_then(|value| value.as_ref());
+    let candidate_patch_id = patch_id_cache
+        .get(&candidate_parent_id)
+        .and_then(|value| value.as_ref());
+
+    Ok(branch_patch_id.is_some() && branch_patch_id == candidate_patch_id)
+}
+
+/// Detects the special case where a floating commit's patch-id matches the
+/// target tip but the trees differ—indicating the target tip was modified
+/// (e.g., via fixup/squash) and the floating commit is the original version.
+///
+/// Requires matching commit summary and author email for safety to avoid
+/// false positives when different commits happen to have the same patch-id.
+///
+/// Returns `true` when all conditions hold:
+/// - `candidate.id == target_id` (same patch-id as target)
+/// - `candidate.tree_id != commit.tree_id()` (trees differ)
+/// - `candidate.summary == commit.summary().unwrap_or("").trim()` (summary matches)
+/// - `candidate.email == commit.author().email().unwrap_or("")` (email matches)
+///
+/// Returns a simple `bool` (no error propagation needed).
+fn is_tip_patch_rewrite(
+    commit: &Commit,
+    candidate: &FloatingTargetCandidate,
+    target_id: Oid,
+) -> bool {
+    candidate.id == target_id
+        && candidate.tree_id != commit.tree_id()
+        && candidate.summary == commit.summary().unwrap_or("").trim()
+        && candidate.email == commit.author().email().unwrap_or("")
 }
 
 fn metadata_matches_target_candidate(
