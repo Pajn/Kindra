@@ -14,6 +14,7 @@ This document provides a detailed overview of the commands available in Kindra v
   - [checkout (co)](#checkout-alias-co)
   - [worktree (wt)](#worktree-alias-wt)
   - [push](#push)
+  - [run](#run)
   - [pr](#pr)
   - [split](#split)
   - [Status & Control (status, continue, abort)](#status--control)
@@ -398,6 +399,50 @@ kin push
 This command performs an atomic push of all branches in the stack using `force-with-lease` to ensure safety.
 
 **When to use it:** Use this when you've updated multiple branches in your stack (e.g., after a `kin commit` or `kin move`) and want to sync them all to the remote in one go.
+
+---
+
+### `run`
+
+**Description:** Runs a shell command on each branch in the stack, starting from the base and moving toward the tips.
+
+**Usage:**
+
+```bash
+kin run -c <command>
+kin run --command <command>
+kin run --continue-on-failure --command <command>
+```
+
+**Arguments:**
+- `-c, --command <command>`: The shell command to run on each branch. Required.
+- `--continue-on-failure`: If the command fails on a branch, continue to the next branch instead of stopping. By default, the command stops on the first failure.
+
+**What it does:**
+- Discovers stack branches from the current HEAD using the same logic as other Kindra commands.
+- Sorts branches topologically from base to tips.
+- For each branch:
+  - Prints a header `=== Running on <branch> ===`
+  - Checks out the branch
+  - Executes the command via `sh -c`
+  - Prints stdout and stderr
+- Returns to the original branch when done.
+- Prints a summary showing success/failure counts and any failed branches.
+
+**When to use it:** Use this to run tests, linters, builds, or any other commands across all branches in your stack. For example, running `cargo test` on each branch to verify tests pass before creating PRs.
+
+**Examples:**
+
+```bash
+# Run tests on all branches
+kin run -c "cargo test"
+
+# Run linter with continue-on-failure to see all results
+kin run --continue-on-failure -c "cargo clippy"
+
+# Run a custom command
+kin run -c "echo 'Hello from $(git branch --show-current)'"
+```
 
 ---
 
