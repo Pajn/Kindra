@@ -251,14 +251,25 @@ pub fn ensure_local_branch_exists(repo: &Repository, branch: &str) -> Result<()>
         Ok(_) => Ok(()),
         Err(err) => {
             if let Some(remote) = remote_for_branch(repo, branch)? {
-                return Err(anyhow!(
-                    "Branch '{}' exists on remote '{}'; create a local branch with 'git checkout -b {} {}/{}'.",
-                    branch,
-                    remote,
-                    branch,
-                    remote,
-                    branch
-                ));
+                // Auto-create local branch tracking the remote
+                let start_point = format!("{}/{}", remote, branch);
+                let mut cmd = Command::new("git");
+                cmd.current_dir(repo_root(repo)?)
+                    .arg("branch")
+                    .arg("--track")
+                    .arg(branch)
+                    .arg(&start_point);
+                let output = cmd.output()?;
+                if !output.status.success() {
+                    return Err(anyhow!(
+                        "Failed to create local branch '{}' tracking '{}/{}': {}",
+                        branch,
+                        remote,
+                        branch,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ));
+                }
+                return Ok(());
             }
 
             Err(err.into())
@@ -358,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn suggests_creating_local_branch_when_only_remote_exists() {
+    fn auto_creates_local_branch_when_only_remote_exists() {
         let remote_dir = TempDir::new().unwrap();
         let init_remote_status = std::process::Command::new("git")
             .current_dir(remote_dir.path())
@@ -439,11 +450,17 @@ mod tests {
         assert!(clone_status.success(), "git clone failed");
 
         let repo = git2::Repository::open(&clone_path).unwrap();
-        let err = ensure_local_branch_exists(&repo, "feature/test").unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "Branch 'feature/test' exists on remote 'origin'; create a local branch with 'git checkout -b feature/test origin/feature/test'."
-        );
+
+        // ensure_local_branch_exists should auto-create local branch from remote
+        ensure_local_branch_exists(&repo, "feature/test").unwrap();
+
+        // Verify local branch exists
+        let local_branch = repo.find_branch("feature/test", BranchType::Local).unwrap();
+
+        // Verify it tracks origin/feature/test
+        let upstream = local_branch.upstream().unwrap();
+        let upstream_name = upstream.name().unwrap().unwrap();
+        assert_eq!(upstream_name, "origin/feature/test");
     }
 
     #[test]
