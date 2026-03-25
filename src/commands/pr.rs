@@ -224,13 +224,15 @@ fn pr_edit() -> Result<()> {
         existing.number, branch_name, existing.url
     );
 
-    let title = prompt_edit_title(&existing.title)?;
-    let mut body = prompt_edit_body(&existing.body)?;
+    let mut title = existing.title.clone();
+    let mut body = None;
     let mut labels = existing.labels.clone();
     let mut reviewers = existing.reviewers.clone();
 
     loop {
         let mut menu_items = vec!["Save".to_string()];
+        menu_items.push("Edit title".to_string());
+        menu_items.push("Edit body".to_string());
         if labels.is_empty() {
             menu_items.push("Set labels".to_string());
         } else {
@@ -241,19 +243,21 @@ fn pr_edit() -> Result<()> {
         } else {
             menu_items.push(format!("Set reviewers [{}]", reviewers.join(", ")));
         }
-        menu_items.push("Edit body".to_string());
-
         let choice = crate::commands::prompt_select("PR edit options:", menu_items)?;
         match choice.as_str() {
             "Save" => break,
+            "Edit title" => {
+                title = prompt_edit_title(&title)?;
+            }
+            "Edit body" => {
+                let current_body = body.as_deref().unwrap_or(existing.body.as_str());
+                body = prompt_edit_body(current_body)?;
+            }
             s if s.starts_with("Set labels") => {
                 labels = prompt_labels_for_edit(&labels)?;
             }
             s if s.starts_with("Set reviewers") => {
                 reviewers = prompt_reviewers_for_edit(&reviewers)?;
-            }
-            "Edit body" => {
-                body = prompt_edit_body(&existing.body)?;
             }
             _ => {}
         }
@@ -1254,6 +1258,10 @@ fn open_editor_for_plain_body(prefill: &str) -> Result<String> {
 
 fn prompt_edit_title(current_title: &str) -> Result<String> {
     if !std::io::stdin().is_terminal() {
+        if let Ok(test_title) = std::env::var("KIN_TEST_PR_EDIT_TITLE") {
+            println!("  [non-interactive] Using title override: {}", test_title);
+            return Ok(test_title);
+        }
         println!("  [non-interactive] Keeping title: {}", current_title);
         return Ok(current_title.to_string());
     }
