@@ -369,6 +369,155 @@ exit 1
     );
 }
 
+#[test]
+fn test_pr_label_flag() {
+    let (dir, _repo) = setup_simple_stack();
+
+    // Set up remote and push
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    // Create mock gh that captures the PR arguments
+    let gh_pr_args = dir.path().join("gh_pr_args.txt");
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        format!(
+            r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo "no pull requests found for branch" >&2
+    exit 1
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
+    printf "%s\n" "$@" > "{}"
+    echo "https://github.com/test/repo/pull/1"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+            gh_pr_args.display()
+        ),
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = kin_cmd()
+        .args(["pr", "--label", "bug", "--label", "urgent"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr --label failed: {:?}",
+        output
+    );
+
+    let pr_args = std::fs::read_to_string(&gh_pr_args).unwrap();
+
+    // Both labels should be passed to gh pr create
+    assert!(
+        pr_args.contains("--label") && pr_args.contains("bug") && pr_args.contains("urgent"),
+        "PR create should contain both labels. Got:\n{}",
+        pr_args
+    );
+}
+
+#[test]
+fn test_pr_push_flag() {
+    let (dir, _repo) = setup_simple_stack();
+
+    // Set up remote and push
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    // Note: NOT pushing feature branch - that's what --push should handle
+
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    // Create mock gh
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo "no pull requests found for branch" >&2
+    exit 1
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
+    echo "https://github.com/test/repo/pull/1"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = kin_cmd()
+        .args(["pr", "--push"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr --push failed: {:?}",
+        output
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Verify that kin prints the push message
+    assert!(
+        stdout.contains("Pushing branches first"),
+        "kin pr --push should indicate it's pushing branches first. Got:\n{}",
+        stdout
+    );
+}
+
 /// Test that after `kin sync`, `kin pr` uses the correct base (origin/main)
 /// even when the local main branch is behind origin/main.
 ///

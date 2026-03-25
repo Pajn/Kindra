@@ -58,14 +58,14 @@ impl PrReviewArgs {
     }
 }
 
-pub fn pr(subcommand: &Option<PrSubcommand>) -> Result<()> {
+pub fn pr(subcommand: &Option<PrSubcommand>, push: bool, labels: &[String]) -> Result<()> {
     match subcommand {
         Some(PrSubcommand::Open) => pr_open(),
         Some(PrSubcommand::Edit) => pr_edit(),
         Some(PrSubcommand::Merge) => pr_merge(),
         Some(PrSubcommand::Status) => pr_status(),
         Some(PrSubcommand::Review(args)) => pr_review(args),
-        None => pr_create_or_update(),
+        None => pr_create_or_update(push, labels),
     }
 }
 
@@ -96,10 +96,16 @@ struct RenderItem {
     is_merged: bool,
 }
 
-fn pr_create_or_update() -> Result<()> {
+fn pr_create_or_update(should_push: bool, labels: &[String]) -> Result<()> {
     gh::check_gh().context("GitHub CLI check failed")?;
 
     let repo = crate::open_repo()?;
+
+    if should_push {
+        println!("Pushing branches first...\n");
+        crate::commands::push::push()?;
+    }
+
     let (upstream_name, branches_with_upstream) = discover_stack_branches_with_upstream(&repo)?;
 
     if branches_with_upstream.is_empty() {
@@ -126,7 +132,7 @@ fn pr_create_or_update() -> Result<()> {
             .unwrap_or_else(|| upstream_name.clone());
         let gh_base = normalize_base_for_gh(&git_base);
 
-        if let Some(pr) = process_branch_pr(&repo, &sb.name, &git_base, &gh_base)? {
+        if let Some(pr) = process_branch_pr(&repo, &sb.name, &git_base, &gh_base, labels)? {
             open_prs.push(StackPr {
                 branch_name: sb.name.clone(),
                 pr,
@@ -705,7 +711,8 @@ fn process_branch_pr(
     branch_name: &str,
     git_base: &str,
     gh_base: &str,
-) -> Result<Option<gh::EditablePr>> {
+    labels: &[String],
+) -> Result<Option<crate::gh::EditablePr>> {
     println!("── {} ──", branch_name);
 
     // Check for an existing open PR
@@ -730,7 +737,7 @@ fn process_branch_pr(
         }
         None => {
             // New PR: run the interactive wizard
-            create_pr_interactive(repo, branch_name, git_base, gh_base)
+            create_pr_interactive(repo, branch_name, git_base, gh_base, labels)
         }
     }
 }
@@ -744,7 +751,8 @@ fn create_pr_interactive(
     branch_name: &str,
     git_base: &str,
     gh_base: &str,
-) -> Result<Option<gh::EditablePr>> {
+    labels: &[String],
+) -> Result<Option<crate::gh::EditablePr>> {
     let commits = get_branch_commits(repo, branch_name, git_base)?;
 
     if commits.is_empty() {
@@ -766,8 +774,15 @@ fn create_pr_interactive(
     let body = prompt_body(branch_name, &commits)?;
 
     // ── Step 3: Submit options ───────────────────────────────────────────────
-    let submission = prompt_submit_options()?;
-    let labels = submission.labels.clone();
+    let submission = if !labels.is_empty() {
+        let mut cli_labels = labels.to_vec();
+        let mut options = prompt_submit_options()?;
+        cli_labels.append(&mut options.labels);
+        options.labels = cli_labels;
+        options
+    } else {
+        prompt_submit_options()?
+    };
     let reviewers = submission.reviewers.clone();
 
     println!("  Creating PR...");
@@ -777,8 +792,8 @@ fn create_pr_interactive(
         base: gh_base.to_string(),
         head: branch_name.to_string(),
         draft: submission.draft,
-        labels: submission.labels,
-        reviewers: submission.reviewers,
+        labels: submission.labels.clone(),
+        reviewers: submission.reviewers.clone(),
     })?;
 
     println!("  ✓ PR created: {}", url);
@@ -787,7 +802,7 @@ fn create_pr_interactive(
         title,
         body,
         url,
-        labels,
+        labels: submission.labels,
         reviewers,
     }))
 }

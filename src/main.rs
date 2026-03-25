@@ -46,6 +46,12 @@ enum Commands {
     Pr {
         #[command(subcommand)]
         subcommand: Option<PrSubcommand>,
+        /// Push branches to remote before creating PRs
+        #[arg(long)]
+        push: bool,
+        /// Set labels on all created PRs (can be specified multiple times)
+        #[arg(long)]
+        label: Vec<String>,
     },
     /// Interactive branch checkout
     #[command(alias = "co")]
@@ -127,7 +133,11 @@ fn main() -> Result<()> {
     match &cli.command {
         Commands::Split => split()?,
         Commands::Push => push()?,
-        Commands::Pr { subcommand } => pr(subcommand)?,
+        Commands::Pr {
+            subcommand,
+            push,
+            label,
+        } => pr(subcommand, *push, label)?,
         Commands::Checkout { subcommand, all } => checkout(subcommand, *all)?,
         Commands::Move(args) => move_cmd(args)?,
         Commands::Reorder(args) => reorder(args)?,
