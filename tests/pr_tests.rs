@@ -1993,6 +1993,81 @@ exit 1
         "Body should remain unchanged in non-interactive mode. Got:\n{}",
         args
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("PR edit options:"),
+        "Expected menu prompt before saving. Got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn pr_edit_menu_can_edit_title_then_save() {
+    let (dir, _repo) = setup_simple_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo '{"number":42,"title":"Current title","body":"Current body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s" "$@" > "$MOCK_GH_EDIT_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let edit_args_path = dir.path().join("edit_args.txt");
+
+    let output = kin_cmd()
+        .args(["pr", "edit"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .env("KIN_TEST_SELECTIONS", "1,0")
+        .env("KIN_TEST_PR_EDIT_TITLE", "Updated title from menu")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "kin pr edit failed: {:?}", output);
+    let args = fs::read_to_string(&edit_args_path).unwrap();
+    assert!(
+        args.contains("predit42--titleUpdated title from menu"),
+        "Expected edited title to be sent. Got:\n{}",
+        args
+    );
 }
 
 #[test]

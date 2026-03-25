@@ -22,6 +22,9 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static TEST_SELECTION_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Subcommand, Clone, Copy)]
 pub enum CheckoutSubcommand {
@@ -42,6 +45,29 @@ pub fn prompt_select(message: &str, options: Vec<String>) -> Result<String> {
     if !std::io::stdin().is_terminal() {
         if options.is_empty() {
             return Err(anyhow!("No options available for selection"));
+        }
+        if let Ok(selection_values) = std::env::var("KIN_TEST_SELECTIONS") {
+            let call_index = TEST_SELECTION_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+            let selected_idx = selection_values
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .nth(call_index)
+                .and_then(|s| s.parse::<usize>().ok());
+
+            if let Some(idx) = selected_idx
+                && idx < options.len()
+            {
+                println!("Options:");
+                for (i, opt) in options.iter().enumerate() {
+                    println!("{}: {}", i, opt);
+                }
+                println!(
+                    "{} (test override: auto-selecting option {})",
+                    message, options[idx]
+                );
+                return Ok(options[idx].clone());
+            }
         }
         println!("{} (auto-selecting first option: {})", message, options[0]);
         return Ok(options[0].clone());
