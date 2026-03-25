@@ -275,6 +275,100 @@ exit 1
     );
 }
 
+#[test]
+fn single_commit_body_prefill_in_editor() {
+    let (dir, _repo) = setup_simple_stack();
+
+    // Overwrite the feature branch commit message to have a body
+    run_ok("git", &["checkout", "feature"], dir.path());
+    run_ok(
+        "git",
+        &[
+            "commit",
+            "--amend",
+            "-m",
+            "feat: add feature\n\nThis is the detailed description of the feature.",
+        ],
+        dir.path(),
+    );
+
+    // Set up remote and push
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+
+    // Checkout feature branch so stack detection finds it
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    // Create mock gh that captures the PR body
+    let gh_pr_args = dir.path().join("gh_pr_args.txt");
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        format!(
+            r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo "no pull requests found for branch" >&2
+    exit 1
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
+    printf "%s\n" "$@" > "{}"
+    echo "https://github.com/test/repo/pull/1"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+            gh_pr_args.display()
+        ),
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = kin_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr failed: {:?}\nstderr: {}",
+        output,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let pr_args = std::fs::read_to_string(&gh_pr_args).unwrap();
+
+    // The body argument to gh pr create should contain the commit message body
+    assert!(
+        pr_args.contains("This is the detailed description of the feature."),
+        "PR body should contain commit body. Got:\n{}",
+        pr_args
+    );
+}
+
 /// Test that after `kin sync`, `kin pr` uses the correct base (origin/main)
 /// even when the local main branch is behind origin/main.
 ///
