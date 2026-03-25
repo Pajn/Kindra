@@ -1092,6 +1092,7 @@ fn parse_pr_number_from_url(url: &str) -> Result<u64> {
 
 pub(crate) struct CommitSummary {
     pub subject: String,
+    pub body: String,
 }
 
 pub(crate) fn get_branch_commits(
@@ -1112,9 +1113,14 @@ pub(crate) fn get_branch_commits(
     let mut commits = Vec::new();
     for oid in revwalk {
         let commit = repo.find_commit(oid?)?;
-        commits.push(CommitSummary {
-            subject: commit.summary().unwrap_or("").to_string(),
-        });
+        let full_message = commit.message().unwrap_or("");
+        let subject = commit.summary().unwrap_or("").to_string();
+        let body = full_message
+            .strip_prefix(&subject)
+            .unwrap_or("")
+            .trim_start()
+            .to_string();
+        commits.push(CommitSummary { subject, body });
     }
 
     Ok(commits)
@@ -1168,7 +1174,11 @@ fn prompt_body(branch_name: &str, commits: &[CommitSummary]) -> Result<String> {
     // Try to read PR template
     let template = read_pr_template().unwrap_or_default();
 
-    let editor_prefill = format!("{}\n{}", preamble, template);
+    let editor_prefill = if commits.len() == 1 && !commits[0].body.is_empty() {
+        format!("{}\n\n{}\n\n{}", commits[0].body, preamble, template)
+    } else {
+        format!("{}\n\n{}", preamble, template)
+    };
 
     if !std::io::stdin().is_terminal() {
         return Ok(editor_prefill);
