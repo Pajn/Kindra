@@ -235,6 +235,44 @@ perl -i -pe 's/.*branch current.*\n?//g' "$file"
 }
 
 #[test]
+fn test_split_checkout_branch_at_current_commit() {
+    let (dir, repo) = setup_repo();
+
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    let head_id = head.id();
+
+    let editor_script = dir.path().join("editor.sh");
+    fs::write(
+        &editor_script,
+        r#"#!/bin/sh
+file=$1
+perl -i -pe 's/(commit 3)/$1\nbranch new-feat/' "$file"
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&editor_script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&editor_script, perms).unwrap();
+    }
+
+    let mut cmd = kin_cmd();
+    cmd.arg("split")
+        .current_dir(dir.path())
+        .env("EDITOR", &editor_script)
+        .assert()
+        .success();
+
+    assert!(!repo.head_detached().unwrap());
+    let branch = repo
+        .find_branch("new-feat", git2::BranchType::Local)
+        .unwrap();
+    assert_eq!(branch.get().target().unwrap(), head_id);
+}
+
+#[test]
 fn test_push_multiple_remotes_no_origin_when_stack_empty() {
     let (dir, repo) = setup_repo();
 
