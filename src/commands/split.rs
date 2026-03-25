@@ -160,7 +160,10 @@ pub fn split() -> Result<()> {
     }
 
     let mut next_branches: HashMap<String, String> = HashMap::new();
-    for (name, id_short) in new_branch_map {
+    let mut new_branch_map_full: Vec<(String, String)> = Vec::new();
+    for (name, id_short) in &new_branch_map {
+        let name = name.clone();
+        let id_short = id_short.clone();
         // Map short ID back to full ID
         let matches: Vec<_> = commits
             .iter()
@@ -187,13 +190,16 @@ pub fn split() -> Result<()> {
             return Err(anyhow!("Duplicate branch row for branch {}", name));
         }
 
-        next_branches.insert(name, matches[0].id.clone());
+        let full_id = matches[0].id.clone();
+        next_branches.insert(name.clone(), full_id.clone());
+        new_branch_map_full.push((name, full_id));
     }
 
     // Apply changes
     apply_split(
         &repo,
         next_branches,
+        new_branch_map_full,
         path_branches.iter().map(|b| b.name.clone()).collect(),
         commit_ids,
     )?;
@@ -204,6 +210,7 @@ pub fn split() -> Result<()> {
 fn apply_split(
     repo: &Repository,
     next_branches: HashMap<String, String>,
+    new_branch_map: Vec<(String, String)>,
     initial_branches: Vec<String>,
     allowed_ids: HashSet<String>,
 ) -> Result<()> {
@@ -316,6 +323,17 @@ fn apply_split(
             println!("Moved branch: {} -> {}", name, &id[..7]);
         } else {
             println!("Created branch: {} -> {}", name, &id[..7]);
+        }
+    }
+
+    if repo.head_detached()? {
+        let head_commit = repo.head()?.peel_to_commit()?;
+        let head_id_str = head_commit.id().to_string();
+        for (name, commit_id) in &new_branch_map {
+            if commit_id == &head_id_str {
+                repo.set_head(&format!("refs/heads/{}", name))?;
+                break;
+            }
         }
     }
 
