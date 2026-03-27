@@ -610,6 +610,7 @@ pub fn collect_merged_local_branches(
 pub struct FloatingTargetContext {
     candidates: Vec<FloatingTargetCandidate>,
     candidate_ids: HashSet<Oid>,
+    candidate_positions: HashMap<Oid, usize>,
     patch_ids: HashSet<String>,
     reflog_ids: HashSet<Oid>,
 }
@@ -621,6 +622,12 @@ struct FloatingTargetCandidate {
     summary: String,
     email: String,
     parent_id: Option<Oid>,
+}
+
+#[derive(Clone, Copy)]
+struct FloatingBaseMatch {
+    branch_id: Oid,
+    target_index: usize,
 }
 
 fn floating_patch_id_boundary(
@@ -663,7 +670,7 @@ pub fn build_floating_target_context(
     history_limit: usize,
     patch_id_cache: &mut HashMap<Oid, Option<String>>,
 ) -> Result<FloatingTargetContext> {
-    let mut candidates = Vec::new();
+    let mut all_candidates = Vec::new();
     let mut commit_ids = Vec::new();
     let mut current = Some(target_commit.id());
     let mut remaining = history_limit;
@@ -673,7 +680,7 @@ pub fn build_floating_target_context(
             break;
         }
         let commit = repo.find_commit(commit_id)?;
-        candidates.push(FloatingTargetCandidate {
+        all_candidates.push(FloatingTargetCandidate {
             id: commit_id,
             tree_id: commit.tree_id(),
             summary: commit.summary().unwrap_or("").trim().to_string(),
@@ -696,6 +703,18 @@ pub fn build_floating_target_context(
     }
 
     let patch_id_boundary = floating_patch_id_boundary(repo, target_commit.id(), target_branch)?;
+    let private_len = match patch_id_boundary {
+        Some(boundary) => commit_ids
+            .iter()
+            .position(|oid| *oid == boundary)
+            .unwrap_or(commit_ids.len()),
+        None => commit_ids.len(),
+    };
+    let private_len = if private_len == 0 {
+        commit_ids.len()
+    } else {
+        private_len
+    };
     let patch_commit_ids: Vec<Oid> = match patch_id_boundary {
         Some(boundary) => commit_ids
             .iter()
@@ -713,11 +732,20 @@ pub fn build_floating_target_context(
         .iter()
         .filter_map(|oid| patch_id_cache.get(oid).and_then(|v| v.as_ref()).cloned())
         .collect();
+    let candidates: Vec<FloatingTargetCandidate> =
+        all_candidates.into_iter().take(private_len).collect();
+    let candidate_ids = candidates.iter().map(|candidate| candidate.id).collect();
+    let candidate_positions = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| (candidate.id, index))
+        .collect();
     let reflog_ids = read_branch_reflog_ids(repo, target_branch);
 
     Ok(FloatingTargetContext {
-        candidate_ids: commit_ids.into_iter().collect(),
         candidates,
+        candidate_ids,
+        candidate_positions,
         patch_ids,
         reflog_ids,
     })
@@ -730,6 +758,17 @@ pub fn find_floating_base(
     history_limit: usize,
     patch_id_cache: &mut HashMap<Oid, Option<String>>,
 ) -> Result<Option<Oid>> {
+    find_floating_match(repo, branch_tip, target, history_limit, patch_id_cache)
+        .map(|found| found.map(|matching| matching.branch_id))
+}
+
+fn find_floating_match(
+    repo: &Repository,
+    branch_tip: Oid,
+    target: &FloatingTargetContext,
+    history_limit: usize,
+    patch_id_cache: &mut HashMap<Oid, Option<String>>,
+) -> Result<Option<FloatingBaseMatch>> {
     let target_id = target
         .candidates
         .first()
@@ -769,17 +808,23 @@ pub fn find_floating_base(
             remaining -= 1;
         }
 
-        if target.candidate_ids.contains(&oid) {
+        if let Some(&target_index) = target.candidate_positions.get(&oid) {
             if oid != branch_tip {
-                return Ok(Some(oid));
+                let matching = FloatingBaseMatch {
+                    branch_id: oid,
+                    target_index,
+                };
+                if validate_floating_match(repo, branch_tip, matching, target, patch_id_cache)? {
+                    return Ok(Some(matching));
+                }
             }
             continue;
         }
 
         // Match by tree-hash against rewritten target commits, but only if the
         // surrounding parent commit also lines up with the rewritten lineage.
-        let mut has_tree_match = false;
-        for candidate in &target.candidates {
+        let mut tree_match = None;
+        for (target_index, candidate) in target.candidates.iter().enumerate() {
             if candidate.tree_id != commit.tree_id() {
                 continue;
             }
@@ -789,18 +834,32 @@ pub fn find_floating_base(
                 candidate.parent_id,
                 patch_id_cache,
             )? {
-                has_tree_match = true;
+                tree_match = Some(target_index);
                 break;
             }
         }
-        if has_tree_match && oid != branch_tip {
-            return Ok(Some(oid));
+        if let Some(target_index) = tree_match
+            && oid != branch_tip
+        {
+            let matching = FloatingBaseMatch {
+                branch_id: oid,
+                target_index,
+            };
+            if validate_floating_match(repo, branch_tip, matching, target, patch_id_cache)? {
+                return Ok(Some(matching));
+            }
         }
 
         // Metadata matches narrow the patch-id fallback, but are not sufficient on their own.
-        if metadata_matches_target_candidate(&commit, oid, target)? {
-            if oid != branch_tip {
-                return Ok(Some(oid));
+        if let Some(target_index) = metadata_matches_target_candidate(&commit, oid, target)?
+            && oid != branch_tip
+        {
+            let matching = FloatingBaseMatch {
+                branch_id: oid,
+                target_index,
+            };
+            if validate_floating_match(repo, branch_tip, matching, target, patch_id_cache)? {
+                return Ok(Some(matching));
             }
             continue;
         }
@@ -862,7 +921,14 @@ pub fn find_floating_base(
 
                 if !old_parent_ancestor_of_any_candidate {
                     // OLD.parent is NOT an ancestor of any candidate - it's orphaned, rebase fork
-                    return Ok(Some(oid));
+                    let matching = FloatingBaseMatch {
+                        branch_id: oid,
+                        target_index: 0,
+                    };
+                    if validate_floating_match(repo, branch_tip, matching, target, patch_id_cache)?
+                    {
+                        return Ok(Some(matching));
+                    }
                 }
             }
         }
@@ -884,8 +950,8 @@ pub fn find_floating_base(
 
         let commit = repo.find_commit(oid)?;
         let parent_id = first_parent_id(&commit)?;
-        let mut has_patch_match = false;
-        for candidate in &target.candidates {
+        let mut patch_match = None;
+        for (target_index, candidate) in target.candidates.iter().enumerate() {
             let Some(candidate_patch_id) =
                 patch_id_cache.get(&candidate.id).and_then(|v| v.as_ref())
             else {
@@ -901,12 +967,18 @@ pub fn find_floating_base(
                 patch_id_cache,
             )? || is_tip_patch_rewrite(&commit, candidate, target_id)
             {
-                has_patch_match = true;
+                patch_match = Some(target_index);
                 break;
             }
         }
-        if has_patch_match {
-            return Ok(Some(oid));
+        if let Some(target_index) = patch_match {
+            let matching = FloatingBaseMatch {
+                branch_id: oid,
+                target_index,
+            };
+            if validate_floating_match(repo, branch_tip, matching, target, patch_id_cache)? {
+                return Ok(Some(matching));
+            }
         }
     }
 
@@ -1007,9 +1079,9 @@ fn metadata_matches_target_candidate(
     commit: &Commit,
     oid: Oid,
     target: &FloatingTargetContext,
-) -> Result<bool> {
+) -> Result<Option<usize>> {
     if !target.reflog_ids.contains(&oid) {
-        return Ok(false);
+        return Ok(None);
     }
 
     let summary = commit.summary().unwrap_or("").trim();
@@ -1021,9 +1093,121 @@ fn metadata_matches_target_candidate(
         None
     };
 
-    Ok(target.candidates.iter().any(|candidate| {
+    Ok(target.candidates.iter().position(|candidate| {
         candidate.summary == summary && candidate.email == email && candidate.parent_id == parent_id
     }))
+}
+
+fn validate_floating_match(
+    repo: &Repository,
+    branch_tip: Oid,
+    matching: FloatingBaseMatch,
+    target: &FloatingTargetContext,
+    patch_id_cache: &mut HashMap<Oid, Option<String>>,
+) -> Result<bool> {
+    let Some(target_tip) = target.candidates.first().map(|candidate| candidate.id) else {
+        return Ok(false);
+    };
+    let branch_chain = match repo.merge_base(branch_tip, target_tip) {
+        Ok(graph_merge_base) => collect_first_parent_chain(repo, graph_merge_base, branch_tip)?,
+        Err(_) => collect_first_parent_chain_to_root(repo, branch_tip)?,
+    };
+    let Some(match_index) = branch_chain
+        .iter()
+        .position(|oid| *oid == matching.branch_id)
+    else {
+        return Ok(false);
+    };
+
+    // Floating branches must have at least one commit ahead of the matched old base.
+    if match_index + 1 >= branch_chain.len() {
+        return Ok(false);
+    }
+
+    let mut chain_len = 1usize;
+    let mut branch_index = match_index;
+    let mut target_index = matching.target_index;
+
+    while branch_index > 0 && target_index + 1 < target.candidates.len() {
+        let branch_oid = branch_chain[branch_index - 1];
+        let candidate = &target.candidates[target_index + 1];
+        if !branch_commit_matches_target_candidate(
+            repo,
+            branch_oid,
+            candidate,
+            target,
+            patch_id_cache,
+        )? {
+            break;
+        }
+        chain_len += 1;
+        branch_index -= 1;
+        target_index += 1;
+    }
+
+    if chain_len >= 2 {
+        return Ok(true);
+    }
+
+    // Fallback: a single matched point is enough only when it is the branch's immediate
+    // fork point above the graph merge-base, meaning all newer commits belong to the suffix
+    // that should be replayed.
+    Ok(match_index == 0)
+}
+
+fn collect_first_parent_chain_to_root(repo: &Repository, tip: Oid) -> Result<Vec<Oid>> {
+    let mut chain = Vec::new();
+    let mut current = Some(tip);
+
+    while let Some(oid) = current {
+        chain.push(oid);
+        let commit = repo.find_commit(oid)?;
+        current = if commit.parent_count() > 0 {
+            Some(commit.parent_id(0)?)
+        } else {
+            None
+        };
+    }
+
+    chain.reverse();
+    Ok(chain)
+}
+
+fn branch_commit_matches_target_candidate(
+    repo: &Repository,
+    branch_oid: Oid,
+    candidate: &FloatingTargetCandidate,
+    target: &FloatingTargetContext,
+    patch_id_cache: &mut HashMap<Oid, Option<String>>,
+) -> Result<bool> {
+    if branch_oid == candidate.id {
+        return Ok(true);
+    }
+
+    let branch_commit = repo.find_commit(branch_oid)?;
+    if branch_commit.tree_id() == candidate.tree_id {
+        return Ok(true);
+    }
+
+    ensure_patch_ids(repo, &[branch_oid, candidate.id], patch_id_cache)?;
+    let branch_patch_id = patch_id_cache
+        .get(&branch_oid)
+        .and_then(|value| value.as_ref());
+    let candidate_patch_id = patch_id_cache
+        .get(&candidate.id)
+        .and_then(|value| value.as_ref());
+    if branch_patch_id.is_some() && branch_patch_id == candidate_patch_id {
+        return Ok(true);
+    }
+
+    if target.reflog_ids.contains(&branch_oid)
+        && candidate.summary == branch_commit.summary().unwrap_or("").trim()
+        && candidate.email == branch_commit.author().email().unwrap_or("")
+    {
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 fn read_branch_reflog_ids(repo: &Repository, branch_name: &str) -> HashSet<Oid> {
