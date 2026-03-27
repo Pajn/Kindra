@@ -1,7 +1,7 @@
 mod common;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use common::{kin_cmd, make_commit, repo_init, run_ok};
+use common::{kin_cmd, make_commit, repo_init, run_ok, write_repo_config};
 use git2::{BranchType, Repository};
 use kindra::commands::pr::resolve_stack_boundary_and_base;
 use std::fs;
@@ -3779,6 +3779,394 @@ exit 1
     assert!(combined.contains("Merge prevented for PR #42"));
     assert!(!combined.contains("Merge anyway despite outstanding reviews/checks?"));
     assert!(!merge_args_path.exists());
+}
+
+#[test]
+fn pr_flatten_retargets_all_open_stack_prs_to_resolved_upstream_base() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"baseRefName":"feature/base-a","state":"OPEN","isDraft":false}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"baseRefName":"feature-a","state":"OPEN","isDraft":false}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s\n" "$@" >> "$MOCK_GH_EDIT_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let edit_args_path = dir.path().join("edit_args.txt");
+    let output = kin_cmd()
+        .args(["pr", "flatten"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr flatten failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let edit_args = fs::read_to_string(&edit_args_path).unwrap();
+    assert!(edit_args.contains("pr\nedit\n10\n--base\nmain"));
+    assert!(edit_args.contains("pr\nedit\n11\n--base\nmain"));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Flatten summary: updated=2, already_on_base=0, failed=0, no_open_pr=0")
+    );
+}
+
+#[test]
+fn pr_flatten_uses_resolved_upstream_not_hardcoded_main() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let main_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "main.txt",
+        "main",
+        "main commit",
+        &[],
+    );
+    let trunk_id = {
+        let main = repo.find_commit(main_id).unwrap();
+        make_commit(
+            &repo,
+            "refs/heads/trunk",
+            "trunk.txt",
+            "trunk",
+            "trunk commit",
+            &[&main],
+        )
+    };
+    {
+        let trunk = repo.find_commit(trunk_id).unwrap();
+        make_commit(
+            &repo,
+            "refs/heads/feature",
+            "feature.txt",
+            "feature",
+            "feature commit",
+            &[&trunk],
+        );
+    }
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    write_repo_config(dir.path(), "upstream_branch = \"trunk\"\n");
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "trunk", "feature"],
+        dir.path(),
+    );
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature" ]]; then
+        echo '{"number":21,"baseRefName":"main","state":"OPEN","isDraft":false}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s\n" "$@" >> "$MOCK_GH_EDIT_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let edit_args_path = dir.path().join("edit_args.txt");
+    let output = kin_cmd()
+        .args(["pr", "flatten"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr flatten failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let edit_args = fs::read_to_string(&edit_args_path).unwrap();
+    assert!(edit_args.contains("pr\nedit\n21\n--base\ntrunk"));
+    assert!(!edit_args.contains("pr\nedit\n21\n--base\nmain"));
+}
+
+#[test]
+fn pr_flatten_continues_on_partial_failures_and_exits_nonzero() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"baseRefName":"feature/base-a","state":"OPEN","isDraft":false}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"baseRefName":"feature-a","state":"OPEN","isDraft":false}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s\n" "$@" >> "$MOCK_GH_EDIT_ARGS"
+    if [[ "$3" == "10" ]]; then
+        echo "mock failure updating #10" >&2
+        exit 1
+    fi
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let edit_args_path = dir.path().join("edit_args.txt");
+    let output = kin_cmd()
+        .args(["pr", "flatten"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "kin pr flatten unexpectedly succeeded: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let edit_args = fs::read_to_string(&edit_args_path).unwrap();
+    assert!(edit_args.contains("pr\nedit\n10\n--base\nmain"));
+    assert!(edit_args.contains("pr\nedit\n11\n--base\nmain"));
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Flatten summary: updated=1, already_on_base=0, failed=1, no_open_pr=0")
+    );
+}
+
+#[test]
+fn pr_flatten_does_not_mutate_local_git_or_pr_body_metadata() {
+    let (dir, repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let before_feature_a = repo
+        .find_branch("feature-a", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let before_feature_b = repo
+        .find_branch("feature-b", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"baseRefName":"feature/base-a","state":"OPEN","isDraft":false}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"baseRefName":"feature-a","state":"OPEN","isDraft":false}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    if [[ "$4" != "--base" ]]; then
+        echo "unexpected gh pr edit invocation: $@" >&2
+        exit 1
+    fi
+    printf "%s\n" "$@" >> "$MOCK_GH_EDIT_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let edit_args_path = dir.path().join("edit_args.txt");
+    let output = kin_cmd()
+        .args(["pr", "flatten"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr flatten failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let after_feature_a = repo
+        .find_branch("feature-a", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let after_feature_b = repo
+        .find_branch("feature-b", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    assert_eq!(before_feature_a, after_feature_a);
+    assert_eq!(before_feature_b, after_feature_b);
+
+    let edit_args = fs::read_to_string(&edit_args_path).unwrap();
+    assert!(edit_args.contains("pr\nedit\n10\n--base\nmain"));
+    assert!(edit_args.contains("pr\nedit\n11\n--base\nmain"));
+    assert!(!edit_args.contains("--title"));
+    assert!(!edit_args.contains("--body"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

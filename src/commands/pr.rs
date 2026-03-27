@@ -19,6 +19,8 @@ pub enum PrSubcommand {
     Open,
     /// Edit an existing PR from the current stack
     Edit,
+    /// Retarget open stack PRs to the resolved upstream base branch
+    Flatten,
     /// Merge an open PR from the current stack
     Merge,
     /// Show status summary for all open PRs in the current stack
@@ -62,6 +64,7 @@ pub fn pr(subcommand: &Option<PrSubcommand>, push: bool, labels: &[String]) -> R
     match subcommand {
         Some(PrSubcommand::Open) => pr_open(),
         Some(PrSubcommand::Edit) => pr_edit(),
+        Some(PrSubcommand::Flatten) => pr_flatten(),
         Some(PrSubcommand::Merge) => pr_merge(),
         Some(PrSubcommand::Status) => pr_status(),
         Some(PrSubcommand::Review(args)) => pr_review(args),
@@ -285,6 +288,85 @@ fn pr_edit() -> Result<()> {
         reviewers,
     })?;
     println!("✓ PR updated: {}", existing.url);
+    Ok(())
+}
+
+fn pr_flatten() -> Result<()> {
+    gh::check_gh().context("GitHub CLI check failed")?;
+
+    let repo = crate::open_repo()?;
+    let (upstream_name, branches_with_upstream) = discover_stack_branches_with_upstream(&repo)?;
+
+    if branches_with_upstream.is_empty() {
+        println!("No branches with a remote upstream in stack.");
+        println!("Run `kin push` first to set upstreams.");
+        return Ok(());
+    }
+
+    let target_base = normalize_base_for_gh(&upstream_name);
+    println!(
+        "Flattening stack PRs onto '{}' (resolved from '{}').",
+        target_base, upstream_name
+    );
+
+    let mut updated = 0usize;
+    let mut already_on_base = 0usize;
+    let mut failed = 0usize;
+    let mut no_open_pr = 0usize;
+    let mut failures = Vec::new();
+
+    for (sb, _remote_upstream) in &branches_with_upstream {
+        match gh::find_open_pr(&sb.name) {
+            Ok(Some(existing)) => {
+                if existing.base_branch == target_base {
+                    println!(
+                        "PR #{} for '{}' is already based on '{}'.",
+                        existing.number, sb.name, target_base
+                    );
+                    already_on_base += 1;
+                    continue;
+                }
+
+                println!(
+                    "Retargeting PR #{} for '{}' from '{}' to '{}'.",
+                    existing.number, sb.name, existing.base_branch, target_base
+                );
+                match gh::update_pr_base(existing.number, &target_base) {
+                    Ok(()) => {
+                        println!("✓ Retargeted PR #{}", existing.number);
+                        updated += 1;
+                    }
+                    Err(err) => {
+                        eprintln!("✗ Failed to retarget PR #{}: {}", existing.number, err);
+                        failed += 1;
+                        failures.push(format!("#{} ({}): {}", existing.number, sb.name, err));
+                    }
+                }
+            }
+            Ok(None) => {
+                println!("No open PR found for '{}'; skipping.", sb.name);
+                no_open_pr += 1;
+            }
+            Err(err) => {
+                eprintln!("✗ Failed to inspect PR for '{}': {}", sb.name, err);
+                failed += 1;
+                failures.push(format!("{}: {}", sb.name, err));
+            }
+        }
+    }
+
+    println!(
+        "Flatten summary: updated={}, already_on_base={}, failed={}, no_open_pr={}",
+        updated, already_on_base, failed, no_open_pr
+    );
+
+    if failed > 0 {
+        for detail in failures {
+            eprintln!("  - {}", detail);
+        }
+        return Err(anyhow!("Failed to flatten one or more PRs."));
+    }
+
     Ok(())
 }
 
