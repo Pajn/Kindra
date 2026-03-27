@@ -60,7 +60,7 @@ impl PrReviewArgs {
     }
 }
 
-pub fn pr(subcommand: &Option<PrSubcommand>, push: bool, labels: &[String]) -> Result<()> {
+pub fn pr(subcommand: &Option<PrSubcommand>, no_push: bool, labels: &[String]) -> Result<()> {
     match subcommand {
         Some(PrSubcommand::Open) => pr_open(),
         Some(PrSubcommand::Edit) => pr_edit(),
@@ -68,7 +68,7 @@ pub fn pr(subcommand: &Option<PrSubcommand>, push: bool, labels: &[String]) -> R
         Some(PrSubcommand::Merge) => pr_merge(),
         Some(PrSubcommand::Status) => pr_status(),
         Some(PrSubcommand::Review(args)) => pr_review(args),
-        None => pr_create_or_update(push, labels),
+        None => pr_create_or_update(no_push, labels),
     }
 }
 
@@ -99,14 +99,13 @@ struct RenderItem {
     is_merged: bool,
 }
 
-fn pr_create_or_update(should_push: bool, labels: &[String]) -> Result<()> {
+fn pr_create_or_update(skip_preflight: bool, labels: &[String]) -> Result<()> {
     gh::check_gh().context("GitHub CLI check failed")?;
 
     let repo = crate::open_repo()?;
 
-    if should_push {
-        println!("Pushing branches first...\n");
-        crate::commands::push::push()?;
+    if !skip_preflight {
+        run_pr_create_or_update_preflight(&repo)?;
     }
 
     let (upstream_name, branches_with_upstream) = discover_stack_branches_with_upstream(&repo)?;
@@ -149,6 +148,49 @@ fn pr_create_or_update(should_push: bool, labels: &[String]) -> Result<()> {
     sync_stack_descriptions(&open_prs)?;
 
     Ok(())
+}
+
+fn run_pr_create_or_update_preflight(repo: &Repository) -> Result<()> {
+    let (upstream_name, branches_with_upstream) = discover_stack_branches_with_upstream(repo)?;
+
+    if !branches_with_upstream.is_empty()
+        && stack_pr_bases_need_flatten(repo, &branches_with_upstream, &upstream_name)?
+    {
+        println!("Detected PR base mismatches relative to the local stack. Flattening first...\n");
+        flatten_stack_prs_to_upstream(&branches_with_upstream, &upstream_name)?;
+        println!();
+    }
+
+    println!("Pushing branches first...\n");
+    crate::commands::push::push()?;
+    println!();
+
+    Ok(())
+}
+
+fn stack_pr_bases_need_flatten(
+    repo: &Repository,
+    branches_with_upstream: &[(StackBranch, String)],
+    upstream_name: &str,
+) -> Result<bool> {
+    let base_map = compute_base_map(repo, branches_with_upstream, upstream_name)?;
+
+    for (sb, _remote_upstream) in branches_with_upstream {
+        let Some(existing) = gh::find_open_pr(&sb.name)? else {
+            continue;
+        };
+
+        let expected_base = base_map
+            .get(&sb.name)
+            .map(|base| normalize_base_for_gh(base))
+            .unwrap_or_else(|| normalize_base_for_gh(upstream_name));
+
+        if existing.base_branch != expected_base {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn pr_open() -> Result<()> {
@@ -303,7 +345,14 @@ fn pr_flatten() -> Result<()> {
         return Ok(());
     }
 
-    let target_base = normalize_base_for_gh(&upstream_name);
+    flatten_stack_prs_to_upstream(&branches_with_upstream, &upstream_name)
+}
+
+fn flatten_stack_prs_to_upstream(
+    branches_with_upstream: &[(StackBranch, String)],
+    upstream_name: &str,
+) -> Result<()> {
+    let target_base = normalize_base_for_gh(upstream_name);
     println!(
         "Flattening stack PRs onto '{}' (resolved from '{}').",
         target_base, upstream_name
@@ -315,7 +364,7 @@ fn pr_flatten() -> Result<()> {
     let mut no_open_pr = 0usize;
     let mut failures = Vec::new();
 
-    for (sb, _remote_upstream) in &branches_with_upstream {
+    for (sb, _remote_upstream) in branches_with_upstream {
         match gh::find_open_pr(&sb.name) {
             Ok(Some(existing)) => {
                 if existing.base_branch == target_base {
