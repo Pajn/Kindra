@@ -471,6 +471,7 @@ kin run -c "echo 'Hello from $(git branch --show-current)'"
 kin pr
 kin pr open
 kin pr edit
+kin pr flatten
 kin pr merge
 kin pr status
 kin pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--reviewer <login>] [--bots|--no-bots]
@@ -479,11 +480,14 @@ kin pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--reviewe
 - `kin pr`: Create/update PRs for stack branches with upstreams.
 - `kin pr open`: Open a PR URL in the default browser (if multiple, choose one).
 - `kin pr edit`: Select a PR (if multiple), then edit title/body/labels/reviewers.
+- `kin pr flatten`: Retarget every open PR in the current stack to the resolved upstream base branch on GitHub (for example, `origin/main` normalizes to `main`).
 - `kin pr merge`: Select an open PR in the current stack and merge it only when review/check state is ready, or prompt/error with the blocking reasons.
 - `kin pr status`: Show each stack PR's reviewer status, unresolved comments, and running/failed checks. It also reports any interrupted `kin commit`, `kin move`, `kin reorder`, `kin sync`, or `kin restack` operation in the current repo and points you to `kin continue`/`kin abort` or native Git rebase commands when there is no saved Kindra state.
 - `kin pr review`: Select an open PR in the current stack, fetch its review threads through `gh api graphql`, and render them as markdown.
 
 `kin pr merge` automatically merges when the PR has no unresolved review comments, no outstanding review state, no running/failed checks, and GitHub reports the PR as mergeable. If issues remain but GitHub would still allow merging, Kindra prints the outstanding reviews/checks and asks for confirmation. If GitHub/repository rules block the merge, Kindra exits with a clear reason instead of attempting it.
+
+`kin pr flatten` only updates PR base branches on GitHub. It does not modify local git refs, stack relationships, PR titles, or PR bodies.
 
 `kin pr review` defaults to unresolved threads only, includes both human and bot comments, and keeps outdated comments unless you opt out.
 
