@@ -46,9 +46,9 @@ enum Commands {
     Pr {
         #[command(subcommand)]
         subcommand: Option<PrSubcommand>,
-        /// Push branches to remote before creating PRs
+        /// Skip the automatic flatten/push preflight before creating PRs
         #[arg(long)]
-        push: bool,
+        no_push: bool,
         /// Set labels on all created PRs (can be specified multiple times)
         #[arg(long)]
         label: Vec<String>,
@@ -135,9 +135,9 @@ fn main() -> Result<()> {
         Commands::Push => push()?,
         Commands::Pr {
             subcommand,
-            push,
+            no_push,
             label,
-        } => pr(subcommand, *push, label)?,
+        } => pr(subcommand, *no_push, label)?,
         Commands::Checkout { subcommand, all } => checkout(subcommand, *all)?,
         Commands::Move(args) => move_cmd(args)?,
         Commands::Reorder(args) => reorder(args)?,

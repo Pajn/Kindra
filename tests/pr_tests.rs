@@ -197,7 +197,8 @@ fn pr_no_upstreams_message() {
     let acceptable = combined.contains("No branches")
         || combined.contains("gh")
         || combined.contains("authenticated")
-        || combined.contains("not found");
+        || combined.contains("not found")
+        || combined.contains("No remotes configured");
 
     assert!(acceptable, "Unexpected output from `kin pr`:\n{}", combined);
 }
@@ -449,7 +450,7 @@ exit 1
 }
 
 #[test]
-fn test_pr_push_flag() {
+fn test_pr_pushes_by_default() {
     let (dir, _repo) = setup_simple_stack();
 
     // Set up remote and push
@@ -461,7 +462,7 @@ fn test_pr_push_flag() {
         &["remote", "add", "origin", remote_dir.to_str().unwrap()],
         dir.path(),
     );
-    // Note: NOT pushing feature branch - that's what --push should handle
+    // Note: NOT pushing feature branch - default kin pr should now preflight push.
 
     run_ok("git", &["checkout", "feature"], dir.path());
 
@@ -489,7 +490,70 @@ exit 1
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
     let output = kin_cmd()
-        .args(["pr", "--push"])
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "kin pr failed: {:?}", output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Verify that kin prints the push message
+    assert!(
+        stdout.contains("Pushing branches first"),
+        "kin pr should indicate it's pushing branches first. Got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_pr_no_push_skips_preflight_push() {
+    let (dir, _repo) = setup_simple_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo "no pull requests found for branch" >&2
+    exit 1
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
+    echo "https://github.com/test/repo/pull/1"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = kin_cmd()
+        .args(["pr", "--no-push"])
         .current_dir(dir.path())
         .env(
             "PATH",
@@ -504,16 +568,14 @@ exit 1
 
     assert!(
         output.status.success(),
-        "kin pr --push failed: {:?}",
+        "kin pr --no-push failed: {:?}",
         output
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Verify that kin prints the push message
     assert!(
-        stdout.contains("Pushing branches first"),
-        "kin pr --push should indicate it's pushing branches first. Got:\n{}",
+        !stdout.contains("Pushing branches first"),
+        "kin pr --no-push should skip the preflight push. Got:\n{}",
         stdout
     );
 }
@@ -4167,6 +4229,347 @@ exit 1
     assert!(edit_args.contains("pr\nedit\n11\n--base\nmain"));
     assert!(!edit_args.contains("--title"));
     assert!(!edit_args.contains("--body"));
+}
+
+#[test]
+fn pr_default_preflight_flattens_pushes_and_then_runs_normal_pr_logic() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","baseRefName":"wrong-a","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","baseRefName":"wrong-b","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s\n" "$@" >> "$MOCK_GH_EDIT_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let edit_args_path = dir.path().join("edit_args.txt");
+    let output = kin_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Detected PR base mismatches relative to the local stack"));
+    assert!(stdout.contains("Flattening stack PRs onto 'main'"));
+    assert!(stdout.contains("Pushing branches first"));
+    assert!(stdout.contains("Found 2 branch(es) with upstreams. Processing PRs..."));
+
+    let flatten_idx = stdout.find("Flattening stack PRs onto 'main'").unwrap();
+    let push_idx = stdout.find("Pushing branches first").unwrap();
+    let process_idx = stdout
+        .find("Found 2 branch(es) with upstreams. Processing PRs...")
+        .unwrap();
+    assert!(flatten_idx < push_idx);
+    assert!(push_idx < process_idx);
+
+    let edit_args = fs::read_to_string(&edit_args_path).unwrap();
+    assert!(edit_args.contains("pr\nedit\n10\n--base\nmain"));
+    assert!(edit_args.contains("pr\nedit\n11\n--base\nmain"));
+    assert!(edit_args.contains("pr\nedit\n11\n--base\nfeature-a"));
+}
+
+#[test]
+fn pr_default_preflight_skips_flatten_when_pr_bases_match() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","baseRefName":"main","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","baseRefName":"feature-a","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s\n" "$@" >> "$MOCK_GH_EDIT_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let edit_args_path = dir.path().join("edit_args.txt");
+    let output = kin_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr failed: {:?}",
+        output.status.code()
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("Detected PR base mismatches relative to the local stack"));
+    assert!(!stdout.contains("Flattening stack PRs onto"));
+    assert!(stdout.contains("Pushing branches first"));
+
+    let edit_args = fs::read_to_string(&edit_args_path).unwrap_or_default();
+    assert!(!edit_args.contains("--base\nmain"));
+}
+
+#[test]
+fn pr_no_push_skips_preflight_flatten() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","baseRefName":"main","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","baseRefName":"main","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s\n" "$@" >> "$MOCK_GH_EDIT_ARGS"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let edit_args_path = dir.path().join("edit_args.txt");
+    let output = kin_cmd()
+        .args(["pr", "--no-push"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr --no-push failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("Detected PR base mismatches relative to the local stack"));
+    assert!(!stdout.contains("Flattening stack PRs onto"));
+    assert!(!stdout.contains("Pushing branches first"));
+
+    let edit_args = fs::read_to_string(&edit_args_path).unwrap();
+    assert!(!edit_args.contains("pr\nedit\n11\n--base\nmain"));
+    assert!(edit_args.contains("pr\nedit\n11\n--base\nfeature-a"));
+}
+
+#[test]
+fn pr_preflight_flatten_failure_stops_before_push_and_pr_processing() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","baseRefName":"wrong-a","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","baseRefName":"wrong-b","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    printf "%s\n" "$@" >> "$MOCK_GH_EDIT_ARGS"
+    echo "flatten failed" >&2
+    exit 1
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
+    printf "%s\n" "$@" >> "$MOCK_GH_CREATE_ARGS"
+    echo "https://github.com/test/repo/pull/99"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let edit_args_path = dir.path().join("edit_args.txt");
+    let create_args_path = dir.path().join("create_args.txt");
+    let output = kin_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .env("MOCK_GH_CREATE_ARGS", &create_args_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "kin pr unexpectedly succeeded: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("Flattening stack PRs onto 'main'"));
+    assert!(!combined.contains("Pushing branches first"));
+    assert!(!combined.contains("Processing PRs"));
+    assert!(!create_args_path.exists());
+    assert!(edit_args_path.exists());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
