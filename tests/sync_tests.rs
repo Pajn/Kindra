@@ -239,6 +239,98 @@ fn sync_handles_squashed_lower_branch() {
 }
 
 #[test]
+fn sync_skips_top_branch_prefix_integrated_via_squash_after_later_target_changes() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "shared.txt",
+        "base\n",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    let prefix_a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "prefix a\n",
+        "feature prefix a",
+        &[&base],
+    );
+    let prefix_a = repo.find_commit(prefix_a_id).unwrap();
+
+    let prefix_b_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "config.txt",
+        "prefix b\n",
+        "feature prefix b",
+        &[&prefix_a],
+    );
+    let prefix_b = repo.find_commit(prefix_b_id).unwrap();
+
+    let old_feature_tip = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "tail.txt",
+        "tail\n",
+        "feature tail",
+        &[&prefix_b],
+    );
+
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    let squash_range = format!("{}^..{}", prefix_a_id, prefix_b_id);
+    run_ok(
+        "git",
+        &["cherry-pick", "--no-commit", &squash_range],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["commit", "-m", "squash feature prefix"],
+        dir.path(),
+    );
+    fs::write(dir.path().join("shared.txt"), "main follow-up\n").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "main follow-up"], dir.path());
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    let mut cmd = kin_cmd();
+    cmd.arg("sync")
+        .arg("--no-delete")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-a"));
+
+    let new_feature_tip = repo
+        .find_branch("feature-a", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let main_tip = repo
+        .find_branch("main", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let feature_tip_commit = repo.find_commit(new_feature_tip).unwrap();
+
+    assert_ne!(new_feature_tip, old_feature_tip);
+    assert!(repo.graph_descendant_of(new_feature_tip, main_tip).unwrap());
+    assert_eq!(feature_tip_commit.summary(), Some("feature tail"));
+    assert_eq!(feature_tip_commit.parent_id(0).unwrap(), main_tip);
+}
+
+#[test]
 fn sync_handles_merged_lower_branch() {
     let dir = tempdir().unwrap();
     let repo = repo_init(dir.path());

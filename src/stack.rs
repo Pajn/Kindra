@@ -40,6 +40,86 @@ pub struct GraphReorderPlan {
     pub new_base_map: HashMap<String, String>,
 }
 
+#[derive(Default)]
+struct TargetPathHistory {
+    commits: Vec<TargetPathCommit>,
+}
+
+struct TargetPathCommit {
+    id: Oid,
+    changed_paths: HashSet<String>,
+}
+
+impl TargetPathHistory {
+    fn load(repo: &Repository, target_tip: Oid, paths: &[String]) -> Result<Self> {
+        if paths.is_empty() {
+            return Ok(Self::default());
+        }
+
+        let output = Command::new("git")
+            .arg("log")
+            .arg("--format=__KINDRA_COMMIT__%H")
+            .arg("--name-only")
+            .arg("--no-renames")
+            .arg("--no-ext-diff")
+            .arg(target_tip.to_string())
+            .arg("--")
+            .args(paths)
+            .current_dir(repo_root(repo)?)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git log failed while indexing target history for sync containment checks."
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut commits = Vec::new();
+        let mut current: Option<TargetPathCommit> = None;
+
+        for line in stdout.lines() {
+            if let Some(raw_oid) = line.strip_prefix("__KINDRA_COMMIT__") {
+                if let Some(commit) = current.take() {
+                    commits.push(commit);
+                }
+                current = Some(TargetPathCommit {
+                    id: Oid::from_str(raw_oid.trim())?,
+                    changed_paths: HashSet::new(),
+                });
+                continue;
+            }
+
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            if let Some(commit) = current.as_mut() {
+                commit.changed_paths.insert(line.to_string());
+            }
+        }
+
+        if let Some(commit) = current {
+            commits.push(commit);
+        }
+
+        Ok(Self { commits })
+    }
+
+    fn covering_commits(&self, touched_paths: &[String]) -> Vec<Oid> {
+        self.commits
+            .iter()
+            .filter(|commit| {
+                commit.changed_paths.len() >= touched_paths.len()
+                    && touched_paths
+                        .iter()
+                        .all(|path| commit.changed_paths.contains(path))
+            })
+            .map(|commit| commit.id)
+            .collect()
+    }
+}
+
 pub fn find_sync_boundary(
     repo: &Repository,
     top_branch: &str,
@@ -63,14 +143,40 @@ pub fn find_sync_boundary(
     }
 
     let first_parent_chain = collect_first_parent_chain(repo, branch_cutoff, top_id)?;
+    let prefix_touched_paths = first_parent_chain
+        .iter()
+        .map(|&commit_id| range_touched_paths(repo, branch_cutoff, commit_id))
+        .collect::<Result<Vec<_>>>()?;
+    let mut union_paths = prefix_touched_paths
+        .iter()
+        .flat_map(|paths| paths.iter().cloned())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    union_paths.sort();
+    let target_history = TargetPathHistory::load(repo, upstream_id, &union_paths)?;
     let mut prefix_end: isize = -1;
 
-    for (idx, &commit_id) in first_parent_chain.iter().enumerate() {
+    for (idx, (&commit_id, touched_paths)) in first_parent_chain
+        .iter()
+        .zip(prefix_touched_paths.iter())
+        .enumerate()
+    {
         let merged_by_graph =
             repo.graph_descendant_of(upstream_id, commit_id)? || upstream_id == commit_id;
-        let merged_by_content =
-            range_changes_present_in_target(repo, branch_cutoff, commit_id, upstream_id)?;
-        if merged_by_graph || merged_by_content {
+        if merged_by_graph {
+            prefix_end = idx as isize;
+            continue;
+        }
+
+        if range_changes_present_in_target_with_history(
+            repo,
+            branch_cutoff,
+            commit_id,
+            upstream_id,
+            touched_paths,
+            &target_history,
+        )? {
             prefix_end = idx as isize;
         }
     }
@@ -1077,6 +1183,22 @@ fn ensure_patch_ids(
 }
 
 fn compute_patch_ids(repo: &Repository, commit_ids: &[Oid]) -> Result<HashMap<Oid, String>> {
+    compute_patch_ids_for_commits(repo_root(repo)?, commit_ids, None)
+}
+
+fn compute_commit_patch_ids_for_paths(
+    repo_root: &Path,
+    commit_ids: &[Oid],
+    touched_paths: &[String],
+) -> Result<HashMap<Oid, String>> {
+    compute_patch_ids_for_commits(repo_root, commit_ids, Some(touched_paths))
+}
+
+fn compute_patch_ids_for_commits(
+    repo_root: &Path,
+    commit_ids: &[Oid],
+    touched_paths: Option<&[String]>,
+) -> Result<HashMap<Oid, String>> {
     if commit_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -1090,11 +1212,11 @@ fn compute_patch_ids(repo: &Repository, commit_ids: &[Oid]) -> Result<HashMap<Oi
         for oid in chunk {
             show.arg(oid.to_string());
         }
+        if let Some(paths) = touched_paths {
+            show.arg("--").args(paths);
+        }
 
-        let mut show_child = show
-            .current_dir(repo_root(repo)?)
-            .stdout(Stdio::piped())
-            .spawn()?;
+        let mut show_child = show.current_dir(repo_root).stdout(Stdio::piped()).spawn()?;
 
         let show_stdout = show_child.stdout.take().ok_or_else(|| {
             anyhow!("Failed to capture git show output for patch-id calculation.")
@@ -1103,7 +1225,7 @@ fn compute_patch_ids(repo: &Repository, commit_ids: &[Oid]) -> Result<HashMap<Oi
         let patch_output = Command::new("git")
             .arg("patch-id")
             .arg("--stable")
-            .current_dir(repo_root(repo)?)
+            .current_dir(repo_root)
             .stdin(Stdio::from(show_stdout))
             .output()?;
 
@@ -1138,8 +1260,26 @@ fn range_changes_present_in_target(
     branch_tip: Oid,
     target_tip: Oid,
 ) -> Result<bool> {
-    if branch_tip == base_id {
+    let touched_paths = range_touched_paths(repo, base_id, branch_tip)?;
+
+    if touched_paths.is_empty() {
         return Ok(true);
+    }
+
+    let target_history = TargetPathHistory::load(repo, target_tip, &touched_paths)?;
+    range_changes_present_in_target_with_history(
+        repo,
+        base_id,
+        branch_tip,
+        target_tip,
+        &touched_paths,
+        &target_history,
+    )
+}
+
+fn range_touched_paths(repo: &Repository, base_id: Oid, branch_tip: Oid) -> Result<Vec<String>> {
+    if branch_tip == base_id {
+        return Ok(Vec::new());
     }
 
     let output = Command::new("git")
@@ -1158,75 +1298,79 @@ fn range_changes_present_in_target(
         ));
     }
 
-    let touched_paths = String::from_utf8_lossy(&output.stdout)
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| line.to_string())
-        .collect::<Vec<_>>();
+        .collect())
+}
 
+fn range_changes_present_in_target_with_history(
+    repo: &Repository,
+    base_id: Oid,
+    branch_tip: Oid,
+    target_tip: Oid,
+    touched_paths: &[String],
+    target_history: &TargetPathHistory,
+) -> Result<bool> {
     if touched_paths.is_empty() {
         return Ok(true);
+    }
+
+    if commits_match_on_paths(repo, branch_tip, target_tip, touched_paths)? {
+        return Ok(true);
+    }
+
+    if commits_match_on_paths(repo, base_id, target_tip, touched_paths)? {
+        return Ok(false);
+    }
+
+    let candidate_commits = target_history.covering_commits(touched_paths);
+    if candidate_commits.is_empty() {
+        return Ok(false);
     }
 
     let repo_root = repo_root(repo)?;
     let branch_patch_id = compute_range_patch_id(
         repo_root,
         &format!("{base_id}..{branch_tip}"),
-        &touched_paths,
+        touched_paths,
     )?
     .ok_or_else(|| anyhow!("Missing branch patch id while checking target containment."))?;
-    let target_patch_id = compute_range_patch_id(
-        repo_root,
-        &format!("{base_id}..{target_tip}"),
-        &touched_paths,
-    )?;
+    let target_patch_ids =
+        compute_commit_patch_ids_for_paths(repo_root, &candidate_commits, touched_paths)?;
 
-    if target_patch_id.as_deref() == Some(branch_patch_id.as_str()) {
-        return Ok(true);
+    Ok(target_patch_ids
+        .values()
+        .any(|patch_id| patch_id == &branch_patch_id))
+}
+
+fn commits_match_on_paths(
+    repo: &Repository,
+    left_tip: Oid,
+    right_tip: Oid,
+    touched_paths: &[String],
+) -> Result<bool> {
+    let left_tree = repo.find_commit(left_tip)?.tree()?;
+    let right_tree = repo.find_commit(right_tip)?.tree()?;
+
+    for path in touched_paths {
+        if tree_entry_state(&left_tree, Path::new(path))?
+            != tree_entry_state(&right_tree, Path::new(path))?
+        {
+            return Ok(false);
+        }
     }
 
-    let Some(_) = target_patch_id else {
-        return Ok(false);
-    };
+    Ok(true)
+}
 
-    let mut log_child = Command::new("git")
-        .arg("log")
-        .arg("-p")
-        .arg("--format=%H")
-        .arg(target_tip.to_string())
-        .arg("--")
-        .args(&touched_paths)
-        .current_dir(repo_root)
-        .stdout(Stdio::piped())
-        .spawn()?;
-
-    let log_stdout = log_child.stdout.take().ok_or_else(|| {
-        anyhow!("Failed to capture git log output while checking target patch ids.")
-    })?;
-
-    let target_patch_output = Command::new("git")
-        .arg("patch-id")
-        .arg("--stable")
-        .current_dir(repo_root)
-        .stdin(Stdio::from(log_stdout))
-        .output()?;
-
-    let log_status = log_child.wait()?;
-    if !log_status.success() {
-        return Err(anyhow!(
-            "git log failed while checking whether branch changes are present in target."
-        ));
+fn tree_entry_state(tree: &git2::Tree<'_>, path: &Path) -> Result<Option<(Oid, i32)>> {
+    match tree.get_path(path) {
+        Ok(entry) => Ok(Some((entry.id(), entry.filemode()))),
+        Err(err) if err.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
     }
-    if !target_patch_output.status.success() {
-        return Err(anyhow!(
-            "git patch-id failed while checking whether branch changes are present in target."
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&target_patch_output.stdout)
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .any(|patch_id| patch_id == branch_patch_id))
 }
 
 fn compute_range_patch_id(
