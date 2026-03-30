@@ -53,6 +53,10 @@ harness = false
 name = "restack_discovery"
 harness = false
 
+[[bench]]
+name = "sync"
+harness = false
+
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
 bin-dir = "{ bin }{ binary-ext }"
