@@ -3,7 +3,8 @@ use crate::worktree::cleanup::{CleanupReason, find_cleanup_candidates};
 use crate::worktree::config::{WorktreeConfig, load_worktree_config};
 use crate::worktree::git::{
     LiveWorktree, add_worktree, checkout_worktree_branch, checkout_worktree_detached,
-    current_branch, current_head_oid, ensure_local_branch_exists,
+    create_local_branch_from_start_point_strict, current_branch, current_head_oid,
+    delete_local_branch_if_tip_matches, ensure_local_branch_exists,
     ensure_local_branch_exists_from_start_point, is_worktree_dirty, list_live_worktrees,
     live_worktree_map, remove_worktree,
 };
@@ -14,7 +15,7 @@ use crate::worktree::path_resolver::{
 };
 use crate::worktree::ui::{WorktreeListRow, confirm_or_abort};
 use anyhow::{Result, anyhow};
-use git2::Repository;
+use git2::{BranchType, ErrorCode, Oid, Repository};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -228,6 +229,83 @@ pub fn ensure_temp(repo: &Repository, requested_branch: Option<&str>) -> Result<
     run_create_hooks(repo, &ctx.config, WorktreeRole::Temp, &path, &branch)?;
     ctx.metadata.upsert(WorktreeRole::Temp, &branch, &path);
     ctx.metadata.save(repo)?;
+
+    Ok(EnsureResult {
+        path,
+        created: true,
+        switched: false,
+    })
+}
+
+pub fn ensure_temp_new_branch(
+    repo: &Repository,
+    branch: &str,
+    requested_start_point: Option<&str>,
+) -> Result<EnsureResult> {
+    let mut ctx = load_context(repo)?;
+    if !ctx.config.temp.enabled {
+        return Err(anyhow!("Temp worktrees are disabled in .git/kindra.toml."));
+    }
+
+    ensure_local_branch_is_new(repo, branch)?;
+    let start_point = resolve_requested_start_point(repo, requested_start_point)?;
+    let path = ctx.metadata.find_temp_branch(branch).map_or_else(
+        || expand_path_template(&ctx.config.temp.path_template, branch),
+        |record| Ok(record.path_buf()),
+    )?;
+
+    ensure_temp_path_available(
+        &ctx.config,
+        &ctx.metadata,
+        &ctx.live_worktrees,
+        branch,
+        &path,
+    )?;
+
+    if path.exists() {
+        return Err(anyhow!(
+            "Configured temp worktree path '{}' exists but is not a valid git worktree.",
+            path.display()
+        ));
+    }
+
+    let branch_tip_after_create = match create_local_branch_from_start_point_strict(
+        repo,
+        branch,
+        &start_point,
+    )? {
+        true => local_branch_tip(repo, branch)?,
+        false => {
+            return Err(anyhow!(
+                "A local branch named '{}' appeared while creating the temp worktree. Resolve the race and retry.",
+                branch
+            ));
+        }
+    };
+    let mut worktree_created = false;
+    if let Err(err) = (|| -> Result<()> {
+        add_worktree(repo, &path, branch)?;
+        worktree_created = true;
+        run_hooks(
+            &ctx.config,
+            WorktreeRole::Temp,
+            HookEvent::Create,
+            &path,
+            branch,
+        )?;
+        ctx.metadata.upsert(WorktreeRole::Temp, branch, &path);
+        ctx.metadata.save(repo)?;
+        Ok(())
+    })() {
+        return Err(rollback_created_temp_branch(
+            repo,
+            &path,
+            branch,
+            branch_tip_after_create,
+            worktree_created,
+            err,
+        ));
+    }
 
     Ok(EnsureResult {
         path,
@@ -535,6 +613,33 @@ fn resolve_requested_branch(repo: &Repository, requested_branch: Option<&str>) -
     }
 }
 
+fn resolve_requested_start_point(
+    repo: &Repository,
+    requested_start_point: Option<&str>,
+) -> Result<String> {
+    match requested_start_point {
+        Some(start_point) => Ok(start_point.to_string()),
+        None => current_branch(repo)?.ok_or_else(|| {
+            anyhow!("Current HEAD is detached; please specify a start point explicitly.")
+        }),
+    }
+}
+
+fn ensure_local_branch_is_new(repo: &Repository, branch: &str) -> Result<()> {
+    match repo.find_branch(branch, BranchType::Local) {
+        Ok(_) => Err(anyhow!("A local branch named '{}' already exists.", branch)),
+        Err(err) if err.code() == ErrorCode::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn local_branch_tip(repo: &Repository, branch: &str) -> Result<Oid> {
+    repo.find_branch(branch, BranchType::Local)?
+        .get()
+        .target()
+        .ok_or_else(|| anyhow!("Local branch '{}' has no target commit.", branch))
+}
+
 fn ensure_temp_path_available(
     config: &WorktreeConfig,
     metadata: &WorktreeMetadata,
@@ -781,6 +886,61 @@ fn rollback_created_worktree(
             "{hook_err}\nAdditionally failed to roll back worktree '{}': {remove_err}",
             path.display()
         ),
+    }
+}
+
+fn rollback_created_temp_branch(
+    repo: &Repository,
+    path: &Path,
+    branch: &str,
+    branch_tip_after_create: Oid,
+    worktree_created: bool,
+    original_err: anyhow::Error,
+) -> anyhow::Error {
+    let mut rollback_errors = Vec::new();
+
+    if (worktree_created || path.exists())
+        && let Err(remove_err) = remove_worktree(repo, path, true)
+    {
+        rollback_errors.push(format!(
+            "Failed to roll back worktree '{}': {}",
+            path.display(),
+            remove_err
+        ));
+    }
+
+    match delete_local_branch_if_tip_matches(repo, branch, branch_tip_after_create) {
+        Ok(true) => {}
+        Ok(false) => match repo.find_branch(branch, BranchType::Local) {
+            Ok(current_branch) => match current_branch.get().target() {
+                Some(current_tip) => rollback_errors.push(format!(
+                "Left branch '{}' in place for manual cleanup because its tip moved from {} to {}.",
+                branch, branch_tip_after_create, current_tip
+                )),
+                None => rollback_errors.push(format!(
+                "Left branch '{}' in place for manual cleanup because its current tip could not be resolved after it was created at {}.",
+                branch, branch_tip_after_create
+                )),
+            },
+            Err(err) if err.code() == ErrorCode::NotFound => {}
+            Err(err) => rollback_errors.push(format!(
+                "Failed to inspect branch '{}' during rollback: {}",
+                branch, err
+            )),
+        },
+        Err(delete_err) => rollback_errors.push(format!(
+            "Failed to roll back branch '{}' at {}: {}",
+            branch, branch_tip_after_create, delete_err
+        )),
+    }
+
+    if rollback_errors.is_empty() {
+        original_err
+    } else {
+        anyhow!(
+            "{original_err}\nAdditionally:\n{}",
+            rollback_errors.join("\n")
+        )
     }
 }
 

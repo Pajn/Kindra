@@ -12,7 +12,7 @@ pub enum WorktreeSubcommand {
     Main,
     /// Ensure the reusable review worktree exists and points at a branch
     Review(ReviewArgs),
-    /// Create or reuse a temp worktree for a branch
+    /// Create or reuse a temp worktree for a branch, or create a new branch with `-b`
     Temp(TempArgs),
     /// Print the path for a managed worktree target
     Path(PathArgs),
@@ -34,8 +34,13 @@ pub struct ReviewArgs {
 
 #[derive(Args, Clone, Debug)]
 pub struct TempArgs {
-    /// Branch to materialize in a temp worktree. Defaults to the current branch.
-    pub branch: Option<String>,
+    /// Create and check out a new branch in the temp worktree
+    #[arg(short = 'b', long = "branch", value_name = "NEW_BRANCH")]
+    pub new_branch: Option<String>,
+
+    /// Branch to materialize, or start point when used with `-b`. Defaults to the current branch.
+    #[arg(value_name = "BRANCH_OR_START_POINT")]
+    pub target: Option<String>,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -86,7 +91,12 @@ pub fn worktree(subcommand: &Option<WorktreeSubcommand>) -> Result<()> {
             println!("{}", result.path.display());
         }
         Some(WorktreeSubcommand::Temp(args)) => {
-            let result = roles::ensure_temp(&repo, args.branch.as_deref())?;
+            let result = match args.new_branch.as_deref() {
+                Some(new_branch) => {
+                    roles::ensure_temp_new_branch(&repo, new_branch, args.target.as_deref())?
+                }
+                None => roles::ensure_temp(&repo, args.target.as_deref())?,
+            };
             println!("{}", result.path.display());
         }
         Some(WorktreeSubcommand::Path(args)) => {

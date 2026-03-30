@@ -106,7 +106,7 @@ Kindra now includes an opinionated `kin wt` workflow for managed git worktrees:
 
 - `kin wt main` ensures a stable trunk worktree exists.
 - `kin wt review [branch]` creates or reuses a fixed review worktree and repoints it safely.
-- `kin wt temp [branch]` creates or reuses a branch-scoped disposable worktree.
+- `kin wt temp [branch]` creates or reuses a branch-scoped disposable worktree, and `kin wt temp -b <new-branch> [start-point]` creates a new branch in one.
 - `kin wt list` shows all Kindra-managed worktrees and their current state.
 - `kin wt path <target>` prints just the managed path for shell/editor integrations.
 - `kin wt remove <target>` removes an explicit managed worktree with confirmation by default.
@@ -134,6 +134,12 @@ kin wt review feature/auth
 
 # Create or reuse a temp worktree for a branch
 kin wt temp feature/auth
+
+# Create a new temp worktree branch from the current branch
+kin wt temp -b feature/spike
+
+# Create a new temp worktree branch from origin/main
+kin wt temp -b hotfix/main origin/main
 
 # Use the resolved path in shell tooling
 cd "$(kin wt path review)"
