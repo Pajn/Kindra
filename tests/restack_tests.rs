@@ -1962,6 +1962,169 @@ fn test_restack_chain_rebase_preserves_stack_relationship() {
 }
 
 #[test]
+fn test_restack_pick_reports_no_candidates_for_repaired_top_stack() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = repo_init(repo_path);
+
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    let root_oid = make_commit(&repo, "HEAD", "root.txt", "root", "root", &[]);
+    let main_oid = make_commit(
+        &repo,
+        "HEAD",
+        "main.txt",
+        "main content",
+        "main commit",
+        &[&repo.find_commit(root_oid).unwrap()],
+    );
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+
+    run_ok("git", &["checkout", "-b", "feature-A"], repo_path);
+    let commit_a = make_commit(
+        &repo,
+        "HEAD",
+        "a.txt",
+        "A content",
+        "Add feature A",
+        &[&repo.find_commit(main_oid).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "feature-B", &commit_a.to_string()],
+        repo_path,
+    );
+    let commit_b = make_commit(
+        &repo,
+        "HEAD",
+        "b.txt",
+        "B content",
+        "Add feature B",
+        &[&repo.find_commit(commit_a).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "feature-C", &commit_b.to_string()],
+        repo_path,
+    );
+    let commit_c = make_commit(
+        &repo,
+        "HEAD",
+        "c.txt",
+        "C content",
+        "Add feature C",
+        &[&repo.find_commit(commit_b).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "feature-D", &commit_c.to_string()],
+        repo_path,
+    );
+    let _commit_d = make_commit(
+        &repo,
+        "HEAD",
+        "d.txt",
+        "D content",
+        "Add feature D",
+        &[&repo.find_commit(commit_c).unwrap()],
+    );
+
+    run_ok("git", &["checkout", "main"], repo_path);
+    let main_prime = make_commit(
+        &repo,
+        "HEAD",
+        "main.txt",
+        "main content v2",
+        "main commit v2",
+        &[&repo.find_commit(main_oid).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "stack-A", &main_prime.to_string()],
+        repo_path,
+    );
+    let new_a = make_commit(
+        &repo,
+        "HEAD",
+        "a.txt",
+        "A content",
+        "Add feature A",
+        &[&repo.find_commit(main_prime).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "stack-B", &new_a.to_string()],
+        repo_path,
+    );
+    let new_b = make_commit(
+        &repo,
+        "HEAD",
+        "b.txt",
+        "B content",
+        "Add feature B",
+        &[&repo.find_commit(new_a).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "stack-C", &new_b.to_string()],
+        repo_path,
+    );
+    let new_c = make_commit(
+        &repo,
+        "HEAD",
+        "c.txt",
+        "C content",
+        "Add feature C",
+        &[&repo.find_commit(new_b).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "stack-D", &new_c.to_string()],
+        repo_path,
+    );
+    let _new_d = make_commit(
+        &repo,
+        "HEAD",
+        "d.txt",
+        "D content",
+        "Add feature D",
+        &[&repo.find_commit(new_c).unwrap()],
+    );
+
+    let output = kin_cmd()
+        .current_dir(repo_path)
+        .arg("restack")
+        .arg("--pick")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "restack --pick failed\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        stdout.contains("No floating children found."),
+        "restack --pick should short-circuit before the picker when no candidates exist\nstdout:\n{}",
+        stdout,
+    );
+    assert!(!stdout.contains("Select branches to restack"));
+}
+
+#[test]
 fn test_restack_preserves_alternate_stack_when_anchor_branch_tip_is_descendant_of_old_base() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
@@ -2055,4 +2218,99 @@ fn test_restack_preserves_alternate_stack_when_anchor_branch_tip_is_descendant_o
         "expected restack to detect and rebase the alternate stack\nstdout:\n{}",
         stdout,
     );
+}
+
+#[test]
+fn test_restack_rebases_multiple_commits_after_single_fork_match() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = repo_init(repo_path);
+
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    let root_oid = make_commit(&repo, "HEAD", "root.txt", "root", "root", &[]);
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+
+    let old_base_oid = make_commit(
+        &repo,
+        "HEAD",
+        "base.txt",
+        "base v1",
+        "base commit",
+        &[&repo.find_commit(root_oid).unwrap()],
+    );
+
+    run_ok(
+        "git",
+        &["checkout", "-b", "feature", &old_base_oid.to_string()],
+        repo_path,
+    );
+    let old_middle_oid = make_commit(
+        &repo,
+        "HEAD",
+        "middle.txt",
+        "middle",
+        "middle commit",
+        &[&repo.find_commit(old_base_oid).unwrap()],
+    );
+    let old_tip_oid = make_commit(
+        &repo,
+        "HEAD",
+        "tip.txt",
+        "tip",
+        "tip commit",
+        &[&repo.find_commit(old_middle_oid).unwrap()],
+    );
+
+    run_ok("git", &["checkout", "main"], repo_path);
+    std::fs::write(repo_path.join("base.txt"), "base v2").unwrap();
+    run_ok("git", &["add", "base.txt"], repo_path);
+    run_ok(
+        "git",
+        &["commit", "--amend", "-m", "base commit"],
+        repo_path,
+    );
+
+    let new_main_oid = repo
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_ne!(new_main_oid, old_base_oid);
+
+    let output = kin_cmd()
+        .current_dir(repo_path)
+        .arg("restack")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "restack failed\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_no_rebase_in_progress(repo_path);
+    assert!(
+        stdout.contains("feature"),
+        "restack should detect the floating child branch\nstdout:\n{}",
+        stdout,
+    );
+
+    run_ok("git", &["checkout", "feature"], repo_path);
+    let new_tip_oid = repo.head().unwrap().target().unwrap();
+    assert_ne!(new_tip_oid, old_tip_oid);
+
+    let new_tip = repo.find_commit(new_tip_oid).unwrap();
+    assert_eq!(new_tip.summary().unwrap(), "tip commit");
+    let new_middle = new_tip.parent(0).unwrap();
+    assert_eq!(new_middle.summary().unwrap(), "middle commit");
+    let new_base = new_middle.parent(0).unwrap();
+    assert_eq!(new_base.id(), new_main_oid);
+    assert_eq!(new_base.summary().unwrap(), "base commit");
 }
