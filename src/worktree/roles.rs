@@ -14,7 +14,7 @@ use crate::worktree::path_resolver::{
 };
 use crate::worktree::ui::{WorktreeListRow, confirm_or_abort};
 use anyhow::{Result, anyhow};
-use git2::Repository;
+use git2::{BranchType, ErrorCode, Repository};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -227,6 +227,51 @@ pub fn ensure_temp(repo: &Repository, requested_branch: Option<&str>) -> Result<
     add_worktree(repo, &path, &branch)?;
     run_create_hooks(repo, &ctx.config, WorktreeRole::Temp, &path, &branch)?;
     ctx.metadata.upsert(WorktreeRole::Temp, &branch, &path);
+    ctx.metadata.save(repo)?;
+
+    Ok(EnsureResult {
+        path,
+        created: true,
+        switched: false,
+    })
+}
+
+pub fn ensure_temp_new_branch(
+    repo: &Repository,
+    branch: &str,
+    requested_start_point: Option<&str>,
+) -> Result<EnsureResult> {
+    let mut ctx = load_context(repo)?;
+    if !ctx.config.temp.enabled {
+        return Err(anyhow!("Temp worktrees are disabled in .git/kindra.toml."));
+    }
+
+    ensure_local_branch_is_new(repo, branch)?;
+    let start_point = resolve_requested_start_point(repo, requested_start_point)?;
+    let path = ctx.metadata.find_temp_branch(branch).map_or_else(
+        || expand_path_template(&ctx.config.temp.path_template, branch),
+        |record| Ok(record.path_buf()),
+    )?;
+
+    ensure_temp_path_available(
+        &ctx.config,
+        &ctx.metadata,
+        &ctx.live_worktrees,
+        branch,
+        &path,
+    )?;
+
+    if path.exists() {
+        return Err(anyhow!(
+            "Configured temp worktree path '{}' exists but is not a valid git worktree.",
+            path.display()
+        ));
+    }
+
+    ensure_local_branch_exists_from_start_point(repo, branch, &start_point)?;
+    add_worktree(repo, &path, branch)?;
+    run_create_hooks(repo, &ctx.config, WorktreeRole::Temp, &path, branch)?;
+    ctx.metadata.upsert(WorktreeRole::Temp, branch, &path);
     ctx.metadata.save(repo)?;
 
     Ok(EnsureResult {
@@ -532,6 +577,26 @@ fn resolve_requested_branch(repo: &Repository, requested_branch: Option<&str>) -
         None => current_branch(repo)?.ok_or_else(|| {
             anyhow!("Current HEAD is detached; please specify a branch explicitly.")
         }),
+    }
+}
+
+fn resolve_requested_start_point(
+    repo: &Repository,
+    requested_start_point: Option<&str>,
+) -> Result<String> {
+    match requested_start_point {
+        Some(start_point) => Ok(start_point.to_string()),
+        None => current_branch(repo)?.ok_or_else(|| {
+            anyhow!("Current HEAD is detached; please specify a start point explicitly.")
+        }),
+    }
+}
+
+fn ensure_local_branch_is_new(repo: &Repository, branch: &str) -> Result<()> {
+    match repo.find_branch(branch, BranchType::Local) {
+        Ok(_) => Err(anyhow!("A local branch named '{}' already exists.", branch)),
+        Err(err) if err.code() == ErrorCode::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
     }
 }
 
