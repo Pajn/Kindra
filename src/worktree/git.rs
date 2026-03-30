@@ -1,6 +1,6 @@
 use crate::worktree::path_resolver::normalize_path;
 use anyhow::{Context, Result, anyhow};
-use git2::{BranchType, Repository};
+use git2::{BranchType, ErrorCode, Oid, Repository};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -307,6 +307,77 @@ pub fn ensure_local_branch_exists_from_start_point(
             original_err
         )
     })
+}
+
+pub fn create_local_branch_from_start_point_strict(
+    repo: &Repository,
+    branch: &str,
+    start_point: &str,
+) -> Result<bool> {
+    match repo.find_branch(branch, BranchType::Local) {
+        Ok(_) => return Ok(false),
+        Err(err) if err.code() == ErrorCode::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    let mut command = Command::new("git");
+    command.current_dir(repo_root(repo)?).arg("branch");
+    if repo.find_branch(start_point, BranchType::Remote).is_ok() {
+        command.arg("--track");
+    }
+    command.arg(branch).arg(start_point);
+
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Failed to create local branch '{}' from '{}': {}",
+            branch,
+            start_point,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(true)
+}
+
+pub fn delete_local_branch_if_tip_matches(
+    repo: &Repository,
+    branch: &str,
+    expected_tip: Oid,
+) -> Result<bool> {
+    match repo.find_branch(branch, BranchType::Local) {
+        Ok(current_branch) => match current_branch.get().target() {
+            Some(current_tip) if current_tip == expected_tip => {}
+            Some(_) | None => return Ok(false),
+        },
+        Err(err) if err.code() == ErrorCode::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    }
+
+    let ref_name = format!("refs/heads/{branch}");
+    let expected_tip_text = expected_tip.to_string();
+    let output = Command::new("git")
+        .current_dir(repo_root(repo)?)
+        .args(["update-ref", "-d", &ref_name, &expected_tip_text])
+        .output()?;
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    match repo.find_branch(branch, BranchType::Local) {
+        Ok(current_branch) => match current_branch.get().target() {
+            Some(current_tip) if current_tip != expected_tip => Ok(false),
+            None => Ok(false),
+            Some(_) => Err(anyhow!(
+                "Failed to delete local branch '{}' at {}: {}",
+                branch,
+                expected_tip,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+        },
+        Err(err) if err.code() == ErrorCode::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn remote_for_branch(repo: &Repository, branch: &str) -> Result<Option<String>> {

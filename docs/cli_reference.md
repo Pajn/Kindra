@@ -301,6 +301,7 @@ kin wt list
 kin wt main
 kin wt review [<branch>] [--force]
 kin wt temp [<branch>]
+kin wt temp -b <new-branch> [<start-point>]
 kin wt path <main|review|branch>
 kin wt remove <main|review|branch> [--yes] [--force]
 kin wt cleanup [--yes] [--force]
@@ -325,6 +326,8 @@ By default, Kindra stores managed worktrees under:
 
 For temp worktrees, Kindra sanitizes branch names for paths, so a branch like `feature/auth` becomes `.git/kindra-worktrees/temp/feature-auth`. If two different branch names would sanitize to the same path, `kin wt temp` fails instead of reusing the wrong directory.
 
+The `kin wt temp` synopsis has two forms: without `-b`, the optional positional argument is treated as the branch name to open (or omitted to use the current branch); with `-b`, the positional argument is treated as the start point for the new branch.
+
 **Subcommands:**
 
 - `kin wt list`: Lists managed worktrees with role, branch, state, and path.
@@ -332,6 +335,7 @@ For temp worktrees, Kindra sanitizes branch names for paths, so a branch like `f
 - `kin wt review [<branch>]`: Ensures the reusable `review` worktree exists. If no branch is provided, it uses the current branch. Reusing an existing review worktree on a different branch performs a checkout in place.
 - `kin wt review --force <branch>`: Discards local changes in the review worktree before switching branches.
 - `kin wt temp [<branch>]`: Ensures a temp worktree exists for the specified branch, or for the current branch if omitted.
+- `kin wt temp -b <new-branch> [<start-point>]`: Creates a new local branch and checks it out in a temp worktree. If no start point is provided, Kindra uses the current branch.
 - `kin wt path <target>`: Prints only the resolved path for `main`, `review`, or a temp worktree branch. This is intended for scripts and editor integrations.
 - `kin wt remove <target>`: Removes a managed worktree. By default Kindra asks for confirmation; use `--yes` to skip the prompt.
 - `kin wt remove --force <target>`: Forces `git worktree remove` when Git would otherwise refuse, such as for a dirty worktree.
