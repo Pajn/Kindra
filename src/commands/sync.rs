@@ -140,11 +140,12 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
                 .filter(|branch| branch != &top_branch),
             remaining_branches: vec![top_branch.clone()],
             in_progress_branch: None,
-            parent_id_map: HashMap::new(),
+            parent_id_map: HashMap::from([(top_branch.clone(), old_base.to_string())]),
             parent_name_map: HashMap::new(),
             new_base_map: HashMap::new(),
             original_commit_count_map: HashMap::new(),
             original_tip_map: HashMap::from([(top_branch.clone(), top_branch_tip.to_string())]),
+            owned_tip_map: HashMap::new(),
             stash_ref: None,
             unstage_on_restore: false,
             autostash,
@@ -212,6 +213,7 @@ fn sync_upstream_branch(
     let upstream_id = repo.revparse_single(upstream_name)?.id();
     let rebase_onto_id = repo.revparse_single(rebase_onto_name)?.id();
     if upstream_id != rebase_onto_id {
+        let rebase_root_id = repo.merge_base(upstream_id, rebase_onto_id)?;
         crate::rebase_utils::ensure_git_supports_reapply_cherry_picks()?;
         let autostash = resolve_rebase_autostash(
             repo,
@@ -231,11 +233,12 @@ fn sync_upstream_branch(
             caller_branch: None,
             remaining_branches: vec![upstream_name.to_string()],
             in_progress_branch: None,
-            parent_id_map: HashMap::new(),
+            parent_id_map: HashMap::from([(upstream_name.to_string(), rebase_root_id.to_string())]),
             parent_name_map: HashMap::new(),
             new_base_map: HashMap::new(),
             original_commit_count_map: HashMap::new(),
             original_tip_map: HashMap::from([(upstream_name.to_string(), upstream_id.to_string())]),
+            owned_tip_map: HashMap::new(),
             stash_ref: None,
             unstage_on_restore: false,
             autostash,

@@ -783,19 +783,26 @@ fn test_abort_uses_exact_stash_message_match() {
     );
 
     let state_path = dir.path().join(".git/gits_rebase_state.json");
+    let main_tip = git_stdout(dir.path(), &["rev-parse", "main"]);
     fs::write(
         &state_path,
-        r#"{
+        format!(
+            r#"{{
   "operation": "Commit",
   "original_branch": "main",
   "target_branch": "main",
   "remaining_branches": [],
   "in_progress_branch": null,
-  "parent_id_map": {},
-  "parent_name_map": {},
+  "parent_id_map": {{}},
+  "parent_name_map": {{}},
+  "owned_tip_map": {{
+    "main": "{main_tip}"
+  }},
   "stash_ref": "kin-commit-on-1-1",
   "unstage_on_restore": false
-}"#,
+}}"#,
+            main_tip = main_tip.trim()
+        ),
     )
     .unwrap();
 
@@ -820,6 +827,107 @@ fn test_abort_uses_exact_stash_message_match() {
         !messages.contains(&"kin-commit-on-1-1"),
         "Expected exact stash to be removed, got:\n{}",
         stash_list
+    );
+}
+
+#[test]
+fn test_abort_preserves_stash_when_owned_tip_map_mismatches() {
+    let (dir, _repo) = setup_repo();
+
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+
+    fs::write(dir.path().join("file.txt"), "stash one").unwrap();
+    run_ok(
+        "git",
+        &["stash", "push", "-m", "kin-commit-on-1-1"],
+        dir.path(),
+    );
+
+    let state_path = dir.path().join(".git/gits_rebase_state.json");
+    fs::write(
+        &state_path,
+        r#"{
+  "operation": "Commit",
+  "original_branch": "main",
+  "target_branch": "main",
+  "remaining_branches": [],
+  "in_progress_branch": null,
+  "parent_id_map": {},
+  "parent_name_map": {},
+  "owned_tip_map": {
+    "main": "0000000000000000000000000000000000000000"
+  },
+  "stash_ref": "kin-commit-on-1-1",
+  "unstage_on_restore": false
+}"#,
+    )
+    .unwrap();
+
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("kin-commit-on-1-1"));
+
+    let stash_list = git_stdout(dir.path(), &["stash", "list"]);
+    assert!(
+        stash_list.contains("kin-commit-on-1-1"),
+        "Expected stash to remain when owned_tip_map does not match, got:\n{}",
+        stash_list
+    );
+    assert!(
+        !state_path.exists(),
+        "State file should be cleared after abort"
+    );
+}
+
+#[test]
+fn test_abort_preserves_stash_for_legacy_state_without_owned_tip_map() {
+    let (dir, _repo) = setup_repo();
+
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+
+    fs::write(dir.path().join("file.txt"), "stash one").unwrap();
+    run_ok(
+        "git",
+        &["stash", "push", "-m", "kin-commit-on-1-1"],
+        dir.path(),
+    );
+
+    let state_path = dir.path().join(".git/gits_rebase_state.json");
+    fs::write(
+        &state_path,
+        r#"{
+  "operation": "Commit",
+  "original_branch": "main",
+  "target_branch": "main",
+  "remaining_branches": [],
+  "in_progress_branch": null,
+  "parent_id_map": {},
+  "parent_name_map": {},
+  "stash_ref": "kin-commit-on-1-1",
+  "unstage_on_restore": false
+}"#,
+    )
+    .unwrap();
+
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("kin-commit-on-1-1"));
+
+    let stash_list = git_stdout(dir.path(), &["stash", "list"]);
+    assert!(
+        stash_list.contains("kin-commit-on-1-1"),
+        "Expected stash to remain for legacy state without owned_tip_map, got:\n{}",
+        stash_list
+    );
+    assert!(
+        !state_path.exists(),
+        "State file should be cleared after abort"
     );
 }
 

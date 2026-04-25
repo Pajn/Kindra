@@ -1118,21 +1118,33 @@ fn test_move_abort_cleans_up_git_rebase() {
 
 #[test]
 fn test_move_abort_preserves_state_on_rebase_abort_failure() {
-    let (dir, _repo) = setup_abort_repo();
+    let (dir, repo) = setup_abort_repo();
+    let feature_tip = repo
+        .find_branch("feature", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
 
     // 1. Manually create a kin move state file
     let state_path = dir.path().join(".git/gits_rebase_state.json");
     fs::write(
         &state_path,
-        r#"{
+        format!(
+            r#"{{
   "operation": "Move",
   "original_branch": "feature",
   "target_branch": "target",
   "remaining_branches": [],
   "in_progress_branch": null,
-  "parent_id_map": {},
-  "parent_name_map": {}
-}"#,
+  "parent_id_map": {{}},
+  "parent_name_map": {{}},
+  "owned_tip_map": {{
+    "feature": "{feature_tip}"
+  }}
+}}"#,
+            feature_tip = feature_tip
+        ),
     )
     .unwrap();
 
@@ -1182,6 +1194,67 @@ exec {} "$@"
     assert!(
         state_path.exists(),
         "State file should be preserved if git rebase --abort fails"
+    );
+}
+
+#[test]
+fn test_move_abort_leaves_manual_rebase_when_owned_tip_map_mismatches() {
+    let (dir, _repo) = setup_abort_repo();
+
+    let out = std::process::Command::new("git")
+        .arg("checkout")
+        .arg("-f")
+        .arg("feature")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git checkout failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let status = std::process::Command::new("git")
+        .arg("rebase")
+        .arg("target")
+        .current_dir(dir.path())
+        .output()
+        .unwrap()
+        .status;
+    assert!(
+        !status.success(),
+        "Manual rebase should have failed due to conflict"
+    );
+
+    let state_path = dir.path().join(".git/gits_rebase_state.json");
+    fs::write(
+        &state_path,
+        r#"{
+  "operation": "Move",
+  "original_branch": "feature",
+  "target_branch": "target",
+  "remaining_branches": [],
+  "in_progress_branch": null,
+  "parent_id_map": {},
+  "parent_name_map": {},
+  "owned_tip_map": {
+    "feature": "0000000000000000000000000000000000000000"
+  }
+}"#,
+    )
+    .unwrap();
+
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    assert!(!state_path.exists(), "State file should have been removed");
+    assert!(
+        dir.path().join(".git/rebase-merge").exists()
+            || dir.path().join(".git/rebase-apply").exists(),
+        "Native rebase should remain in progress when owned_tip_map does not match"
     );
 }
 
@@ -1654,7 +1727,13 @@ fn test_move_abort_does_not_abort_manual_rebase() {
 
 #[test]
 fn test_move_abort_cleans_up_rebase_when_state_exists() {
-    let (dir, _repo) = setup_abort_repo();
+    let (dir, repo) = setup_abort_repo();
+    let feature_tip = repo
+        .find_branch("feature", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
 
     // Start a manual git rebase that will conflict
     let out = std::process::Command::new("git")
@@ -1686,15 +1765,21 @@ fn test_move_abort_cleans_up_rebase_when_state_exists() {
     let state_path = dir.path().join(".git/gits_rebase_state.json");
     fs::write(
         &state_path,
-        r#"{
+        format!(
+            r#"{{
   "operation": "Move",
   "original_branch": "feature",
   "target_branch": "target",
   "remaining_branches": [],
   "in_progress_branch": null,
-  "parent_id_map": {},
-  "parent_name_map": {}
-}"#,
+  "parent_id_map": {{}},
+  "parent_name_map": {{}},
+  "owned_tip_map": {{
+    "feature": "{feature_tip}"
+  }}
+}}"#,
+            feature_tip = feature_tip
+        ),
     )
     .unwrap();
 

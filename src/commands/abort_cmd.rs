@@ -1,6 +1,6 @@
 use crate::rebase_utils::{
-    apply_stash, checkout_branch, drop_stash, git_rebase_in_progress, load_state, save_state,
-    state_path, unstage_all,
+    apply_stash, checkout_branch, drop_stash, git_rebase_in_progress, load_state,
+    owned_tip_state_matches, save_state, state_path, unstage_all,
 };
 use anyhow::{Result, anyhow};
 use git2::Oid;
@@ -21,9 +21,10 @@ pub fn abort_cmd() -> Result<()> {
 
     if has_rebase_state {
         let mut parsed_state = load_state(&repo)?;
+        let git_rebase_active = git_rebase_in_progress(&repo);
+        let kindra_owns_current_state = owned_tip_state_matches(&repo, &parsed_state)?;
 
-        // Only try to abort a git rebase if we were actually in a kindra operation
-        if git_rebase_in_progress(&repo) {
+        if git_rebase_active && kindra_owns_current_state {
             println!("Aborting active git rebase...");
             let status = Command::new("git").arg("rebase").arg("--abort").status()?;
             if !status.success() {
@@ -31,27 +32,53 @@ pub fn abort_cmd() -> Result<()> {
             }
         }
 
-        restore_original_branch_tips(&parsed_state.original_tip_map)?;
+        if kindra_owns_current_state {
+            restore_original_branch_tips(&parsed_state.original_tip_map)?;
 
-        let restore_branch = parsed_state
-            .caller_branch
-            .clone()
-            .unwrap_or_else(|| parsed_state.original_branch.clone());
-        checkout_branch(&restore_branch)?;
-        if let Some(stash_ref) = parsed_state.stash_ref.clone() {
-            apply_stash(&stash_ref)?;
-            parsed_state.stash_ref = None;
-            save_state(&repo, &parsed_state)?;
-            if let Err(err) = drop_stash(&stash_ref) {
-                eprintln!("Warning: {}", err);
+            let restore_branch = parsed_state
+                .caller_branch
+                .clone()
+                .unwrap_or_else(|| parsed_state.original_branch.clone());
+            checkout_branch(&restore_branch)?;
+            if let Some(stash_ref) = parsed_state.stash_ref.clone() {
+                apply_stash(&stash_ref)?;
+                parsed_state.stash_ref = None;
+                save_state(&repo, &parsed_state)?;
+                if let Err(err) = drop_stash(&stash_ref) {
+                    eprintln!("Warning: {}", err);
+                }
             }
-        }
-        if parsed_state.unstage_on_restore {
-            unstage_all()?;
+            if parsed_state.unstage_on_restore {
+                unstage_all()?;
+            }
         }
 
         std::fs::remove_file(path)?;
-        println!("Operation aborted (state cleared).");
+        if kindra_owns_current_state {
+            println!("Operation aborted (state cleared).");
+        } else if git_rebase_active {
+            if let Some(stash_ref) = parsed_state.stash_ref.clone() {
+                println!(
+                    "Kindra state cleared without touching the active git rebase because the repository no longer matches Kindra's saved state. Saved stash '{}' was left untouched for manual recovery.",
+                    stash_ref
+                );
+            } else {
+                println!(
+                    "Kindra state cleared without touching the active git rebase because the repository no longer matches Kindra's saved state."
+                );
+            }
+        } else {
+            if let Some(stash_ref) = parsed_state.stash_ref.clone() {
+                println!(
+                    "Kindra state cleared without restoring refs because the repository no longer matches Kindra's saved state. Saved stash '{}' was left untouched for manual recovery.",
+                    stash_ref
+                );
+            } else {
+                println!(
+                    "Kindra state cleared without restoring refs because the repository no longer matches Kindra's saved state."
+                );
+            }
+        }
     } else if has_run_state {
         crate::commands::run::abort_run(&repo)?;
     } else if git_rebase_in_progress(&repo) {
