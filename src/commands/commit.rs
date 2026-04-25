@@ -196,6 +196,7 @@ pub fn commit(args: &[String]) -> Result<()> {
             new_base_map: HashMap::new(),
             original_commit_count_map: HashMap::new(),
             original_tip_map,
+            owned_tip_map: HashMap::new(),
             stash_ref,
             unstage_on_restore: switching_branches,
             autostash,

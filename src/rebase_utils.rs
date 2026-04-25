@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use git2::{Oid, Repository};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -16,7 +16,7 @@ pub enum Operation {
     Sync,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct RebaseState {
     pub operation: Operation,
     /// Branch that acts as the rebase-root for this operation.
@@ -45,6 +45,9 @@ pub struct RebaseState {
     /// branch_name -> original tip commit id before the operation started
     #[serde(default)]
     pub original_tip_map: HashMap<String, String>,
+    /// branch_name -> tip commit id Kindra most recently left behind in a resumable state
+    #[serde(default)]
+    pub owned_tip_map: HashMap<String, String>,
     /// Optional stash token created by `kin commit --on` to preserve non-staged files.
     #[serde(default)]
     pub stash_ref: Option<String>,
@@ -67,7 +70,11 @@ pub fn state_path(repo: &Repository) -> PathBuf {
 }
 
 pub fn save_state(repo: &Repository, state: &RebaseState) -> Result<()> {
-    let json = serde_json::to_string_pretty(state)?;
+    let mut persisted_state = state.clone();
+    merge_persisted_original_tips(repo, &mut persisted_state)?;
+    augment_original_tip_map(repo, &mut persisted_state)?;
+    persisted_state.owned_tip_map = capture_owned_tip_map(repo, &persisted_state);
+    let json = serde_json::to_string_pretty(&persisted_state)?;
     fs::write(state_path(repo), json)?;
     Ok(())
 }
@@ -102,6 +109,147 @@ pub fn clear_state(repo: &Repository) -> Result<()> {
         fs::remove_file(path)?;
     }
     Ok(())
+}
+
+/// `owned_tip_state_matches` treats an empty `state.owned_tip_map` as a deliberate
+/// "no tracked branches" sentinel and also as the migration fallback for legacy
+/// on-disk state loaded via `#[serde(default)]`. That means `abort` will skip
+/// restoration when ownership cannot be proven. A secondary consequence is that if
+/// `capture_owned_tip_map` ever returns an empty map and `save_state` persists it,
+/// later `owned_tip_state_matches` checks will also report "not owned" and `abort`
+/// will clear Kindra state without restoring refs.
+pub fn owned_tip_state_matches(repo: &Repository, state: &RebaseState) -> Result<bool> {
+    if state.owned_tip_map.is_empty() {
+        return Ok(false);
+    }
+
+    let current_tip_map = capture_owned_tip_map(repo, state);
+    Ok(current_tip_map == state.owned_tip_map)
+}
+
+fn capture_owned_tip_map(repo: &Repository, state: &RebaseState) -> HashMap<String, String> {
+    let mut tip_map = HashMap::new();
+    let tracked_branch_names = tracked_branch_names(state);
+    let rebased_commit_set = collect_rebased_commit_set(repo, state);
+
+    for branch_name in tracked_branch_names {
+        if let Ok(branch) = repo.find_branch(&branch_name, git2::BranchType::Local)
+            && let Some(oid) = branch.get().target()
+        {
+            tip_map.insert(branch_name, oid.to_string());
+        }
+    }
+
+    if let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) {
+        for branch_result in branches.flatten() {
+            let (branch, _) = branch_result;
+            let Ok(Some(branch_name)) = branch.name() else {
+                continue;
+            };
+            let Some(oid) = branch.get().target() else {
+                continue;
+            };
+            if rebased_commit_set.contains(&oid) {
+                tip_map
+                    .entry(branch_name.to_string())
+                    .or_insert(oid.to_string());
+            }
+        }
+    }
+
+    tip_map
+}
+
+fn augment_original_tip_map(repo: &Repository, state: &mut RebaseState) -> Result<()> {
+    let rebased_commit_set = collect_rebased_commit_set(repo, state);
+    if rebased_commit_set.is_empty() {
+        return Ok(());
+    }
+
+    let branches = repo.branches(Some(git2::BranchType::Local))?;
+    for branch_result in branches {
+        let (branch, _) = branch_result?;
+        let Some(oid) = branch.get().target() else {
+            continue;
+        };
+        if !rebased_commit_set.contains(&oid) {
+            continue;
+        }
+
+        let Ok(Some(branch_name)) = branch.name() else {
+            continue;
+        };
+        state
+            .original_tip_map
+            .entry(branch_name.to_string())
+            .or_insert_with(|| oid.to_string());
+    }
+
+    Ok(())
+}
+
+fn merge_persisted_original_tips(repo: &Repository, state: &mut RebaseState) -> Result<()> {
+    let path = state_path(repo);
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let json = fs::read_to_string(path)?;
+    let previous_state: RebaseState = serde_json::from_str(&json)?;
+    for (branch_name, original_tip) in previous_state.original_tip_map {
+        state
+            .original_tip_map
+            .entry(branch_name)
+            .or_insert(original_tip);
+    }
+
+    Ok(())
+}
+
+fn tracked_branch_names(state: &RebaseState) -> HashSet<String> {
+    let mut branch_names = HashSet::new();
+
+    branch_names.extend(state.original_tip_map.keys().cloned());
+    branch_names.extend(state.remaining_branches.iter().cloned());
+    branch_names.insert(state.original_branch.clone());
+    if let Some(branch) = &state.caller_branch {
+        branch_names.insert(branch.clone());
+    }
+    if let Some(branch) = &state.in_progress_branch {
+        branch_names.insert(branch.clone());
+    }
+
+    branch_names
+}
+
+fn collect_rebased_commit_set(repo: &Repository, state: &RebaseState) -> HashSet<Oid> {
+    let mut rebased_commits = HashSet::new();
+
+    for (branch_name, original_tip_str) in &state.original_tip_map {
+        let Some(old_parent_id_str) = state.parent_id_map.get(branch_name) else {
+            continue;
+        };
+        let Ok(original_tip) = Oid::from_str(original_tip_str) else {
+            continue;
+        };
+        let Ok(old_parent_id) = Oid::from_str(old_parent_id_str) else {
+            continue;
+        };
+        if original_tip == old_parent_id {
+            continue;
+        }
+
+        let Ok(mut walk) = repo.revwalk() else {
+            continue;
+        };
+        if walk.push(original_tip).is_err() || walk.hide(old_parent_id).is_err() {
+            continue;
+        }
+
+        rebased_commits.extend(walk.filter_map(|id| id.ok()));
+    }
+
+    rebased_commits
 }
 
 pub fn check_worktrees(branches: &[String], force: bool) -> Result<()> {

@@ -111,6 +111,7 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
         new_base_map: HashMap::new(),
         original_commit_count_map: HashMap::new(),
         original_tip_map,
+        owned_tip_map: HashMap::new(),
         stash_ref: None,
         unstage_on_restore: false,
         autostash,
