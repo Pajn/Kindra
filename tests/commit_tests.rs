@@ -1,6 +1,8 @@
 mod common;
 use common::{kin_cmd, make_commit, repo_init, run_ok};
 use git2::Repository;
+use kindra::rebase_utils::{Operation, RebaseState, save_state};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
@@ -52,6 +54,37 @@ fn git_stdout(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn write_commit_rebase_state_fixture(repo: &Repository, stash_ref: &str) {
+    let main_tip = repo
+        .find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap()
+        .to_string();
+    let state = RebaseState {
+        operation: Operation::Commit,
+        original_branch: "main".to_string(),
+        target_branch: "main".to_string(),
+        caller_branch: None,
+        remaining_branches: vec![],
+        in_progress_branch: None,
+        parent_id_map: HashMap::new(),
+        parent_name_map: HashMap::new(),
+        new_base_map: HashMap::new(),
+        original_commit_count_map: HashMap::new(),
+        original_tip_map: HashMap::new(),
+        owned_tip_map: HashMap::from([("main".to_string(), main_tip)]),
+        stash_ref: Some(stash_ref.to_string()),
+        unstage_on_restore: false,
+        autostash: false,
+        cleanup_merged_branches: Vec::new(),
+        cleanup_checkout_fallback: None,
+    };
+
+    save_state(repo, &state).unwrap();
 }
 
 fn assert_no_staged_changes(dir: &Path) {
@@ -764,7 +797,7 @@ fn test_abort_malformed_state() {
 
 #[test]
 fn test_abort_uses_exact_stash_message_match() {
-    let (dir, _repo) = setup_repo();
+    let (dir, repo) = setup_repo();
 
     run_ok("git", &["checkout", "-f", "main"], dir.path());
 
@@ -782,29 +815,7 @@ fn test_abort_uses_exact_stash_message_match() {
         dir.path(),
     );
 
-    let state_path = dir.path().join(".git/gits_rebase_state.json");
-    let main_tip = git_stdout(dir.path(), &["rev-parse", "main"]);
-    fs::write(
-        &state_path,
-        format!(
-            r#"{{
-  "operation": "Commit",
-  "original_branch": "main",
-  "target_branch": "main",
-  "remaining_branches": [],
-  "in_progress_branch": null,
-  "parent_id_map": {{}},
-  "parent_name_map": {{}},
-  "owned_tip_map": {{
-    "main": "{main_tip}"
-  }},
-  "stash_ref": "kin-commit-on-1-1",
-  "unstage_on_restore": false
-}}"#,
-            main_tip = main_tip.trim()
-        ),
-    )
-    .unwrap();
+    write_commit_rebase_state_fixture(&repo, "kin-commit-on-1-1");
 
     let mut cmd_abort = kin_cmd();
     cmd_abort
