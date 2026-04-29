@@ -1,7 +1,10 @@
 mod common;
 use common::{kin_cmd, make_commit, repo_init, run_ok};
-use git2::Repository;
+use git2::{Oid, Repository};
+use kindra::rebase_utils::{Operation, RebaseState, save_state};
+use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 use tempfile::tempdir;
 
 fn setup_repo() -> (tempfile::TempDir, Repository) {
@@ -53,6 +56,30 @@ fn setup_repo() -> (tempfile::TempDir, Repository) {
     }
 
     (dir, repo)
+}
+
+fn write_rebase_state_fixture(repo: &Repository, _state_path: &Path, feature_tip: Oid) {
+    let state = RebaseState {
+        operation: Operation::Move,
+        original_branch: "feature".to_string(),
+        target_branch: "target".to_string(),
+        caller_branch: None,
+        remaining_branches: vec![],
+        in_progress_branch: None,
+        parent_id_map: HashMap::new(),
+        parent_name_map: HashMap::new(),
+        new_base_map: HashMap::new(),
+        original_commit_count_map: HashMap::new(),
+        original_tip_map: HashMap::new(),
+        owned_tip_map: HashMap::from([("feature".to_string(), feature_tip.to_string())]),
+        stash_ref: None,
+        unstage_on_restore: false,
+        autostash: false,
+        cleanup_merged_branches: Vec::new(),
+        cleanup_checkout_fallback: None,
+    };
+
+    save_state(repo, &state).unwrap();
 }
 
 #[test]
@@ -1126,27 +1153,8 @@ fn test_move_abort_preserves_state_on_rebase_abort_failure() {
         .target()
         .unwrap();
 
-    // 1. Manually create a kin move state file
     let state_path = dir.path().join(".git/gits_rebase_state.json");
-    fs::write(
-        &state_path,
-        format!(
-            r#"{{
-  "operation": "Move",
-  "original_branch": "feature",
-  "target_branch": "target",
-  "remaining_branches": [],
-  "in_progress_branch": null,
-  "parent_id_map": {{}},
-  "parent_name_map": {{}},
-  "owned_tip_map": {{
-    "feature": "{feature_tip}"
-  }}
-}}"#,
-            feature_tip = feature_tip
-        ),
-    )
-    .unwrap();
+    write_rebase_state_fixture(&repo, &state_path, feature_tip);
 
     // 2. Manually create a rebase-merge directory to simulate an active rebase
     fs::create_dir_all(dir.path().join(".git/rebase-merge")).unwrap();
@@ -1761,27 +1769,8 @@ fn test_move_abort_cleans_up_rebase_when_state_exists() {
         "rebase should have failed with conflict"
     );
 
-    // Manually create a kin move state file
     let state_path = dir.path().join(".git/gits_rebase_state.json");
-    fs::write(
-        &state_path,
-        format!(
-            r#"{{
-  "operation": "Move",
-  "original_branch": "feature",
-  "target_branch": "target",
-  "remaining_branches": [],
-  "in_progress_branch": null,
-  "parent_id_map": {{}},
-  "parent_name_map": {{}},
-  "owned_tip_map": {{
-    "feature": "{feature_tip}"
-  }}
-}}"#,
-            feature_tip = feature_tip
-        ),
-    )
-    .unwrap();
+    write_rebase_state_fixture(&repo, &state_path, feature_tip);
 
     // Run kin move abort
     let mut cmd = kin_cmd();

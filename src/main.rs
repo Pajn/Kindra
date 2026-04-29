@@ -24,9 +24,10 @@ use crate::commands::tree::{TreeArgs, tree};
 use crate::commands::worktree::{WorktreeSubcommand, worktree};
 pub use crate::repository::open_repo;
 use anyhow::Result;
-use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::{Shell, generate};
+use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand};
+use clap_complete::generate;
 use commands::CheckoutSubcommand;
+use std::process::Command as ProcessCommand;
 
 #[derive(Parser)]
 #[command(name = "kin")]
@@ -105,6 +106,7 @@ enum ShellChoice {
     Bash,
     Zsh,
     Fish,
+    #[value(name = "powershell", alias = "power-shell")]
     PowerShell,
     Elvish,
     Nu,
@@ -128,6 +130,10 @@ fn main() -> Result<()> {
         runtime::configure_runtime_tuning()?;
     }
 
+    clap_complete::CompleteEnv::with_factory(completion_command)
+        .bin("kin")
+        .complete();
+
     let cli = Cli::parse();
 
     match &cli.command {
@@ -150,27 +156,51 @@ fn main() -> Result<()> {
         Commands::Status => status_cmd()?,
         Commands::Tree(args) => tree(args)?,
         Commands::Worktree { subcommand } => worktree(subcommand)?,
-        Commands::Completions { shell } => {
-            let mut cmd = Cli::command();
-            match shell {
-                ShellChoice::Bash => generate(Shell::Bash, &mut cmd, "kin", &mut std::io::stdout()),
-                ShellChoice::Zsh => generate(Shell::Zsh, &mut cmd, "kin", &mut std::io::stdout()),
-                ShellChoice::Fish => generate(Shell::Fish, &mut cmd, "kin", &mut std::io::stdout()),
-                ShellChoice::PowerShell => {
-                    generate(Shell::PowerShell, &mut cmd, "kin", &mut std::io::stdout())
-                }
-                ShellChoice::Elvish => {
-                    generate(Shell::Elvish, &mut cmd, "kin", &mut std::io::stdout())
-                }
-                ShellChoice::Nu => generate(
-                    clap_complete_nushell::Nushell,
-                    &mut cmd,
-                    "kin",
-                    &mut std::io::stdout(),
-                ),
-            }
-        }
+        Commands::Completions { shell } => match shell {
+            ShellChoice::Bash => print_dynamic_completion_script("bash")?,
+            ShellChoice::Zsh => print_dynamic_completion_script("zsh")?,
+            ShellChoice::Fish => print_dynamic_completion_script("fish")?,
+            ShellChoice::PowerShell => print_dynamic_completion_script("powershell")?,
+            ShellChoice::Elvish => print_dynamic_completion_script("elvish")?,
+            ShellChoice::Nu => generate(
+                clap_complete_nushell::Nushell,
+                &mut completion_command(),
+                "kin",
+                &mut std::io::stdout(),
+            ),
+        },
     }
 
+    Ok(())
+}
+
+fn completion_command() -> Command {
+    let mut cmd = Cli::command();
+    if let Some(commit_cmd) = cmd.find_subcommand_mut("commit") {
+        let updated = std::mem::replace(commit_cmd, Command::new("commit")).arg(
+            Arg::new("on")
+                .long("on")
+                .value_name("branch")
+                .num_args(0..=1)
+                .action(ArgAction::Set)
+                .help("Commit onto another branch instead of the current one")
+                .add(crate::commands::local_branch_completer()),
+        );
+        *commit_cmd = updated;
+    }
+    cmd
+}
+
+fn print_dynamic_completion_script(shell: &str) -> Result<()> {
+    let output = ProcessCommand::new(std::env::current_exe()?)
+        .env("COMPLETE", shell)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "failed to generate {shell} completions: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    print!("{}", String::from_utf8_lossy(&output.stdout));
     Ok(())
 }

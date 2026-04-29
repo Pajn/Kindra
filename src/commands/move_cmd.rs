@@ -12,7 +12,7 @@ use std::collections::HashMap;
 #[derive(Args)]
 pub struct MoveArgs {
     /// Target branch to move onto
-    #[arg(long)]
+    #[arg(long, add = crate::commands::local_branch_completer())]
     pub onto: Option<String>,
     /// List all local branches instead of just the stack
     #[arg(long)]

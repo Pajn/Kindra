@@ -25,6 +25,7 @@ pub enum WorktreeSubcommand {
 #[derive(Args, Clone, Debug)]
 pub struct ReviewArgs {
     /// Branch to check out in the review worktree. Defaults to the current branch.
+    #[arg(add = crate::commands::local_branch_completer())]
     pub branch: Option<String>,
 
     /// Discard local changes in the review worktree when switching branches
@@ -39,7 +40,10 @@ pub struct TempArgs {
     pub new_branch: Option<String>,
 
     /// Branch to materialize, or start point when used with `-b`. Defaults to the current branch.
-    #[arg(value_name = "BRANCH_OR_START_POINT")]
+    #[arg(
+        value_name = "BRANCH_OR_START_POINT",
+        add = crate::commands::local_branch_completer()
+    )]
     pub target: Option<String>,
 }
 

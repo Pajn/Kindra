@@ -569,7 +569,7 @@ If a `kin commit`, `kin move`, `kin reorder`, `kin sync`, or `kin restack` opera
 
 ### Shell Completions
 
-**Description:** Generates shell completion scripts for various shells.
+**Description:** Generates shell completion scripts for various shells. Bash, zsh, fish, PowerShell, and Elvish completions call back into `kin` as you type, so branch-aware flags such as `kin commit --on <branch>` and `kin move --onto <branch>` complete local branch names from the current repository.
 
 **Usage:**
 
@@ -582,8 +582,23 @@ Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`, `nu`.
 **Installation Example (Zsh):**
 
 ```bash
-mkdir -p ~/.zsh/completions
-kin completions zsh > ~/.zsh/completions/_kin
-fpath=(~/.zsh/completions $fpath)
-autoload -Uz compinit && compinit
+source <(kin completions zsh)
 ```
+
+Add that line to `~/.zshrc` to enable completions for new shells.
+
+**Installation Example (Bash):**
+
+```bash
+source <(kin completions bash)
+```
+
+Add that line to `~/.bashrc` to enable completions for new shells.
+
+**Installation Example (Fish):**
+
+```fish
+kin completions fish | source
+```
+
+Add that line to `~/.config/fish/config.fish` to enable completions for new shells.

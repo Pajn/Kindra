@@ -534,7 +534,7 @@ fn reorder_abort_restores_extra_local_refs_moved_by_update_refs() {
     let alias_tip_before = branch_tip(&repo, "feature-bookmark");
 
     let mut state = RebaseState {
-        operation: Operation::Move,
+        operation: Operation::Reorder,
         original_branch: "feature-a".to_string(),
         target_branch: "target".to_string(),
         caller_branch: None,
