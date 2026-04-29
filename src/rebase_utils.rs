@@ -222,6 +222,11 @@ fn tracked_branch_names(state: &RebaseState) -> HashSet<String> {
     branch_names
 }
 
+// collect_rebased_commit_set iterates state.original_tip_map while reading
+// state.parent_id_map. This depends on save_state calling augment_original_tip_map
+// before capture_owned_tip_map, so state.original_tip_map contains all branches
+// present in state.parent_id_map. Callers must preserve that ordering and ensure
+// state.original_tip_map contains the branches to inspect.
 fn collect_rebased_commit_set(repo: &Repository, state: &RebaseState) -> HashSet<Oid> {
     let mut rebased_commits = HashSet::new();
 

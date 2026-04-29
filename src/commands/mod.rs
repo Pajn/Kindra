@@ -17,9 +17,11 @@ pub mod worktree;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Subcommand;
+use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use git2::{BranchType, Repository};
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,6 +41,33 @@ pub enum CheckoutSubcommand {
 pub struct CommitInfo {
     pub id: String,
     pub summary: String,
+}
+
+pub fn local_branch_completer() -> ArgValueCompleter {
+    ArgValueCompleter::new(local_branch_candidates)
+}
+
+fn local_branch_candidates(current: &OsStr) -> Vec<CompletionCandidate> {
+    let Some(current) = current.to_str() else {
+        return Vec::new();
+    };
+    let Ok(repo) = Repository::discover(".") else {
+        return Vec::new();
+    };
+    let Ok(branches) = repo.branches(Some(BranchType::Local)) else {
+        return Vec::new();
+    };
+
+    let mut candidates = branches
+        .filter_map(|branch| {
+            let (branch, _) = branch.ok()?;
+            let name = branch.name().ok()??;
+            name.starts_with(current)
+                .then(|| CompletionCandidate::new(name).help(Some("local branch".into())))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.get_value().cmp(right.get_value()));
+    candidates
 }
 
 pub fn prompt_select(message: &str, options: Vec<String>) -> Result<String> {

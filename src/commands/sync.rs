@@ -140,6 +140,8 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
                 .filter(|branch| branch != &top_branch),
             remaining_branches: vec![top_branch.clone()],
             in_progress_branch: None,
+            // For sync, parent_id_map stores the old rebase base for recovery/rollback,
+            // not the normal branch-parent relationship used by move/reorder.
             parent_id_map: HashMap::from([(top_branch.clone(), old_base.to_string())]),
             parent_name_map: HashMap::new(),
             new_base_map: HashMap::new(),
@@ -233,6 +235,8 @@ fn sync_upstream_branch(
             caller_branch: None,
             remaining_branches: vec![upstream_name.to_string()],
             in_progress_branch: None,
+            // For sync, parent_id_map stores the old rebase base for recovery/rollback,
+            // not the normal branch-parent relationship used by move/reorder.
             parent_id_map: HashMap::from([(upstream_name.to_string(), rebase_root_id.to_string())]),
             parent_name_map: HashMap::new(),
             new_base_map: HashMap::new(),
