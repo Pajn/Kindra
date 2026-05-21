@@ -1,6 +1,6 @@
 mod common;
 
-use common::{kin_cmd, make_commit, repo_init, run_ok};
+use common::{git_command, kin_cmd, make_commit, repo_init, run_ok};
 use git2::{BranchType, Repository};
 use kindra::rebase_utils::{Operation, RebaseState, save_state};
 use std::collections::HashMap;
@@ -561,7 +561,7 @@ fn reorder_abort_restores_extra_local_refs_moved_by_update_refs() {
     save_state(&repo, &state).unwrap();
 
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
-    let first_rebase = std::process::Command::new("git")
+    let first_rebase = git_command(dir.path())
         .args([
             "rebase",
             "--no-ff",
@@ -572,7 +572,6 @@ fn reorder_abort_restores_extra_local_refs_moved_by_update_refs() {
             &main_id.to_string(),
             "feature-a",
         ])
-        .current_dir(dir.path())
         .output()
         .unwrap();
     assert!(
@@ -600,7 +599,7 @@ fn reorder_abort_restores_extra_local_refs_moved_by_update_refs() {
     save_state(&repo, &state).unwrap();
 
     run_ok("git", &["checkout", "-f", "feature-b"], dir.path());
-    let second_rebase = std::process::Command::new("git")
+    let second_rebase = git_command(dir.path())
         .args([
             "rebase",
             "--no-ff",
@@ -613,7 +612,6 @@ fn reorder_abort_restores_extra_local_refs_moved_by_update_refs() {
             &feature_a_tip_id.to_string(),
             "feature-b",
         ])
-        .current_dir(dir.path())
         .output()
         .unwrap();
     assert!(

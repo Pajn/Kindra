@@ -36,6 +36,18 @@ pub fn run_ok(program: &str, args: &[&str], cwd: &std::path::Path) {
 }
 
 #[allow(dead_code)]
+pub fn git_command(cwd: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command
+        .current_dir(cwd)
+        .env("GIT_AUTHOR_NAME", "Run Ok User")
+        .env("GIT_AUTHOR_EMAIL", "run-ok@example.com")
+        .env("GIT_COMMITTER_NAME", "Run Ok User")
+        .env("GIT_COMMITTER_EMAIL", "run-ok@example.com");
+    command
+}
+
+#[allow(dead_code)]
 pub fn make_commit_at(
     repo: &Repository,
     refname: &str,
