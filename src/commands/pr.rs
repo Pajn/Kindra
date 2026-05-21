@@ -1164,12 +1164,9 @@ fn remove_existing_stack_section(body: &str) -> (String, bool) {
     let mut current_body = body.to_string();
     let mut any_removed = false;
 
-    loop {
-        let Some((start_idx, end_idx, _start_marker, end_marker)) =
-            find_removable_stack_section(&current_body)
-        else {
-            break;
-        };
+    while let Some((start_idx, end_idx, _start_marker, end_marker)) =
+        find_removable_stack_section(&current_body)
+    {
         let slice_end = end_idx + end_marker.len();
 
         let before = current_body[..start_idx].trim_end();
@@ -1182,7 +1179,6 @@ fn remove_existing_stack_section(body: &str) -> (String, bool) {
             (false, false) => format!("{before}\n\n{after}"),
         };
         any_removed = true;
-        continue;
     }
 
     (current_body, any_removed)
