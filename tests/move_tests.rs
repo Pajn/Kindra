@@ -297,6 +297,69 @@ fn test_move_conflict_and_continue() {
 }
 
 #[test]
+fn test_move_continue_forwards_editor_env_to_git() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let base_id = make_commit(&repo, "refs/heads/main", "file.txt", "base", "initial", &[]);
+    let base = repo.find_commit(base_id).unwrap();
+
+    let target_id = make_commit(
+        &repo,
+        "refs/heads/target",
+        "file.txt",
+        "target content",
+        "target commit",
+        &[&base],
+    );
+
+    let feature_id = make_commit(
+        &repo,
+        "refs/heads/feature",
+        "file.txt",
+        "feature content",
+        "feature commit",
+        &[&base],
+    );
+    let feature = repo.find_commit(feature_id).unwrap();
+
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_tree(
+        feature.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+
+    kin_cmd()
+        .arg("move")
+        .arg("--onto")
+        .arg("target")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Resolve conflicts"));
+
+    fs::write(dir.path().join("file.txt"), "resolved content").unwrap();
+    run_ok("git", &["add", "file.txt"], dir.path());
+
+    kin_cmd()
+        .arg("continue")
+        .current_dir(dir.path())
+        .env("EDITOR", "true")
+        .assert()
+        .success();
+
+    let feature_new = repo
+        .find_branch("feature", git2::BranchType::Local)
+        .unwrap();
+    let target = repo.find_commit(target_id).unwrap();
+    assert!(
+        repo.graph_descendant_of(feature_new.get().target().unwrap(), target.id())
+            .unwrap()
+    );
+}
+
+#[test]
 fn test_move_abort() {
     let (dir, repo) = setup_repo();
 

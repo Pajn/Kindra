@@ -23,10 +23,16 @@ pub fn continue_cmd() -> Result<()> {
         }
 
         println!("Continuing git rebase...");
-        let status = Command::new("git")
-            .arg("rebase")
-            .arg("--continue")
-            .status()?;
+        let mut git = Command::new("git");
+        git.envs(std::env::vars_os());
+        if std::env::var_os("GIT_EDITOR").is_none() {
+            if let Some(editor) = std::env::var_os("EDITOR") {
+                git.env("GIT_EDITOR", editor);
+            } else if let Some(editor) = std::env::var_os("VISUAL") {
+                git.env("GIT_EDITOR", editor);
+            }
+        }
+        let status = git.arg("rebase").arg("--continue").status()?;
         if !status.success() {
             return Err(anyhow!(
                 "git rebase --continue failed. Resolve conflicts and try again."
