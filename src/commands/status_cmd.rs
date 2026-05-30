@@ -1,4 +1,4 @@
-use crate::rebase_utils::{Operation, load_state};
+use crate::rebase_utils::{Operation, ReconcileMode, reconcile_saved_rebase_state};
 use anyhow::Result;
 
 pub fn status_cmd() -> Result<()> {
@@ -29,9 +29,9 @@ pub fn status_cmd() -> Result<()> {
         return Ok(());
     }
 
-    let state = match load_state(&repo) {
-        Ok(state) => state,
-        Err(_) => {
+    let state = match reconcile_saved_rebase_state(&repo, ReconcileMode::Passive)? {
+        Some(state) => state,
+        None => {
             println!("No Kindra operation active.");
             return Ok(());
         }

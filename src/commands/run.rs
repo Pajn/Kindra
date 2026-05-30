@@ -1,5 +1,5 @@
 use crate::commands::find_upstream;
-use crate::rebase_utils::state_path;
+use crate::rebase_utils::passively_reconcile_rebase_state;
 use crate::stack::{
     get_stack_branches_from_merge_base, resolve_merge_base, sort_branches_topologically,
 };
@@ -47,7 +47,7 @@ pub(crate) struct RunState {
 
 pub fn run(args: &RunArgs) -> Result<()> {
     let repo = crate::open_repo()?;
-    if state_path(&repo).exists() || run_state_exists(&repo) {
+    if passively_reconcile_rebase_state(&repo)? || run_state_exists(&repo) {
         return Err(anyhow!(
             "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));

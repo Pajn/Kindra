@@ -65,8 +65,14 @@ pub struct RebaseState {
     pub cleanup_checkout_fallback: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconcileMode {
+    Continue,
+    Passive,
+}
+
 pub fn state_path(repo: &Repository) -> PathBuf {
-    repo.path().join("gits_rebase_state.json")
+    repo.path().join("kindra_rebase_state.json")
 }
 
 pub fn save_state(repo: &Repository, state: &RebaseState) -> Result<()> {
@@ -109,6 +115,81 @@ pub fn clear_state(repo: &Repository) -> Result<()> {
         fs::remove_file(path)?;
     }
     Ok(())
+}
+
+pub fn reconcile_saved_rebase_state(
+    repo: &Repository,
+    mode: ReconcileMode,
+) -> Result<Option<RebaseState>> {
+    if !state_path(repo).exists() {
+        return Ok(None);
+    }
+
+    let mut state = load_state(repo)?;
+    if git_rebase_in_progress(repo) {
+        if !active_git_rebase_matches_state(repo, &state)? {
+            return Err(anyhow!(
+                "Active git rebase does not match saved Kindra rebase state. Resolve or abort the active git rebase before continuing."
+            ));
+        }
+        return Ok(Some(state));
+    }
+
+    let mut changed = false;
+    if state.operation == Operation::Sync {
+        if sync_rebase_completed(repo, &state)? {
+            state.remaining_branches.clear();
+            state.in_progress_branch = None;
+            changed = true;
+        }
+    } else {
+        while let Some(current_name) = state.remaining_branches.first().cloned() {
+            if !branch_rebase_completed(repo, &state, &current_name)? {
+                break;
+            }
+
+            if mode == ReconcileMode::Continue {
+                println!("Branch {} already rebased.", current_name);
+            }
+            state.remaining_branches.remove(0);
+            if state.in_progress_branch.as_ref() == Some(&current_name) {
+                state.in_progress_branch = None;
+            }
+            changed = true;
+        }
+    }
+
+    if state.remaining_branches.is_empty()
+        && state.in_progress_branch.is_none()
+        && mode == ReconcileMode::Passive
+        && can_passively_clear_completed_state(repo, &state)?
+    {
+        clear_state(repo)?;
+        return Ok(None);
+    }
+
+    if changed {
+        save_state(repo, &state)?;
+    }
+
+    Ok(Some(state))
+}
+
+pub fn passively_reconcile_rebase_state(repo: &Repository) -> Result<bool> {
+    if !state_path(repo).exists() {
+        return Ok(false);
+    }
+
+    match reconcile_saved_rebase_state(repo, ReconcileMode::Passive) {
+        Ok(state) => Ok(state.is_some()),
+        Err(err) => {
+            eprintln!(
+                "Warning: failed to reconcile saved Kindra rebase state; treating it as active: {}",
+                err
+            );
+            Ok(true)
+        }
+    }
 }
 
 /// `owned_tip_state_matches` treats an empty `state.owned_tip_map` as a deliberate
@@ -257,6 +338,140 @@ fn collect_rebased_commit_set(repo: &Repository, state: &RebaseState) -> HashSet
     rebased_commits
 }
 
+fn branch_rebase_target(state: &RebaseState, branch_name: &str) -> Result<(String, String)> {
+    let old_parent_id_str = state
+        .parent_id_map
+        .get(branch_name)
+        .ok_or_else(|| anyhow!("Parent ID not found for branch '{}'", branch_name))?
+        .clone();
+
+    let new_base = if let Some(explicit_base) = state.new_base_map.get(branch_name) {
+        explicit_base.clone()
+    } else if branch_name == state.original_branch {
+        state.target_branch.clone()
+    } else {
+        match state.parent_name_map.get(branch_name) {
+            Some(name) => name.clone(),
+            None => old_parent_id_str.clone(),
+        }
+    };
+
+    Ok((old_parent_id_str, new_base))
+}
+
+/// Checks rebase completion in three stages that each cover a different edge
+/// case. First, `branch_rebase_target` identifies the expected base and the
+/// branch tip must be a descendant of it, or equal to it, which handles branches
+/// whose commits were fully replayed or intentionally emptied. Second, the
+/// first-parent chain length is compared against `original_commit_count_map` so
+/// a branch with hidden extra commits past the expected replay is not accepted
+/// as complete. Finally, the revwalk from the current tip back to `new_base_id`
+/// verifies that the first replayed commit's first parent is exactly the new
+/// base, protecting against histories that contain the base but are attached
+/// through an unexpected first-parent path.
+fn branch_rebase_completed(
+    repo: &Repository,
+    state: &RebaseState,
+    branch_name: &str,
+) -> Result<bool> {
+    let (_, new_base) = branch_rebase_target(state, branch_name)?;
+    let current_id = repo.revparse_single(branch_name)?.id();
+    let new_base_id = repo.revparse_single(&new_base)?.id();
+    let mut is_done =
+        repo.graph_descendant_of(current_id, new_base_id)? || current_id == new_base_id;
+
+    if is_done
+        && current_id != new_base_id
+        && let Some(original_commit_count) = state.original_commit_count_map.get(branch_name)
+    {
+        let current_first_parent_chain = collect_first_parent_chain(repo, new_base_id, current_id)?;
+        if current_first_parent_chain.len() > *original_commit_count {
+            is_done = false;
+        }
+    }
+
+    if is_done && current_id != new_base_id {
+        let mut walk = repo.revwalk()?;
+        walk.push(current_id)?;
+        walk.hide(new_base_id)?;
+        let mut commits: Vec<Oid> = walk.filter_map(|id| id.ok()).collect();
+        commits.reverse();
+
+        if let Some(&first_id) = commits.first() {
+            let first_commit = repo.find_commit(first_id)?;
+            if first_commit.parent_count() > 0 && first_commit.parent_id(0)? != new_base_id {
+                is_done = false;
+            }
+        }
+    }
+
+    Ok(is_done)
+}
+
+fn active_git_rebase_matches_state(repo: &Repository, state: &RebaseState) -> Result<bool> {
+    if let Some(active_branch) = active_git_rebase_branch(repo)? {
+        return Ok(state.in_progress_branch.as_deref() == Some(active_branch.as_str()));
+    }
+
+    owned_tip_state_matches(repo, state)
+}
+
+fn active_git_rebase_branch(repo: &Repository) -> Result<Option<String>> {
+    for rebase_dir in ["rebase-merge", "rebase-apply"] {
+        let head_name_path = repo.path().join(rebase_dir).join("head-name");
+        if !head_name_path.exists() {
+            continue;
+        }
+
+        let head_name = fs::read_to_string(head_name_path)?;
+        let branch_name = head_name
+            .trim()
+            .strip_prefix("refs/heads/")
+            .unwrap_or_else(|| head_name.trim())
+            .to_string();
+        if !branch_name.is_empty() {
+            return Ok(Some(branch_name));
+        }
+    }
+
+    Ok(None)
+}
+
+fn sync_rebase_completed(repo: &Repository, state: &RebaseState) -> Result<bool> {
+    let original_tip = repo.revparse_single(&state.original_branch)?.id();
+    let target_tip = repo.revparse_single(&state.target_branch)?.id();
+    Ok(original_tip == target_tip || repo.graph_descendant_of(original_tip, target_tip)?)
+}
+
+fn can_passively_clear_completed_state(repo: &Repository, state: &RebaseState) -> Result<bool> {
+    if state.stash_ref.is_some()
+        || state.unstage_on_restore
+        || !state.cleanup_merged_branches.is_empty()
+    {
+        return Ok(false);
+    }
+
+    if state.operation != Operation::Sync {
+        let restore_branch = state
+            .caller_branch
+            .as_deref()
+            .unwrap_or(state.original_branch.as_str());
+        if current_branch_name(repo)? != Some(restore_branch.to_string()) {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn current_branch_name(repo: &Repository) -> Result<Option<String>> {
+    if repo.head_detached()? {
+        return Ok(None);
+    }
+
+    Ok(repo.head()?.shorthand().map(ToString::to_string))
+}
+
 pub fn check_worktrees(branches: &[String], force: bool) -> Result<()> {
     if force {
         return Ok(());
@@ -393,58 +608,10 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         // Check if we are resuming a rebase that was already in progress
         let is_resuming = state.in_progress_branch.as_ref() == Some(&current_name);
 
-        let old_parent_id_str = state
-            .parent_id_map
-            .get(&current_name)
-            .ok_or_else(|| anyhow!("Parent ID not found for branch '{}'", current_name))?;
-
-        let new_base = if let Some(explicit_base) = state.new_base_map.get(&current_name) {
-            explicit_base.clone()
-        } else if current_name == state.original_branch {
-            state.target_branch.clone()
-        } else {
-            match state.parent_name_map.get(&current_name) {
-                Some(name) => name.clone(),        // rebase onto the already-moved branch
-                None => old_parent_id_str.clone(), // rebase onto original commit
-            }
-        };
+        let (old_parent_id_str, new_base) = branch_rebase_target(&state, &current_name)?;
 
         // Check if the branch is already rebased (e.g. by a previous --update-refs)
-        let current_id = repo.revparse_single(&current_name)?.id();
-        let new_base_id = repo.revparse_single(&new_base)?.id();
-        let mut is_done =
-            repo.graph_descendant_of(current_id, new_base_id)? || current_id == new_base_id;
-
-        if is_done
-            && current_id != new_base_id
-            && let Some(original_commit_count) = state.original_commit_count_map.get(&current_name)
-        {
-            let current_first_parent_chain =
-                collect_first_parent_chain(repo, new_base_id, current_id)?;
-            if current_first_parent_chain.len() > *original_commit_count {
-                is_done = false;
-            }
-        }
-
-        if is_done && current_id != new_base_id {
-            // Stricter check: the first commit in the branch's delta (relative to its new base)
-            // must now be a child of new_base_id.
-            // We walk from current_id back to new_base_id.
-            let mut walk = repo.revwalk()?;
-            walk.push(current_id)?;
-            walk.hide(new_base_id)?;
-            let mut commits: Vec<Oid> = walk.filter_map(|id| id.ok()).collect();
-            commits.reverse(); // Now oldest to newest
-
-            if let Some(&first_id) = commits.first() {
-                let first_commit = repo.find_commit(first_id)?;
-                if first_commit.parent_count() > 0 && first_commit.parent_id(0)? != new_base_id {
-                    // It's a descendant of new_base, but not immediately building on it.
-                    // This could mean it's based on an old version of the base.
-                    is_done = false;
-                }
-            }
-        }
+        let is_done = branch_rebase_completed(repo, &state, &current_name)?;
 
         if is_done && (is_resuming || started_any) && !git_rebase_in_progress(repo) {
             println!("Branch {} already rebased.", current_name);
@@ -474,7 +641,7 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
             .arg("--update-refs")
             .arg("--onto")
             .arg(&new_base)
-            .arg(old_parent_id_str)
+            .arg(&old_parent_id_str)
             .arg(&current_name)
             .status()?;
 

@@ -1,12 +1,13 @@
 use crate::rebase_utils::{
-    Operation, git_rebase_in_progress, load_state, run_rebase_loop, state_path,
+    Operation, ReconcileMode, git_rebase_in_progress, reconcile_saved_rebase_state, run_rebase_loop,
 };
 use anyhow::{Result, anyhow};
 use std::process::Command;
 
 pub fn continue_cmd() -> Result<()> {
     let repo = crate::open_repo()?;
-    let has_rebase_state = state_path(&repo).exists();
+    let rebase_state = reconcile_saved_rebase_state(&repo, ReconcileMode::Continue)?;
+    let has_rebase_state = rebase_state.is_some();
     let has_run_state = crate::commands::run::run_state_exists(&repo);
 
     if has_rebase_state && has_run_state {
@@ -40,8 +41,7 @@ pub fn continue_cmd() -> Result<()> {
         }
     }
 
-    if has_rebase_state {
-        let state = load_state(&repo)?;
+    if let Some(state) = rebase_state {
         return match state.operation {
             Operation::Sync => crate::commands::sync::finish_sync_after_rebase(&repo, state),
             _ => run_rebase_loop(&repo, state),
