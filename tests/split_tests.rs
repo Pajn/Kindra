@@ -676,5 +676,5 @@ mv "$file.tmp" "$file"
         .stderr(predicates::str::contains("must follow a commit line"));
 
     // Verify state file does NOT exist
-    assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
 }

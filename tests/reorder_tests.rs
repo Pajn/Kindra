@@ -479,7 +479,7 @@ fn reorder_conflict_and_abort_restores_original_graph_and_cleans_up() {
     assert_direct_parent_id(&repo, "feature-c", original_parent_feature_c);
     assert_direct_parent_id(&repo, "feature-a", original_parent_feature_a);
     assert_direct_parent_id(&repo, "feature-b", original_parent_feature_b);
-    assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
 }
@@ -634,7 +634,7 @@ fn reorder_abort_restores_extra_local_refs_moved_by_update_refs() {
 
     let repo = Repository::open(dir.path()).unwrap();
     assert_eq!(branch_tip(&repo, "feature-bookmark"), alias_tip_before);
-    assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
 }
@@ -713,7 +713,7 @@ fn reorder_manual_git_continue_then_abort_clears_state_without_rewinding_refs() 
     assert_eq!(branch_tip(&repo, "feature-a"), feature_a_tip_before_abort);
     assert_eq!(branch_tip(&repo, "feature-b"), feature_b_tip_before_abort);
     assert_eq!(branch_tip(&repo, "feature-c"), feature_c_tip_before_abort);
-    assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
 }

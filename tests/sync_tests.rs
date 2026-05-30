@@ -2,7 +2,9 @@ mod common;
 
 use common::{kin_cmd, make_commit, repo_init, run_ok};
 use git2::{BranchType, Repository};
+use kindra::rebase_utils::{Operation, RebaseState, load_state, save_state};
 use predicates::prelude::*;
+use std::collections::HashMap;
 use std::fs;
 use tempfile::TempDir;
 use tempfile::tempdir;
@@ -1010,8 +1012,116 @@ fn sync_reports_rebase_conflict() {
         "Expected git rebase state to remain after conflict"
     );
     assert!(
-        dir.path().join(".git/gits_rebase_state.json").exists(),
+        dir.path().join(".git/kindra_rebase_state.json").exists(),
         "Expected kindra state to remain after conflict"
+    );
+}
+
+#[test]
+fn sync_no_delete_manual_continue_from_non_tip_branch_clears_passively() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "file.txt",
+        "feature change",
+        "feature a",
+        &[&base],
+    );
+    let a = repo.find_commit(a_id).unwrap();
+
+    let b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "feature b",
+        &[&a],
+    );
+
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "main change",
+        "main conflicting change",
+        &[&base],
+    );
+
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    kin_cmd()
+        .arg("sync")
+        .arg("--no-delete")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("rebase").or(predicate::str::contains("Resolve conflicts")),
+        );
+
+    let state_path = dir.path().join(".git/kindra_rebase_state.json");
+    assert!(state_path.exists());
+
+    fs::write(dir.path().join("file.txt"), "resolved").unwrap();
+    run_ok("git", &["add", "file.txt"], dir.path());
+    run_ok(
+        "git",
+        &["-c", "core.editor=true", "rebase", "--continue"],
+        dir.path(),
+    );
+
+    kin_cmd()
+        .arg("status")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No Kindra operation active."));
+
+    assert!(
+        !state_path.exists(),
+        "completed sync state should be cleared without requiring kin continue"
+    );
+    assert!(
+        Repository::open(dir.path())
+            .unwrap()
+            .find_branch("feature-a", BranchType::Local)
+            .is_ok(),
+        "--no-delete sync should not delete the lower branch"
+    );
+    let repo = Repository::open(dir.path()).unwrap();
+    let feature_a_tip = repo
+        .find_branch("feature-a", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let feature_b_tip = repo
+        .find_branch("feature-b", BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    assert_ne!(
+        feature_b_tip, b_id,
+        "manual continuation should finish rebasing the upper branch"
+    );
+    assert!(
+        repo.graph_descendant_of(feature_b_tip, feature_a_tip)
+            .unwrap(),
+        "upper branch should remain stacked on the updated lower branch"
     );
 }
 
@@ -1069,7 +1179,7 @@ fn sync_abort_restores_original_branch_after_tip_switch_conflict() {
             predicate::str::contains("rebase").or(predicate::str::contains("Resolve conflicts")),
         );
 
-    assert!(dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
 
     let repo = Repository::open(dir.path()).unwrap();
     assert_ne!(repo.state(), git2::RepositoryState::Clean);
@@ -1093,9 +1203,87 @@ fn sync_abort_restores_original_branch_after_tip_switch_conflict() {
             .unwrap(),
         old_feature_b
     );
-    assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
+}
+
+#[test]
+fn status_blocks_and_preserves_state_when_active_git_rebase_mismatches_kindra_state() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feature a",
+        &[&base],
+    );
+    let b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "feature b",
+        &[&base],
+    );
+
+    let state = RebaseState {
+        operation: Operation::Sync,
+        original_branch: "feature-a".to_string(),
+        target_branch: "main".to_string(),
+        caller_branch: None,
+        remaining_branches: vec!["feature-a".to_string()],
+        in_progress_branch: Some("feature-a".to_string()),
+        parent_id_map: HashMap::from([("feature-a".to_string(), base_id.to_string())]),
+        parent_name_map: HashMap::new(),
+        new_base_map: HashMap::new(),
+        original_commit_count_map: HashMap::new(),
+        original_tip_map: HashMap::from([("feature-a".to_string(), a_id.to_string())]),
+        owned_tip_map: HashMap::from([("feature-a".to_string(), a_id.to_string())]),
+        stash_ref: Some("stash@{0}".to_string()),
+        unstage_on_restore: false,
+        autostash: false,
+        cleanup_merged_branches: vec!["feature-b".to_string()],
+        cleanup_checkout_fallback: Some("main".to_string()),
+    };
+    save_state(&repo, &state).unwrap();
+
+    repo.set_head("refs/heads/feature-b").unwrap();
+    repo.checkout_tree(
+        repo.find_commit(b_id).unwrap().as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+    let rebase_dir = dir.path().join(".git/rebase-merge");
+    fs::create_dir_all(&rebase_dir).unwrap();
+    fs::write(rebase_dir.join("head-name"), "refs/heads/feature-b\n").unwrap();
+
+    kin_cmd()
+        .arg("status")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Active git rebase does not match saved Kindra rebase state",
+        ));
+
+    let preserved = load_state(&repo).unwrap();
+    assert_eq!(preserved.in_progress_branch.as_deref(), Some("feature-a"));
+    assert_eq!(preserved.stash_ref.as_deref(), Some("stash@{0}"));
+    assert_eq!(preserved.cleanup_merged_branches, vec!["feature-b"]);
 }
 
 #[test]
@@ -1946,7 +2134,7 @@ fn sync_preserves_state_on_prestart_rebase_failure_after_tip_checkout() {
     let repo = Repository::open(dir.path()).unwrap();
     assert_eq!(repo.state(), git2::RepositoryState::Clean);
     assert_eq!(repo.head().unwrap().shorthand(), Some("feature-b"));
-    assert!(dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
 
@@ -1968,7 +2156,7 @@ fn sync_preserves_state_on_prestart_rebase_failure_after_tip_checkout() {
     let repo = Repository::open(dir.path()).unwrap();
     assert_eq!(repo.state(), git2::RepositoryState::Clean);
     assert_eq!(repo.head().unwrap().shorthand(), Some("feature-a"));
-    assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
 }
@@ -2064,7 +2252,7 @@ fn sync_on_main_handles_rebase_conflict_and_preserves_state() {
         "Expected git rebase state to remain after main sync conflict"
     );
     assert!(
-        dir.path().join(".git/gits_rebase_state.json").exists(),
+        dir.path().join(".git/kindra_rebase_state.json").exists(),
         "Expected kindra state to remain after main sync conflict"
     );
     assert!(repo.find_branch("feature-a", BranchType::Local).is_ok());
@@ -2140,7 +2328,7 @@ fn sync_on_main_conflict_can_continue_with_gits() {
             predicate::str::contains("rebase").or(predicate::str::contains("Resolve conflicts")),
         );
 
-    assert!(dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
 
     fs::write(dir.path().join("shared.txt"), "resolved main").unwrap();
     run_ok("git", &["add", "shared.txt"], dir.path());
@@ -2156,7 +2344,7 @@ fn sync_on_main_conflict_can_continue_with_gits() {
     let repo = Repository::open(dir.path()).unwrap();
     assert_eq!(repo.state(), git2::RepositoryState::Clean);
     assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
-    assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
 
     let main_tip = repo.find_branch("main", BranchType::Local).unwrap();
     let main_tip = main_tip.get().target().unwrap();
@@ -2226,7 +2414,7 @@ fn sync_on_main_conflict_continue_after_rebase() {
     run_ok("git", &["reset", "--hard", "origin/main"], dir.path());
 
     fs::write(
-        dir.path().join(".git/gits_rebase_state.json"),
+        dir.path().join(".git/kindra_rebase_state.json"),
         r#"{
   "operation": "Sync",
   "original_branch": "main",
@@ -2249,7 +2437,7 @@ fn sync_on_main_conflict_continue_after_rebase() {
     let repo = Repository::open(dir.path()).unwrap();
     assert_eq!(repo.state(), git2::RepositoryState::Clean);
     assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
-    assert!(!dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
 
@@ -2343,7 +2531,7 @@ fn sync_on_main_manual_git_abort_does_not_finalize_or_delete_branches() {
             predicate::str::contains("rebase").or(predicate::str::contains("Resolve conflicts")),
         );
 
-    assert!(dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
     run_ok("git", &["rebase", "--abort"], dir.path());
 
     let mut continue_cmd = kin_cmd();
@@ -2356,7 +2544,7 @@ fn sync_on_main_manual_git_abort_does_not_finalize_or_delete_branches() {
 
     let repo = Repository::open(dir.path()).unwrap();
     assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
-    assert!(dir.path().join(".git/gits_rebase_state.json").exists());
+    assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
     assert!(repo.find_branch("feature-a", BranchType::Local).is_ok());
 }
 

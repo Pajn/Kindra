@@ -1,7 +1,9 @@
 use crate::commands::{
     prompt_multi_select, resolve_rebase_autostash, resolve_restack_history_limit,
 };
-use crate::rebase_utils::{Operation, RebaseState, run_rebase_loop, state_path};
+use crate::rebase_utils::{
+    Operation, RebaseState, passively_reconcile_rebase_state, run_rebase_loop,
+};
 use anyhow::{Result, anyhow};
 use clap::Args;
 use git2::{BranchType, Commit, Oid, Repository};
@@ -27,8 +29,10 @@ pub struct RestackArgs {
 pub fn restack(args: &RestackArgs) -> Result<()> {
     let repo = crate::open_repo()?;
 
-    if state_path(&repo).exists() {
-        return Err(anyhow!("A rebase operation is already in progress."));
+    if passively_reconcile_rebase_state(&repo)? {
+        return Err(anyhow!(
+            "A Kindra-managed operation is already in progress. Use 'kin continue' or 'kin abort'."
+        ));
     }
 
     let head = repo.head()?;

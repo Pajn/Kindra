@@ -1,5 +1,7 @@
 use crate::commands::{find_upstream, resolve_rebase_autostash};
-use crate::rebase_utils::{Operation, RebaseState, run_rebase_loop, save_state, state_path};
+use crate::rebase_utils::{
+    Operation, RebaseState, passively_reconcile_rebase_state, run_rebase_loop, save_state,
+};
 use anyhow::{Result, anyhow};
 use clap::Args;
 use std::collections::{HashMap, HashSet};
@@ -21,7 +23,7 @@ pub struct ReorderArgs {
 
 pub fn reorder(args: &ReorderArgs) -> Result<()> {
     let repo = crate::open_repo()?;
-    if state_path(&repo).exists() {
+    if passively_reconcile_rebase_state(&repo)? {
         return Err(anyhow!(
             "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));

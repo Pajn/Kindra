@@ -1,7 +1,7 @@
 use crate::commands::{find_upstream, resolve_rebase_autostash};
 use crate::rebase_utils::{
     RebaseState, apply_stash, check_worktrees, checkout_branch, clear_state, drop_stash,
-    git_rebase_in_progress, run_rebase_loop, save_state, state_path,
+    git_rebase_in_progress, passively_reconcile_rebase_state, run_rebase_loop, save_state,
 };
 use crate::stack::{
     StackBranch, StackCommit, collect_descendants, enumerate_stack_commits,
@@ -17,8 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub fn commit(args: &[String]) -> Result<()> {
     let repo = crate::open_repo()?;
 
-    let path = state_path(&repo);
-    if path.exists() {
+    if passively_reconcile_rebase_state(&repo)? {
         return Err(anyhow!(
             "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));
@@ -254,8 +253,22 @@ pub fn commit(args: &[String]) -> Result<()> {
             let status = cmd.status()?;
 
             if !status.success() {
-                if !pre_commit_state_required && git_rebase_in_progress(&repo) {
-                    save_state(&repo, &state)?;
+                if !pre_commit_state_required {
+                    if git_rebase_in_progress(&repo) {
+                        state.in_progress_branch = Some(target_branch.clone());
+                        save_state(&repo, &state)?;
+                    } else if autosquash_state_required
+                        && let Some(stash_ref) = state.stash_ref.clone()
+                    {
+                        state.stash_ref = None;
+                        state.in_progress_branch = None;
+                        save_state(&repo, &state)?;
+                        apply_stash(&stash_ref)?;
+                        if let Err(err) = drop_stash(&stash_ref) {
+                            eprintln!("Warning: {}", err);
+                        }
+                        save_state(&repo, &state)?;
+                    }
                 }
                 return Err(anyhow!(
                     "git rebase --autosquash failed. Resolve conflicts and run 'kin continue', or run 'kin abort'."
@@ -264,12 +277,14 @@ pub fn commit(args: &[String]) -> Result<()> {
 
             if autosquash_state_required {
                 if let Some(stash_ref) = state.stash_ref.clone() {
-                    apply_stash(&stash_ref)?;
                     state.stash_ref = None;
+                    state.in_progress_branch = None;
                     save_state(&repo, &state)?;
+                    apply_stash(&stash_ref)?;
                     if let Err(err) = drop_stash(&stash_ref) {
                         eprintln!("Warning: {}", err);
                     }
+                    save_state(&repo, &state)?;
                 }
                 clear_state(&repo)?;
             }

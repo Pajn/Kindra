@@ -1,5 +1,7 @@
 use crate::commands::{find_upstream, resolve_rebase_autostash};
-use crate::rebase_utils::{Operation, RebaseState, run_rebase_loop, save_state, state_path};
+use crate::rebase_utils::{
+    Operation, RebaseState, passively_reconcile_rebase_state, run_rebase_loop, save_state,
+};
 use crate::stack::{
     collect_descendants, get_stack_branches_from_merge_base, plan_descendant_reorder,
     visualize_stack,
@@ -34,8 +36,7 @@ pub fn move_cmd(args: &MoveArgs) -> Result<()> {
 }
 
 fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
-    let path = state_path(repo);
-    if path.exists() {
+    if passively_reconcile_rebase_state(repo)? {
         return Err(anyhow!(
             "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));

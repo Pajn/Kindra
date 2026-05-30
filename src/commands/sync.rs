@@ -1,8 +1,8 @@
 use crate::commands::find_upstream;
 use crate::commands::resolve_rebase_autostash;
 use crate::rebase_utils::{
-    Operation, RebaseState, checkout_branch, clear_state, git_rebase_in_progress, save_state,
-    state_path,
+    Operation, RebaseState, checkout_branch, clear_state, git_rebase_in_progress,
+    passively_reconcile_rebase_state, save_state,
 };
 use crate::stack::{
     collect_merged_local_branches, find_sync_boundary, get_stack_branches_from_merge_base,
@@ -37,8 +37,7 @@ pub struct SyncArgs {
 pub fn sync(args: &SyncArgs) -> Result<()> {
     let repo = crate::open_repo()?;
 
-    let path = state_path(&repo);
-    if path.exists() {
+    if passively_reconcile_rebase_state(&repo)? {
         return Err(anyhow!(
             "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));
