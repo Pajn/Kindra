@@ -1,0 +1,9 @@
+allow-branch = ["main"]
+tag-name = "v{{version}}"
+tag-message = "Release {{tag_name}}"
+pre-release-commit-message = "Bump version to {{version}}"
+publish = false
+
+pre-release-replacements = [
+  { file = "Cargo.toml", search = 'documentation = "https://docs.rs/kindra/[^/]+/kindra/"', replace = 'documentation = "https://docs.rs/kindra/{{version}}/kindra/"' },
+]

@@ -41,6 +41,20 @@ cd kindra
 cargo install --path .
 ```
 
+## Releasing
+
+Kindra uses `cargo-release` to keep the Cargo version, version bump commit, and Git tag in sync. The GitHub release workflow runs when a `v*` tag is pushed.
+
+```bash
+cargo install cargo-release
+
+# Review the planned version bump, commit, tag, and push.
+cargo release 0.3.0
+
+# Perform the release after reviewing the dry run.
+cargo release 0.3.0 --execute
+```
+
 ## Quick Start
 
 1. **Start a stack**: Create several branches, each building on the previous one.
