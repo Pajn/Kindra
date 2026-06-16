@@ -1211,6 +1211,215 @@ exit 1
     );
 }
 
+#[test]
+fn pr_default_skips_stack_prs_authored_by_other_users() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "user" ]]; then
+    echo "alice"
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        if [[ "$5" == *"author"* ]]; then
+            echo '{"number":10,"baseRefName":"main","state":"OPEN","isDraft":false,"author":{"login":"bob"}}'
+        else
+            echo '{"number":10,"title":"PR A","body":"Body A","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}'
+        fi
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        if [[ "$5" == *"author"* ]]; then
+            echo '{"number":11,"baseRefName":"feature-a","state":"OPEN","isDraft":false,"author":{"login":"alice"}}'
+        else
+            echo '{"number":11,"title":"PR B","body":"Body B\n\n<!-- kindra-stack:start -->\n## Stack\n- [feature-a](https://github.com/test/repo/pull/10) #10\n- → feature-b #11\n<!-- kindra-stack:end -->","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}'
+        fi
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    echo "$3" >> "$MOCK_GH_EDIT_LOG"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let edit_log = dir.path().join("edit-log.txt");
+    let output = kin_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_EDIT_LOG", &edit_log)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "kin pr failed: {:?}", output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Skipping 'feature-a' because PR #10 is authored by bob"),
+        "kin pr should explain skipped foreign-authored PRs. Got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Pushing 1 branches to origin"),
+        "kin pr should only push the scoped branch. Got:\n{}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("── feature-a ──"),
+        "kin pr should not process the foreign-authored PR. Got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("── feature-b ──"),
+        "kin pr should still process the current user's PR. Got:\n{}",
+        stdout
+    );
+
+    let edits = fs::read_to_string(edit_log).unwrap();
+    assert_eq!(
+        edits.trim(),
+        "11",
+        "only the current user's PR should be edited by default"
+    );
+}
+
+#[test]
+fn pr_all_includes_stack_prs_authored_by_other_users() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "user" ]]; then
+    echo "alice"
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "feature-a" ]]; then
+        if [[ "$5" == *"author"* ]]; then
+            echo '{"number":10,"baseRefName":"main","state":"OPEN","isDraft":false,"author":{"login":"bob"}}'
+        else
+            echo '{"number":10,"title":"PR A","body":"Body A","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}'
+        fi
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        if [[ "$5" == *"author"* ]]; then
+            echo '{"number":11,"baseRefName":"feature-a","state":"OPEN","isDraft":false,"author":{"login":"alice"}}'
+        else
+            echo '{"number":11,"title":"PR B","body":"Body B","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}'
+        fi
+        exit 0
+    fi
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    echo "$3" >> "$MOCK_GH_EDIT_LOG"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let edit_log = dir.path().join("edit-log.txt");
+    let output = kin_cmd()
+        .args(["pr", "--all"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_EDIT_LOG", &edit_log)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "kin pr --all failed: {:?}", output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("Skipping 'feature-a'"),
+        "kin pr --all should not skip foreign-authored PRs. Got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Pushing 2 branches to origin"),
+        "kin pr --all should push the full stack. Got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("── feature-a ──") && stdout.contains("── feature-b ──"),
+        "kin pr --all should process both PRs. Got:\n{}",
+        stdout
+    );
+
+    let edits = fs::read_to_string(edit_log).unwrap();
+    assert!(
+        edits.lines().any(|line| line == "10") && edits.lines().any(|line| line == "11"),
+        "kin pr --all should edit both stack PRs. Got:\n{}",
+        edits
+    );
+}
+
 // Test: multi-commit branch → title is NOT prefilled (shows commit list instead)
 // ──────────────────────────────────────────────────────────────────────────────
 

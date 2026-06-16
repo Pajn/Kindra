@@ -50,6 +50,9 @@ enum Commands {
         /// Skip the automatic flatten/push preflight before creating PRs
         #[arg(long)]
         no_push: bool,
+        /// Include PRs authored by other GitHub users in stack updates
+        #[arg(long)]
+        all: bool,
         /// Set labels on all created PRs (can be specified multiple times)
         #[arg(long)]
         label: Vec<String>,
@@ -142,8 +145,9 @@ fn main() -> Result<()> {
         Commands::Pr {
             subcommand,
             no_push,
+            all,
             label,
-        } => pr(subcommand, *no_push, label)?,
+        } => pr(subcommand, *no_push, *all, label)?,
         Commands::Checkout { subcommand, all } => checkout(subcommand, *all)?,
         Commands::Move(args) => move_cmd(args)?,
         Commands::Reorder(args) => reorder(args)?,

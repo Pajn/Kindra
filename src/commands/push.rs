@@ -103,6 +103,19 @@ pub fn push() -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn push_tracked_stack_branches(repo: &Repository, branches: &[String]) -> Result<()> {
+    let mut branches_to_push = Vec::new();
+
+    for name in branches {
+        let branch = repo.find_branch(name, BranchType::Local)?;
+        if let Some(target) = tracked_push_target(repo, &branch, name.clone())? {
+            branches_to_push.push(target);
+        }
+    }
+
+    perform_push(branches_to_push)
+}
+
 fn push_upstream_branch(repo: &Repository, upstream_name: &str) -> Result<()> {
     let branch = repo.find_branch(upstream_name, BranchType::Local)?;
     if let Some(target) = tracked_push_target(repo, &branch, upstream_name.to_string())? {

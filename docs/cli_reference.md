@@ -472,7 +472,7 @@ kin run -c "echo 'Hello from $(git branch --show-current)'"
 **Usage:**
 
 ```bash
-kin pr [--no-push]
+kin pr [--no-push] [--all]
 kin pr open
 kin pr edit
 kin pr flatten
@@ -481,8 +481,9 @@ kin pr status
 kin pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--reviewer <login>] [--bots|--no-bots]
 ```
 
-- `kin pr`: Create/update PRs for stack branches with upstreams. By default it first checks whether open PR bases on GitHub still match the local stack order, flattens them to the resolved upstream base if needed, and pushes before running normal PR creation/update logic.
+- `kin pr`: Create/update PRs for stack branches with upstreams, skipping open PRs authored by other GitHub users. By default it first checks whether open PR bases on GitHub still match the local stack order, flattens them to the resolved upstream base if needed, and pushes before running normal PR creation/update logic.
 - `kin pr --no-push`: Skip that automatic flatten/push preflight and use the previous create/update behavior.
+- `kin pr --all`: Include stack PRs authored by other GitHub users in push, base update, and stack-section updates.
 - `kin pr open`: Open a PR URL in the default browser (if multiple, choose one).
 - `kin pr edit`: Select a PR (if multiple), then edit title/body/labels/reviewers.
 - `kin pr flatten`: Retarget every open PR in the current stack to the resolved upstream base branch on GitHub (for example, `origin/main` normalizes to `main`).

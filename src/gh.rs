@@ -28,6 +28,7 @@ pub struct ExistingPr {
     pub number: u64,
     pub base_branch: String,
     pub is_draft: bool,
+    pub author_login: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +93,10 @@ pub struct PrReviewThread {
 /// Check if an open PR exists for `branch`. Returns `Some(ExistingPr)` or `None`.
 pub fn find_open_pr(branch: &str) -> Result<Option<ExistingPr>> {
     #[derive(Deserialize)]
+    struct User {
+        login: String,
+    }
+    #[derive(Deserialize)]
     struct PrView {
         number: u64,
         #[serde(rename = "baseRefName", default)]
@@ -99,6 +104,8 @@ pub fn find_open_pr(branch: &str) -> Result<Option<ExistingPr>> {
         state: String,
         #[serde(rename = "isDraft", default)]
         is_draft: bool,
+        #[serde(default)]
+        author: Option<User>,
     }
 
     let output = Command::new("gh")
@@ -107,7 +114,7 @@ pub fn find_open_pr(branch: &str) -> Result<Option<ExistingPr>> {
             "view",
             branch,
             "--json",
-            "number,baseRefName,state,isDraft",
+            "number,baseRefName,state,isDraft,author",
         ])
         .output()
         .context("Failed to run `gh pr view`")?;
@@ -128,10 +135,33 @@ pub fn find_open_pr(branch: &str) -> Result<Option<ExistingPr>> {
             number: pr.number,
             base_branch: pr.base_ref_name,
             is_draft: pr.is_draft,
+            author_login: pr.author.map(|author| author.login),
         }))
     } else {
         Ok(None)
     }
+}
+
+pub fn current_user_login() -> Result<String> {
+    let output = Command::new("gh")
+        .args(["api", "user", "--jq", ".login"])
+        .output()
+        .context("Failed to run `gh api user`")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "Failed to fetch current GitHub user: {}",
+            stderr.trim()
+        ));
+    }
+
+    let login = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if login.is_empty() {
+        return Err(anyhow!("GitHub CLI returned an empty current user login."));
+    }
+
+    Ok(login)
 }
 
 /// Check if an open PR exists for `branch`. Returns its URL if open.

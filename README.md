@@ -65,7 +65,8 @@ cargo release 0.3.0 --execute
 6. **Reorder the stack**: Need to reshuffle or fork branches? Run `kin reorder` and edit the parent map in your editor.
 7. **Repair broken stacks**: Amended a commit and left dependent branches "floating"? Run `kin restack` to fix them.
 8. **Manage PRs in stack**:
-   - `kin pr` to create/update PRs, automatically flattening mismatched PR bases and pushing first
+   - `kin pr` to create/update your PRs, automatically flattening mismatched PR bases and pushing first
+   - `kin pr --all` to include PRs in the stack that are authored by other GitHub users
    - `kin pr --no-push` to skip that preflight and use the old create/update behavior
    - `kin pr open` to open a PR from the stack
    - `kin pr edit` to edit title/body/labels/reviewers
