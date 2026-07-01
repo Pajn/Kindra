@@ -106,8 +106,31 @@ pub fn prompt_select(message: &str, options: Vec<String>) -> Result<String> {
         .context("Selection failed")
 }
 
-pub fn prompt_multi_select<T: std::fmt::Display>(message: &str, options: Vec<T>) -> Result<Vec<T>> {
+pub fn prompt_multi_select<T: std::fmt::Display + Clone>(
+    message: &str,
+    options: Vec<T>,
+) -> Result<Vec<T>> {
     if !std::io::stdin().is_terminal() {
+        if let Ok(selection_values) = std::env::var("KIN_TEST_MULTI_SELECTIONS") {
+            let selected = selection_values
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.parse::<usize>().ok())
+                .filter_map(|idx| options.get(idx).cloned())
+                .collect::<Vec<_>>();
+
+            println!("Options:");
+            for (i, opt) in options.iter().enumerate() {
+                println!("{}: {}", i, opt);
+            }
+            println!(
+                "{} (test override: auto-selecting {} option(s))",
+                message,
+                selected.len()
+            );
+            return Ok(selected);
+        }
         println!("{} (non-interactive mode: auto-selecting NONE)", message);
         return Ok(Vec::new());
     }

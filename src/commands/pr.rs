@@ -109,18 +109,30 @@ fn pr_create_or_update(skip_preflight: bool, include_all: bool, labels: &[String
 
     let repo = crate::open_repo()?;
 
-    let (upstream_name, all_branches_with_upstream) = discover_stack_branches_with_upstream(&repo)?;
-    let branches_with_upstream =
-        filter_branches_for_pr_scope(all_branches_with_upstream.clone(), include_all)?;
+    let (upstream_name, all_stack_branches) = discover_stack_branches(&repo)?;
+    let scoped_stack_branches =
+        filter_stack_branches_for_pr_scope(all_stack_branches.clone(), include_all)?;
 
     if !skip_preflight {
         run_pr_create_or_update_preflight(
             &repo,
             &upstream_name,
-            &all_branches_with_upstream,
-            &branches_with_upstream,
+            &all_stack_branches,
+            &scoped_stack_branches,
         )?;
     }
+
+    let scoped_branch_names = scoped_stack_branches
+        .iter()
+        .map(|branch| branch.name.clone())
+        .collect::<HashSet<_>>();
+    let (_upstream_name_after_push, all_branches_with_upstream) =
+        discover_stack_branches_with_upstream(&repo)?;
+    let branches_with_upstream = all_branches_with_upstream
+        .iter()
+        .filter(|(sb, _remote_upstream)| scoped_branch_names.contains(&sb.name))
+        .cloned()
+        .collect::<Vec<_>>();
 
     if branches_with_upstream.is_empty() {
         println!("No branches with a remote upstream to create PRs for.");
@@ -165,52 +177,63 @@ fn pr_create_or_update(skip_preflight: bool, include_all: bool, labels: &[String
 fn run_pr_create_or_update_preflight(
     repo: &Repository,
     upstream_name: &str,
-    all_branches_with_upstream: &[(StackBranch, String)],
-    branches_with_upstream: &[(StackBranch, String)],
+    all_stack_branches: &[StackBranch],
+    scoped_stack_branches: &[StackBranch],
 ) -> Result<()> {
-    if !branches_with_upstream.is_empty()
+    let all_branches_with_upstream = stack_branches_for_base_map(all_stack_branches);
+    let scoped_branches_with_upstream = stack_branches_for_base_map(scoped_stack_branches);
+
+    if !scoped_branches_with_upstream.is_empty()
         && stack_pr_bases_need_flatten(
             repo,
-            all_branches_with_upstream,
-            branches_with_upstream,
+            &all_branches_with_upstream,
+            &scoped_branches_with_upstream,
             upstream_name,
         )?
     {
         println!("Detected PR base mismatches relative to the local stack. Flattening first...\n");
-        flatten_stack_prs_to_upstream(branches_with_upstream, upstream_name)?;
+        flatten_stack_prs_to_upstream(&scoped_branches_with_upstream, upstream_name)?;
         println!();
     }
 
     println!("Pushing branches first...\n");
-    let branch_names = branches_with_upstream
+    let branch_names = scoped_stack_branches
         .iter()
-        .map(|(sb, _remote_upstream)| sb.name.clone())
+        .map(|sb| sb.name.clone())
         .collect::<Vec<_>>();
-    crate::commands::push::push_tracked_stack_branches(repo, &branch_names)?;
+    crate::commands::push::push_stack_branches(repo, &branch_names)?;
     println!();
 
     Ok(())
 }
 
-fn filter_branches_for_pr_scope(
-    branches_with_upstream: Vec<(StackBranch, String)>,
+fn stack_branches_for_base_map(branches: &[StackBranch]) -> Vec<(StackBranch, String)> {
+    branches
+        .iter()
+        .cloned()
+        .map(|branch| (branch, String::new()))
+        .collect()
+}
+
+fn filter_stack_branches_for_pr_scope(
+    stack_branches: Vec<StackBranch>,
     include_all: bool,
-) -> Result<Vec<(StackBranch, String)>> {
+) -> Result<Vec<StackBranch>> {
     if include_all {
-        return Ok(branches_with_upstream);
+        return Ok(stack_branches);
     }
 
     let mut current_user = None::<String>;
     let mut scoped = Vec::new();
 
-    for (sb, remote_upstream) in branches_with_upstream {
+    for sb in stack_branches {
         let Some(existing) = gh::find_open_pr(&sb.name)? else {
-            scoped.push((sb, remote_upstream));
+            scoped.push(sb);
             continue;
         };
 
         let Some(author_login) = existing.author_login else {
-            scoped.push((sb, remote_upstream));
+            scoped.push(sb);
             continue;
         };
 
@@ -223,7 +246,7 @@ fn filter_branches_for_pr_scope(
         };
 
         if author_login.eq_ignore_ascii_case(login) {
-            scoped.push((sb, remote_upstream));
+            scoped.push(sb);
         } else {
             println!(
                 "Skipping '{}' because PR #{} is authored by {}. Use --all to include it.",
@@ -644,6 +667,30 @@ fn format_stack_pr_option(pr: &StackPr) -> String {
 pub(crate) fn discover_stack_branches_with_upstream(
     repo: &Repository,
 ) -> Result<(String, Vec<(StackBranch, String)>)> {
+    let (git_boundary_ref, stack_branches) = discover_stack_branches(repo)?;
+    let upstream_name = crate::commands::find_upstream(repo)?.ok_or_else(|| {
+        anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
+    })?;
+
+    // Only operate on branches that have a remote upstream configured.
+    let branches_with_upstream: Vec<(StackBranch, String)> = stack_branches
+        .into_iter()
+        .filter_map(|sb| {
+            let branch = repo.find_branch(&sb.name, BranchType::Local).ok()?;
+            let up = branch.upstream().ok()?;
+            let up_name = up.name().ok()??.to_string();
+            Some((sb, up_name))
+        })
+        .filter(|(sb, _up_name)| {
+            // Exclude the upstream branch itself (e.g., "main") from PR suggestions.
+            sb.name != upstream_name
+        })
+        .collect();
+
+    Ok((git_boundary_ref, branches_with_upstream))
+}
+
+fn discover_stack_branches(repo: &Repository) -> Result<(String, Vec<StackBranch>)> {
     let upstream_name = crate::commands::find_upstream(repo)?.ok_or_else(|| {
         anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
     })?;
@@ -666,22 +713,9 @@ pub(crate) fn discover_stack_branches_with_upstream(
         return Ok((git_boundary_ref, Vec::new()));
     }
 
-    // Only operate on branches that have a remote upstream configured.
-    let branches_with_upstream: Vec<(StackBranch, String)> = stack_branches
-        .into_iter()
-        .filter_map(|sb| {
-            let branch = repo.find_branch(&sb.name, BranchType::Local).ok()?;
-            let up = branch.upstream().ok()?;
-            let up_name = up.name().ok()??.to_string();
-            Some((sb, up_name))
-        })
-        .filter(|(sb, _up_name)| {
-            // Exclude the upstream branch itself (e.g., "main") from PR suggestions.
-            sb.name != upstream_name
-        })
-        .collect();
+    stack_branches.retain(|branch| branch.name != upstream_name);
 
-    Ok((git_boundary_ref, branches_with_upstream))
+    Ok((git_boundary_ref, stack_branches))
 }
 
 fn render_review_markdown(threads: Vec<gh::PrReviewThread>, args: &PrReviewArgs) -> String {
