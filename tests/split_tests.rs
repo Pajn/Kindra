@@ -2,6 +2,8 @@ mod common;
 
 use common::{kin_cmd, make_commit, repo_init};
 use git2::{Repository, Signature};
+use kindra::rebase_utils::{Operation, RebaseState, save_state};
+use std::collections::HashMap;
 use std::fs;
 use tempfile::tempdir;
 
@@ -343,9 +345,12 @@ fn test_checkout_up_fork() {
         .arg("up")
         .current_dir(dir.path())
         .env("TERM", "dumb")
+        .env("KIN_TEST_SELECTIONS", "0")
         .assert()
         .success()
-        .stdout(predicates::str::contains("auto-selecting first option"));
+        .stdout(predicates::str::contains(
+            "test override: auto-selecting option",
+        ));
 
     let new_head = repo.head().unwrap().shorthand().unwrap().to_string();
     assert!(
@@ -395,9 +400,12 @@ fn test_checkout_top_fork() {
         .arg("top")
         .current_dir(dir.path())
         .env("TERM", "dumb")
+        .env("KIN_TEST_SELECTIONS", "0")
         .assert()
         .success()
-        .stdout(predicates::str::contains("auto-selecting first option"));
+        .stdout(predicates::str::contains(
+            "test override: auto-selecting option",
+        ));
 
     let new_head = repo.head().unwrap().shorthand().unwrap().to_string();
     assert!(
@@ -521,9 +529,12 @@ exit 0
         .current_dir(dir.path())
         .env("EDITOR", &editor_script)
         .env("TERM", "dumb")
+        .env("KIN_TEST_SELECTIONS", "0")
         .assert()
         .success()
-        .stdout(predicates::str::contains("auto-selecting first option"));
+        .stdout(predicates::str::contains(
+            "test override: auto-selecting option",
+        ));
 }
 
 #[test]
@@ -557,7 +568,7 @@ fn test_checkout_all_works_without_main() {
         .env("TERM", "dumb")
         .assert()
         .success()
-        .stdout(predicates::str::contains("auto-selecting first option"));
+        .stdout(predicates::str::contains("only one option available"));
 
     let new_head = repo.head().unwrap().shorthand().unwrap().to_string();
     assert_eq!(new_head, "trunk");
@@ -596,7 +607,7 @@ fn test_checkout_all_detached_no_main() {
         .env("TERM", "dumb")
         .assert()
         .success()
-        .stdout(predicates::str::contains("auto-selecting first option"));
+        .stdout(predicates::str::contains("only one option available"));
 
     let new_head = repo.head().unwrap().shorthand().unwrap().to_string();
     assert_eq!(new_head, "trunk");
@@ -636,9 +647,14 @@ fn test_checkout_all_ignores_kin_test_selection_override() {
         .env("KIN_TEST_SELECTION", "1")
         .env("TERM", "dumb")
         .assert()
-        .success()
-        .stdout(predicates::str::contains("auto-selecting first option"));
+        .failure()
+        .stderr(predicates::str::contains(
+            "Cannot choose between 2 options in a non-interactive session",
+        ));
 
+    // The singular KIN_TEST_SELECTION var is not honored (only the plural
+    // KIN_TEST_SELECTIONS is), so with two branches and no terminal the command
+    // refuses to guess and leaves HEAD untouched instead of picking zzz-side.
     let new_head = repo.head().unwrap().shorthand().unwrap().to_string();
     assert_eq!(new_head, "trunk");
 }
@@ -677,4 +693,143 @@ mv "$file.tmp" "$file"
 
     // Verify state file does NOT exist
     assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+}
+
+#[test]
+fn test_split_refuses_when_kindra_operation_in_progress() {
+    let (dir, repo) = setup_repo();
+
+    // A branch that split would delete if it were allowed to run.
+    {
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature-b", &head, false).unwrap();
+    }
+    repo.set_head("refs/heads/feature-b").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    // Simulate an interrupted Kindra operation. With no parent maps recorded,
+    // reconciliation cannot prove the branch is done, so the state is treated as
+    // active and any mutating command must refuse.
+    let state = RebaseState {
+        operation: Operation::Move,
+        original_branch: "feature-b".to_string(),
+        target_branch: "main".to_string(),
+        caller_branch: None,
+        remaining_branches: vec!["feature-b".to_string()],
+        in_progress_branch: Some("feature-b".to_string()),
+        parent_id_map: HashMap::new(),
+        parent_name_map: HashMap::new(),
+        new_base_map: HashMap::new(),
+        original_commit_count_map: HashMap::new(),
+        original_tip_map: HashMap::new(),
+        owned_tip_map: HashMap::new(),
+        stash_ref: None,
+        unstage_on_restore: false,
+        autostash: false,
+        cleanup_merged_branches: Vec::new(),
+        cleanup_checkout_fallback: None,
+    };
+    save_state(&repo, &state).unwrap();
+
+    // An editor that would happily rewrite the buffer if split ever reached it.
+    let editor_script = dir.path().join("editor.sh");
+    fs::write(&editor_script, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&editor_script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&editor_script, perms).unwrap();
+    }
+
+    kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("EDITOR", &editor_script)
+        .env("TERM", "dumb")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("already in progress"));
+
+    // The interrupted operation's state is untouched and no branches were changed.
+    assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(
+        repo.find_branch("feature-b", git2::BranchType::Local)
+            .is_ok()
+    );
+}
+
+#[test]
+fn test_split_does_not_reattach_head_to_skipped_overwrite_branch() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let m = make_commit(&repo, "refs/heads/main", "m.txt", "m", "init", &[]);
+    let mc = repo.find_commit(m).unwrap();
+    let c1 = make_commit(&repo, "refs/heads/current", "c1.txt", "1", "c1", &[&mc]);
+    let c1c = repo.find_commit(c1).unwrap();
+    make_commit(&repo, "refs/heads/current", "c2.txt", "2", "c2", &[&c1c]);
+
+    // A sibling branch off main, unrelated to the stack, whose desired commit in
+    // the editor will be c2 (== the detached HEAD) even though it will be skipped.
+    let outside_id = make_commit(&repo, "refs/heads/outside", "o.txt", "o", "outside", &[&mc]);
+
+    repo.set_head("refs/heads/current").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    // Move 'current' from c2 down to c1, and assign the out-of-stack 'outside' to
+    // c2. 'outside' is unsafe to overwrite, so in a non-interactive run it is
+    // skipped — but its editor entry still points at c2 (the detached HEAD).
+    let editor_script = dir.path().join("editor.sh");
+    fs::write(
+        &editor_script,
+        r#"#!/bin/sh
+file=$1
+perl -i -ne 'print unless /^branch current$/' "$file"
+perl -i -pe 's/^([0-9a-f]{7} c1)$/$1\nbranch current/' "$file"
+perl -i -pe 's/^([0-9a-f]{7} c2)$/$1\nbranch outside/' "$file"
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&editor_script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&editor_script, perms).unwrap();
+    }
+
+    kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("EDITOR", &editor_script)
+        .env("TERM", "dumb")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Skipping branch 'outside'"));
+
+    // HEAD must NOT be reattached to the skipped 'outside' branch just because its
+    // desired commit equalled the detached HEAD; it should stay detached.
+    assert!(
+        repo.head_detached().unwrap(),
+        "HEAD should remain detached rather than attach to the skipped 'outside' branch"
+    );
+    let outside = repo
+        .find_branch("outside", git2::BranchType::Local)
+        .unwrap();
+    assert_eq!(
+        outside.get().target().unwrap(),
+        outside_id,
+        "skipped 'outside' branch should still point at its original commit"
+    );
+    let current = repo
+        .find_branch("current", git2::BranchType::Local)
+        .unwrap();
+    assert_eq!(
+        current.get().target().unwrap(),
+        c1,
+        "'current' should have been moved down to c1"
+    );
 }

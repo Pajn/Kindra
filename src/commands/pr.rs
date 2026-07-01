@@ -9,7 +9,7 @@ use clap::{Args, Subcommand};
 use git2::{BranchType, Repository};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
 
@@ -1644,6 +1644,19 @@ struct Submission {
 }
 
 fn prompt_submit_options() -> Result<Submission> {
+    // The submit menu is an action prompt whose primary action is "Submit". In a
+    // non-interactive session there is nothing to drive it, so default to Submit
+    // rather than erroring — this keeps `kin pr` usable in CI. Labels can still be
+    // supplied via the `--label` flag, which is applied by the caller.
+    if !std::io::stdin().is_terminal() {
+        println!("  [non-interactive] Submitting with default options.");
+        return Ok(Submission {
+            draft: false,
+            labels: Vec::new(),
+            reviewers: Vec::new(),
+        });
+    }
+
     let mut labels: Vec<String> = Vec::new();
     let mut reviewers: Vec<String> = Vec::new();
 
@@ -1714,12 +1727,6 @@ fn prompt_reviewers() -> Result<Vec<String>> {
     )?;
     Ok(selected)
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// is_terminal helper (std::io::IsTerminal is in scope via mod.rs import)
-// ────────────────────────────────────────────────────────────────────────────
-
-use std::io::IsTerminal;
 
 #[cfg(test)]
 mod tests {

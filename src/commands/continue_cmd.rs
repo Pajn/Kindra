@@ -6,6 +6,7 @@ use std::process::Command;
 
 pub fn continue_cmd() -> Result<()> {
     let repo = crate::open_repo()?;
+    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
     let rebase_state = reconcile_saved_rebase_state(&repo, ReconcileMode::Continue)?;
     let has_rebase_state = rebase_state.is_some();
     let has_run_state = crate::commands::run::run_state_exists(&repo);

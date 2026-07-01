@@ -12,6 +12,7 @@ pub mod gh;
 pub mod rebase_utils;
 pub mod repository;
 pub mod stack;
+pub(crate) mod state_io;
 pub mod worktree;
 
 pub use commands::CheckoutSubcommand;

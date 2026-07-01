@@ -23,7 +23,8 @@ pub struct ReorderArgs {
 
 pub fn reorder(args: &ReorderArgs) -> Result<()> {
     let repo = crate::open_repo()?;
-    if passively_reconcile_rebase_state(&repo)? {
+    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+    if passively_reconcile_rebase_state(&repo)? || crate::commands::run::run_state_exists(&repo) {
         return Err(anyhow!(
             "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));

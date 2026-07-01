@@ -1515,13 +1515,16 @@ fn test_commit_on_without_argument_uses_interactive_selection() {
         .arg("interactive target")
         .current_dir(dir.path())
         .env("GIT_EDITOR", "true")
+        .env("KIN_TEST_SELECTIONS", "0")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
         .assert()
         .success()
-        .stdout(predicates::str::contains("auto-selecting first option"));
+        .stdout(predicates::str::contains(
+            "test override: auto-selecting option",
+        ));
 
     let main_after = repo
         .find_branch("main", git2::BranchType::Local)
@@ -2860,4 +2863,37 @@ fn test_commit_interactive_stack_select_intermediate_from_child() {
     let new_b1_commit = tip_commit.parent(0).unwrap();
     assert_eq!(new_b1_commit.summary().unwrap(), "commit b1");
     assert_eq!(new_b1_commit.parent_id(0).unwrap(), new_a_id);
+}
+
+#[test]
+fn test_commit_blocked_by_stale_run_state() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    make_commit(&repo, "refs/heads/main", "file.txt", "x", "initial", &[]);
+    repo.set_head("refs/heads/main").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    // An interrupted `kin run` left run state behind.
+    std::fs::write(
+        dir.path().join(".git/kindra_run_state.json"),
+        r#"{"target_branches":["main"],"current_index":0,"args":{"command":"false","continue_on_failure":false},"original_branch":"main","original_head_id":"0000000000000000000000000000000000000000","status":"failed"}"#,
+    )
+    .unwrap();
+
+    // Stage a change so commit would otherwise proceed.
+    fs::write(dir.path().join("file2.txt"), "y").unwrap();
+    run_ok("git", &["add", "file2.txt"], dir.path());
+
+    kin_cmd()
+        .arg("commit")
+        .arg("-m")
+        .arg("should be blocked")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("already in progress"));
+
+    // The interrupted run state must be left untouched.
+    assert!(dir.path().join(".git/kindra_run_state.json").exists());
 }

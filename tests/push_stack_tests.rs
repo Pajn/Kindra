@@ -499,3 +499,109 @@ fn test_push_empty_stack_does_not_resolve_remote() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("No branches in stack to push."));
 }
+
+#[test]
+fn test_push_reports_divergence_on_lease_failure() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let main_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "main.txt",
+        "initial",
+        "initial commit",
+        &[],
+    );
+    let main_commit = repo.find_commit(main_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature",
+        "f.txt",
+        "f",
+        "feat: f",
+        &[&main_commit],
+    );
+
+    // Bare remote with main + feature pushed and tracked.
+    let remote_dir = tempdir().unwrap();
+    run_ok("git", &["init", "--bare"], remote_dir.path());
+    run_ok(
+        "git",
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok("git", &["push", "-u", "origin", "main"], dir.path());
+    run_ok("git", &["push", "-u", "origin", "feature"], dir.path());
+
+    // A teammate advances origin/feature via a separate clone. The original repo
+    // never fetches, so its origin/feature remote-tracking ref goes stale.
+    let other_dir = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote_dir.path().to_str().unwrap(),
+            other_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], other_dir.path());
+    std::fs::write(other_dir.path().join("teammate.txt"), "teammate").unwrap();
+    run_ok("git", &["add", "teammate.txt"], other_dir.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "teammate change"],
+        other_dir.path(),
+    );
+    run_ok("git", &["push", "origin", "feature"], other_dir.path());
+
+    // Locally advance feature too so it diverges from the (stale) tracking ref.
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+    let f_tip = repo.head().unwrap().peel_to_commit().unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature",
+        "local2.txt",
+        "local2",
+        "local change",
+        &[&f_tip],
+    );
+
+    // The push must be rejected (force-with-lease --force-if-includes) and report
+    // the divergence with actionable guidance instead of a bare failure line.
+    let output = kin_cmd()
+        .arg("push")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "push should be rejected when the remote diverged: {:?}",
+        output
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("was rejected"),
+        "expected a rejection explanation, got stderr:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("git fetch"),
+        "expected recovery guidance mentioning git fetch, got stderr:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("feature"),
+        "expected the diverged branch to be named, got stderr:\n{}",
+        stderr
+    );
+}

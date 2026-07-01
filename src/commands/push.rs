@@ -1,7 +1,7 @@
 use crate::commands::find_upstream;
 use crate::stack::get_stack_branches;
 use anyhow::{Result, anyhow};
-use git2::{BranchType, Repository};
+use git2::{BranchType, ErrorCode, Repository};
 use std::collections::HashSet;
 use std::fmt;
 use std::process::Command;
@@ -53,7 +53,7 @@ pub(crate) fn push_stack_branches(repo: &Repository, branches: &[String]) -> Res
     }
 
     if branches_without_upstream.is_empty() {
-        perform_push(branches_to_push)?;
+        perform_push(repo, branches_to_push)?;
     } else {
         let mut all_branches = branches_to_push.clone();
         all_branches.extend(branches_without_upstream.clone());
@@ -66,7 +66,7 @@ pub(crate) fn push_stack_branches(repo: &Repository, branches: &[String]) -> Res
             .collect::<Vec<_>>();
 
         if options.is_empty() {
-            perform_push(branches_to_push)?;
+            perform_push(repo, branches_to_push)?;
             return Ok(());
         }
 
@@ -107,7 +107,7 @@ pub(crate) fn push_stack_branches(repo: &Repository, branches: &[String]) -> Res
             .collect();
 
         if !existing_upstream.is_empty() {
-            perform_push(existing_upstream)?;
+            perform_push(repo, existing_upstream)?;
         }
     }
 
@@ -117,7 +117,7 @@ pub(crate) fn push_stack_branches(repo: &Repository, branches: &[String]) -> Res
 fn push_upstream_branch(repo: &Repository, upstream_name: &str) -> Result<()> {
     let branch = repo.find_branch(upstream_name, BranchType::Local)?;
     if let Some(target) = tracked_push_target(repo, &branch, upstream_name.to_string())? {
-        perform_push(vec![target])
+        perform_push(repo, vec![target])
     } else {
         let remote_name = resolve_remote(repo)?;
         perform_push_with_upstream(repo, &[upstream_name.to_string()], remote_name.as_str())
@@ -178,7 +178,7 @@ fn resolve_remote(repo: &Repository) -> Result<String> {
     }
 }
 
-fn perform_push_with_upstream(_repo: &Repository, branches: &[String], remote: &str) -> Result<()> {
+fn perform_push_with_upstream(repo: &Repository, branches: &[String], remote: &str) -> Result<()> {
     if branches.is_empty() {
         return Ok(());
     }
@@ -192,6 +192,7 @@ fn perform_push_with_upstream(_repo: &Repository, branches: &[String], remote: &
     cmd.arg("push")
         .arg("--atomic")
         .arg("--force-with-lease")
+        .arg("--force-if-includes")
         .arg("-u")
         .arg(remote);
 
@@ -199,15 +200,25 @@ fn perform_push_with_upstream(_repo: &Repository, branches: &[String], remote: &
         cmd.arg(format!("{}:{}", branch, branch));
     }
 
-    let status = cmd.status()?;
-    if !status.success() {
+    let output = cmd.output()?;
+    // Stream git's own output through so the user still sees progress/errors.
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        if push_rejected_by_lease(&String::from_utf8_lossy(&output.stderr)) {
+            let refs: Vec<(String, String)> = branches
+                .iter()
+                .map(|name| (name.clone(), name.clone()))
+                .collect();
+            report_push_divergence(repo, remote, &refs);
+        }
         return Err(anyhow!("Push failed for remote '{}'", remote));
     }
 
     Ok(())
 }
 
-fn perform_push(branches: Vec<BranchStatus>) -> Result<()> {
+fn perform_push(repo: &Repository, branches: Vec<BranchStatus>) -> Result<()> {
     if branches.is_empty() {
         println!("Nothing to push.");
         return Ok(());
@@ -240,19 +251,107 @@ fn perform_push(branches: Vec<BranchStatus>) -> Result<()> {
         cmd.arg("push")
             .arg("--atomic")
             .arg("--force-with-lease")
+            .arg("--force-if-includes")
             .arg(&remote);
 
         for (local_name, remote_ref) in &refs {
             cmd.arg(format!("{}:{}", local_name, remote_ref));
         }
 
-        let status = cmd.status()?;
-        if !status.success() {
+        let output = cmd.output()?;
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        if !output.status.success() {
+            if push_rejected_by_lease(&String::from_utf8_lossy(&output.stderr)) {
+                report_push_divergence(repo, &remote, &refs);
+            }
             return Err(anyhow!("Push failed for remote '{}'", remote));
         }
     }
 
     Ok(())
+}
+
+/// Heuristic: did the push fail specifically because the remote rejected a
+/// non-fast-forward / `--force-with-lease` update? Only then is the divergence
+/// report relevant — auth, network, and hook failures must not be mislabeled as
+/// lease rejections.
+fn push_rejected_by_lease(stderr: &str) -> bool {
+    const MARKERS: [&str; 6] = [
+        "stale info",
+        "force-with-lease",
+        "force-if-includes",
+        "non-fast-forward",
+        "fetch first",
+        "[rejected]",
+    ];
+    let lower = stderr.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// Print a per-branch divergence summary and recovery guidance after a rejected push.
+///
+/// Kindra pushes with `--force-with-lease --force-if-includes`, so a rejection
+/// means the remote holds commits that are not in the local history. The
+/// ahead/behind counts are measured against the last-fetched remote-tracking
+/// refs, so a branch can still show `↓0` if those refs are stale — hence the
+/// advice to fetch before re-inspecting.
+fn report_push_divergence(repo: &Repository, remote: &str, refs: &[(String, String)]) {
+    eprintln!();
+    eprintln!(
+        "Push to '{remote}' was rejected. Kindra uses --force-with-lease --force-if-includes, which"
+    );
+    eprintln!("refuses to overwrite remote commits that are not in your local history.");
+    eprintln!("Per-branch status (local vs last-fetched {remote}/…):");
+    for (local_name, remote_ref) in refs {
+        match branch_ahead_behind(repo, local_name, remote, remote_ref) {
+            Ok(Some((ahead, behind))) => {
+                eprintln!("  {local_name}: ↑{ahead} ↓{behind} vs {remote}/{remote_ref}");
+            }
+            Ok(None) => {
+                eprintln!(
+                    "  {local_name}: no local remote-tracking ref for {remote}/{remote_ref} yet"
+                );
+            }
+            Err(_) => {
+                eprintln!("  {local_name}: could not compute divergence");
+            }
+        }
+    }
+    eprintln!();
+    eprintln!(
+        "The remote likely advanced (a teammate pushed, or GitHub's \"Update branch\" was used)."
+    );
+    eprintln!(
+        "Run 'git fetch {remote}', rebase your stack onto the updated base (e.g. 'kin sync'), then push again."
+    );
+}
+
+/// Ahead/behind of a local branch vs its last-fetched remote-tracking ref.
+/// Returns `Ok(None)` when either tip cannot be resolved (e.g. no tracking ref yet).
+fn branch_ahead_behind(
+    repo: &Repository,
+    local_name: &str,
+    remote: &str,
+    remote_ref: &str,
+) -> Result<Option<(usize, usize)>> {
+    let local = repo.find_branch(local_name, BranchType::Local)?;
+    let Some(local_tip) = local.get().target() else {
+        return Ok(None);
+    };
+
+    let tracking_ref = format!("refs/remotes/{remote}/{remote_ref}");
+    let remote_tip = match repo.find_reference(&tracking_ref) {
+        Ok(reference) => reference.target(),
+        Err(e) if e.code() == ErrorCode::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(remote_tip) = remote_tip else {
+        return Ok(None);
+    };
+
+    let (ahead, behind) = repo.graph_ahead_behind(local_tip, remote_tip)?;
+    Ok(Some((ahead, behind)))
 }
 
 fn tracked_push_target(
