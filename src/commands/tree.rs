@@ -1,6 +1,6 @@
 use crate::commands::find_upstream;
 use crate::gh;
-use crate::stack::{StackBranch, find_parent_in_stack, get_stack_branches};
+use crate::stack::{StackBranch, find_parent_in_stack, get_stack_branches_for_head};
 use anyhow::{Context, Result};
 use clap::Args;
 use crossterm::style::{Color, Stylize};
@@ -119,7 +119,7 @@ pub fn tree(args: &TreeArgs) -> Result<()> {
         .context("Failed to get HEAD")?
         .peel_to_commit()?
         .id();
-    let stack_branches = get_stack_branches(&repo, head_id, upstream_id, &upstream_name)?;
+    let stack_branches = get_stack_branches_for_head(&repo, head_id, upstream_id, &upstream_name)?;
 
     if stack_branches.is_empty() {
         println!("{} (empty stack)", upstream_name);
@@ -267,6 +267,23 @@ fn populate_branch_details(
     show_remote: bool,
     show_pr: bool,
 ) -> Result<()> {
+    // Fetch every open PR once instead of one `gh pr view` per branch. Tolerate
+    // failures (e.g. gh missing/unauthenticated) so `tree` still renders, but warn
+    // so the user knows PR columns are missing rather than empty.
+    let pr_map = if show_pr {
+        match gh::list_open_prs() {
+            Ok(map) => map,
+            Err(err) => {
+                eprintln!(
+                    "Warning: could not fetch PR status (is `gh` installed and authenticated?): {err}"
+                );
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
     for tb in tree.values_mut() {
         let branch_name = &tb.branch.name;
 
@@ -281,7 +298,7 @@ fn populate_branch_details(
         }
 
         // Get PR status
-        if show_pr && let Ok(Some(pr)) = gh::find_open_pr(branch_name) {
+        if show_pr && let Some(pr) = pr_map.get(branch_name) {
             tb.pr_status = Some(PrStatus {
                 number: pr.number,
                 is_draft: pr.is_draft,
