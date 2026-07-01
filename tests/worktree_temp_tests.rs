@@ -66,6 +66,17 @@ fn branch_upstream(cwd: &Path, branch: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn branch_has_upstream(cwd: &Path, branch: &str) -> bool {
+    let upstream = format!("{branch}@{{upstream}}");
+    std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", &upstream])
+        .current_dir(cwd)
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
 fn toml_basic_string(value: &str) -> String {
     let mut escaped = value.replace('\\', "\\\\");
     escaped = escaped.replace('\n', "\\n");
@@ -205,6 +216,60 @@ fn worktree_temp_b_creates_new_branch_from_current_branch() {
             .unwrap()
             .iter()
             .any(|record| record["role"] == "temp" && record["branch"] == "feature/spike")
+    );
+}
+
+#[test]
+fn worktree_temp_b_from_local_start_point_leaves_no_upstream() {
+    let dir = setup_repo();
+
+    let output = kin_cmd()
+        .args(["wt", "temp", "-b", "feature/spike"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "kin wt temp -b feature/spike failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // A temp branch created off a local start point (here the current branch)
+    // is disposable and must not track it.
+    assert!(
+        !branch_has_upstream(dir.path(), "feature/spike"),
+        "temp branch should have no upstream"
+    );
+}
+
+#[test]
+fn worktree_temp_b_leaves_no_upstream_even_with_auto_setup_merge_always() {
+    let dir = setup_repo();
+    // Regression: with branch.autoSetupMerge=always git would otherwise set the
+    // new branch's upstream to the local start point. Temp branches must stay
+    // upstream-free regardless of this setting.
+    run_ok(
+        "git",
+        &["config", "branch.autoSetupMerge", "always"],
+        dir.path(),
+    );
+
+    let output = kin_cmd()
+        .args(["wt", "temp", "-b", "feature/spike"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "kin wt temp -b feature/spike failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert!(
+        !branch_has_upstream(dir.path(), "feature/spike"),
+        "temp branch should have no upstream even with branch.autoSetupMerge=always"
     );
 }
 

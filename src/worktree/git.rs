@@ -323,7 +323,13 @@ pub fn create_local_branch_from_start_point_strict(
     let mut command = Command::new("git");
     command.current_dir(repo_root(repo)?).arg("branch");
     if repo.find_branch(start_point, BranchType::Remote).is_ok() {
+        // An explicit remote start point tracks it, matching `git branch --track`.
         command.arg("--track");
+    } else {
+        // For a local start point (e.g. trunk), pass --no-track so a disposable
+        // temp branch gets an empty upstream even when the user's
+        // branch.autoSetupMerge is set to "always".
+        command.arg("--no-track");
     }
     command.arg(branch).arg(start_point);
 
@@ -399,7 +405,10 @@ fn remote_for_branch(repo: &Repository, branch: &str) -> Result<Option<String>> 
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_local_branch_exists, list_live_worktrees, live_worktree_map};
+    use super::{
+        create_local_branch_from_start_point_strict, ensure_local_branch_exists,
+        list_live_worktrees, live_worktree_map,
+    };
     use git2::BranchType;
     use tempfile::TempDir;
 
@@ -436,6 +445,46 @@ mod tests {
         assert!(
             map.values()
                 .any(|worktree| worktree.branch.as_deref() == Some("main"))
+        );
+    }
+
+    #[test]
+    fn strict_temp_branch_has_no_upstream_even_with_auto_setup_merge_always() {
+        let dir = TempDir::new().unwrap();
+        let init_status = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["init", "--initial-branch=main"])
+            .status()
+            .unwrap();
+        assert!(init_status.success(), "git init failed");
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Test").unwrap();
+        cfg.set_str("user.email", "test@example.com").unwrap();
+        // Reproduce the config that would otherwise track the start point.
+        cfg.set_str("branch.autoSetupMerge", "always").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let add_status = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["add", "a.txt"])
+            .status()
+            .unwrap();
+        assert!(add_status.success(), "git add failed");
+        let commit_status = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["commit", "-m", "init"])
+            .status()
+            .unwrap();
+        assert!(commit_status.success(), "git commit failed");
+
+        let created =
+            create_local_branch_from_start_point_strict(&repo, "temp/spike", "main").unwrap();
+        assert!(created, "expected a new branch to be created");
+
+        let branch = repo.find_branch("temp/spike", BranchType::Local).unwrap();
+        assert!(
+            branch.upstream().is_err(),
+            "temp branch should have no upstream configured"
         );
     }
 
