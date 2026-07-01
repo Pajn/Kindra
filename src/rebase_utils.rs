@@ -81,7 +81,7 @@ pub fn save_state(repo: &Repository, state: &RebaseState) -> Result<()> {
     augment_original_tip_map(repo, &mut persisted_state)?;
     persisted_state.owned_tip_map = capture_owned_tip_map(repo, &persisted_state);
     let json = serde_json::to_string_pretty(&persisted_state)?;
-    fs::write(state_path(repo), json)?;
+    crate::state_io::write_atomic(&state_path(repo), &json)?;
     Ok(())
 }
 

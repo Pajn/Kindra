@@ -75,6 +75,15 @@ pub fn prompt_select(message: &str, options: Vec<String>) -> Result<String> {
         if options.is_empty() {
             return Err(anyhow!("No options available for selection"));
         }
+        // A single option is unambiguous: selecting it is deterministic and safe,
+        // so we do not need an interactive terminal (and it consumes no test index).
+        if options.len() == 1 {
+            println!(
+                "{} (only one option available, selecting: {})",
+                message, options[0]
+            );
+            return Ok(options[0].clone());
+        }
         if let Ok(selection_values) = std::env::var("KIN_TEST_SELECTIONS") {
             let call_index = TEST_SELECTION_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
             let selected_idx = selection_values
@@ -98,8 +107,13 @@ pub fn prompt_select(message: &str, options: Vec<String>) -> Result<String> {
                 return Ok(options[idx].clone());
             }
         }
-        println!("{} (auto-selecting first option: {})", message, options[0]);
-        return Ok(options[0].clone());
+        // Multiple options with no way to ask: refuse rather than silently guessing.
+        return Err(anyhow!(
+            "Cannot choose between {} options in a non-interactive session (stdin is not a terminal): {} \
+             Re-run in an interactive terminal, or checkout/pass the desired branch explicitly so no prompt is needed.",
+            options.len(),
+            message
+        ));
     }
     inquire::Select::new(message, options)
         .prompt()

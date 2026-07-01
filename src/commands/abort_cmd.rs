@@ -9,6 +9,7 @@ use std::process::Command;
 
 pub fn abort_cmd() -> Result<()> {
     let repo = crate::open_repo()?;
+    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
     let path = state_path(&repo);
     let has_rebase_state = path.exists();
     let has_run_state = crate::commands::run::run_state_exists(&repo);

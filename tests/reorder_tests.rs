@@ -760,3 +760,38 @@ fn reorder_checks_worktrees() {
         .failure()
         .stderr(predicates::str::contains("feature-c is checked out in"));
 }
+
+#[test]
+fn test_reorder_blocked_by_stale_run_state() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let main_id = make_commit(&repo, "refs/heads/main", "file.txt", "x", "initial", &[]);
+    let main_commit = repo.find_commit(main_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature",
+        "f.txt",
+        "f",
+        "feat",
+        &[&main_commit],
+    );
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    // An interrupted `kin run` left run state behind.
+    std::fs::write(
+        dir.path().join(".git/kindra_run_state.json"),
+        r#"{"target_branches":["feature"],"current_index":0,"args":{"command":"false","continue_on_failure":false},"original_branch":"feature","original_head_id":"0000000000000000000000000000000000000000","status":"failed"}"#,
+    )
+    .unwrap();
+
+    kin_cmd()
+        .arg("reorder")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("already in progress"));
+
+    assert!(dir.path().join(".git/kindra_run_state.json").exists());
+}

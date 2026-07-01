@@ -2493,3 +2493,38 @@ fn test_restack_rebases_multiple_commits_after_single_fork_match() {
     assert_eq!(new_base.id(), new_main_oid);
     assert_eq!(new_base.summary().unwrap(), "base commit");
 }
+
+#[test]
+fn restack_blocked_by_stale_run_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    make_commit(&repo, "refs/heads/main", "file.txt", "x", "initial", &[]);
+    repo.set_head("refs/heads/main").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    // An unresolved `kin run` left persisted run state behind.
+    std::fs::write(
+        dir.path().join(".git/kindra_run_state.json"),
+        r#"{"target_branches":["main"],"current_index":0,"args":{"command":"false","continue_on_failure":false},"original_branch":"main","original_head_id":"0000000000000000000000000000000000000000","status":"failed"}"#,
+    )
+    .unwrap();
+
+    let output = kin_cmd()
+        .arg("restack")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "restack should be rejected while run state is persisted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("already in progress"),
+        "expected an in-progress state-gate error, got:\n{}",
+        stderr
+    );
+    assert!(dir.path().join(".git/kindra_run_state.json").exists());
+}

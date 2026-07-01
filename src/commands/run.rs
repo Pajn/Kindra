@@ -47,6 +47,7 @@ pub(crate) struct RunState {
 
 pub fn run(args: &RunArgs) -> Result<()> {
     let repo = crate::open_repo()?;
+    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
     if passively_reconcile_rebase_state(&repo)? || run_state_exists(&repo) {
         return Err(anyhow!(
             "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
@@ -135,7 +136,7 @@ pub(crate) fn load_run_state(repo: &Repository) -> Result<RunState> {
 
 fn persist_run_state(repo: &Repository, run_state: &RunState) -> Result<()> {
     let json = serde_json::to_string_pretty(run_state)?;
-    fs::write(run_state_path(repo), json)?;
+    crate::state_io::write_atomic(&run_state_path(repo), &json)?;
     Ok(())
 }
 

@@ -5,6 +5,7 @@ mod rebase_utils;
 mod repository;
 mod runtime;
 mod stack;
+mod state_io;
 mod worktree;
 
 use crate::commands::abort_cmd::abort_cmd;

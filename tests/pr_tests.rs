@@ -1913,12 +1913,13 @@ exit 0
         )
         .env("GITS_OPEN_COMMAND", open_mock.to_str().unwrap())
         .env("MOCK_OPEN_CAPTURE", &opened_url_path)
+        .env("KIN_TEST_SELECTIONS", "0")
         .output()
         .unwrap();
 
     assert!(output.status.success(), "kin pr open failed: {:?}", output);
     let opened_url = fs::read_to_string(&opened_url_path).unwrap();
-    // Non-interactive tests auto-select the first option.
+    // Selecting option 0 (the test-selection override) opens the first PR.
     assert_eq!(opened_url, "https://github.com/test/repo/pull/10");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1979,6 +1980,7 @@ exit 1
 
     let output = kin_cmd()
         .args(["pr", "edit"])
+        .env("KIN_TEST_SELECTIONS", "0,0")
         .current_dir(dir.path())
         .env(
             "PATH",
@@ -2076,6 +2078,7 @@ exit 1
 
     let output = kin_cmd()
         .args(["pr", "edit"])
+        .env("KIN_TEST_SELECTIONS", "0,0")
         .current_dir(dir.path())
         .env(
             "PATH",
@@ -2185,6 +2188,7 @@ exit 1
 
     let output = kin_cmd()
         .args(["pr", "edit"])
+        .env("KIN_TEST_SELECTIONS", "0,0")
         .current_dir(dir.path())
         .env(
             "PATH",
@@ -2271,6 +2275,7 @@ exit 1
 
     let output = kin_cmd()
         .args(["pr", "edit"])
+        .env("KIN_TEST_SELECTIONS", "0,0")
         .current_dir(dir.path())
         .env(
             "PATH",
@@ -2434,6 +2439,7 @@ exit 1
             ),
         )
         .env("MOCK_GH_EDIT_ARGS", &edit_args_path)
+        .env("KIN_TEST_SELECTIONS", "0,0")
         .output()
         .unwrap();
 
@@ -2441,7 +2447,7 @@ exit 1
     let args = fs::read_to_string(&edit_args_path).unwrap();
     assert!(
         args.contains("predit10--titleA title"),
-        "Non-interactive mode should auto-select first PR. Got:\n{}",
+        "Selecting option 0 should target the first PR and save. Got:\n{}",
         args
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2511,6 +2517,7 @@ exit 1
 
     let output = kin_cmd()
         .args(["pr", "edit"])
+        .env("KIN_TEST_SELECTIONS", "0,0")
         .current_dir(dir.path())
         .env(
             "PATH",
@@ -2630,6 +2637,7 @@ exit 1
 
     let output = kin_cmd()
         .args(["pr", "edit"])
+        .env("KIN_TEST_SELECTIONS", "0,0")
         .current_dir(dir.path())
         .env(
             "PATH",
@@ -3034,6 +3042,7 @@ exit 1
 
     let output = kin_cmd()
         .args(["pr", "review"])
+        .env("KIN_TEST_SELECTIONS", "0")
         .current_dir(dir.path())
         .env(
             "PATH",
@@ -3445,6 +3454,7 @@ exit 1
     let edit_args_path = dir.path().join("edit_args.txt");
     let output = kin_cmd()
         .args(["pr", "merge"])
+        .env("KIN_TEST_SELECTIONS", "0")
         .current_dir(dir.path())
         .env(
             "PATH",
@@ -3618,6 +3628,7 @@ exit 1
     let edit_args_path = dir.path().join("edit_args.txt");
     let output = kin_cmd()
         .args(["pr", "merge"])
+        .env("KIN_TEST_SELECTIONS", "0")
         .current_dir(dir.path())
         .env(
             "PATH",
@@ -3718,6 +3729,7 @@ exit 1
     let edit_args_path = dir.path().join("edit_args.txt");
     let output = kin_cmd()
         .args(["pr", "merge"])
+        .env("KIN_TEST_SELECTIONS", "0")
         .current_dir(dir.path())
         .env(
             "PATH",
@@ -3820,6 +3832,7 @@ exit 1
     let edit_args_path = dir.path().join("edit_args.txt");
     let output = kin_cmd()
         .args(["pr", "merge"])
+        .env("KIN_TEST_SELECTIONS", "0")
         .current_dir(dir.path())
         .env(
             "PATH",
