@@ -1,5 +1,5 @@
 use crate::commands::find_upstream;
-use crate::stack::get_stack_branches;
+use crate::stack::get_stack_branches_from_merge_base;
 use anyhow::{Result, anyhow};
 use git2::{BranchType, ErrorCode, Repository};
 use std::collections::HashSet;
@@ -21,7 +21,14 @@ pub fn push() -> Result<()> {
     let upstream_id = upstream_obj.id();
     let head_id = repo.head()?.peel_to_commit()?.id();
 
-    let stack_branches = get_stack_branches(&repo, head_id, upstream_id, &upstream_name)?;
+    let merge_base = repo.merge_base(head_id, upstream_id)?;
+    let stack_branches = get_stack_branches_from_merge_base(
+        &repo,
+        merge_base,
+        head_id,
+        upstream_id,
+        &upstream_name,
+    )?;
     let branch_names = stack_branches
         .into_iter()
         .map(|sb| sb.name)

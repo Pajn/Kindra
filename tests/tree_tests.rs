@@ -445,3 +445,83 @@ fn test_tree_complex_fork_topology() {
         "Should contain branch 'e'"
     );
 }
+
+/// `kin tree --pr` must fetch all stack PRs with a single `gh pr list` call
+/// rather than one `gh pr view` per branch.
+#[test]
+fn test_tree_pr_uses_single_gh_list_call() {
+    let (dir, repo) = setup_simple_stack();
+
+    // Look at the whole stack from the tip so both branches are included.
+    repo.set_head("refs/heads/feature-b").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let calls_path = dir.path().join("gh_calls.txt");
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+echo "$1 $2" >> "$GH_CALLS"
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"number":10,"headRefName":"feature-a","baseRefName":"main","isDraft":false,"author":{"login":"me"}},{"number":11,"headRefName":"feature-b","baseRefName":"feature-a","isDraft":true,"author":{"login":"me"}}]'
+    exit 0
+fi
+echo "unexpected gh command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    common::run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = kin_cmd()
+        .arg("tree")
+        .arg("--pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("GH_CALLS", &calls_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin tree --pr failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("#10"),
+        "expected feature-a PR, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("#11"),
+        "expected feature-b PR, got:\n{}",
+        stdout
+    );
+
+    let calls = std::fs::read_to_string(&calls_path).unwrap_or_default();
+    assert!(
+        calls.contains("pr list"),
+        "expected a single `gh pr list`, calls were:\n{}",
+        calls
+    );
+    assert!(
+        !calls.contains("pr view"),
+        "expected no per-branch `gh pr view`, calls were:\n{}",
+        calls
+    );
+    assert_eq!(
+        calls.matches("pr list").count(),
+        1,
+        "expected exactly one `gh pr list`, calls were:\n{}",
+        calls
+    );
+}
