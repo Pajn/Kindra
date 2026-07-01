@@ -1,7 +1,7 @@
 use crate::commands::pr_merge::pr_merge;
 use crate::gh::{self, CreatePrParams};
 use crate::stack::{
-    StackBranch, compute_base_map, get_stack_branches, sort_branches_topologically,
+    StackBranch, compute_base_map, get_stack_branches_from_merge_base, sort_branches_topologically,
 };
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -109,17 +109,28 @@ fn pr_create_or_update(skip_preflight: bool, include_all: bool, labels: &[String
 
     let repo = crate::open_repo()?;
 
+    // A single `gh pr list` snapshot serves scope filtering, the flatten-need
+    // check, and per-branch processing — instead of ~4 `gh pr view` subprocesses
+    // per branch. It is only re-fetched when a flatten mutates PR bases below.
+    let mut open_prs = gh::list_open_prs()?;
+
     let (upstream_name, all_stack_branches) = discover_stack_branches(&repo)?;
     let scoped_stack_branches =
-        filter_stack_branches_for_pr_scope(all_stack_branches.clone(), include_all)?;
+        filter_stack_branches_for_pr_scope(&open_prs, all_stack_branches.clone(), include_all)?;
 
     if !skip_preflight {
-        run_pr_create_or_update_preflight(
+        let flattened = run_pr_create_or_update_preflight(
+            &open_prs,
             &repo,
             &upstream_name,
             &all_stack_branches,
             &scoped_stack_branches,
         )?;
+        if flattened {
+            // Flatten retargeted PR bases on GitHub, so the pre-flatten snapshot is
+            // stale for base comparisons. Refresh it before processing.
+            open_prs = gh::list_open_prs()?;
+        }
     }
 
     let scoped_branch_names = scoped_stack_branches
@@ -150,7 +161,7 @@ fn pr_create_or_update(skip_preflight: bool, include_all: bool, labels: &[String
         branches_with_upstream.len()
     );
 
-    let mut open_prs = Vec::new();
+    let mut processed_prs = Vec::new();
     for (sb, _remote_upstream) in &branches_with_upstream {
         let git_base = base_map
             .get(&sb.name)
@@ -158,8 +169,10 @@ fn pr_create_or_update(skip_preflight: bool, include_all: bool, labels: &[String
             .unwrap_or_else(|| upstream_name.clone());
         let gh_base = normalize_base_for_gh(&git_base);
 
-        if let Some(pr) = process_branch_pr(&repo, &sb.name, &git_base, &gh_base, labels)? {
-            open_prs.push(StackPr {
+        if let Some(pr) =
+            process_branch_pr(&open_prs, &repo, &sb.name, &git_base, &gh_base, labels)?
+        {
+            processed_prs.push(StackPr {
                 branch_name: sb.name.clone(),
                 pr,
             });
@@ -169,22 +182,27 @@ fn pr_create_or_update(skip_preflight: bool, include_all: bool, labels: &[String
 
     // Now that we have all active PRs, update descriptions to include the full stack
     // (including merged ones parsed from existing descriptions).
-    sync_stack_descriptions(&open_prs)?;
+    sync_stack_descriptions(&processed_prs)?;
 
     Ok(())
 }
 
+/// Returns `true` if a flatten was performed (so the caller should refresh its
+/// PR snapshot, since flatten mutates PR bases on GitHub).
 fn run_pr_create_or_update_preflight(
+    open_prs: &HashMap<String, gh::OpenPr>,
     repo: &Repository,
     upstream_name: &str,
     all_stack_branches: &[StackBranch],
     scoped_stack_branches: &[StackBranch],
-) -> Result<()> {
+) -> Result<bool> {
     let all_branches_with_upstream = stack_branches_for_base_map(all_stack_branches);
     let scoped_branches_with_upstream = stack_branches_for_base_map(scoped_stack_branches);
 
+    let mut flattened = false;
     if !scoped_branches_with_upstream.is_empty()
         && stack_pr_bases_need_flatten(
+            open_prs,
             repo,
             &all_branches_with_upstream,
             &scoped_branches_with_upstream,
@@ -192,7 +210,8 @@ fn run_pr_create_or_update_preflight(
         )?
     {
         println!("Detected PR base mismatches relative to the local stack. Flattening first...\n");
-        flatten_stack_prs_to_upstream(&scoped_branches_with_upstream, upstream_name)?;
+        flatten_stack_prs_to_upstream(open_prs, &scoped_branches_with_upstream, upstream_name)?;
+        flattened = true;
         println!();
     }
 
@@ -204,7 +223,7 @@ fn run_pr_create_or_update_preflight(
     crate::commands::push::push_stack_branches(repo, &branch_names)?;
     println!();
 
-    Ok(())
+    Ok(flattened)
 }
 
 fn stack_branches_for_base_map(branches: &[StackBranch]) -> Vec<(StackBranch, String)> {
@@ -216,6 +235,7 @@ fn stack_branches_for_base_map(branches: &[StackBranch]) -> Vec<(StackBranch, St
 }
 
 fn filter_stack_branches_for_pr_scope(
+    open_prs: &HashMap<String, gh::OpenPr>,
     stack_branches: Vec<StackBranch>,
     include_all: bool,
 ) -> Result<Vec<StackBranch>> {
@@ -227,12 +247,12 @@ fn filter_stack_branches_for_pr_scope(
     let mut scoped = Vec::new();
 
     for sb in stack_branches {
-        let Some(existing) = gh::find_open_pr(&sb.name)? else {
+        let Some(existing) = open_prs.get(&sb.name) else {
             scoped.push(sb);
             continue;
         };
 
-        let Some(author_login) = existing.author_login else {
+        let Some(author_login) = existing.author_login.as_deref() else {
             scoped.push(sb);
             continue;
         };
@@ -259,6 +279,7 @@ fn filter_stack_branches_for_pr_scope(
 }
 
 fn stack_pr_bases_need_flatten(
+    open_prs: &HashMap<String, gh::OpenPr>,
     repo: &Repository,
     all_branches_with_upstream: &[(StackBranch, String)],
     branches_with_upstream: &[(StackBranch, String)],
@@ -267,7 +288,7 @@ fn stack_pr_bases_need_flatten(
     let base_map = compute_base_map(repo, all_branches_with_upstream, upstream_name)?;
 
     for (sb, _remote_upstream) in branches_with_upstream {
-        let Some(existing) = gh::find_open_pr(&sb.name)? else {
+        let Some(existing) = open_prs.get(&sb.name) else {
             continue;
         };
 
@@ -436,10 +457,12 @@ fn pr_flatten() -> Result<()> {
         return Ok(());
     }
 
-    flatten_stack_prs_to_upstream(&branches_with_upstream, &upstream_name)
+    let open_prs = gh::list_open_prs()?;
+    flatten_stack_prs_to_upstream(&open_prs, &branches_with_upstream, &upstream_name)
 }
 
 fn flatten_stack_prs_to_upstream(
+    open_prs: &HashMap<String, gh::OpenPr>,
     branches_with_upstream: &[(StackBranch, String)],
     upstream_name: &str,
 ) -> Result<()> {
@@ -456,8 +479,8 @@ fn flatten_stack_prs_to_upstream(
     let mut failures = Vec::new();
 
     for (sb, _remote_upstream) in branches_with_upstream {
-        match gh::find_open_pr(&sb.name) {
-            Ok(Some(existing)) => {
+        match open_prs.get(&sb.name) {
+            Some(existing) => {
                 if existing.base_branch == target_base {
                     println!(
                         "PR #{} for '{}' is already based on '{}'.",
@@ -483,14 +506,9 @@ fn flatten_stack_prs_to_upstream(
                     }
                 }
             }
-            Ok(None) => {
+            None => {
                 println!("No open PR found for '{}'; skipping.", sb.name);
                 no_open_pr += 1;
-            }
-            Err(err) => {
-                eprintln!("✗ Failed to inspect PR for '{}': {}", sb.name, err);
-                failed += 1;
-                failures.push(format!("{}: {}", sb.name, err));
             }
         }
     }
@@ -705,7 +723,14 @@ fn discover_stack_branches(repo: &Repository) -> Result<(String, Vec<StackBranch
 
     // Collect all stack branches and sort bottom→top so base branches are
     // processed before the branches that depend on them.
-    let mut stack_branches = get_stack_branches(repo, head_id, upstream_id, &git_boundary_ref)?;
+    let merge_base = repo.merge_base(head_id, upstream_id)?;
+    let mut stack_branches = get_stack_branches_from_merge_base(
+        repo,
+        merge_base,
+        head_id,
+        upstream_id,
+        &git_boundary_ref,
+    )?;
     sort_branches_topologically(repo, &mut stack_branches)?;
 
     if stack_branches.is_empty() {
@@ -944,6 +969,7 @@ pub(crate) fn normalize_base_for_gh(base: &str) -> String {
 }
 
 fn process_branch_pr(
+    open_prs: &HashMap<String, gh::OpenPr>,
     repo: &Repository,
     branch_name: &str,
     git_base: &str,
@@ -952,8 +978,8 @@ fn process_branch_pr(
 ) -> Result<Option<crate::gh::EditablePr>> {
     println!("── {} ──", branch_name);
 
-    // Check for an existing open PR
-    match gh::find_open_pr(branch_name)? {
+    // Check for an existing open PR in the snapshot.
+    match open_prs.get(branch_name) {
         Some(existing) => {
             println!("  Open PR #{} found.", existing.number);
             if existing.base_branch != gh_base {
@@ -963,14 +989,14 @@ fn process_branch_pr(
             } else {
                 println!("  Base is already '{}'. Nothing to update.", gh_base);
             }
-            let pr = gh::find_open_pr_for_edit(branch_name)?.ok_or_else(|| {
-                anyhow!(
-                    "Expected editable PR details for branch '{}' after finding PR #{}.",
-                    branch_name,
-                    existing.number
-                )
-            })?;
-            Ok(Some(pr))
+            Ok(Some(crate::gh::EditablePr {
+                number: existing.number,
+                title: existing.title.clone(),
+                body: existing.body.clone(),
+                url: existing.url.clone(),
+                labels: existing.labels.clone(),
+                reviewers: existing.reviewers.clone(),
+            }))
         }
         None => {
             // New PR: run the interactive wizard

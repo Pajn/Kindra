@@ -95,6 +95,10 @@ fn pr_after_branch_merged_into_main() {
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     echo "no pull requests found for branch" >&2
     exit 1
@@ -219,6 +223,10 @@ fn pr_unmerged_branches_work() {
         format!(
             r#"#!/bin/bash
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then

@@ -233,6 +233,10 @@ fn single_commit_branch_title_prefill() {
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     echo "no pull requests found for branch" >&2
     exit 1
@@ -321,6 +325,10 @@ fn single_commit_body_prefill_in_editor() {
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     echo "no pull requests found for branch" >&2
     exit 1
@@ -401,6 +409,10 @@ fn test_pr_label_flag() {
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     echo "no pull requests found for branch" >&2
     exit 1
@@ -472,6 +484,10 @@ fn test_pr_pushes_by_default() {
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -567,6 +583,10 @@ fn test_pr_no_push_skips_preflight_push() {
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -749,6 +769,10 @@ fn pr_uses_origin_main_as_base_when_local_main_is_behind_after_sync() {
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     echo "no pull requests found for branch" >&2
     exit 1
@@ -840,6 +864,10 @@ fn pr_template_detected() {
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     echo "no pull requests found for branch" >&2
     exit 1
@@ -912,6 +940,10 @@ fn pr_adds_stack_section_to_multi_pr_descriptions() {
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -1030,6 +1062,10 @@ fn pr_stack_sync_continues_when_one_edit_fails() {
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     echo "no pull requests found for branch" >&2
     exit 1
@@ -1144,12 +1180,16 @@ fn pr_stack_sync_skips_inaccessible_historical_pr_entries() {
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{{"number":10,"headRefName":"feature-a","baseRefName":"main","state":"OPEN","title":"PR A","body":"{0}","url":"https://github.com/test/repo/pull/10","labels":[],"reviewRequests":[]}},{{"number":11,"headRefName":"feature-b","baseRefName":"feature-a","state":"OPEN","title":"PR B","body":"Body B","url":"https://github.com/test/repo/pull/11","labels":[],"reviewRequests":[]}}]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     if [[ "$3" == "feature-a" ]]; then
         if [[ "$5" == "number,baseRefName,state" ]]; then
             echo '{{"number":10,"baseRefName":"main","state":"OPEN"}}'
         else
-            echo '{{"number":10,"title":"PR A","body":"{}","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}}'
+            echo '{{"number":10,"title":"PR A","body":"{0}","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}}'
         fi
         exit 0
     fi
@@ -1273,6 +1313,10 @@ if [[ "$1" == "api" ]] && [[ "$2" == "user" ]]; then
     echo "alice"
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"number":10,"headRefName":"feature-a","baseRefName":"main","state":"OPEN","isDraft":false,"author":{"login":"bob"},"title":"PR A","body":"Body A","url":"https://github.com/test/repo/pull/10","labels":[],"reviewRequests":[]},{"number":11,"headRefName":"feature-b","baseRefName":"feature-a","state":"OPEN","isDraft":false,"author":{"login":"alice"},"title":"PR B","body":"Body B\n\n<!-- kindra-stack:start -->\n## Stack\n- [feature-a](https://github.com/test/repo/pull/10) #10\n- → feature-b #11\n<!-- kindra-stack:end -->","url":"https://github.com/test/repo/pull/11","labels":[],"reviewRequests":[]}]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     if [[ "$3" == "feature-a" ]]; then
         if [[ "$5" == *"author"* ]]; then
@@ -1378,6 +1422,10 @@ if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "user" ]]; then
     echo "alice"
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"number":10,"baseRefName":"main","state":"OPEN","isDraft":false,"author":{"login":"bob"},"headRefName":"feature-a"},{"number":11,"baseRefName":"feature-a","state":"OPEN","isDraft":false,"author":{"login":"alice"},"headRefName":"feature-b"}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -1516,6 +1564,10 @@ fn multi_commit_branch_title_empty() {
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     echo "no pull requests found for branch" >&2
     exit 1
@@ -1601,6 +1653,10 @@ if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
     exit 0
 fi
 # Handle all gh commands that may be called during the test
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     # Return no PR for all branches (so they all go through interactive mode)
     echo "no pull requests found for branch" >&2
@@ -1723,6 +1779,10 @@ fn slash_base_branch_uses_git_base_for_local_history() {
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -4123,6 +4183,10 @@ fn pr_flatten_retargets_all_open_stack_prs_to_resolved_upstream_base() {
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"number":10,"baseRefName":"feature/base-a","state":"OPEN","isDraft":false,"headRefName":"feature-a"},{"number":11,"baseRefName":"feature-a","state":"OPEN","isDraft":false,"headRefName":"feature-b"}]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     if [[ "$3" == "feature-a" ]]; then
         echo '{"number":10,"baseRefName":"feature/base-a","state":"OPEN","isDraft":false}'
@@ -4240,6 +4304,10 @@ fn pr_flatten_uses_resolved_upstream_not_hardcoded_main() {
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"number":21,"baseRefName":"main","state":"OPEN","isDraft":false,"headRefName":"feature"}]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     if [[ "$3" == "feature" ]]; then
         echo '{"number":21,"baseRefName":"main","state":"OPEN","isDraft":false}'
@@ -4310,6 +4378,10 @@ fn pr_flatten_continues_on_partial_failures_and_exits_nonzero() {
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"number":10,"baseRefName":"feature/base-a","state":"OPEN","isDraft":false,"headRefName":"feature-a"},{"number":11,"baseRefName":"feature-a","state":"OPEN","isDraft":false,"headRefName":"feature-b"}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -4414,6 +4486,10 @@ fn pr_flatten_does_not_mutate_local_git_or_pr_body_metadata() {
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"number":10,"baseRefName":"feature/base-a","state":"OPEN","isDraft":false,"headRefName":"feature-a"},{"number":11,"baseRefName":"feature-a","state":"OPEN","isDraft":false,"headRefName":"feature-b"}]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     if [[ "$3" == "feature-a" ]]; then
         echo '{"number":10,"baseRefName":"feature/base-a","state":"OPEN","isDraft":false}'
@@ -4511,6 +4587,10 @@ fn pr_default_preflight_flattens_pushes_and_then_runs_normal_pr_logic() {
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","baseRefName":"wrong-a","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false,"headRefName":"feature-a"},{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","baseRefName":"wrong-b","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false,"headRefName":"feature-b"}]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     if [[ "$3" == "feature-a" ]]; then
         echo '{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","baseRefName":"wrong-a","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false}'
@@ -4602,6 +4682,10 @@ fn pr_default_preflight_skips_flatten_when_pr_bases_match() {
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","baseRefName":"main","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false,"headRefName":"feature-a"},{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","baseRefName":"feature-a","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false,"headRefName":"feature-b"}]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     if [[ "$3" == "feature-a" ]]; then
         echo '{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","baseRefName":"main","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false}'
@@ -4678,6 +4762,10 @@ fn pr_no_push_skips_preflight_flatten() {
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","baseRefName":"main","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false,"headRefName":"feature-a"},{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","baseRefName":"main","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false,"headRefName":"feature-b"}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -4759,6 +4847,10 @@ fn pr_preflight_flatten_failure_stops_before_push_and_pr_processing() {
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","baseRefName":"wrong-a","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false,"headRefName":"feature-a"},{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","baseRefName":"wrong-b","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false,"headRefName":"feature-b"}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -5055,6 +5147,10 @@ fn pr_command_excludes_upstream_branch() {
 if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
     exit 0
 fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
+    exit 0
+fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     echo "no pull requests found for branch" >&2
     exit 1
@@ -5128,5 +5224,88 @@ exit 1
         !main_in_pr_section,
         "main should NOT be suggested for PR, but found it in PR-processing output:\n{}",
         combined
+    );
+}
+
+/// `kin pr` must gather PR state with a single `gh pr list` call for the whole
+/// stack instead of one `gh pr view` per branch.
+#[test]
+fn pr_uses_single_gh_pr_list_for_the_stack() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let calls_path = dir.path().join("gh_calls.txt");
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+echo "$1 $2" >> "$GH_CALLS"
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
+    if [[ "$*" == *"feature-a"* ]]; then
+        echo "https://github.com/test/repo/pull/1"
+    else
+        echo "https://github.com/test/repo/pull/2"
+    fi
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = kin_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("GH_CALLS", &calls_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "kin pr failed: {:?}", output);
+
+    let calls = std::fs::read_to_string(&calls_path).unwrap_or_default();
+    assert_eq!(
+        calls.matches("pr list").count(),
+        1,
+        "expected exactly one `gh pr list` for the whole stack, calls were:\n{}",
+        calls
+    );
+    assert!(
+        !calls.contains("pr view"),
+        "expected no per-branch `gh pr view`, calls were:\n{}",
+        calls
     );
 }
