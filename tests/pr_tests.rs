@@ -500,6 +500,7 @@ exit 1
                 std::env::var("PATH").unwrap()
             ),
         )
+        .env("KIN_TEST_MULTI_SELECTIONS", "0")
         .output()
         .unwrap();
 
@@ -512,6 +513,37 @@ exit 1
         stdout.contains("Pushing branches first"),
         "kin pr should indicate it's pushing branches first. Got:\n{}",
         stdout
+    );
+    assert!(
+        stdout.contains("Pushing 1 branches with upstream to origin"),
+        "kin pr should set an upstream for the selected new branch. Got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Found 1 branch(es) with upstreams"),
+        "kin pr should rediscover the newly pushed branch before creating PRs. Got:\n{}",
+        stdout
+    );
+
+    let upstream = std::process::Command::new("git")
+        .args([
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "feature@{upstream}",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        upstream.status.success(),
+        "feature should have an upstream after kin pr\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&upstream.stdout),
+        String::from_utf8_lossy(&upstream.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&upstream.stdout).trim(),
+        "origin/feature"
     );
 }
 

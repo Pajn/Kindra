@@ -2,6 +2,7 @@ use crate::commands::find_upstream;
 use crate::stack::get_stack_branches;
 use anyhow::{Result, anyhow};
 use git2::{BranchType, Repository};
+use std::collections::HashSet;
 use std::fmt;
 use std::process::Command;
 
@@ -20,18 +21,28 @@ pub fn push() -> Result<()> {
     let upstream_id = upstream_obj.id();
     let head_id = repo.head()?.peel_to_commit()?.id();
 
+    let stack_branches = get_stack_branches(&repo, head_id, upstream_id, &upstream_name)?;
+    let branch_names = stack_branches
+        .into_iter()
+        .map(|sb| sb.name)
+        .collect::<Vec<_>>();
+
+    push_stack_branches(&repo, &branch_names)
+}
+
+pub(crate) fn push_stack_branches(repo: &Repository, branches: &[String]) -> Result<()> {
+    let branch_filter = branches.iter().collect::<HashSet<_>>();
     let mut branches_to_push = Vec::new();
     let mut branches_without_upstream = Vec::new();
 
-    let stack_branches = get_stack_branches(&repo, head_id, upstream_id, &upstream_name)?;
-    for sb in stack_branches {
-        let branch = repo.find_branch(&sb.name, BranchType::Local)?;
-        match tracked_push_target(&repo, &branch, sb.name.clone())? {
+    for name in branches {
+        let branch = repo.find_branch(name, BranchType::Local)?;
+        match tracked_push_target(repo, &branch, name.clone())? {
             Some(target) => {
                 branches_to_push.push(target);
             }
             None => {
-                branches_without_upstream.push(BranchStatus::without_upstream(sb.name));
+                branches_without_upstream.push(BranchStatus::without_upstream(name.clone()));
             }
         }
     }
@@ -50,7 +61,7 @@ pub fn push() -> Result<()> {
 
         let options = all_branches
             .iter()
-            .filter(|b| b.tracked_ref.is_none())
+            .filter(|b| b.tracked_ref.is_none() && branch_filter.contains(&b.name))
             .cloned()
             .collect::<Vec<_>>();
 
@@ -69,7 +80,7 @@ pub fn push() -> Result<()> {
             return Ok(());
         }
 
-        let remote_name = resolve_remote(&repo)?;
+        let remote_name = resolve_remote(repo)?;
         let mut branches_with_upstream = Vec::new();
         for branch_status in selected {
             branches_with_upstream.push(branch_status.name.clone());
@@ -86,7 +97,7 @@ pub fn push() -> Result<()> {
 
         branches_to_push.extend(branches_to_push_with_upstream);
 
-        perform_push_with_upstream(&repo, &branches_with_upstream, &remote_name)?;
+        perform_push_with_upstream(repo, &branches_with_upstream, &remote_name)?;
 
         let pushed_names: Vec<&String> = branches_with_upstream.iter().collect();
         let existing_upstream: Vec<BranchStatus> = branches_to_push
@@ -101,19 +112,6 @@ pub fn push() -> Result<()> {
     }
 
     Ok(())
-}
-
-pub(crate) fn push_tracked_stack_branches(repo: &Repository, branches: &[String]) -> Result<()> {
-    let mut branches_to_push = Vec::new();
-
-    for name in branches {
-        let branch = repo.find_branch(name, BranchType::Local)?;
-        if let Some(target) = tracked_push_target(repo, &branch, name.clone())? {
-            branches_to_push.push(target);
-        }
-    }
-
-    perform_push(branches_to_push)
 }
 
 fn push_upstream_branch(repo: &Repository, upstream_name: &str) -> Result<()> {
