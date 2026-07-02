@@ -9,7 +9,7 @@ use crate::stack::{
 };
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Oid, Repository};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -53,36 +53,69 @@ pub fn commit(args: &[String]) -> Result<()> {
         let commits =
             enumerate_stack_commits(&repo, &current_stack.stack_branches, &upstream_name)?;
         Some(select_commit_interactive(&commits)?)
+    } else if let Some(fixup_target) = &parsed.fixup_target {
+        let commits =
+            enumerate_stack_commits(&repo, &current_stack.stack_branches, &upstream_name)?;
+        Some(resolve_fixup_commit(&repo, &commits, fixup_target)?)
     } else {
         None
     };
 
     let mut is_fixup = false;
     let mut fixup_commit_id = String::new();
+    // When true, fold the staged changes into the target *in place* on the current
+    // branch (commit a `fixup!` here, then autosquash the range with
+    // `--update-refs`) instead of checking out the target's branch and carrying
+    // staged changes across a possibly-diverged tree. See the autosquash below.
+    let mut inline_fixup = false;
 
+    // Every picked commit is treated the same: fold the staged changes into it,
+    // never reword. The current tip is folded with an in-place amend; a commit
+    // below HEAD is folded via fixup + autosquash without checking out its branch;
+    // any other commit (a sibling stack, or another branch sharing HEAD's commit)
+    // is folded via the checkout path, which rewrites the selected branch and then
+    // restacks its dependents onto the folded commit.
     if let Some(sel) = &interactive_selection {
-        if sel.is_tip {
+        if sel.commit_id == head_id && sel.branch_name == current_branch_name {
             if !parsed.git_commit_args.iter().any(|arg| arg == "--amend") {
                 insert_generated_commit_arg(&mut parsed.git_commit_args, "--amend".to_string());
+            }
+            if !parsed.git_commit_args.iter().any(|arg| arg == "--no-edit") {
+                insert_generated_commit_arg(&mut parsed.git_commit_args, "--no-edit".to_string());
             }
         } else {
             is_fixup = true;
             fixup_commit_id = sel.commit_id.to_string();
+            // A commit *strictly* below HEAD is folded in place; `--update-refs` on
+            // the autosquash moves the branch tips at/below HEAD, and branches
+            // stacked above HEAD are restacked afterwards by the rebase loop. A
+            // commit that is HEAD but on another branch (a shared-head sibling)
+            // isn't below HEAD, so it takes the checkout path: the selected branch
+            // is rewritten and its dependents are restacked to follow it.
+            inline_fixup =
+                sel.commit_id != head_id && repo.graph_descendant_of(head_id, sel.commit_id)?;
             insert_generated_commit_arg(
                 &mut parsed.git_commit_args,
-                format!("--fixup={}", fixup_commit_id),
+                format!("--fixup={fixup_commit_id}"),
             );
         }
     }
 
-    if parsed.interactive
-        && interactive_requires_staged_changes(&parsed.git_commit_args)
-        && !has_staged_changes(&repo)?
-    {
+    // A picked commit folds the staged changes into the target, so a non-empty
+    // index is required unless `-a`/`-p`/a pathspec supplies the content instead.
+    let requires_staged_changes = !parsed
+        .git_commit_args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-a" | "--all" | "-p" | "--patch"))
+        && !has_forwarded_pathspec(&parsed.git_commit_args);
+    if interactive_selection.is_some() && requires_staged_changes && !has_staged_changes(&repo)? {
         return Err(anyhow!("nothing to commit, working tree clean"));
     }
 
     let target_branch = match &interactive_selection {
+        // An inline fixup stays on the current branch: it folds into an ancestor
+        // and restacks descendants, never switching to the target's branch.
+        Some(_) if inline_fixup => current_branch_name.clone(),
         Some(sel) => sel.branch_name.clone(),
         None => match parsed.on_target {
             None => current_branch_name.clone(),
@@ -148,23 +181,16 @@ pub fn commit(args: &[String]) -> Result<()> {
         check_worktrees(&remaining_branches, parsed.force)?;
     }
 
+    // The autosquash below rewrites branch tips with `--update-refs` (git >= 2.38).
+    // Verify support up front, before `git commit` creates a `fixup!` commit or
+    // any state is stashed/saved, so an unsupported git fails cleanly with nothing
+    // left to undo.
+    if needs_autosquash {
+        crate::rebase_utils::ensure_git_supports_update_refs()?;
+    }
+
     let pre_commit_state_required = switching_branches || will_rebase;
     if pre_commit_state_required || needs_autosquash {
-        // Deliberate exception to the uniform clean-or-autostash contract:
-        // whenever we commit onto a *different* branch than the one checked out —
-        // either `--on <branch>` or an interactive pick of another branch
-        // (`target_branch = sel.branch_name`), both of which set
-        // `switching_branches` — we keep the *staged* changes (they are what
-        // we're committing there) while setting aside the *unstaged* ones.
-        // `git stash --keep-index --include-untracked` does exactly that, so this
-        // is not the plain autostash the other commands use. The autostash flag
-        // still governs the dependent-rebase phase below.
-        let stash_ref = if switching_branches {
-            stash_non_staged_changes()?
-        } else {
-            None
-        };
-
         let (parent_id_map, parent_name_map) = if will_rebase {
             crate::stack::build_parent_maps(
                 &repo,
@@ -185,6 +211,21 @@ pub fn commit(args: &[String]) -> Result<()> {
                     .iter()
                     .map(|branch| (branch.name.clone(), branch.id.to_string())),
             );
+        }
+        // An inline fixup autosquashes with `--update-refs`, which rewrites every
+        // branch tip between the fixup target's parent and HEAD — including
+        // branches *below* HEAD that own the target commit. Those are not in
+        // `sub_stack` (which is HEAD's branch plus its descendants), so record
+        // their pre-fold tips here too; otherwise `kin abort` would restore
+        // HEAD's branch and its descendants but leave a below-HEAD branch
+        // stranded at the folded commit.
+        if inline_fixup {
+            record_below_head_rewritten_tips(
+                &repo,
+                &fixup_commit_id,
+                target_old_head_id,
+                &mut original_tip_map,
+            )?;
         }
 
         let mut state = RebaseState {
@@ -208,15 +249,28 @@ pub fn commit(args: &[String]) -> Result<()> {
             original_commit_count_map: HashMap::new(),
             original_tip_map,
             owned_tip_map: HashMap::new(),
-            stash_ref,
+            stash_ref: None,
             unstage_on_restore: switching_branches,
             autostash,
             cleanup_merged_branches: Vec::new(),
             cleanup_checkout_fallback: None,
         };
 
-        if pre_commit_state_required {
-            save_state(&repo, &state)?;
+        // Deliberate exception to the uniform clean-or-autostash contract: when
+        // committing onto another branch (`--on`), keep the *staged* changes (what
+        // we're committing there) while setting the *unstaged* ones aside via
+        // `git stash --keep-index --include-untracked`. Take it only now — after
+        // the fallible planning above — so a failure there can't strand the user's
+        // changes, and record it in the saved state right away.
+        if switching_branches {
+            state.stash_ref = stash_non_staged_changes()?;
+        }
+
+        if pre_commit_state_required && let Err(err) = save_state(&repo, &state) {
+            // Persisting failed, so no later `kin continue`/`abort` knows about
+            // the stash; pop it back rather than stranding the user's changes.
+            restore_stashed_changes(state.stash_ref.take());
+            return Err(err);
         }
 
         if switching_branches && let Err(err) = checkout_branch(&target_branch) {
@@ -241,15 +295,44 @@ pub fn commit(args: &[String]) -> Result<()> {
 
         if needs_autosquash {
             if autosquash_state_required {
-                state.stash_ref = stash_non_staged_changes()?;
-                save_state(&repo, &state)?;
+                // Take the pre-rebase stash only *after* the fixup commit: the
+                // staged content we're folding in is now committed, so a
+                // `--keep-index` stash captures genuinely unstaged leftovers rather
+                // than re-capturing (and later re-applying) the fixup content. If
+                // stashing fails, undo the fixup commit we just created so the
+                // failure can't strand a `fixup!` commit without a recoverable
+                // state.
+                state.stash_ref = match stash_non_staged_changes() {
+                    Ok(stash_ref) => stash_ref,
+                    Err(err) => {
+                        // Roll back the fixup commit we just created. If the reset
+                        // itself fails, surface that explicitly — a stray `fixup!`
+                        // commit is now stranded at HEAD and the user must remove it.
+                        match Command::new("git")
+                            .args(["reset", "--soft", "HEAD^"])
+                            .status()
+                        {
+                            Ok(status) if status.success() => return Err(err),
+                            _ => {
+                                return Err(err.context(
+                                    "Additionally, failed to roll back the fixup commit; a stray 'fixup!' commit remains at HEAD. Remove it with 'git reset --soft HEAD^'.",
+                                ));
+                            }
+                        }
+                    }
+                };
+                if let Err(err) = save_state(&repo, &state) {
+                    // Persisting failed; pop the stash back rather than leaving
+                    // the user's unstaged changes stranded.
+                    restore_stashed_changes(state.stash_ref.take());
+                    return Err(err);
+                }
             }
 
             let fixup_commit = repo.find_commit(Oid::from_str(&fixup_commit_id)?)?;
-            let autosquash_base = if fixup_commit.parent_count() > 0 {
-                fixup_commit.parent_id(0)?.to_string()
-            } else {
-                "--root".to_string()
+            let autosquash_base_arg = match autosquash_base(&fixup_commit)? {
+                Some(base) => base.to_string(),
+                None => "--root".to_string(),
             };
 
             let mut cmd = Command::new("git");
@@ -260,27 +343,33 @@ pub fn commit(args: &[String]) -> Result<()> {
             if autostash {
                 cmd.arg("--autostash");
             }
-            cmd.arg(&autosquash_base);
+            // Always move the branch tips inside the rewritten range with the fold
+            // rather than relying on the ambient `rebase.updateRefs` git config
+            // (off by default): this moves an inline fixup's below-HEAD ancestor
+            // branches and any sibling branch sharing the folded commit (e.g. a
+            // shared-head interactive pick). Branches stacked *above* the range are
+            // restacked afterwards by the rebase loop, which skips any this moved.
+            // (Support for `--update-refs` is verified up front in the validation
+            // path above, before any state is mutated.)
+            cmd.arg("--update-refs");
+            cmd.arg(&autosquash_base_arg);
 
             let status = cmd.status()?;
 
             if !status.success() {
-                if !pre_commit_state_required {
-                    if git_rebase_in_progress(&repo) {
-                        state.in_progress_branch = Some(target_branch.clone());
-                        save_state(&repo, &state)?;
-                    } else if autosquash_state_required
-                        && let Some(stash_ref) = state.stash_ref.clone()
-                    {
-                        state.stash_ref = None;
-                        state.in_progress_branch = None;
-                        save_state(&repo, &state)?;
-                        apply_stash(&stash_ref)?;
-                        if let Err(err) = drop_stash(&stash_ref) {
-                            eprintln!("Warning: {}", err);
-                        }
-                        save_state(&repo, &state)?;
-                    }
+                if git_rebase_in_progress(&repo) {
+                    // The autosquash rebase paused on a conflict. Record which
+                    // branch is mid-rebase so `kin continue` matches the saved
+                    // state — required whether or not the target has dependents
+                    // (a missing in_progress_branch makes `kin continue` refuse).
+                    state.in_progress_branch = Some(target_branch.clone());
+                    save_state(&repo, &state)?;
+                } else if autosquash_state_required {
+                    // autosquash_state_required implies no dependents/switch, so
+                    // this only runs on the single-branch path. The rebase failed
+                    // without a resumable state, so put the user's autostash back
+                    // before surfacing the error.
+                    restore_autostash(&repo, &mut state)?;
                 }
                 return Err(anyhow!(
                     "git rebase --autosquash failed. Resolve conflicts and run 'kin continue', or run 'kin abort'."
@@ -288,16 +377,7 @@ pub fn commit(args: &[String]) -> Result<()> {
             }
 
             if autosquash_state_required {
-                if let Some(stash_ref) = state.stash_ref.clone() {
-                    state.stash_ref = None;
-                    state.in_progress_branch = None;
-                    save_state(&repo, &state)?;
-                    apply_stash(&stash_ref)?;
-                    if let Err(err) = drop_stash(&stash_ref) {
-                        eprintln!("Warning: {}", err);
-                    }
-                    save_state(&repo, &state)?;
-                }
+                restore_autostash(&repo, &mut state)?;
                 clear_state(&repo)?;
             }
         }
@@ -333,6 +413,7 @@ struct StackContext {
 struct ParsedCommitArgs {
     on_target: Option<Option<String>>,
     interactive: bool,
+    fixup_target: Option<String>,
     force: bool,
     autostash: Option<bool>,
     git_commit_args: Vec<String>,
@@ -421,6 +502,34 @@ fn parse_commit_args(args: &[String]) -> Result<ParsedCommitArgs> {
             continue;
         }
 
+        if arg == "--fixup" {
+            if parsed.fixup_target.is_some() {
+                return Err(anyhow!("--fixup can only be specified once."));
+            }
+            if idx + 1 == args.len() || args[idx + 1].is_empty() || args[idx + 1].starts_with('-') {
+                return Err(anyhow!(
+                    "--fixup requires a commit to fix up (e.g. 'kin commit --fixup <sha>')."
+                ));
+            }
+            parsed.fixup_target = Some(args[idx + 1].clone());
+            idx += 2;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--fixup=") {
+            if parsed.fixup_target.is_some() {
+                return Err(anyhow!("--fixup can only be specified once."));
+            }
+            if value.is_empty() {
+                return Err(anyhow!(
+                    "--fixup requires a commit to fix up (e.g. 'kin commit --fixup=<sha>')."
+                ));
+            }
+            parsed.fixup_target = Some(value.to_string());
+            idx += 1;
+            continue;
+        }
+
         if arg == "--on" {
             if parsed.on_target.is_some() {
                 return Err(anyhow!("--on can only be specified once."));
@@ -460,6 +569,18 @@ fn parse_commit_args(args: &[String]) -> Result<ParsedCommitArgs> {
     if parsed.interactive && parsed.on_target.is_some() {
         return Err(anyhow!(
             "--interactive and --on are mutually exclusive. Use one or the other."
+        ));
+    }
+
+    if parsed.fixup_target.is_some() && parsed.interactive {
+        return Err(anyhow!(
+            "--fixup and --interactive are mutually exclusive. Use one or the other."
+        ));
+    }
+
+    if parsed.fixup_target.is_some() && parsed.on_target.is_some() {
+        return Err(anyhow!(
+            "--fixup and --on are mutually exclusive. --fixup determines the target branch from the commit."
         ));
     }
 
@@ -555,6 +676,57 @@ fn collect_target_sub_stack(
     Ok(sub_stack)
 }
 
+/// The base of the autosquash range for a fixup: the fixup target commit's first
+/// parent, or `None` for a root commit (which rewrites the whole history). Both
+/// the rebase invocation and the abort-tip bookkeeping derive the rewritten range
+/// (`base..HEAD`) from this single place so they can't disagree on what
+/// `--update-refs` will move.
+fn autosquash_base(fixup_commit: &git2::Commit) -> Result<Option<Oid>> {
+    if fixup_commit.parent_count() > 0 {
+        Ok(Some(fixup_commit.parent_id(0)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Record, into `original_tip_map`, the pre-rewrite tip of every local branch
+/// whose tip lies in the range an inline-fixup autosquash rewrites with
+/// `--update-refs`: from the fixup target commit's parent up to (and including)
+/// the current HEAD. Existing entries are preserved. This is what lets `kin
+/// abort` roll a completed fold back off a below-HEAD ancestor branch.
+fn record_below_head_rewritten_tips(
+    repo: &Repository,
+    fixup_commit_id: &str,
+    head_id: Oid,
+    original_tip_map: &mut HashMap<String, String>,
+) -> Result<()> {
+    let fixup_commit = repo.find_commit(Oid::from_str(fixup_commit_id)?)?;
+    let mut walk = repo.revwalk()?;
+    walk.push(head_id)?;
+    // Hide everything at/below the autosquash base so only the rewritten range
+    // (base..HEAD) remains; a root fixup has no base, so hide nothing.
+    if let Some(base) = autosquash_base(&fixup_commit)? {
+        walk.hide(base)?;
+    }
+    let rewritten: HashSet<Oid> = walk.filter_map(|id| id.ok()).collect();
+
+    for (branch, _) in repo.branches(Some(BranchType::Local))?.flatten() {
+        let Some(oid) = branch.get().target() else {
+            continue;
+        };
+        if !rewritten.contains(&oid) {
+            continue;
+        }
+        let Ok(Some(name)) = branch.name() else {
+            continue;
+        };
+        original_tip_map
+            .entry(name.to_string())
+            .or_insert_with(|| oid.to_string());
+    }
+    Ok(())
+}
+
 fn has_dependents_to_rebase(
     target_branch: &str,
     upstream_name: &str,
@@ -601,27 +773,6 @@ fn has_staged_changes(_repo: &Repository) -> Result<bool> {
     // git diff --cached returns exit code 0 whether or not there are staged changes.
     // Check both exit status (for errors) and stdout emptiness to determine presence of staged changes.
     Ok(output.status.success() && !output.stdout.is_empty())
-}
-
-fn interactive_requires_staged_changes(args: &[String]) -> bool {
-    if args.iter().any(|arg| {
-        matches!(
-            arg.as_str(),
-            "--dry-run" | "-a" | "--all" | "-p" | "--patch" | "--amend"
-        )
-    }) {
-        return false;
-    }
-
-    let has_include_or_only = args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "-i" | "--include" | "-o" | "--only"));
-
-    if has_include_or_only && has_forwarded_pathspec(args) {
-        return false;
-    }
-
-    true
 }
 
 fn has_forwarded_pathspec(args: &[String]) -> bool {
@@ -692,6 +843,39 @@ fn option_takes_value(arg: &str) -> bool {
     )
 }
 
+/// Pop a stash taken by `stash_non_staged_changes` back onto the working tree,
+/// best-effort. Used on error paths where no saved state will restore it later,
+/// so the user's unstaged changes aren't stranded in the stash list.
+fn restore_stashed_changes(stash_ref: Option<String>) {
+    let Some(stash_ref) = stash_ref else {
+        return;
+    };
+    if apply_stash(&stash_ref).is_ok() {
+        let _ = drop_stash(&stash_ref);
+    }
+}
+
+/// Reapply the autostash recorded in `state` (if any), drop it, and only then
+/// clear the `stash_ref` / `in_progress_branch` fields and persist.
+///
+/// The ordering matters: `apply_stash` runs *before* the saved state stops
+/// referencing the stash. If it fails, the on-disk state still points at the
+/// stash, so `kin abort` can recover the user's changes instead of orphaning
+/// them. `save_state` already persists `stash_ref` before the autosquash rebase,
+/// so no state is lost on the failure path.
+fn restore_autostash(repo: &Repository, state: &mut RebaseState) -> Result<()> {
+    let Some(stash_ref) = state.stash_ref.clone() else {
+        return Ok(());
+    };
+    apply_stash(&stash_ref)?;
+    if let Err(err) = drop_stash(&stash_ref) {
+        eprintln!("Warning: {}", err);
+    }
+    state.stash_ref = None;
+    state.in_progress_branch = None;
+    save_state(repo, state)
+}
+
 fn stash_non_staged_changes() -> Result<Option<String>> {
     let before = stash_head_ref()?;
     let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -713,6 +897,34 @@ fn stash_non_staged_changes() -> Result<Option<String>> {
     } else {
         Ok(None)
     }
+}
+
+fn resolve_fixup_commit(
+    repo: &Repository,
+    commits: &[StackCommit],
+    fixup_target: &str,
+) -> Result<StackCommit> {
+    if commits.is_empty() {
+        return Err(anyhow!("No commits found in the stack."));
+    }
+
+    let target_id = repo
+        .revparse_single(fixup_target)
+        .with_context(|| format!("Could not resolve '{}' to a commit.", fixup_target))?
+        .peel_to_commit()
+        .with_context(|| format!("'{}' does not refer to a commit.", fixup_target))?
+        .id();
+
+    commits
+        .iter()
+        .find(|c| c.commit_id == target_id)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!(
+                "Commit '{}' is not part of the current stack. Only commits in the current stack can be fixed up.",
+                fixup_target
+            )
+        })
 }
 
 fn select_commit_interactive(commits: &[StackCommit]) -> Result<StackCommit> {

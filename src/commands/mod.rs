@@ -81,6 +81,37 @@ fn local_branch_candidates(current: &OsStr) -> Vec<CompletionCandidate> {
     candidates
 }
 
+pub fn fixup_commit_completer() -> ArgValueCompleter {
+    ArgValueCompleter::new(fixup_commit_candidates)
+}
+
+/// Suggest the commits in the current stack for `kin commit --fixup <sha>` — the
+/// same set `resolve_fixup_commit` accepts as targets — offering the abbreviated
+/// SHA as the value and the commit subject as help. Stack discovery is delegated
+/// to [`crate::stack::enumerate_current_stack_commits`]. Best-effort: any failure
+/// to resolve the stack yields no suggestions rather than an error.
+fn fixup_commit_candidates(current: &OsStr) -> Vec<CompletionCandidate> {
+    let Some(current) = current.to_str() else {
+        return Vec::new();
+    };
+    let Ok(repo) = Repository::discover(".") else {
+        return Vec::new();
+    };
+    let Ok(commits) = crate::stack::enumerate_current_stack_commits(&repo) else {
+        return Vec::new();
+    };
+    commits
+        .iter()
+        .filter_map(|commit| {
+            let short: String = commit.commit_id.to_string().chars().take(12).collect();
+            short.starts_with(current).then(|| {
+                let subject = commit.message.lines().next().unwrap_or("").to_string();
+                CompletionCandidate::new(short).help(Some(subject.into()))
+            })
+        })
+        .collect()
+}
+
 /// Prompt the user to pick one of `options`.
 ///
 /// A single option is always unambiguous and returned directly (it consumes no

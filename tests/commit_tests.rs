@@ -2138,7 +2138,7 @@ fn test_commit_interactive_amend_tip() {
 }
 
 #[test]
-fn test_commit_interactive_amend_tip_no_staged_changes() {
+fn test_commit_interactive_pick_current_tip_folds_without_reword() {
     let (dir, repo) = setup_repo();
     let main_id = repo.revparse_single("main").unwrap().id();
     let main_commit = repo.find_commit(main_id).unwrap();
@@ -2174,14 +2174,17 @@ fn test_commit_interactive_amend_tip_no_staged_changes() {
     repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
         .unwrap();
 
+    // Stage a change; picking the current tip folds it in without rewording.
+    // `false` as the editor would fail if a reword editor were (wrongly) opened.
+    fs::write(dir.path().join("a3.txt"), "a3-fixed").unwrap();
+    run_ok("git", &["add", "a3.txt"], dir.path());
+
     let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("--interactive")
-        .arg("-m")
-        .arg("new subject")
         .current_dir(dir.path())
-        .env("KIN_TEST_SELECTION", "0")
-        .env("GIT_EDITOR", "true")
+        .env("KIN_TEST_SELECTION", "0") // a3 = current tip
+        .env("GIT_EDITOR", "false")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -2196,8 +2199,10 @@ fn test_commit_interactive_amend_tip_no_staged_changes() {
         .unwrap();
     assert_ne!(new_a_id, a3_id);
     let new_a_commit = repo.find_commit(new_a_id).unwrap();
-    assert_eq!(new_a_commit.summary().unwrap(), "new subject");
+    // Folded, message unchanged (no reword).
+    assert_eq!(new_a_commit.summary().unwrap(), "commit a3");
     assert_eq!(new_a_commit.parent_id(0).unwrap(), a2_id);
+    assert_eq!(blob_text(&repo, new_a_id, "a3.txt"), "a3-fixed");
 }
 
 #[test]
@@ -2810,14 +2815,18 @@ fn test_commit_interactive_picker_keeps_shared_head_tips_selectable() {
         .unwrap();
     assert_eq!(feature_a_before, feature_b_before);
 
+    // Fold a staged change into the selected shared-head commit; both branches
+    // share it, so both follow it to the folded version (asserted below), and its
+    // message is unchanged (no reword).
+    fs::write(dir.path().join("shared.txt"), "shared-fixed").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+
     let mut cmd = kin_cmd();
     cmd.arg("commit")
         .arg("--interactive")
-        .arg("-m")
-        .arg("shared tip amended")
         .current_dir(dir.path())
         .env("KIN_TEST_SELECTION", "1")
-        .env("GIT_EDITOR", "true")
+        .env("GIT_EDITOR", "false")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
@@ -2836,11 +2845,17 @@ fn test_commit_interactive_picker_keeps_shared_head_tips_selectable() {
         .target()
         .unwrap();
 
-    // Selecting index 1 should pick the second shared-head tip entry (feature-a).
+    // The shared-head tip is selectable, and the change folds into that commit
+    // with its message unchanged. Both branches share the commit, so both follow
+    // it to the folded version.
     assert_ne!(feature_a_after, feature_a_before);
-    assert_eq!(feature_b_after, feature_b_before);
+    assert_eq!(feature_a_after, feature_b_after);
     let feature_a_commit = repo.find_commit(feature_a_after).unwrap();
-    assert_eq!(feature_a_commit.summary().unwrap(), "shared tip amended");
+    assert_eq!(feature_a_commit.summary().unwrap(), "shared tip");
+    assert_eq!(
+        blob_text(&repo, feature_a_after, "shared.txt"),
+        "shared-fixed"
+    );
 }
 
 #[test]
@@ -2920,7 +2935,7 @@ fn test_commit_interactive_stack_select_intermediate_from_child() {
     // Feature-a should be updated
     assert_ne!(new_a_id, a2_id);
     let new_a2_commit = repo.find_commit(new_a_id).unwrap();
-    assert_eq!(new_a2_commit.message().unwrap(), "commit a2\n");
+    assert_eq!(new_a2_commit.summary().unwrap(), "commit a2");
     assert_eq!(new_a2_commit.parent_id(0).unwrap(), a1_id);
 
     // Feature-b should be rebased on top of new Feature-a
@@ -2963,4 +2978,1015 @@ fn test_commit_blocked_by_stale_run_state() {
 
     // The interrupted run state must be left untouched.
     assert!(dir.path().join(".git/kindra_run_state.json").exists());
+}
+
+#[test]
+fn test_commit_fixup_intermediate_rebases_descendants() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    // feature-a: a1 -> a2
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a1.txt",
+        "a1",
+        "commit a1",
+        &[&main_commit],
+    );
+    let a1_commit = repo.find_commit(a1_id).unwrap();
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2.txt",
+        "a2",
+        "commit a2",
+        &[&a1_commit],
+    );
+    let a2_commit = repo.find_commit(a2_id).unwrap();
+
+    // feature-b on feature-a
+    let _b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "commit b",
+        &[&a2_commit],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("a1.txt"), "fixed a1").unwrap();
+    run_ok("git", &["add", "a1.txt"], dir.path());
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("--fixup")
+        .arg(a1_id.to_string())
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    // feature-a: the fixup squashed into a1 (subject unchanged), a2 preserved.
+    let new_a_id = repo
+        .find_reference("refs/heads/feature-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    let a2_new = repo.find_commit(new_a_id).unwrap();
+    assert_eq!(a2_new.summary().unwrap(), "commit a2");
+    let a1_new = a2_new.parent(0).unwrap();
+    assert_eq!(a1_new.summary().unwrap(), "commit a1");
+    assert_ne!(a1_new.id(), a1_id); // a1 was rewritten by the fixup
+    // The staged edit was actually folded into a1's blob, and a2 is untouched.
+    assert_eq!(blob_text(&repo, a1_new.id(), "a1.txt"), "fixed a1");
+    assert_eq!(blob_text(&repo, new_a_id, "a2.txt"), "a2");
+
+    // feature-b rebased onto the new feature-a tip.
+    let new_b_id = repo
+        .find_reference("refs/heads/feature-b")
+        .unwrap()
+        .target()
+        .unwrap();
+    let new_b_commit = repo.find_commit(new_b_id).unwrap();
+    assert_eq!(new_b_commit.parent_id(0).unwrap(), new_a_id);
+    assert_eq!(new_b_commit.summary().unwrap(), "commit b");
+    // The fold propagated down to feature-b, and b's own content is preserved.
+    assert_eq!(blob_text(&repo, new_b_id, "a1.txt"), "fixed a1");
+    assert_eq!(blob_text(&repo, new_b_id, "b.txt"), "b");
+}
+
+#[test]
+fn test_commit_fixup_with_dash_a_commits_unstaged_changes() {
+    // `--fixup <sha> -a` must not be rejected as "nothing to commit" when the
+    // index is empty: `-a` supplies the content by staging tracked changes.
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a1.txt",
+        "a1",
+        "commit a1",
+        &[&main_commit],
+    );
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    // Modify a tracked file but do NOT stage it — only `-a` should pick it up.
+    fs::write(dir.path().join("a1.txt"), "fixed a1").unwrap();
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("--fixup")
+        .arg(a1_id.to_string())
+        .arg("-a")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    // The change was folded into the tip and the working tree is now clean.
+    let new_a = repo
+        .find_reference("refs/heads/feature-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_ne!(new_a, a1_id, "fixup -a should have rewritten the commit");
+    // The unstaged edit `-a` picked up was actually folded into the commit blob.
+    assert_eq!(blob_text(&repo, new_a, "a1.txt"), "fixed a1");
+    // `git_stdout` asserts the status command itself succeeded before we inspect it.
+    let dirty = git_stdout(dir.path(), &["status", "--porcelain"]);
+    assert!(
+        dirty.trim().is_empty(),
+        "`-a` should have committed the change, leaving a clean tree"
+    );
+}
+
+#[test]
+fn test_commit_fixup_autosquash_conflict_with_dependents_can_continue() {
+    // An autosquash conflict when the target has dependents must record the
+    // in-progress branch so `kin continue` can resume — otherwise continue
+    // rejects with "does not match saved state".
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    // feature-a: a1 (creates shared.txt) -> a2 (modifies shared.txt).
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "line1\n",
+        "commit a1",
+        &[&main_commit],
+    );
+    let a1_commit = repo.find_commit(a1_id).unwrap();
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "line1\nline2\n",
+        "commit a2",
+        &[&a1_commit],
+    );
+    let a2_commit = repo.find_commit(a2_id).unwrap();
+
+    // feature-b depends on feature-a, so the commit will rebase dependents.
+    make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "commit b",
+        &[&a2_commit],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    // Fixup a1 with a change to shared.txt that conflicts when a2 replays.
+    fs::write(dir.path().join("shared.txt"), "CHANGED\n").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+
+    let conflict = kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg(a1_id.to_string())
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .unwrap();
+    assert!(
+        !conflict.status.success(),
+        "expected the autosquash to stop on a conflict"
+    );
+
+    // The fixup squash conflicts on shared.txt, and a2's replay conflicts on it
+    // again — two conflict rounds. Resolve each and `kin continue`. The cap is a
+    // small safety bound comfortably above those expected rounds, so a regression
+    // that never converges fails loudly here instead of looping forever. The point
+    // under test is that `kin continue` *resumes* at all — before the fix it
+    // refused with "does not match saved state" because in_progress_branch was
+    // left unset.
+    const MAX_CONTINUE_ROUNDS: usize = 5;
+    let mut resumed = false;
+    let mut rounds = 0;
+    while !resumed && rounds < MAX_CONTINUE_ROUNDS {
+        rounds += 1;
+        fs::write(dir.path().join("shared.txt"), "resolved\n").unwrap();
+        run_ok("git", &["add", "-A"], dir.path());
+        let out = kin_cmd()
+            .arg("continue")
+            .current_dir(dir.path())
+            .env("GIT_EDITOR", "true")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        resumed = out.status.success();
+    }
+    assert!(
+        resumed,
+        "kin continue should resolve the fixup/replay conflict sequence within {MAX_CONTINUE_ROUNDS} rounds (took {rounds})"
+    );
+
+    // feature-b ends up rebased onto the rewritten feature-a.
+    let new_a = repo
+        .find_reference("refs/heads/feature-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    let new_b = repo
+        .find_reference("refs/heads/feature-b")
+        .unwrap()
+        .target()
+        .unwrap();
+    let new_b_commit = repo.find_commit(new_b).unwrap();
+    assert_eq!(new_b_commit.parent_id(0).unwrap(), new_a);
+}
+
+fn blob_text(repo: &git2::Repository, commit: git2::Oid, name: &str) -> String {
+    let tree = repo.find_commit(commit).unwrap().tree().unwrap();
+    let entry = tree.get_name(name).unwrap();
+    let blob = repo
+        .find_object(entry.id(), None)
+        .unwrap()
+        .peel_to_blob()
+        .unwrap();
+    String::from_utf8(blob.content().to_vec()).unwrap()
+}
+
+#[test]
+fn test_commit_fixup_from_top_of_stack_folds_into_lower_branch() {
+    // The case that previously failed: sit on the TOP of the stack and fix up a
+    // commit owned by a lower branch. Option A folds it in place (no checkout of
+    // the lower branch) and `--update-refs` moves every branch tip in the range.
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    // main <- branch-a(shared="L1") <- branch-b(shared+="L2") <- branch-c(c.txt).
+    // An intervening branch (branch-b) modifies the same file the fixup touches,
+    // which is exactly what made the old checkout-carry approach hard-fail.
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/branch-a",
+        "shared.txt",
+        "L1\n",
+        "A",
+        &[&main_commit],
+    );
+    let a_commit = repo.find_commit(a_id).unwrap();
+    let b_id = make_commit(
+        &repo,
+        "refs/heads/branch-b",
+        "shared.txt",
+        "L1\nL2\n",
+        "B",
+        &[&a_commit],
+    );
+    let b_commit = repo.find_commit(b_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/branch-c",
+        "c.txt",
+        "c",
+        "C",
+        &[&b_commit],
+    );
+
+    // Sit on the top branch.
+    repo.set_head("refs/heads/branch-c").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    // Prepend a line (folds into A) — disjoint from B's appended line, so the
+    // autosquash 3-way merges cleanly even though B also touched shared.txt.
+    fs::write(dir.path().join("shared.txt"), "L0\nL1\nL2\n").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+
+    kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg(a_id.to_string())
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    // Never switched branches: HEAD is still branch-c.
+    assert_eq!(
+        repo.head().unwrap().shorthand().unwrap(),
+        "branch-c",
+        "inline fixup must not switch branches"
+    );
+
+    // The bottom commit was rewritten, and every branch above it moved.
+    let new_a = repo
+        .find_reference("refs/heads/branch-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_ne!(new_a, a_id, "the fixup target was rewritten");
+    let new_c = repo
+        .find_reference("refs/heads/branch-c")
+        .unwrap()
+        .target()
+        .unwrap();
+    let new_b = repo
+        .find_reference("refs/heads/branch-b")
+        .unwrap()
+        .target()
+        .unwrap();
+    // Chain is intact: c -> b -> a.
+    let c_commit = repo.find_commit(new_c).unwrap();
+    assert_eq!(c_commit.parent_id(0).unwrap(), new_b);
+    assert_eq!(
+        repo.find_commit(new_b).unwrap().parent_id(0).unwrap(),
+        new_a
+    );
+    // The prepend folded into A and B's append both survive at the top.
+    assert_eq!(blob_text(&repo, new_c, "shared.txt"), "L0\nL1\nL2\n");
+    assert_eq!(blob_text(&repo, new_c, "c.txt"), "c");
+    // No fixup! commit leaked into history.
+    assert_eq!(c_commit.summary().unwrap(), "C");
+}
+
+#[test]
+fn test_commit_fixup_restores_autostash_on_single_branch_path() {
+    // A fixup with no dependents to restack (autosquash_state_required) that also
+    // has unstaged/untracked changes: those are set aside for the autosquash
+    // rebase and must be reapplied afterward, with no stash left dangling.
+    let (dir, repo) = setup_repo();
+    // `feature` has one commit (feature.txt); add a second so there is a lower
+    // commit to fix up while sitting on the tip with no dependents above it.
+    let c1 = repo
+        .find_branch("feature", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    run_ok("git", &["checkout", "feature"], dir.path());
+    fs::write(dir.path().join("c2.txt"), "c2").unwrap();
+    run_ok("git", &["add", "c2.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "c2"], dir.path());
+
+    // Staged fix folded into the lower commit...
+    fs::write(dir.path().join("feature.txt"), "feature-fixed").unwrap();
+    run_ok("git", &["add", "feature.txt"], dir.path());
+    // ...plus an unrelated untracked change that must survive the fixup.
+    fs::write(dir.path().join("scratch.txt"), "WIP").unwrap();
+
+    kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg(c1.to_string())
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    // The fold applied (feature.txt carries the fixed content)...
+    assert_eq!(
+        fs::read_to_string(dir.path().join("feature.txt")).unwrap(),
+        "feature-fixed"
+    );
+    // ...the autostashed untracked change is restored onto the result...
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "WIP",
+        "the autostashed change must be reapplied after the fixup"
+    );
+    // ...no stash lingers, and no operation state is left behind.
+    let stash_list = git_stdout(dir.path(), &["stash", "list"]);
+    assert!(
+        stash_list.trim().is_empty(),
+        "the autostash must be dropped, not left dangling. Got:\n{stash_list}"
+    );
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+}
+
+#[test]
+fn test_commit_fixup_from_middle_restacks_branches_above() {
+    // From the MIDDLE of the stack, `--update-refs` moves the tips at/below HEAD,
+    // and the branch stacked ABOVE HEAD is restacked onto the new HEAD afterward.
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/branch-a",
+        "a.txt",
+        "a",
+        "A",
+        &[&main_commit],
+    );
+    let a_commit = repo.find_commit(a_id).unwrap();
+    let b_id = make_commit(
+        &repo,
+        "refs/heads/branch-b",
+        "b.txt",
+        "b",
+        "B",
+        &[&a_commit],
+    );
+    let b_commit = repo.find_commit(b_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/branch-c",
+        "c.txt",
+        "c",
+        "C",
+        &[&b_commit],
+    );
+
+    // Sit on the middle branch.
+    repo.set_head("refs/heads/branch-b").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("a.txt"), "a-fixed").unwrap();
+    run_ok("git", &["add", "a.txt"], dir.path());
+
+    kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg(a_id.to_string())
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "branch-b");
+
+    let new_a = repo
+        .find_reference("refs/heads/branch-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    let new_b = repo
+        .find_reference("refs/heads/branch-b")
+        .unwrap()
+        .target()
+        .unwrap();
+    let new_c = repo
+        .find_reference("refs/heads/branch-c")
+        .unwrap()
+        .target()
+        .unwrap();
+    // Below/at HEAD moved via --update-refs; above-HEAD (branch-c) restacked.
+    assert_ne!(new_a, a_id);
+    assert_eq!(
+        repo.find_commit(new_b).unwrap().parent_id(0).unwrap(),
+        new_a
+    );
+    assert_eq!(
+        repo.find_commit(new_c).unwrap().parent_id(0).unwrap(),
+        new_b,
+        "branch-c (above HEAD) must be restacked onto the rewritten branch-b"
+    );
+    assert_eq!(blob_text(&repo, new_c, "a.txt"), "a-fixed");
+    assert_eq!(blob_text(&repo, new_c, "c.txt"), "c");
+}
+
+#[test]
+fn test_commit_fixup_abort_after_autosquash_restores_below_head_branch() {
+    // The dangerous window: the inline autosquash SUCCEEDS (rewriting the
+    // below-HEAD ancestor branch via --update-refs), then the above-HEAD restack
+    // hits a conflict. `kin abort` must roll the fold back off the ancestor
+    // branch too, not just HEAD's branch and its descendants.
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    // branch-a creates shared.txt; branch-b (HEAD) only adds b.txt (so the
+    // autosquash into branch-a replays cleanly through branch-b); branch-c
+    // modifies shared.txt so restacking it onto the rewritten stack conflicts.
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/branch-a",
+        "shared.txt",
+        "line1\n",
+        "A",
+        &[&main_commit],
+    );
+    let a_commit = repo.find_commit(a_id).unwrap();
+    let b_id = make_commit(
+        &repo,
+        "refs/heads/branch-b",
+        "b.txt",
+        "b",
+        "B",
+        &[&a_commit],
+    );
+    let b_commit = repo.find_commit(b_id).unwrap();
+    let c_id = make_commit(
+        &repo,
+        "refs/heads/branch-c",
+        "shared.txt",
+        "from-c\n",
+        "C",
+        &[&b_commit],
+    );
+
+    // Sit on the middle branch.
+    repo.set_head("refs/heads/branch-b").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("shared.txt"), "CHANGED\n").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+
+    let out = kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg(a_id.to_string())
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected the above-HEAD restack of branch-c to stop on a conflict"
+    );
+
+    // The autosquash already completed, so branch-a is at its folded tip here.
+    let folded_a = repo
+        .find_reference("refs/heads/branch-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_ne!(folded_a, a_id, "branch-a should be folded at this point");
+
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    // Every branch the operation touched — including the below-HEAD ancestor
+    // branch-a — must be back at its pre-command tip.
+    assert_eq!(
+        repo.find_reference("refs/heads/branch-a")
+            .unwrap()
+            .target()
+            .unwrap(),
+        a_id,
+        "abort must restore the below-HEAD ancestor branch, not leave it folded"
+    );
+    assert_eq!(
+        repo.find_reference("refs/heads/branch-b")
+            .unwrap()
+            .target()
+            .unwrap(),
+        b_id
+    );
+    assert_eq!(
+        repo.find_reference("refs/heads/branch-c")
+            .unwrap()
+            .target()
+            .unwrap(),
+        c_id
+    );
+    assert_eq!(blob_text(&repo, a_id, "shared.txt"), "line1\n");
+}
+
+#[test]
+fn test_commit_interactive_fixup_lower_intermediate_from_above() {
+    // The interactive equivalent of the top-of-stack fixup: pick an *intermediate*
+    // commit that lives on a lower branch, while sitting on a higher branch. This
+    // must use the same in-place fold path (no checkout of the lower branch).
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    // branch-a has two commits (a1 intermediate, a2 tip); branch-b sits on top.
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/branch-a",
+        "a1.txt",
+        "a1",
+        "A1",
+        &[&main_commit],
+    );
+    let a1_commit = repo.find_commit(a1_id).unwrap();
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/branch-a",
+        "a2.txt",
+        "a2",
+        "A2",
+        &[&a1_commit],
+    );
+    let a2_commit = repo.find_commit(a2_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/branch-b",
+        "b.txt",
+        "b",
+        "B",
+        &[&a2_commit],
+    );
+
+    repo.set_head("refs/heads/branch-b").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    // Fold a change to a1's file into a1, chosen interactively from branch-b.
+    fs::write(dir.path().join("a1.txt"), "a1-fixed").unwrap();
+    run_ok("git", &["add", "a1.txt"], dir.path());
+
+    // Commits newest-first: B(0), A2(1), A1(2) — select the lower intermediate A1.
+    kin_cmd()
+        .arg("commit")
+        .arg("--interactive")
+        .current_dir(dir.path())
+        .env("KIN_TEST_SELECTION", "2")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    // No branch switch, a1 rewritten in place, chain intact, change folded.
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "branch-b");
+    let new_b = repo
+        .find_reference("refs/heads/branch-b")
+        .unwrap()
+        .target()
+        .unwrap();
+    let new_a = repo
+        .find_reference("refs/heads/branch-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    let b_commit = repo.find_commit(new_b).unwrap();
+    assert_eq!(b_commit.parent_id(0).unwrap(), new_a);
+    assert_eq!(blob_text(&repo, new_b, "a1.txt"), "a1-fixed");
+    assert_eq!(blob_text(&repo, new_b, "b.txt"), "b");
+}
+
+#[test]
+fn test_commit_interactive_lower_tip_folds_without_reword() {
+    // Selecting a lower branch's *tip* interactively behaves like any other pick:
+    // it folds the staged changes in place (no reword, no editor, no checkout).
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/branch-a",
+        "a.txt",
+        "a",
+        "orig A",
+        &[&main_commit],
+    );
+    let a_commit = repo.find_commit(a_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/branch-b",
+        "b.txt",
+        "b",
+        "B",
+        &[&a_commit],
+    );
+    repo.set_head("refs/heads/branch-b").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    // Stage a change to branch-a's file, then pick branch-a's tip. `false` as the
+    // editor would fail if a reword editor were (wrongly) opened.
+    fs::write(dir.path().join("a.txt"), "a-fixed").unwrap();
+    run_ok("git", &["add", "a.txt"], dir.path());
+
+    // Commits newest-first: B(0), A(1) — select branch-a's tip A.
+    kin_cmd()
+        .arg("commit")
+        .arg("--interactive")
+        .current_dir(dir.path())
+        .env("KIN_TEST_SELECTION", "1")
+        .env("GIT_EDITOR", "false")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    // No branch switch; change folded into branch-a with its message unchanged.
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "branch-b");
+    let new_a = repo
+        .find_reference("refs/heads/branch-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_ne!(new_a, a_id);
+    assert_eq!(
+        repo.find_commit(new_a).unwrap().summary().unwrap(),
+        "orig A",
+        "the message must not be reworded"
+    );
+    let new_b = repo
+        .find_reference("refs/heads/branch-b")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_eq!(
+        repo.find_commit(new_b).unwrap().parent_id(0).unwrap(),
+        new_a
+    );
+    assert_eq!(blob_text(&repo, new_b, "a.txt"), "a-fixed");
+}
+
+#[test]
+fn test_commit_fixup_tip_amends() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a1.txt",
+        "a1",
+        "commit a1",
+        &[&main_commit],
+    );
+    let a1_commit = repo.find_commit(a1_id).unwrap();
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2.txt",
+        "a2",
+        "commit a2",
+        &[&a1_commit],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("a2.txt"), "amended a2").unwrap();
+    run_ok("git", &["add", "a2.txt"], dir.path());
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("--fixup")
+        .arg(a2_id.to_string())
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    // Fixing up the tip amends it: subject preserved, parent unchanged, id rewritten.
+    let new_a_id = repo
+        .find_reference("refs/heads/feature-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_ne!(new_a_id, a2_id);
+    let new_a_commit = repo.find_commit(new_a_id).unwrap();
+    assert_eq!(new_a_commit.summary().unwrap(), "commit a2");
+    assert_eq!(new_a_commit.parent_id(0).unwrap(), a1_id);
+}
+
+#[test]
+fn test_commit_fixup_sha_outside_stack_errors() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a1.txt",
+        "a1",
+        "commit a1",
+        &[&main_commit],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("a2.txt"), "a2").unwrap();
+    run_ok("git", &["add", "a2.txt"], dir.path());
+
+    // The main commit is not part of the current stack (it's the base).
+    kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg(main_id.to_string())
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("not part of the current stack"));
+}
+
+#[test]
+fn test_commit_fixup_and_on_are_mutually_exclusive() {
+    let (dir, _repo) = setup_repo();
+
+    kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg("HEAD")
+        .arg("--on")
+        .arg("main")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("mutually exclusive"));
+}
+
+#[test]
+fn test_commit_fixup_requires_argument() {
+    let (dir, _repo) = setup_repo();
+
+    kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--fixup requires a commit"));
+}
+
+#[test]
+fn test_commit_fixup_rejects_empty_argument() {
+    let (dir, _repo) = setup_repo();
+
+    // The space-separated form must reject an empty target too, matching the
+    // `--fixup=` form, so an empty selector never reaches resolve_fixup_commit.
+    kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg("")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--fixup requires a commit"));
+}
+
+/// feature-a with commits a1 <- a2 on top of main, checked out. Returns the
+/// tip (a2) oid for --fixup targeting.
+fn setup_feature_a_two_commits() -> (tempfile::TempDir, Repository, git2::Oid) {
+    let (dir, repo) = setup_repo();
+    // Scope the borrowed Commit handles so they drop before `repo` is returned.
+    let a2_id = {
+        let main_id = repo.revparse_single("main").unwrap().id();
+        let main_commit = repo.find_commit(main_id).unwrap();
+        let a1_id = make_commit(
+            &repo,
+            "refs/heads/feature-a",
+            "a1.txt",
+            "a1",
+            "commit a1",
+            &[&main_commit],
+        );
+        let a1_commit = repo.find_commit(a1_id).unwrap();
+        make_commit(
+            &repo,
+            "refs/heads/feature-a",
+            "a2.txt",
+            "a2",
+            "commit a2",
+            &[&a1_commit],
+        )
+    };
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+    (dir, repo, a2_id)
+}
+
+#[test]
+fn test_commit_fixup_tip_does_not_open_editor() {
+    // GIT_EDITOR=false would fail the command if an editor were opened, so
+    // success proves `--fixup <tip>` inserts `--no-edit` (non-interactive).
+    let (dir, repo, a2_id) = setup_feature_a_two_commits();
+    fs::write(dir.path().join("a2.txt"), "amended a2").unwrap();
+    run_ok("git", &["add", "a2.txt"], dir.path());
+
+    kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg(a2_id.to_string())
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "false")
+        .assert()
+        .success();
+
+    let new_a = repo
+        .find_reference("refs/heads/feature-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_ne!(new_a, a2_id);
+    assert_eq!(
+        repo.find_commit(new_a).unwrap().summary().unwrap(),
+        "commit a2"
+    );
+}
+
+#[test]
+fn test_commit_fixup_equals_form_amends_tip() {
+    // The `--fixup=<sha>` equals form must behave like the space form.
+    let (dir, repo, a2_id) = setup_feature_a_two_commits();
+    fs::write(dir.path().join("a2.txt"), "amended a2").unwrap();
+    run_ok("git", &["add", "a2.txt"], dir.path());
+
+    kin_cmd()
+        .arg("commit")
+        .arg(format!("--fixup={a2_id}"))
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "false")
+        .assert()
+        .success();
+
+    let new_a = repo
+        .find_reference("refs/heads/feature-a")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_ne!(new_a, a2_id);
+}
+
+#[test]
+fn test_commit_fixup_tip_requires_staged_changes() {
+    // Nothing staged: `--fixup <tip>` must fail loudly rather than silently
+    // amend a no-op (the inserted `--amend` used to skip this guard).
+    let (dir, _repo, a2_id) = setup_feature_a_two_commits();
+
+    kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg(a2_id.to_string())
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "false")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("nothing to commit"));
+}
+
+#[test]
+fn test_commit_fixup_and_interactive_are_mutually_exclusive() {
+    let (dir, _repo) = setup_repo();
+    kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg("HEAD")
+        .arg("--interactive")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("mutually exclusive"));
 }
