@@ -577,3 +577,81 @@ exit 1
         stdout
     );
 }
+
+/// Color must be gated on the terminal environment: piped stdout (no TTY, no
+/// force flag) gets plain text.
+#[test]
+fn test_tree_no_color_when_piped() {
+    let (dir, _repo) = setup_simple_stack();
+    let output = kin_cmd()
+        .arg("tree")
+        .current_dir(dir.path())
+        .env_remove("CLICOLOR_FORCE")
+        .env_remove("FORCE_COLOR")
+        .output()
+        .expect("run kin tree");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "piped tree output must contain no ANSI escapes:\n{:?}",
+        stdout
+    );
+}
+
+/// ...but CLICOLOR_FORCE=1 opts back into color even without a TTY.
+#[test]
+fn test_tree_color_when_forced() {
+    let (dir, _repo) = setup_simple_stack();
+    let output = kin_cmd()
+        .arg("tree")
+        .current_dir(dir.path())
+        .env("CLICOLOR_FORCE", "1")
+        .env_remove("NO_COLOR")
+        .output()
+        .expect("run kin tree");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains('\u{1b}'),
+        "CLICOLOR_FORCE=1 must produce ANSI escapes:\n{:?}",
+        stdout
+    );
+}
+
+/// A non-empty `NO_COLOR` wins even over `CLICOLOR_FORCE` (opt-out precedence).
+#[test]
+fn test_tree_no_color_overrides_force() {
+    let (dir, _repo) = setup_simple_stack();
+    let output = kin_cmd()
+        .arg("tree")
+        .current_dir(dir.path())
+        .env("CLICOLOR_FORCE", "1")
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run kin tree");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "NO_COLOR must suppress color even with CLICOLOR_FORCE:\n{:?}",
+        stdout
+    );
+}
+
+/// An *empty* `NO_COLOR` does not count as opt-out (per the no-color.org spec),
+/// so it must not suppress a forced color.
+#[test]
+fn test_tree_empty_no_color_is_ignored() {
+    let (dir, _repo) = setup_simple_stack();
+    let output = kin_cmd()
+        .arg("tree")
+        .current_dir(dir.path())
+        .env("CLICOLOR_FORCE", "1")
+        .env("NO_COLOR", "")
+        .output()
+        .expect("run kin tree");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains('\u{1b}'),
+        "empty NO_COLOR must not suppress forced color:\n{:?}",
+        stdout
+    );
+}

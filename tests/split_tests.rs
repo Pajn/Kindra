@@ -87,7 +87,7 @@ perl -i -pe 's/(commit 2)/$1\nbranch feature-x/' "$file"
     let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
-        .env("EDITOR", &editor_script)
+        .env("GIT_EDITOR", &editor_script)
         .assert()
         .success();
 
@@ -125,7 +125,7 @@ perl -i -pe 's/(commit 3)/$1\nbranch another-feat/' "$file"
     let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
-        .env("EDITOR", &editor_script)
+        .env("GIT_EDITOR", &editor_script)
         .assert()
         .success();
 
@@ -151,7 +151,7 @@ perl -i -pe 's/.*branch new-feat.*\n?//g' "$file"
     let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
-        .env("EDITOR", &editor_script)
+        .env("GIT_EDITOR", &editor_script)
         .assert()
         .success();
 
@@ -189,7 +189,7 @@ perl -i -pe 's/^[0-9a-f]{7}/deadbee/' "$file"
     let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
-        .env("EDITOR", &editor_script)
+        .env("GIT_EDITOR", &editor_script)
         .assert()
         .failure()
         .stderr(predicates::str::contains("modified or moved"));
@@ -225,7 +225,7 @@ perl -i -pe 's/.*branch current.*\n?//g' "$file"
     let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
-        .env("EDITOR", &editor_script)
+        .env("GIT_EDITOR", &editor_script)
         .assert()
         .success();
 
@@ -263,7 +263,7 @@ perl -i -pe 's/(commit 3)/$1\nbranch new-feat/' "$file"
     let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
-        .env("EDITOR", &editor_script)
+        .env("GIT_EDITOR", &editor_script)
         .assert()
         .success();
 
@@ -527,7 +527,7 @@ exit 0
     let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
-        .env("EDITOR", &editor_script)
+        .env("GIT_EDITOR", &editor_script)
         .env("TERM", "dumb")
         .env("KIN_TEST_SELECTIONS", "0")
         .assert()
@@ -686,7 +686,7 @@ mv "$file.tmp" "$file"
     let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
-        .env("EDITOR", &editor_script)
+        .env("GIT_EDITOR", &editor_script)
         .assert()
         .failure()
         .stderr(predicates::str::contains("must follow a commit line"));
@@ -746,7 +746,7 @@ fn test_split_refuses_when_kindra_operation_in_progress() {
     kin_cmd()
         .arg("split")
         .current_dir(dir.path())
-        .env("EDITOR", &editor_script)
+        .env("GIT_EDITOR", &editor_script)
         .env("TERM", "dumb")
         .assert()
         .failure()
@@ -804,7 +804,7 @@ perl -i -pe 's/^([0-9a-f]{7} c2)$/$1\nbranch outside/' "$file"
     kin_cmd()
         .arg("split")
         .current_dir(dir.path())
-        .env("EDITOR", &editor_script)
+        .env("GIT_EDITOR", &editor_script)
         .env("TERM", "dumb")
         .assert()
         .success()
@@ -875,7 +875,7 @@ perl -i -pe 's/(commit 1)/$1\nbranch new-feat/' "$file"
     kin_cmd()
         .arg("split")
         .current_dir(dir.path())
-        .env("EDITOR", &editor_script)
+        .env("GIT_EDITOR", &editor_script)
         .assert()
         .success();
 
@@ -909,7 +909,7 @@ perl -i -pe 's/^[0-9a-f]{7}/deadbee/' "$file"
     let output = kin_cmd()
         .arg("split")
         .current_dir(dir.path())
-        .env("EDITOR", &editor_script)
+        .env("GIT_EDITOR", &editor_script)
         .output()
         .unwrap();
 

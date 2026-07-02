@@ -27,12 +27,12 @@ pub fn continue_cmd() -> Result<()> {
         println!("Continuing git rebase...");
         let mut git = Command::new("git");
         git.envs(std::env::vars_os());
+        // If the caller didn't pin GIT_EDITOR, resolve the editor the same way
+        // the rest of the CLI does (GIT_EDITOR > core.editor > VISUAL > EDITOR >
+        // vi) and hand it to git, so `kin continue` never picks a different
+        // editor than the original interactive command would have.
         if std::env::var_os("GIT_EDITOR").is_none() {
-            if let Some(editor) = std::env::var_os("EDITOR") {
-                git.env("GIT_EDITOR", editor);
-            } else if let Some(editor) = std::env::var_os("VISUAL") {
-                git.env("GIT_EDITOR", editor);
-            }
+            git.env("GIT_EDITOR", crate::editor::resolve_editor());
         }
         let status = git.arg("rebase").arg("--continue").status()?;
         if !status.success() {

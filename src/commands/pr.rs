@@ -9,7 +9,7 @@ use clap::{Args, Subcommand};
 use git2::{BranchType, Repository};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 #[derive(Subcommand, Clone)]
@@ -638,8 +638,13 @@ fn pr_review(args: &PrReviewArgs) -> Result<()> {
     }
 
     if args.copy {
-        copy_via_osc52(&markdown)?;
-        eprintln!("Copied review markdown to clipboard");
+        if copy_via_osc52(&markdown)? {
+            eprintln!("Copied review markdown to clipboard");
+        } else {
+            eprintln!(
+                "Warning: --copy uses the terminal clipboard (OSC 52) but stderr is not a terminal; skipped copy"
+            );
+        }
     }
 
     Ok(())
@@ -921,12 +926,25 @@ fn review_comment_matches_filters(comment: &gh::PrReviewComment, args: &PrReview
     true
 }
 
-fn copy_via_osc52(text: &str) -> Result<()> {
-    let encoded = STANDARD.encode(text.as_bytes());
+/// Emit an OSC 52 escape on stderr so the terminal copies `text` to the
+/// clipboard. Returns `Ok(false)` without writing when stderr is not a terminal
+/// (the escape would otherwise land as garbage in a redirected/piped stream and
+/// nothing would be copied); `Ok(true)` when the sequence was written.
+fn copy_via_osc52(text: &str) -> Result<bool> {
     let mut stderr = std::io::stderr();
-    write!(stderr, "\x1b]52;c;{encoded}\x07").context("Failed to write OSC 52 sequence")?;
+    if !stderr.is_terminal() {
+        return Ok(false);
+    }
+    write!(stderr, "{}", osc52_sequence(text)).context("Failed to write OSC 52 sequence")?;
     stderr.flush().context("Failed to flush OSC 52 sequence")?;
-    Ok(())
+    Ok(true)
+}
+
+/// The OSC 52 escape sequence that instructs the terminal to copy `text` to the
+/// clipboard. Split out from [`copy_via_osc52`] so the byte format is testable
+/// without a real terminal attached.
+fn osc52_sequence(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", STANDARD.encode(text.as_bytes()))
 }
 
 fn sanitize_review_body(text: &str) -> String {
@@ -2059,6 +2077,12 @@ fn prompt_reviewers() -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn osc52_sequence_wraps_base64_in_the_clipboard_escape() {
+        // OSC 52: ESC ] 52 ; c ; <base64> BEL
+        assert_eq!(osc52_sequence("hi"), "\x1b]52;c;aGk=\x07");
+    }
 
     /// A draft seeded with body content in a temp dir, for retry-driver tests.
     fn seeded_draft(dir: &std::path::Path) -> crate::editor::Draft {

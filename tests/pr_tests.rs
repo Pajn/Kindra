@@ -3314,7 +3314,7 @@ exit 1
 }
 
 #[test]
-fn pr_review_writes_output_and_copies_with_osc52() {
+fn pr_review_writes_output_and_skips_osc52_copy_when_not_tty() {
     let (dir, _repo) = setup_simple_stack();
 
     let remote_dir = dir.path().join("remote.git");
@@ -3385,13 +3385,20 @@ exit 1
     assert_eq!(saved_markdown, "### `src/lib.rs:9` — @alice\nLooks good.");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let expected_osc52 = format!(
+    // Under `cargo test` stderr is a pipe, not a terminal, so the OSC 52
+    // clipboard escape must be suppressed (it would otherwise land as garbage
+    // in a redirected stream) and the command warns instead of claiming a copy.
+    let osc52 = format!(
         "\u{1b}]52;c;{}\u{7}",
         STANDARD.encode(saved_markdown.as_bytes())
     );
-    assert!(stderr.contains(&expected_osc52));
+    assert!(
+        !stderr.contains(&osc52),
+        "OSC 52 escape must not be emitted when stderr is not a terminal"
+    );
     assert!(stderr.contains("Saved review markdown to"));
-    assert!(stderr.contains("Copied review markdown to clipboard"));
+    assert!(!stderr.contains("Copied review markdown to clipboard"));
+    assert!(stderr.contains("stderr is not a terminal"));
 }
 
 #[test]
@@ -5601,7 +5608,7 @@ fn pr_create_failure_preserves_body_draft() {
     // gh that fails `pr create` (simulating e.g. a rejected base or network flake).
     write_script(&dir.path().join("gh"), &gh_mock_with_create(GH_CREATE_FAIL));
 
-    // $EDITOR writes a body the user "typed".
+    // GIT_EDITOR writes a body the user "typed".
     let editor = write_script(
         &dir.path().join("fake-editor.sh"),
         "#!/bin/sh\nprintf 'MY PRECIOUS BODY\\n' > \"$1\"\n",
@@ -5618,7 +5625,7 @@ fn pr_create_failure_preserves_body_draft() {
                 std::env::var("PATH").unwrap()
             ),
         )
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .env("KIN_TEST_PR_BODY_ACTION", "editor")
         .output()
         .unwrap();
@@ -5676,7 +5683,7 @@ fn pr_create_success_discards_body_draft() {
                 std::env::var("PATH").unwrap()
             ),
         )
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .env("KIN_TEST_PR_BODY_ACTION", "editor")
         .env("MOCK_GH_BODY_FILE", &body_file)
         .output()
@@ -5720,7 +5727,7 @@ fn pr_resumes_saved_draft_on_next_run() {
         .arg("pr")
         .current_dir(dir.path())
         .env("PATH", &path_env)
-        .env("EDITOR", &writer)
+        .env("GIT_EDITOR", &writer)
         .env("KIN_TEST_PR_BODY_ACTION", "editor")
         .output()
         .unwrap();
@@ -5742,7 +5749,7 @@ fn pr_resumes_saved_draft_on_next_run() {
         .arg("pr")
         .current_dir(dir.path())
         .env("PATH", &path_env)
-        .env("EDITOR", &noop)
+        .env("GIT_EDITOR", &noop)
         .env("KIN_TEST_PR_BODY_ACTION", "editor")
         // The recovery prompt offers [Resume, Discard]; pick Resume (index 0).
         .env("KIN_TEST_SELECTIONS", "0")
@@ -5851,7 +5858,7 @@ fn pr_recovery_discard_ignores_saved_draft() {
                 std::env::var("PATH").unwrap()
             ),
         )
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .env("KIN_TEST_PR_BODY_ACTION", "editor")
         // Recovery prompt offers [Resume, Discard]; pick Discard (index 1).
         .env("KIN_TEST_SELECTIONS", "1")
