@@ -895,10 +895,13 @@ query($threadId: ID!, $commentsCursor: String) {
 }
 
 /// Merge a PR through the GitHub CLI.
-pub fn merge_pr(pr_number: u64, head_oid: Option<&str>) -> Result<()> {
+pub fn merge_pr(pr_number: u64, head_oid: Option<&str>, method_flag: Option<&str>) -> Result<()> {
     let pr_number = pr_number.to_string();
     let mut command = Command::new("gh");
     command.args(["pr", "merge", &pr_number]);
+    if let Some(method_flag) = method_flag {
+        command.arg(method_flag);
+    }
     if let Some(head_oid) = head_oid {
         command.args(["--match-head-commit", head_oid]);
     }
@@ -931,6 +934,36 @@ pub fn update_pr_base(pr_number: u64, new_base: &str) -> Result<()> {
         return Err(anyhow!("Failed to update base for PR #{}", pr_number));
     }
     Ok(())
+}
+
+/// Delete a branch on the remote (e.g. after its PR was merged). A missing
+/// remote branch is treated as success so a re-run or a server-side
+/// auto-delete-on-merge setting does not turn into an error.
+pub fn delete_remote_branch(remote: &str, branch: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["push", remote, "--delete", branch])
+        .output()
+        .with_context(|| format!("Failed to run `git push {remote} --delete {branch}`"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // GitHub deletes the head branch itself when merged with
+    // auto-delete-on-merge, so the ref may already be gone. Match only git's
+    // specific already-deleted message, not any "does not exist" (which also
+    // covers a wrong remote or missing repository — real errors to surface).
+    if stderr.contains("remote ref does not exist") {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "Failed to delete remote branch '{}' on '{}': {}",
+        branch,
+        remote,
+        stderr.trim()
+    ))
 }
 
 /// Fetch the state of a PR (e.g., "OPEN", "MERGED", "CLOSED").

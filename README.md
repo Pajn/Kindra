@@ -14,7 +14,7 @@ Kindra is a CLI tool for managing **stacked git branches**. Its `kin` command au
 - **Visual Branch Splitting**: Assign branches to specific commits in a linear history using your favorite `$EDITOR`.
 - **Atomic Pushes**: Push all branches in your stack simultaneously with `force-with-lease` safety.
 - **Run Commands Across Stack**: Execute shell commands on each branch in your stack with `kin run`.
-- **PR Workflow Helpers**: Create/update stack PRs with automatic flatten/push preflight, flatten stack PR bases to upstream, open PRs in your browser, edit PR metadata, inspect review/check status, export threaded review comments as markdown, and merge stack PRs with readiness checks.
+- **PR Workflow Helpers**: Create/update stack PRs with automatic flatten/push preflight, flatten stack PR bases to upstream, open PRs in your browser, edit PR metadata, inspect review/check status, export threaded review comments as markdown, and merge stack PRs with readiness checks — retargeting child PR bases on GitHub so they aren't orphaned by the merge, then (unless `--no-cascade`) restacking children onto the updated trunk and deleting the merged branch locally and on the remote (`--method squash|rebase|merge`, `--no-cascade`, `--no-delete`).
 
 ## Installation
 

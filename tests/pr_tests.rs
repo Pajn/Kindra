@@ -5955,3 +5955,389 @@ echo "mock gh: unexpected: $@" >&2; exit 1
         "the pr-edit draft should be cleaned up after a successful save"
     );
 }
+
+/// Init a bare `remote.git`, wire it as `origin`, and push the given refs with
+/// tracking. Shared scaffolding for the `pr merge` cascade tests below.
+fn init_origin_and_push(dir: &std::path::Path, refs: &[&str]) {
+    let remote_dir = dir.join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir,
+    );
+    let mut push = vec!["push", "-u", "origin"];
+    push.extend_from_slice(refs);
+    run_ok("git", &push, dir);
+}
+
+/// Write an executable `gh` mock from a case-specific handler snippet, wrapped
+/// with the shared `auth status` stub and a trailing unexpected-command guard.
+/// The snippet handles the scenario-specific `pr view` / `api graphql` /
+/// `pr merge` cases; its literal `{`/`}` are inserted verbatim (no escaping).
+fn write_gh_mock(dir: &std::path::Path, handlers: &str) {
+    let script = format!(
+        "#!/bin/bash\n\
+         if [[ \"$1\" == \"auth\" && \"$2\" == \"status\" ]]; then exit 0; fi\n\
+         {handlers}\n\
+         echo \"mock gh: unexpected command: $@\" >&2\n\
+         exit 1\n"
+    );
+    let path = dir.join("gh");
+    std::fs::write(&path, script).unwrap();
+    run_ok("chmod", &["+x", path.to_str().unwrap()], dir);
+}
+
+/// A `kin pr merge` command in `dir` with the mock `gh` ahead on PATH. Callers
+/// add scenario args/env (e.g. `--no-cascade`, `KIN_TEST_SELECTIONS`).
+fn pr_merge_cmd(dir: &std::path::Path) -> assert_cmd::Command {
+    let mut cmd = kin_cmd();
+    cmd.args(["pr", "merge"]).current_dir(dir).env(
+        "PATH",
+        format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
+    );
+    cmd
+}
+
+#[test]
+fn pr_merge_no_cascade_skips_restack_and_delete() {
+    let (dir, _repo) = setup_simple_stack();
+
+    init_origin_and_push(dir.path(), &["main", "feature"]);
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    write_gh_mock(
+        dir.path(),
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "42" ]]; then echo '{"state":"MERGED"}'; exit 0; fi
+    echo '{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then exit 0; fi"#,
+    );
+
+    let output = pr_merge_cmd(dir.path())
+        .arg("--no-cascade")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr merge --no-cascade failed: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\u{2713} Merged PR #42"));
+    // --no-cascade must short-circuit before the restack/delete cascade.
+    assert!(
+        stdout.contains("Skipping local cascade"),
+        "expected the no-cascade skip message. Got:\n{}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("Restacking children"),
+        "sync cascade must not run under --no-cascade. Got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn pr_merge_cascade_restacks_children_and_deletes_merged_branch() {
+    // The headline cascade: after a successful default merge, the merged branch's
+    // children are restacked onto the updated trunk and the merged branch is
+    // deleted both locally and on the remote. The mock `gh pr merge` advances
+    // origin/main to feature-a so `kin sync` actually detects the merge.
+    let (dir, repo) = setup_two_level_stack();
+
+    init_origin_and_push(dir.path(), &["main", "feature-a", "feature-b"]);
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    // feature-a's tip is the commit that becomes the merged trunk; feature-b
+    // must end up parented on it after the restack.
+    let merged_tip = repo.revparse_single("feature-a").unwrap().id();
+
+    write_gh_mock(
+        dir.path(),
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "10" ]]; then echo '{"state":"MERGED"}'; exit 0; fi
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then exit 0; fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
+    # Simulate GitHub landing the merge: fast-forward origin/main to feature-a.
+    git push origin feature-a:main >/dev/null 2>&1
+    exit 0
+fi"#,
+    );
+
+    let output = pr_merge_cmd(dir.path())
+        .env("KIN_TEST_SELECTIONS", "0")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "kin pr merge failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\u{2713} Merged PR #10"), "got:\n{stdout}");
+    assert!(
+        stdout.contains("Restacking children onto"),
+        "cascade restack message missing. Got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\u{2713} Deleted remote branch origin/feature-a"),
+        "remote-branch delete message missing. Got:\n{stdout}"
+    );
+
+    // feature-a was merged: deleted locally and on the remote; feature-b is
+    // restacked onto the merged trunk.
+    assert!(
+        repo.find_branch("feature-a", git2::BranchType::Local)
+            .is_err(),
+        "merged branch feature-a must be deleted locally"
+    );
+    let remote_refs = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["ls-remote", "--heads", "origin"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(
+        !remote_refs.contains("refs/heads/feature-a"),
+        "merged branch feature-a must be deleted on the remote. Got:\n{remote_refs}"
+    );
+    let feature_b_parent = repo
+        .find_commit(
+            repo.find_branch("feature-b", git2::BranchType::Local)
+                .unwrap()
+                .get()
+                .target()
+                .unwrap(),
+        )
+        .unwrap()
+        .parent_id(0)
+        .unwrap();
+    assert_eq!(
+        feature_b_parent, merged_tip,
+        "feature-b must be restacked directly onto the merged trunk"
+    );
+}
+
+#[test]
+fn pr_merge_cascade_surfaces_restack_failure_and_still_deletes_remote() {
+    // If sync's restack conflicts after the merge lands, merge_and_cascade must
+    // still delete the merged branch on the remote (it's already merged upstream)
+    // and then surface the contextual "restack failed" error.
+    let (dir, _repo) = setup_two_level_stack();
+    init_origin_and_push(dir.path(), &["main", "feature-a", "feature-b"]);
+
+    // Build a trunk-advance commit that conflicts with feature-b when it is
+    // rebased onto the merged trunk: merged-main = feature-a plus a commit that
+    // also adds b.txt (feature-b adds b.txt too), so the restack hits a conflict.
+    run_ok(
+        "git",
+        &["checkout", "-b", "merged-main", "feature-a"],
+        dir.path(),
+    );
+    fs::write(dir.path().join("b.txt"), "trunk-b").unwrap();
+    run_ok("git", &["add", "b.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "trunk advances b.txt"], dir.path());
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    write_gh_mock(
+        dir.path(),
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "10" ]]; then echo '{"state":"MERGED"}'; exit 0; fi
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{"number":10,"title":"A","body":"A","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{"number":11,"title":"B","body":"B","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then exit 0; fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
+    # Land the merge as a trunk that conflicts with feature-b on restack.
+    git push origin merged-main:main >/dev/null 2>&1
+    exit 0
+fi"#,
+    );
+
+    let output = pr_merge_cmd(dir.path())
+        .env("KIN_TEST_SELECTIONS", "0")
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "a restack conflict after the merge must surface as an error: {output:?}"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("the local restack (`kin sync`) failed"),
+        "the contextual restack-failure error must be surfaced. Got:\n{combined}"
+    );
+    // Cleanup still happens: the merged branch is deleted on the remote even
+    // though the local restack failed.
+    let remote_refs = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["ls-remote", "--heads", "origin"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(
+        !remote_refs.contains("refs/heads/feature-a"),
+        "the merged remote branch must still be deleted after a restack failure. Got:\n{remote_refs}"
+    );
+}
+
+#[test]
+fn pr_merge_passes_method_flag_to_gh() {
+    let (dir, _repo) = setup_simple_stack();
+
+    init_origin_and_push(dir.path(), &["main", "feature"]);
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    // Mock gh records the args passed to `gh pr merge`.
+    let merge_args = dir.path().join("merge_args.txt");
+    write_gh_mock(
+        dir.path(),
+        &format!(
+            r#"if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "42" ]]; then echo '{{"state":"MERGED"}}'; exit 0; fi
+    echo '{{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}}'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}},"reviewRequests":{{"nodes":[]}},"latestReviews":{{"nodes":[{{"state":"APPROVED","author":{{"login":"alice"}}}}]}},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{{"contexts":{{"nodes":[]}}}}}}}}]}}}}}}}}}}'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then printf '%s\n' "$@" > "{}"; exit 0; fi"#,
+            merge_args.display()
+        ),
+    );
+
+    let output = pr_merge_cmd(dir.path())
+        .args(["--no-cascade", "--method", "squash"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "kin pr merge failed: {output:?}");
+    let args = std::fs::read_to_string(&merge_args).unwrap();
+    assert!(
+        args.contains("--squash"),
+        "--method squash must reach `gh pr merge`. Got:\n{args}"
+    );
+}
+
+#[test]
+fn pr_merge_pending_state_skips_cascade_and_delete() {
+    let (dir, _repo) = setup_simple_stack();
+
+    init_origin_and_push(dir.path(), &["main", "feature"]);
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    // Mock: the post-merge state check reports the PR still OPEN (e.g. a merge
+    // queue), so the command must short-circuit without cascading or deleting.
+    write_gh_mock(
+        dir.path(),
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "42" ]]; then echo '{"state":"OPEN"}'; exit 0; fi
+    echo '{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then exit 0; fi"#,
+    );
+
+    let output = pr_merge_cmd(dir.path()).output().unwrap();
+
+    assert!(output.status.success(), "kin pr merge failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("current GitHub state is OPEN"),
+        "pending state must be surfaced. Got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Restacking children") && !stdout.contains("Deleted"),
+        "a non-merged PR must not trigger cascade/delete. Got:\n{stdout}"
+    );
+}
+
+#[test]
+fn pr_merge_surfaces_merge_when_state_read_fails() {
+    // If the merge is accepted but the follow-up state read fails, the error must
+    // make clear the merge happened and point to `kin sync`, not hide it behind a
+    // bare "get state" failure that leaves the stack half-cascaded.
+    let (dir, _repo) = setup_simple_stack();
+
+    init_origin_and_push(dir.path(), &["main", "feature"]);
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    // Mock: merge succeeds, but the post-merge `pr view 42` state read fails.
+    write_gh_mock(
+        dir.path(),
+        r#"if [[ "$1" == "pr" && "$2" == "view" ]]; then
+    if [[ "$3" == "42" ]]; then echo "network blip" >&2; exit 1; fi
+    echo '{"number":42,"title":"Feature title","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" && "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "merge" ]]; then exit 0; fi"#,
+    );
+
+    let output = pr_merge_cmd(dir.path())
+        .arg("--no-interactive")
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "the state-read failure should error"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("was merged on GitHub") && combined.contains("kin sync"),
+        "error must surface that the merge happened and how to finish. Got:\n{combined}"
+    );
+}
