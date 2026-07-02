@@ -11,7 +11,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
-use tempfile::NamedTempFile;
 
 #[derive(Subcommand, Clone)]
 pub enum PrSubcommand {
@@ -397,6 +396,20 @@ fn pr_edit() -> Result<()> {
     let mut labels = existing.labels.clone();
     let mut reviewers = existing.reviewers.clone();
 
+    // Durable draft for the edited body, so a failed `gh pr edit` doesn't
+    // discard the user's changes.
+    let draft = crate::editor::Draft::new(crate::editor::draft_path(
+        repo.path(),
+        &format!("pr-edit-{}", existing.number),
+    ));
+
+    // Surface a leftover draft from a previous failed edit *before* the menu, so
+    // it's recovered even if the user goes straight to "Save" without reopening
+    // the body editor (otherwise a successful save would silently discard it).
+    if let Some(recovered) = recover_edit_body(&draft)? {
+        body = Some(recovered);
+    }
+
     loop {
         let mut menu_items = vec!["Save".to_string()];
         menu_items.push("Edit title".to_string());
@@ -419,7 +432,7 @@ fn pr_edit() -> Result<()> {
             }
             "Edit body" => {
                 let current_body = body.as_deref().unwrap_or(existing.body.as_str());
-                body = prompt_edit_body(current_body)?;
+                body = prompt_edit_body(current_body, &draft)?;
             }
             s if s.starts_with("Set labels") => {
                 labels = prompt_labels_for_edit(&labels)?;
@@ -431,27 +444,42 @@ fn pr_edit() -> Result<()> {
         }
     }
 
-    let body_for_reconciliation = body.as_deref().unwrap_or(&existing.body);
-    let old_list = parse_stack_section(body_for_reconciliation);
-    let merged_list = merge_stack_lists(&old_list, &all_stack_prs, &branch_name)?;
-    let stack_section = render_stack_section(&merged_list);
-    let final_body = update_stack_section(body_for_reconciliation, stack_section);
+    // `body` may be re-edited across retries, so it's shared between the
+    // attempt and re-edit closures. Stack-section reconciliation depends on the
+    // current body, so it's recomputed inside each attempt.
+    let body = std::cell::RefCell::new(body);
+    submit_with_retry(
+        &draft,
+        || {
+            let body = body.borrow();
+            let body_for_reconciliation = body.as_deref().unwrap_or(&existing.body);
+            let old_list = parse_stack_section(body_for_reconciliation);
+            let merged_list = merge_stack_lists(&old_list, &all_stack_prs, &branch_name)?;
+            let stack_section = render_stack_section(&merged_list);
+            let final_body = update_stack_section(body_for_reconciliation, stack_section);
 
-    let body_to_send = if final_body == existing.body && body.is_none() {
-        None
-    } else {
-        Some(final_body)
-    };
+            let body_to_send = if final_body == existing.body && body.is_none() {
+                None
+            } else {
+                Some(final_body)
+            };
 
-    gh::edit_pr(&gh::EditPrParams {
-        number: existing.number,
-        title,
-        body: body_to_send,
-        current_labels: existing.labels.clone(),
-        labels,
-        current_reviewers: existing.reviewers.clone(),
-        reviewers,
-    })?;
+            gh::edit_pr(&gh::EditPrParams {
+                number: existing.number,
+                title: title.clone(),
+                body: body_to_send,
+                current_labels: existing.labels.clone(),
+                labels: labels.clone(),
+                current_reviewers: existing.reviewers.clone(),
+                reviewers: reviewers.clone(),
+            })
+        },
+        || {
+            *body.borrow_mut() = Some(draft.reedit()?);
+            Ok(())
+        },
+        |e| prompt_submit_retry(e, &draft),
+    )?;
     println!("✓ PR updated: {}", existing.url);
     Ok(())
 }
@@ -1032,7 +1060,13 @@ fn create_pr_interactive(
     }
 
     // ── Step 2: Body ─────────────────────────────────────────────────────────
-    let body = prompt_body(branch_name, &commits)?;
+    // The body is captured into a durable draft file so it survives a failed
+    // `gh pr create` (or a crash) and can be recovered / retried below.
+    let draft = crate::editor::Draft::new(crate::editor::draft_path(
+        repo.path(),
+        &format!("pr-body-{branch_name}"),
+    ));
+    let body = prompt_body(branch_name, &commits, &draft)?;
 
     // ── Step 3: Submit options ───────────────────────────────────────────────
     let submission = if !labels.is_empty() {
@@ -1047,15 +1081,30 @@ fn create_pr_interactive(
     let reviewers = submission.reviewers.clone();
 
     println!("  Creating PR...");
-    let url = gh::create_pr(&CreatePrParams {
-        title: title.clone(),
-        body: body.clone(),
-        base: gh_base.to_string(),
-        head: branch_name.to_string(),
-        draft: submission.draft,
-        labels: submission.labels.clone(),
-        reviewers: submission.reviewers.clone(),
-    })?;
+    // `body` may be re-edited across retries, so it lives in a cell shared by
+    // the attempt and re-edit closures. `submit_with_retry` discards the draft
+    // on success and preserves it on abort.
+    let body = std::cell::RefCell::new(body);
+    let url = submit_with_retry(
+        &draft,
+        || {
+            gh::create_pr(&CreatePrParams {
+                title: title.clone(),
+                body: body.borrow().clone(),
+                base: gh_base.to_string(),
+                head: branch_name.to_string(),
+                draft: submission.draft,
+                labels: submission.labels.clone(),
+                reviewers: submission.reviewers.clone(),
+            })
+        },
+        || {
+            *body.borrow_mut() = reopen_editor_for_body(&draft)?;
+            Ok(())
+        },
+        |e| prompt_submit_retry(e, &draft),
+    )?;
+    let body = body.into_inner();
 
     println!("  ✓ PR created: {}", url);
     Ok(Some(gh::EditablePr {
@@ -1435,7 +1484,11 @@ fn prompt_title(commits: &[CommitSummary]) -> Result<String> {
     Ok(title)
 }
 
-fn prompt_body(branch_name: &str, commits: &[CommitSummary]) -> Result<String> {
+fn prompt_body(
+    branch_name: &str,
+    commits: &[CommitSummary],
+    draft: &crate::editor::Draft,
+) -> Result<String> {
     // Build commit list HTML comment preamble
     let mut preamble = format!("<!--\nCommits on {}:\n", branch_name);
     for c in commits {
@@ -1452,8 +1505,45 @@ fn prompt_body(branch_name: &str, commits: &[CommitSummary]) -> Result<String> {
         format!("{}\n\n{}", preamble, template)
     };
 
-    if !std::io::stdin().is_terminal() {
-        return Ok(editor_prefill);
+    // In a non-interactive session we normally can't prompt, so we fall back to
+    // the prefilled template. Integration tests set KIN_TEST_PR_BODY_ACTION to
+    // exercise the editor/draft/recovery machinery headlessly (mirroring the
+    // KIN_TEST_* seams used elsewhere); it emulates the menu choice a user would
+    // otherwise make with the keyboard.
+    let test_action = std::env::var("KIN_TEST_PR_BODY_ACTION").ok();
+    if !std::io::stdin().is_terminal() && test_action.is_none() {
+        // Prefer a saved draft over the generated template: a body left by an
+        // earlier failed/interrupted attempt must not be silently dropped (and
+        // then discarded on the next success). We can't prompt here, so reuse it.
+        return match draft.recover() {
+            Some(saved) => Ok(strip_html_comment(&saved).trim().to_string()),
+            None => Ok(editor_prefill),
+        };
+    }
+
+    // A leftover draft means an earlier PR-creation attempt for this branch
+    // failed or was interrupted before the PR was created. Offer to resume it.
+    if draft.recover().is_some() {
+        println!("  Found an unsaved PR body draft from a previous attempt.");
+        let choice = crate::commands::prompt_select(
+            "  Resume it?",
+            vec![
+                "Resume in editor".to_string(),
+                "Discard and start fresh".to_string(),
+            ],
+        )?;
+        if choice.starts_with("Resume") {
+            return reopen_editor_for_body(draft);
+        }
+        draft.discard();
+    }
+
+    if let Some(action) = test_action {
+        return match action.as_str() {
+            "editor" | "template" => open_editor_for_body(&editor_prefill, draft),
+            "blank" => Ok(String::new()),
+            other => Err(anyhow!("unknown KIN_TEST_PR_BODY_ACTION: {other}")),
+        };
     }
 
     println!("  PR body: [e] open editor  [b] leave blank  [enter] use PR template");
@@ -1466,7 +1556,7 @@ fn prompt_body(branch_name: &str, commits: &[CommitSummary]) -> Result<String> {
         match key.as_deref() {
             Some("e") => {
                 println!("e");
-                return open_editor_for_body(&editor_prefill);
+                return open_editor_for_body(&editor_prefill, draft);
             }
             Some("b") => {
                 println!("b");
@@ -1475,7 +1565,7 @@ fn prompt_body(branch_name: &str, commits: &[CommitSummary]) -> Result<String> {
             Some("\r") | Some("\n") | Some("") => {
                 println!();
                 // Use template (open editor prefilled with preamble + template)
-                return open_editor_for_body(&editor_prefill);
+                return open_editor_for_body(&editor_prefill, draft);
             }
             _ => {
                 // ignore and re-prompt
@@ -1484,29 +1574,101 @@ fn prompt_body(branch_name: &str, commits: &[CommitSummary]) -> Result<String> {
     }
 }
 
-fn open_editor_for_body(prefill: &str) -> Result<String> {
-    let mut temp = NamedTempFile::new()?;
-    temp.write_all(prefill.as_bytes())?;
-    let path = temp.path().to_path_buf();
-
-    crate::editor::launch_editor(&path)?;
-
-    let body = fs::read_to_string(&path)?;
-
+fn open_editor_for_body(prefill: &str, draft: &crate::editor::Draft) -> Result<String> {
+    let body = draft.edit(prefill)?;
     // Strip the HTML comment preamble from the final body; it's only for
     // the author's reference and should not appear in the PR description.
-    let cleaned = strip_html_comment(&body);
-    Ok(cleaned.trim().to_string())
+    Ok(strip_html_comment(&body).trim().to_string())
 }
 
-fn open_editor_for_plain_body(prefill: &str) -> Result<String> {
-    let mut temp = NamedTempFile::new()?;
-    temp.write_all(prefill.as_bytes())?;
-    let path = temp.path().to_path_buf();
+/// Reopen an existing draft (recovery / retry path) and apply the same
+/// preamble stripping as [`open_editor_for_body`].
+fn reopen_editor_for_body(draft: &crate::editor::Draft) -> Result<String> {
+    let body = draft.reedit()?;
+    Ok(strip_html_comment(&body).trim().to_string())
+}
 
-    crate::editor::launch_editor(&path)?;
-    let body = fs::read_to_string(&path)?;
-    Ok(body)
+fn open_editor_for_plain_body(prefill: &str, draft: &crate::editor::Draft) -> Result<String> {
+    draft.edit(prefill)
+}
+
+/// What to do after a `gh pr create`/`gh pr edit` invocation fails.
+enum SubmitRetry {
+    /// Re-run the same submission unchanged (transient failure).
+    Retry,
+    /// Reopen the body in `$EDITOR` before retrying.
+    Reedit,
+    /// Give up; the draft (if any) is left on disk for recovery.
+    Abort,
+}
+
+/// Prompt the user for how to proceed after a failed submission. The body draft
+/// is left untouched so nothing is lost regardless of the choice. Re-editing is
+/// only offered when a body draft actually exists. Non-interactive sessions
+/// always abort so the error propagates as before.
+fn prompt_submit_retry(err: &anyhow::Error, draft: &crate::editor::Draft) -> SubmitRetry {
+    eprintln!("  ✗ Submission failed: {err:#}");
+
+    if !std::io::stdin().is_terminal() {
+        return SubmitRetry::Abort;
+    }
+
+    let has_body = draft.recover().is_some();
+    let mut options = vec!["Retry".to_string()];
+    if has_body {
+        options.push("Re-edit body in editor, then retry".to_string());
+    }
+    options.push("Save draft and quit".to_string());
+
+    match crate::commands::prompt_select("  How would you like to proceed?", options) {
+        Ok(choice) if choice == "Retry" => SubmitRetry::Retry,
+        Ok(choice) if choice.starts_with("Re-edit") => SubmitRetry::Reedit,
+        _ => SubmitRetry::Abort,
+    }
+}
+
+/// Emit a recovery hint when aborting with a draft still on disk.
+fn report_saved_draft(draft: &crate::editor::Draft) {
+    if draft.recover().is_some() {
+        eprintln!("  Your body was saved to {}", draft.path().display());
+        eprintln!("  Re-run the same command to resume from it.");
+    }
+}
+
+/// Drive a submission (`gh pr create`/`edit`) with retry, re-edit, and abort
+/// handling around a durable draft. `attempt` performs the actual submission;
+/// `on_reedit` reopens the body in `$EDITOR`; `decide` chooses what to do after
+/// a failure (in production that's [`prompt_submit_retry`]).
+///
+/// On success the draft is discarded. On abort the draft is left on disk and a
+/// recovery hint is printed, then the original error is returned unchanged.
+/// The `decide`/`on_reedit` seams are injectable so this can be tested without
+/// a terminal, editor, or network.
+fn submit_with_retry<T>(
+    draft: &crate::editor::Draft,
+    mut attempt: impl FnMut() -> Result<T>,
+    mut on_reedit: impl FnMut() -> Result<()>,
+    mut decide: impl FnMut(&anyhow::Error) -> SubmitRetry,
+) -> Result<T> {
+    loop {
+        match attempt() {
+            Ok(value) => {
+                draft.discard();
+                return Ok(value);
+            }
+            Err(e) => match decide(&e) {
+                SubmitRetry::Retry => continue,
+                SubmitRetry::Reedit => {
+                    on_reedit()?;
+                    continue;
+                }
+                SubmitRetry::Abort => {
+                    report_saved_draft(draft);
+                    return Err(e);
+                }
+            },
+        }
+    }
 }
 
 fn prompt_edit_title(current_title: &str) -> Result<String> {
@@ -1531,7 +1693,36 @@ fn prompt_edit_title(current_title: &str) -> Result<String> {
     }
 }
 
-fn prompt_edit_body(current_body: &str) -> Result<Option<String>> {
+/// If a leftover PR-edit draft exists (from an earlier failed edit), offer to
+/// resume it. Interactively the user chooses resume vs. discard; non-interactive
+/// sessions can't prompt, so the saved draft is reused rather than dropped.
+/// Returns the recovered body when one should replace the current body.
+fn recover_edit_body(draft: &crate::editor::Draft) -> Result<Option<String>> {
+    let Some(saved) = draft.recover() else {
+        return Ok(None);
+    };
+
+    if !std::io::stdin().is_terminal() {
+        return Ok(Some(saved));
+    }
+
+    println!("  Found an unsaved PR body draft from a previous attempt.");
+    let choice = crate::commands::prompt_select(
+        "  Resume it?",
+        vec![
+            "Resume in editor".to_string(),
+            "Discard and start fresh".to_string(),
+        ],
+    )?;
+    if choice.starts_with("Resume") {
+        Ok(Some(draft.reedit()?))
+    } else {
+        draft.discard();
+        Ok(None)
+    }
+}
+
+fn prompt_edit_body(current_body: &str, draft: &crate::editor::Draft) -> Result<Option<String>> {
     if !std::io::stdin().is_terminal() {
         println!("  [non-interactive] Keeping body unchanged");
         return Ok(None);
@@ -1545,7 +1736,7 @@ fn prompt_edit_body(current_body: &str) -> Result<Option<String>> {
         match key.as_deref() {
             Some("e") => {
                 println!("e");
-                let edited = open_editor_for_plain_body(current_body)?;
+                let edited = open_editor_for_plain_body(current_body, draft)?;
                 return Ok(Some(edited));
             }
             Some("\r") | Some("\n") | Some("") => {
@@ -1755,6 +1946,115 @@ fn prompt_reviewers() -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    /// A draft seeded with body content in a temp dir, for retry-driver tests.
+    fn seeded_draft(dir: &std::path::Path) -> crate::editor::Draft {
+        let draft = crate::editor::Draft::new(dir.join("kindra-drafts").join("body.md"));
+        std::fs::create_dir_all(draft.path().parent().unwrap()).unwrap();
+        std::fs::write(draft.path(), "body text").unwrap();
+        draft
+    }
+
+    #[test]
+    fn submit_with_retry_discards_draft_on_first_try_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft = seeded_draft(dir.path());
+
+        let out = submit_with_retry(
+            &draft,
+            || Ok::<_, anyhow::Error>("url"),
+            || panic!("should not re-edit"),
+            |_| panic!("should not decide on success"),
+        )
+        .unwrap();
+
+        assert_eq!(out, "url");
+        assert!(draft.recover().is_none(), "draft removed after success");
+    }
+
+    #[test]
+    fn submit_with_retry_retries_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft = seeded_draft(dir.path());
+
+        let attempts = Cell::new(0);
+        let out = submit_with_retry(
+            &draft,
+            || {
+                let n = attempts.get();
+                attempts.set(n + 1);
+                if n == 0 {
+                    Err(anyhow!("transient failure"))
+                } else {
+                    Ok("url")
+                }
+            },
+            || panic!("Retry must not re-edit"),
+            |_| SubmitRetry::Retry,
+        )
+        .unwrap();
+
+        assert_eq!(out, "url");
+        assert_eq!(attempts.get(), 2, "failed once, retried once");
+        assert!(draft.recover().is_none());
+    }
+
+    #[test]
+    fn submit_with_retry_reedits_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft = seeded_draft(dir.path());
+
+        let attempts = Cell::new(0);
+        let reedits = Cell::new(0);
+        let out = submit_with_retry(
+            &draft,
+            || {
+                let n = attempts.get();
+                attempts.set(n + 1);
+                if n == 0 {
+                    Err(anyhow!("bad body"))
+                } else {
+                    Ok("url")
+                }
+            },
+            || {
+                reedits.set(reedits.get() + 1);
+                Ok(())
+            },
+            |_| SubmitRetry::Reedit,
+        )
+        .unwrap();
+
+        assert_eq!(out, "url");
+        assert_eq!(reedits.get(), 1, "re-edited once before the retry");
+        assert!(draft.recover().is_none());
+    }
+
+    #[test]
+    fn submit_with_retry_preserves_draft_on_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft = seeded_draft(dir.path());
+
+        let result = submit_with_retry(
+            &draft,
+            || Err::<&str, _>(anyhow!("permanent failure")),
+            || panic!("Abort must not re-edit"),
+            |_| SubmitRetry::Abort,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "permanent failure",
+            "original error propagates unchanged"
+        );
+        assert_eq!(
+            draft.recover().as_deref(),
+            Some("body text"),
+            "draft kept on disk for recovery after abort"
+        );
+    }
 
     #[test]
     fn test_parse_stack_line() {

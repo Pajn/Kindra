@@ -795,3 +795,80 @@ fn test_reorder_blocked_by_stale_run_state() {
 
     assert!(dir.path().join(".git/kindra_run_state.json").exists());
 }
+
+/// Path of the reorder draft for a given current branch.
+fn reorder_draft_path(dir: &Path, current_branch: &str) -> PathBuf {
+    kindra::editor::draft_path(&dir.join(".git"), &format!("reorder-{current_branch}"))
+}
+
+/// Build a simple linear stack (main → feature-a → feature-b → feature-c) and
+/// check out feature-a. Returns the temp dir.
+fn linear_stack_on_feature_a() -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let main_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
+    let main = repo.find_commit(main_id).unwrap();
+    let a_id = make_commit(&repo, "refs/heads/feature-a", "a.txt", "a", "A", &[&main]);
+    let a = repo.find_commit(a_id).unwrap();
+    let b_id = make_commit(&repo, "refs/heads/feature-b", "b.txt", "b", "B", &[&a]);
+    let b = repo.find_commit(b_id).unwrap();
+    make_commit(&repo, "refs/heads/feature-c", "c.txt", "c", "C", &[&b]);
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    dir
+}
+
+#[test]
+fn reorder_success_discards_draft() {
+    let dir = linear_stack_on_feature_a();
+    let editor = write_editor_script(
+        dir.path(),
+        "branch feature-c parent main\nbranch feature-a\nbranch feature-b\n",
+    );
+
+    kin_cmd()
+        .arg("reorder")
+        .current_dir(dir.path())
+        .env("EDITOR", &editor)
+        .assert()
+        .success();
+
+    assert!(
+        !reorder_draft_path(dir.path(), "feature-a").exists(),
+        "reorder draft should be discarded after a successful reorder"
+    );
+}
+
+#[test]
+fn reorder_failure_preserves_draft_and_prints_guidance() {
+    let dir = linear_stack_on_feature_a();
+    // A malformed line makes parse_parent_map fail.
+    let editor = write_editor_script(dir.path(), "this is not a valid reorder line\n");
+
+    let output = kin_cmd()
+        .arg("reorder")
+        .current_dir(dir.path())
+        .env("EDITOR", &editor)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "reorder should fail on a bad buffer"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("re-run `kin reorder`"),
+        "failure should print rerun guidance, got:\n{stderr}"
+    );
+
+    let draft = reorder_draft_path(dir.path(), "feature-a");
+    assert!(
+        draft.exists(),
+        "reorder draft should be preserved on failure"
+    );
+    let saved = fs::read_to_string(&draft).unwrap();
+    assert!(
+        saved.contains("this is not a valid reorder line"),
+        "preserved draft should hold the user's edits, got:\n{saved}"
+    );
+}

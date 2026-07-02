@@ -3,9 +3,6 @@ use crate::stack::{collect_path_branches, get_stack_tips};
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, ErrorCode, Oid, Repository};
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::Write;
-use tempfile::NamedTempFile;
 
 pub fn split() -> Result<()> {
     let repo = crate::open_repo()?;
@@ -112,15 +109,41 @@ pub fn split() -> Result<()> {
     buffer.push_str(&format!("# Base branch: {}\n", upstream_name));
     buffer.push_str(&format!("# Path to tip: {}\n", target_tip_name));
 
-    // Open editor
-    let mut temp_file = NamedTempFile::new()?;
-    temp_file.write_all(buffer.as_bytes())?;
-    let temp_path = temp_file.path().to_path_buf();
+    // Open editor. The buffer is captured into a durable draft so a parse or
+    // validation failure below doesn't discard the user's edits. `edit_or_resume`
+    // reopens a draft left by an earlier failed run instead of overwriting it
+    // with a freshly generated buffer, so re-running `kin split` resumes the
+    // user's previous edits.
+    let draft = crate::editor::Draft::new(crate::editor::draft_path(
+        repo.path(),
+        &format!("split-{target_tip_name}"),
+    ));
+    let edited_buffer = draft.edit_or_resume(&buffer)?;
 
-    crate::editor::launch_editor(&temp_path)?;
+    match split_from_buffer(&repo, &edited_buffer, &commits, &path_branches, commit_ids) {
+        Ok(()) => {
+            draft.discard();
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "  Your split buffer was saved to {} — fix it and re-run `kin split`.",
+                draft.path().display()
+            );
+            Err(e)
+        }
+    }
+}
 
-    let edited_buffer = fs::read_to_string(&temp_path)?;
-
+/// Parse the edited split buffer, validate it against the original commit list,
+/// and apply the resulting branch layout.
+fn split_from_buffer(
+    repo: &Repository,
+    edited_buffer: &str,
+    commits: &[CommitInfo],
+    path_branches: &[crate::stack::StackBranch],
+    commit_ids: HashSet<String>,
+) -> Result<()> {
     // Parse and Validate
     let mut new_commits_short = Vec::new();
     let mut new_branch_map: Vec<(String, String)> = Vec::new(); // (branch_name, commit_id_short)
@@ -213,7 +236,7 @@ pub fn split() -> Result<()> {
 
     // Apply changes
     apply_split(
-        &repo,
+        repo,
         next_branches,
         new_branch_map_full,
         path_branches.iter().map(|b| b.name.clone()).collect(),

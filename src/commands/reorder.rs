@@ -5,8 +5,6 @@ use crate::rebase_utils::{
 use anyhow::{Result, anyhow};
 use clap::Args;
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
-use tempfile::NamedTempFile;
 
 #[derive(Args)]
 pub struct ReorderArgs {
@@ -70,6 +68,7 @@ pub fn reorder(args: &ReorderArgs) -> Result<()> {
         &current_parent_map,
         &upstream_name,
         &current_branch_name,
+        repo.path(),
     )?;
 
     if edited_parent_map == current_parent_map {
@@ -147,6 +146,7 @@ fn edit_parent_map(
     current_parent_map: &HashMap<String, String>,
     upstream_name: &str,
     current_branch_name: &str,
+    git_dir: &std::path::Path,
 ) -> Result<HashMap<String, String>> {
     let buffer = render_parent_map_buffer(
         branches,
@@ -155,13 +155,29 @@ fn edit_parent_map(
         current_branch_name,
     )?;
 
-    let mut temp_file = NamedTempFile::new()?;
-    temp_file.write_all(buffer.as_bytes())?;
-    let temp_path = temp_file.into_temp_path();
+    // Capture into a durable draft so a parse failure below doesn't discard the
+    // user's edits. `edit_or_resume` reopens a draft left by an earlier failed
+    // run instead of overwriting it with a freshly generated buffer, so
+    // re-running `kin reorder` resumes the user's previous edits.
+    let draft = crate::editor::Draft::new(crate::editor::draft_path(
+        git_dir,
+        &format!("reorder-{current_branch_name}"),
+    ));
+    let edited_buffer = draft.edit_or_resume(&buffer)?;
 
-    crate::editor::launch_editor(&temp_path)?;
-    let edited_buffer = std::fs::read_to_string(&temp_path)?;
-    parse_parent_map(&edited_buffer, branches, upstream_name)
+    match parse_parent_map(&edited_buffer, branches, upstream_name) {
+        Ok(map) => {
+            draft.discard();
+            Ok(map)
+        }
+        Err(e) => {
+            eprintln!(
+                "  Your reorder edits were saved to {} — fix them and re-run `kin reorder`.",
+                draft.path().display()
+            );
+            Err(e)
+        }
+    }
 }
 
 fn render_parent_map_buffer(
