@@ -21,11 +21,43 @@ pub enum PrSubcommand {
     /// Retarget open stack PRs to the resolved upstream base branch
     Flatten,
     /// Merge an open PR from the current stack
-    Merge,
+    Merge(PrMergeArgs),
     /// Show status summary for all open PRs in the current stack
     Status,
     /// Fetch and render review comments for an open PR in the current stack
     Review(PrReviewArgs),
+}
+
+/// How GitHub should combine the PR's commits when merging.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum MergeMethod {
+    Squash,
+    Rebase,
+    Merge,
+}
+
+impl MergeMethod {
+    /// The `gh pr merge` flag that selects this method.
+    pub fn gh_flag(self) -> &'static str {
+        match self {
+            MergeMethod::Squash => "--squash",
+            MergeMethod::Rebase => "--rebase",
+            MergeMethod::Merge => "--merge",
+        }
+    }
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct PrMergeArgs {
+    /// Merge method (defaults to the repository's configured/allowed method)
+    #[arg(long, value_enum)]
+    pub method: Option<MergeMethod>,
+    /// Skip the local restack/delete cascade after merging
+    #[arg(long)]
+    pub no_cascade: bool,
+    /// Keep the merged branch locally and on the remote
+    #[arg(long)]
+    pub no_delete: bool,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -86,7 +118,7 @@ pub fn pr(
         Some(PrSubcommand::Open) => pr_open(),
         Some(PrSubcommand::Edit) => pr_edit(),
         Some(PrSubcommand::Flatten) => pr_flatten(),
-        Some(PrSubcommand::Merge) => pr_merge(),
+        Some(PrSubcommand::Merge(args)) => pr_merge(args),
         Some(PrSubcommand::Status) => pr_status(),
         Some(PrSubcommand::Review(args)) => pr_review(args),
         None => pr_create_or_update(no_push, include_all, &options),

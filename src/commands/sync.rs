@@ -14,7 +14,7 @@ use git2::BranchType;
 use std::collections::HashMap;
 use std::process::Command;
 
-#[derive(Args)]
+#[derive(Args, Default)]
 pub struct SyncArgs {
     /// Force the sync even if branches are checked out in other worktrees
     #[arg(long)]
