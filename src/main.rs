@@ -17,6 +17,7 @@ use crate::commands::continue_cmd::continue_cmd;
 use crate::commands::move_cmd::{MoveArgs, move_cmd};
 use crate::commands::pr::{PrSubcommand, pr};
 use crate::commands::push::push;
+use crate::commands::rename::{RenameArgs, rename};
 use crate::commands::reorder::{ReorderArgs, reorder};
 use crate::commands::restack::{RestackArgs, restack};
 use crate::commands::run::{RunArgs, run};
@@ -97,6 +98,8 @@ enum Commands {
     },
     /// Move current branch stack onto another branch
     Move(MoveArgs),
+    /// Rename a branch (defaults to the current branch), preserving the stack
+    Rename(RenameArgs),
     /// Reorder the current stack by editing branch parents
     Reorder(ReorderArgs),
     /// Rebase the current stack onto the upstream branch in one pass
@@ -255,6 +258,7 @@ fn dispatch() -> Result<()> {
         }
         Commands::Checkout { subcommand, all } => checkout(subcommand, *all)?,
         Commands::Move(args) => move_cmd(args)?,
+        Commands::Rename(args) => rename(args)?,
         Commands::Reorder(args) => reorder(args)?,
         Commands::Sync(args) => sync(args)?,
         Commands::Restack(args) => restack(args)?,
