@@ -1,5 +1,4 @@
 use crate::commands::find_upstream;
-use crate::commands::resolve_rebase_autostash;
 use crate::rebase_utils::{
     Operation, RebaseState, checkout_branch, clear_state, git_rebase_in_progress,
     passively_reconcile_rebase_state, save_state,
@@ -125,16 +124,8 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
 
     if let Some(old_base) = boundary.old_base {
         crate::rebase_utils::ensure_git_supports_update_refs()?;
-        let autostash = resolve_rebase_autostash(
-            &repo,
-            if args.autostash {
-                Some(true)
-            } else if args.no_autostash {
-                Some(false)
-            } else {
-                None
-            },
-        )?;
+        let autostash =
+            crate::commands::resolve_and_check_autostash(&repo, args.autostash, args.no_autostash)?;
 
         let state = RebaseState {
             operation: Operation::Sync,
@@ -225,16 +216,8 @@ fn sync_upstream_branch(
     if upstream_id != rebase_onto_id {
         let rebase_root_id = repo.merge_base(upstream_id, rebase_onto_id)?;
         crate::rebase_utils::ensure_git_supports_reapply_cherry_picks()?;
-        let autostash = resolve_rebase_autostash(
-            repo,
-            if args.autostash {
-                Some(true)
-            } else if args.no_autostash {
-                Some(false)
-            } else {
-                None
-            },
-        )?;
+        let autostash =
+            crate::commands::resolve_and_check_autostash(repo, args.autostash, args.no_autostash)?;
 
         let state = RebaseState {
             operation: Operation::Sync,

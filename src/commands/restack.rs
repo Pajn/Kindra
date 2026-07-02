@@ -1,6 +1,4 @@
-use crate::commands::{
-    prompt_multi_select, resolve_rebase_autostash, resolve_restack_history_limit,
-};
+use crate::commands::{prompt_multi_select, resolve_restack_history_limit};
 use crate::rebase_utils::{
     Operation, RebaseState, passively_reconcile_rebase_state, run_rebase_loop,
 };
@@ -48,16 +46,6 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
     );
 
     let history_limit = resolve_restack_history_limit(&repo, args.history_limit)?;
-    let autostash = resolve_rebase_autostash(
-        &repo,
-        if args.autostash {
-            Some(true)
-        } else if args.no_autostash {
-            Some(false)
-        } else {
-            None
-        },
-    )?;
     let children =
         find_floating_children(&repo, &head_commit, &current_branch_name, history_limit)?;
 
@@ -65,6 +53,14 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
         println!("No floating children found.");
         return Ok(());
     }
+
+    // Now that there is real work to do, enforce the clean-or-autostash contract
+    // before the (possibly interactive) `--pick` prompt, so a dirty tree with
+    // `--no-autostash` fails fast rather than after the user makes a selection.
+    // (Kept after the no-op check above so a restack with nothing to do still
+    // succeeds on a dirty tree, matching its previous behavior.)
+    let autostash =
+        crate::commands::resolve_and_check_autostash(&repo, args.autostash, args.no_autostash)?;
 
     let children = if args.pick {
         // prompt_multi_select resolves the selection per mode: interactive shows

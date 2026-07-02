@@ -21,6 +21,17 @@ pub struct RunArgs {
     /// Continue on failure instead of stopping at the first error
     #[arg(long)]
     pub continue_on_failure: bool,
+
+    /// Stash uncommitted changes for the duration of the run and restore them
+    /// when it finishes (defaults to the rebase.autostash config)
+    #[arg(long, overrides_with = "no_autostash")]
+    #[serde(default, skip)]
+    pub autostash: bool,
+
+    /// Refuse to run with a dirty working tree even if autostash is configured
+    #[arg(long = "no-autostash", overrides_with = "autostash")]
+    #[serde(default, skip)]
+    pub no_autostash: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,6 +54,10 @@ pub(crate) struct RunState {
     pub failed_branches: Vec<String>,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Autostash ref set aside for the duration of the run; restored (applied +
+    /// dropped) on any terminal exit — success, failure, or `kin abort`.
+    #[serde(default)]
+    pub stash_ref: Option<String>,
 }
 
 pub fn run(args: &RunArgs) -> Result<()> {
@@ -86,6 +101,14 @@ pub fn run(args: &RunArgs) -> Result<()> {
     // Sort from base to tips (topological order)
     sort_branches_topologically(&repo, &mut stack_branches)?;
 
+    // Enforce the uniform clean-or-autostash contract before checking out any
+    // branch, so uncommitted changes never travel across the stack.
+    let autostash = crate::commands::resolve_rebase_autostash(
+        &repo,
+        crate::commands::autostash_override(args.autostash, args.no_autostash),
+    )?;
+    let stash_ref = crate::rebase_utils::take_autostash(&repo, autostash)?;
+
     let mut run_state = RunState {
         target_branches: stack_branches.into_iter().map(|b| b.name).collect(),
         current_index: 0,
@@ -95,23 +118,22 @@ pub fn run(args: &RunArgs) -> Result<()> {
         status: RunStatus::InProgress,
         failed_branches: Vec::new(),
         last_error: None,
+        stash_ref,
     };
-    persist_run_state(&repo, &run_state)?;
+    // If persisting fails, nothing downstream knows to restore the autostash, so
+    // pop it back now rather than stranding the user's uncommitted changes.
+    if let Err(err) = persist_run_state(&repo, &run_state) {
+        restore_run_stash(&mut run_state);
+        return Err(err);
+    }
     execute_run(&repo, &mut run_state)
-}
-
-pub(crate) fn continue_run(repo: &Repository) -> Result<()> {
-    let mut run_state = load_run_state(repo)?;
-    run_state.status = RunStatus::InProgress;
-    run_state.last_error = None;
-    persist_run_state(repo, &run_state)?;
-    execute_run(repo, &mut run_state)
 }
 
 pub(crate) fn abort_run(repo: &Repository) -> Result<()> {
     let mut run_state = load_run_state(repo)?;
     mark_aborted(repo, &mut run_state, None)?;
     checkout_original_checkout(&run_state.original_branch, &run_state.original_head_id)?;
+    restore_run_stash(&mut run_state);
     clear_run_state(repo)?;
     println!("Run operation aborted (state cleared).");
     Ok(())
@@ -138,6 +160,32 @@ fn persist_run_state(repo: &Repository, run_state: &RunState) -> Result<()> {
     let json = serde_json::to_string_pretty(run_state)?;
     crate::state_io::write_atomic(&run_state_path(repo), &json)?;
     Ok(())
+}
+
+/// Restore the autostash set aside at the start of the run, if any. Called on
+/// every terminal exit — success, failure, or `kin abort` — once HEAD is back on
+/// the original checkout, so uncommitted work lands where the user left it.
+/// (A run is not resumable: leftover state after a failed checkout-restore is
+/// recovered by `kin abort`, not `kin continue`.)
+fn restore_run_stash(run_state: &mut RunState) {
+    let Some(stash_ref) = run_state.stash_ref.take() else {
+        return;
+    };
+    if let Err(err) = crate::rebase_utils::apply_stash(&stash_ref) {
+        // `run` is a reporter, not a resumable operation, so callers clear the
+        // run-state file after this returns — keeping the ref in the (dropped)
+        // state would lose it. Surface an actionable message instead, so the
+        // surviving stash entry isn't orphaned silently. A failed apply does not
+        // drop the stash, so the user's changes remain recoverable.
+        eprintln!(
+            "Warning: could not reapply your autostashed changes: {err}\n         \
+             They are preserved in `git stash list` (\"{stash_ref}\"); reapply with `git stash pop`."
+        );
+        return;
+    }
+    if let Err(err) = crate::rebase_utils::drop_stash(&stash_ref) {
+        eprintln!("Warning: {err}");
+    }
 }
 
 fn clear_run_state(repo: &Repository) -> Result<()> {
@@ -245,8 +293,16 @@ fn execute_run(repo: &Repository, run_state: &mut RunState) -> Result<()> {
         }
     }
 
-    checkout_original_checkout(&run_state.original_branch, &run_state.original_head_id)
-        .context("Failed to restore original checkout after run.")?;
+    if let Err(restore_err) =
+        checkout_original_checkout(&run_state.original_branch, &run_state.original_head_id)
+    {
+        // Record why the restore failed so `kin status` can show it and `kin
+        // abort` can recover the stranded autostash, instead of leaving RunState
+        // stuck InProgress with no reason. Mirrors fail_and_restore's error path.
+        let msg = format!("Failed to restore original checkout after run: {restore_err}");
+        persist_failure(repo, run_state, msg.clone())?;
+        return Err(anyhow!(msg));
+    }
 
     println!("\n=== Summary ===");
     println!("Succeeded: {}", success_count);
@@ -255,36 +311,35 @@ fn execute_run(repo: &Repository, run_state: &mut RunState) -> Result<()> {
         println!("Failed branches: {}", run_state.failed_branches.join(", "));
     }
 
+    // `run` is a reporter, not a resumable operation. Whether or not the command
+    // failed, the original checkout (above) and autostash are restored and the
+    // state is cleared, so a non-zero command never leaves a blocking operation
+    // behind. Failure is surfaced only through the error / exit code.
+    restore_run_stash(run_state);
+    clear_run_state(repo)?;
+
     if run_state.failed_branches.is_empty() {
-        clear_run_state(repo)?;
         return Ok(());
     }
 
-    if let Some(first_failed_index) = first_failed_index(run_state) {
-        run_state.current_index = first_failed_index;
-    }
-    let message = format!(
+    Err(anyhow!(
         "Command failed on {} branch(es): {}",
         run_state.failed_branches.len(),
         run_state.failed_branches.join(", ")
-    );
-    persist_failure(repo, run_state, message.clone())?;
-    Err(anyhow!(message))
-}
-
-fn first_failed_index(run_state: &RunState) -> Option<usize> {
-    run_state.target_branches.iter().position(|branch| {
-        run_state
-            .failed_branches
-            .iter()
-            .any(|failed| failed == branch)
-    })
+    ))
 }
 
 fn fail_and_restore(repo: &Repository, run_state: &mut RunState, state_error: &str) -> Result<()> {
-    persist_failure(repo, run_state, state_error.to_string())?;
+    // Same reporter contract as the end-of-loop path: restore the original
+    // checkout + autostash and clear state, so stopping at the first failure
+    // does not leave a blocking operation. Only a genuine failure to restore the
+    // checkout keeps state, so `kin abort` can recover the stranded autostash.
     match checkout_original_checkout(&run_state.original_branch, &run_state.original_head_id) {
-        Ok(()) => Err(anyhow!(state_error.to_string())),
+        Ok(()) => {
+            restore_run_stash(run_state);
+            clear_run_state(repo)?;
+            Err(anyhow!(state_error.to_string()))
+        }
         Err(restore_err) => {
             let combined = format!(
                 "{} Failed to restore original checkout: {}",

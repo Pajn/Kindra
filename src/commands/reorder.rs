@@ -1,4 +1,4 @@
-use crate::commands::{find_upstream, resolve_rebase_autostash};
+use crate::commands::find_upstream;
 use crate::rebase_utils::{
     Operation, RebaseState, passively_reconcile_rebase_state, run_rebase_loop, save_state,
 };
@@ -84,16 +84,8 @@ pub fn reorder(args: &ReorderArgs) -> Result<()> {
         &edited_parent_map,
     )?;
 
-    let autostash = resolve_rebase_autostash(
-        &repo,
-        if args.autostash {
-            Some(true)
-        } else if args.no_autostash {
-            Some(false)
-        } else {
-            None
-        },
-    )?;
+    let autostash =
+        crate::commands::resolve_and_check_autostash(&repo, args.autostash, args.no_autostash)?;
 
     crate::rebase_utils::check_worktrees(&plan.remaining_branches, args.force)?;
 

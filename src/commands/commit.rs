@@ -150,6 +150,15 @@ pub fn commit(args: &[String]) -> Result<()> {
 
     let pre_commit_state_required = switching_branches || will_rebase;
     if pre_commit_state_required || needs_autosquash {
+        // Deliberate exception to the uniform clean-or-autostash contract:
+        // whenever we commit onto a *different* branch than the one checked out —
+        // either `--on <branch>` or an interactive pick of another branch
+        // (`target_branch = sel.branch_name`), both of which set
+        // `switching_branches` — we keep the *staged* changes (they are what
+        // we're committing there) while setting aside the *unstaged* ones.
+        // `git stash --keep-index --include-untracked` does exactly that, so this
+        // is not the plain autostash the other commands use. The autostash flag
+        // still governs the dependent-rebase phase below.
         let stash_ref = if switching_branches {
             stash_non_staged_changes()?
         } else {

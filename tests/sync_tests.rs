@@ -2080,7 +2080,7 @@ fn sync_does_not_delete_local_main_when_syncing_from_stack_branch() {
 }
 
 #[test]
-fn sync_preserves_state_on_prestart_rebase_failure_after_tip_checkout() {
+fn sync_refuses_dirty_working_tree_with_no_autostash() {
     let dir = tempdir().unwrap();
     let repo = repo_init(dir.path());
 
@@ -2121,41 +2121,26 @@ fn sync_preserves_state_on_prestart_rebase_failure_after_tip_checkout() {
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
     fs::write(dir.path().join("shared.txt"), "dirty").unwrap();
 
+    // With --no-autostash and a dirty tree, sync now refuses up front — before
+    // checking out the stack tip or writing any operation state — instead of
+    // moving HEAD and then failing inside git rebase.
     let mut cmd = kin_cmd();
     cmd.arg("sync")
         .arg("--no-autostash")
         .current_dir(dir.path())
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "git rebase failed before sync could enter an in-progress state",
-        ));
+        .stderr(predicate::str::contains("uncommitted changes"));
 
     let repo = Repository::open(dir.path()).unwrap();
     assert_eq!(repo.state(), git2::RepositoryState::Clean);
-    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-b"));
-    assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
-    assert!(!dir.path().join(".git/rebase-merge").exists());
-    assert!(!dir.path().join(".git/rebase-apply").exists());
-
-    let mut continue_cmd = kin_cmd();
-    continue_cmd
-        .arg("continue")
-        .current_dir(dir.path())
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Sync did not complete"));
-
-    let mut abort_cmd = kin_cmd();
-    abort_cmd
-        .arg("abort")
-        .current_dir(dir.path())
-        .assert()
-        .success();
-
-    let repo = Repository::open(dir.path()).unwrap();
-    assert_eq!(repo.state(), git2::RepositoryState::Clean);
+    // HEAD is untouched (still on the branch we started from) and the dirty
+    // change is preserved, so there is nothing to continue or abort.
     assert_eq!(repo.head().unwrap().shorthand(), Some("feature-a"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
+        "dirty"
+    );
     assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());

@@ -1,10 +1,23 @@
 use crate::commands::{CommitInfo, find_upstream};
 use crate::stack::{collect_path_branches, get_stack_tips};
 use anyhow::{Context, Result, anyhow};
+use clap::Args;
 use git2::{BranchType, ErrorCode, Oid, Repository};
 use std::collections::{HashMap, HashSet};
 
-pub fn split() -> Result<()> {
+#[derive(Args, Default)]
+pub struct SplitArgs {
+    /// Stash uncommitted changes for the duration of the split and restore them
+    /// afterward (defaults to the rebase.autostash config)
+    #[arg(long, overrides_with = "no_autostash")]
+    pub autostash: bool,
+
+    /// Refuse to split with a dirty working tree even if autostash is configured
+    #[arg(long = "no-autostash", overrides_with = "autostash")]
+    pub no_autostash: bool,
+}
+
+pub fn split(args: &SplitArgs) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
 
@@ -16,6 +29,12 @@ pub fn split() -> Result<()> {
         ));
     }
     crate::commands::sync::ensure_no_native_git_operation(&repo)?;
+
+    // Enforce the uniform clean-or-autostash contract up front (before any
+    // oplog entry or ref mutation); the actual stash is taken later, right
+    // before the mutations in `apply_split`.
+    let autostash =
+        crate::commands::resolve_and_check_autostash(&repo, args.autostash, args.no_autostash)?;
 
     // Snapshot for undo. The guard settles it on every exit — the "no commits"
     // no-op, an editor/parse failure, a successful apply, or a rolled-back
@@ -128,7 +147,14 @@ pub fn split() -> Result<()> {
     ));
     let edited_buffer = draft.edit_or_resume(&buffer)?;
 
-    match split_from_buffer(&repo, &edited_buffer, &commits, &path_branches, commit_ids) {
+    match split_from_buffer(
+        &repo,
+        &edited_buffer,
+        &commits,
+        &path_branches,
+        commit_ids,
+        autostash,
+    ) {
         Ok(()) => {
             draft.discard();
             Ok(())
@@ -151,6 +177,7 @@ fn split_from_buffer(
     commits: &[CommitInfo],
     path_branches: &[crate::stack::StackBranch],
     commit_ids: HashSet<String>,
+    autostash: bool,
 ) -> Result<()> {
     // Parse and Validate
     let mut new_commits_short = Vec::new();
@@ -249,6 +276,7 @@ fn split_from_buffer(
         new_branch_map_full,
         path_branches.iter().map(|b| b.name.clone()).collect(),
         commit_ids,
+        autostash,
     )?;
 
     Ok(())
@@ -260,6 +288,7 @@ fn apply_split(
     new_branch_map: Vec<(String, String)>,
     initial_branches: Vec<String>,
     allowed_ids: HashSet<String>,
+    autostash: bool,
 ) -> Result<()> {
     let initial_names: HashSet<String> = initial_branches.into_iter().collect();
 
@@ -332,8 +361,14 @@ fn apply_split(
         .map(|(name, _, _)| name.clone())
         .collect();
     touched.extend(delete_names.iter().cloned());
+    // Snapshot the refs and HEAD first (both read-only). Only then set aside
+    // uncommitted changes, so a failure while snapshotting can't strand the
+    // autostash — `take_autostash` is the last fallible step before the mutations
+    // that `restore_split_autostash` pairs with. The stash is restored below onto
+    // the final HEAD (on success) or the rolled-back HEAD (on failure).
     let snapshot = snapshot_branches(repo, &touched)?;
     let head_snapshot = HeadSnapshot::capture(repo)?;
+    let stash_ref = crate::rebase_utils::take_autostash(repo, autostash)?;
 
     // 3. Perform the ref mutations, rolling back on any error.
     let result = apply_split_mutations(
@@ -355,13 +390,38 @@ fn apply_split(
         if let Err(rollback_err) = head_snapshot.restore(repo) {
             eprintln!("Warning: rollback of HEAD was incomplete: {rollback_err:#}");
         }
+        restore_split_autostash(stash_ref);
         // The undo guard in `split` finalizes on return: if rollback fully
         // restored the pre-split refs it records nothing; if it was incomplete,
         // the residual changes become an undoable entry.
         return Err(err.context("kin split was aborted and rolled back"));
     }
 
+    restore_split_autostash(stash_ref);
     Ok(())
+}
+
+/// Pop the autostash taken by [`apply_split`] back onto the current HEAD. On
+/// conflict it is left on the stash stack (with a warning) rather than lost.
+fn restore_split_autostash(stash_ref: Option<String>) {
+    let Some(stash_ref) = stash_ref else {
+        return;
+    };
+    if crate::rebase_utils::apply_stash(&stash_ref).is_err() {
+        // `split` is not resumable, so the generic apply_stash guidance ("run kin
+        // continue / kin abort") doesn't apply here. Point the user straight at
+        // the stash instead.
+        eprintln!(
+            "Warning: could not reapply your autostashed working-tree changes. They are \
+             still saved on the stash stack, labeled `{stash_ref}`. Recover them manually: \
+             locate it with `git stash list`, then `git stash apply <ref>` (and \
+             `git stash drop <ref>` once applied)."
+        );
+        return;
+    }
+    if let Err(err) = crate::rebase_utils::drop_stash(&stash_ref) {
+        eprintln!("Warning: {err}");
+    }
 }
 
 /// Apply the resolved branch creations/moves and deletions.

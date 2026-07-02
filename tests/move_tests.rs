@@ -2179,3 +2179,62 @@ fn test_move_blocked_by_stale_run_state() {
 
     assert!(dir.path().join(".git/kindra_run_state.json").exists());
 }
+
+#[test]
+fn move_refuses_dirty_working_tree_with_no_autostash() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "shared.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feature a",
+        &[&base],
+    );
+    let a = repo.find_commit(a_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "feature b",
+        &[&a],
+    );
+
+    run_ok("git", &["checkout", "-f", "feature-b"], dir.path());
+    fs::write(dir.path().join("shared.txt"), "dirty").unwrap();
+
+    // With --no-autostash and a dirty tree, `move` refuses up front — before
+    // checking out anything or writing operation state — the same guard `sync`
+    // enforces, rather than moving HEAD and then failing inside git rebase.
+    kin_cmd()
+        .args(["move", "--onto", "main", "--no-autostash"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("uncommitted changes"));
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(repo.state(), git2::RepositoryState::Clean);
+    // HEAD is untouched and the dirty change is preserved, so there is nothing to
+    // continue or abort.
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-b"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
+        "dirty"
+    );
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!dir.path().join(".git/rebase-merge").exists());
+    assert!(!dir.path().join(".git/rebase-apply").exists());
+}

@@ -927,3 +927,221 @@ perl -i -pe 's/^[0-9a-f]{7}/deadbee/' "$file"
         "split draft should be preserved on failure for recovery"
     );
 }
+
+#[test]
+fn test_split_refuses_dirty_working_tree_by_default() {
+    let (dir, repo) = setup_repo();
+    {
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature-x", &head, false).unwrap();
+    }
+    repo.set_head("refs/heads/feature-x").unwrap();
+
+    // Pin the config so the default resolves to "off" regardless of the host's
+    // global rebase.autostash setting.
+    repo.config()
+        .unwrap()
+        .set_bool("rebase.autostash", false)
+        .unwrap();
+
+    // Dirty a tracked file.
+    fs::write(dir.path().join("file.txt"), "dirty").unwrap();
+
+    // An editor that would move the branch — it must never be invoked because
+    // the dirty-tree check fires first.
+    let editor_script = dir.path().join("editor.sh");
+    fs::write(&editor_script, "#!/bin/sh\necho editor-ran >> editor.log\n").unwrap();
+    make_executable(&editor_script);
+
+    let mut cmd = kin_cmd();
+    cmd.arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor_script)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("uncommitted changes"));
+
+    // Editor never opened, dirty change preserved, no operation state left behind.
+    assert!(!dir.path().join("editor.log").exists());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "dirty"
+    );
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+}
+
+#[test]
+fn split_autostash_restored_when_apply_fails() {
+    // If apply_split_mutations fails after the autostash is taken, apply_split's
+    // rollback path must reapply the stashed working-tree changes onto the
+    // rolled-back state (and not strand the stash) rather than leaving the user's
+    // uncommitted work in limbo.
+    let (dir, repo) = setup_repo();
+
+    // A branch `foo` makes the new `foo/bar` branch below hit a git
+    // directory/file ref conflict, failing apply_split_mutations *after* the
+    // autostash has already been created.
+    let main_commit = repo
+        .revparse_single("main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    repo.branch("foo", &main_commit, false).unwrap();
+
+    let pre_head = repo.head().unwrap().peel_to_commit().unwrap().id();
+
+    // Dirty a tracked file; `--autostash` routes it through take_autostash.
+    fs::write(dir.path().join("file.txt"), "dirty").unwrap();
+
+    // Editor assigns a new branch `foo/bar` to commit 1 — invalid to create while
+    // `foo` exists, so the ref mutation fails mid-apply.
+    let editor_script = dir.path().join("editor.sh");
+    fs::write(
+        &editor_script,
+        "#!/bin/sh\nfile=$1\nperl -i -pe 's{(commit 1)}{$1\\nbranch foo/bar}' \"$file\"\n",
+    )
+    .unwrap();
+    make_executable(&editor_script);
+
+    let output = kin_cmd()
+        .arg("split")
+        .arg("--autostash")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor_script)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "split should fail on the ref conflict"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("rolled back"),
+        "failure should report the rollback. Got:\n{combined}"
+    );
+
+    let repo = Repository::open(dir.path()).unwrap();
+    // Nothing was left half-applied: the conflicting branch was not created and
+    // HEAD is back where it started.
+    assert!(
+        repo.find_branch("foo/bar", git2::BranchType::Local)
+            .is_err(),
+        "the conflicting branch must not survive the rollback"
+    );
+    assert_eq!(
+        repo.head().unwrap().peel_to_commit().unwrap().id(),
+        pre_head,
+        "HEAD must be rolled back to its pre-split commit"
+    );
+    // The autostashed changes are restored onto the rolled-back tree, and no
+    // stash is left dangling.
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "dirty",
+        "the autostashed working-tree change must be reapplied after rollback"
+    );
+    let stash_list = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(
+        stash_list.trim().is_empty(),
+        "the autostash must be reapplied and dropped, not left behind. Got:\n{stash_list}"
+    );
+}
+
+#[test]
+fn test_split_no_autostash_flag_overrides_configured_autostash() {
+    let (dir, repo) = setup_repo();
+    {
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature-x", &head, false).unwrap();
+    }
+    repo.set_head("refs/heads/feature-x").unwrap();
+
+    // Config would enable autostash, but the explicit --no-autostash flag must
+    // win, so a dirty tree is refused rather than stashed.
+    repo.config()
+        .unwrap()
+        .set_bool("rebase.autostash", true)
+        .unwrap();
+
+    fs::write(dir.path().join("file.txt"), "dirty").unwrap();
+
+    let editor_script = dir.path().join("editor.sh");
+    fs::write(&editor_script, "#!/bin/sh\necho editor-ran >> editor.log\n").unwrap();
+    make_executable(&editor_script);
+
+    let mut cmd = kin_cmd();
+    cmd.arg("split")
+        .arg("--no-autostash")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor_script)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("uncommitted changes"));
+
+    // The dirty change is preserved and the editor never opened.
+    assert!(!dir.path().join("editor.log").exists());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "dirty"
+    );
+}
+
+#[test]
+fn test_split_autostash_moves_branch_and_restores_changes() {
+    let (dir, repo) = setup_repo();
+    {
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature-x", &head, false).unwrap();
+    }
+    repo.set_head("refs/heads/feature-x").unwrap();
+
+    // Dirty a tracked file before splitting.
+    fs::write(dir.path().join("file.txt"), "dirty").unwrap();
+
+    let editor_script = dir.path().join("editor.sh");
+    fs::write(
+        &editor_script,
+        r#"#!/bin/sh
+file=$1
+perl -i -pe 's/.*branch feature-x.*\n?//g' "$file"
+perl -i -pe 's/(commit 2)/$1\nbranch feature-x/' "$file"
+"#,
+    )
+    .unwrap();
+    make_executable(&editor_script);
+
+    let mut cmd = kin_cmd();
+    cmd.arg("split")
+        .arg("--autostash")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor_script)
+        .assert()
+        .success();
+
+    // Branch moved as instructed...
+    let branch = repo
+        .find_branch("feature-x", git2::BranchType::Local)
+        .unwrap();
+    let commit = repo.find_commit(branch.get().target().unwrap()).unwrap();
+    assert_eq!(commit.summary().unwrap(), "commit 2");
+
+    // ...and the uncommitted change is restored afterward.
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "dirty"
+    );
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+}
