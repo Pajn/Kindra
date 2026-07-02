@@ -833,3 +833,97 @@ perl -i -pe 's/^([0-9a-f]{7} c2)$/$1\nbranch outside/' "$file"
         "'current' should have been moved down to c1"
     );
 }
+
+/// Locate the split recovery draft (named `split-*.md`) if present.
+fn split_draft_file(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let drafts = dir.join(".git").join("kindra-drafts");
+    for entry in fs::read_dir(&drafts).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("split-") && name.ends_with(".md") {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+fn make_executable(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).unwrap();
+    }
+}
+
+#[test]
+fn split_success_discards_draft() {
+    let (dir, repo) = setup_repo();
+
+    let editor_script = dir.path().join("editor.sh");
+    fs::write(
+        &editor_script,
+        r#"#!/bin/sh
+file=$1
+perl -i -pe 's/(commit 1)/$1\nbranch new-feat/' "$file"
+"#,
+    )
+    .unwrap();
+    make_executable(&editor_script);
+
+    kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("EDITOR", &editor_script)
+        .assert()
+        .success();
+
+    assert!(
+        repo.find_branch("new-feat", git2::BranchType::Local)
+            .is_ok(),
+        "the split should have created the branch"
+    );
+    assert!(
+        split_draft_file(dir.path()).is_none(),
+        "split draft should be discarded after a successful split"
+    );
+}
+
+#[test]
+fn split_failure_preserves_draft_and_prints_guidance() {
+    let (dir, _repo) = setup_repo();
+
+    // Mutating a commit SHA makes split_from_buffer's validation fail.
+    let editor_script = dir.path().join("editor.sh");
+    fs::write(
+        &editor_script,
+        r#"#!/bin/sh
+file=$1
+perl -i -pe 's/^[0-9a-f]{7}/deadbee/' "$file"
+"#,
+    )
+    .unwrap();
+    make_executable(&editor_script);
+
+    let output = kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("EDITOR", &editor_script)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "split should fail on a modified commit"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("re-run `kin split`"),
+        "failure should print rerun guidance, got:\n{stderr}"
+    );
+    assert!(
+        split_draft_file(dir.path()).is_some(),
+        "split draft should be preserved on failure for recovery"
+    );
+}

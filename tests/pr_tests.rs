@@ -5406,3 +5406,436 @@ exit 1
         bodies
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PR body draft persistence & recovery (kin pr)
+//
+// These drive the real binary end-to-end with a mock `gh`, a scripted `$EDITOR`,
+// and real draft files on disk. The KIN_TEST_PR_BODY_ACTION seam makes the
+// editor/draft path run headlessly (there is no TTY under `cargo test`).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Push main+feature to a fresh bare remote and check out feature.
+fn setup_pushed_feature() -> tempfile::TempDir {
+    let (dir, _repo) = setup_simple_stack();
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+    dir
+}
+
+/// Write an executable script and return its path.
+fn write_script(path: &std::path::Path, body: &str) -> std::path::PathBuf {
+    std::fs::write(path, body).unwrap();
+    run_ok(
+        "chmod",
+        &["+x", path.to_str().unwrap()],
+        path.parent().unwrap(),
+    );
+    path.to_path_buf()
+}
+
+/// The draft file `kin pr` uses for the `feature` branch's body. Derived from
+/// the production path builder so it stays correct as the naming scheme evolves.
+fn feature_draft_path(dir: &std::path::Path) -> std::path::PathBuf {
+    kindra::editor::draft_path(&dir.join(".git"), "pr-body-feature")
+}
+
+/// The draft file `kin pr edit` uses for a given PR number.
+fn edit_draft_path(dir: &std::path::Path, pr_number: u64) -> std::path::PathBuf {
+    kindra::editor::draft_path(&dir.join(".git"), &format!("pr-edit-{pr_number}"))
+}
+
+/// A `pr create` handler that fails, for a mock `gh`.
+const GH_CREATE_FAIL: &str = r#"    echo "simulated create failure" >&2; exit 1"#;
+
+/// A `pr create` handler that captures `--body` to `$MOCK_GH_BODY_FILE` and
+/// succeeds, for a mock `gh`.
+const GH_CREATE_CAPTURE: &str = r#"    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--body" ]]; then printf "%s" "$2" > "$MOCK_GH_BODY_FILE"; break; fi
+        shift
+    done
+    echo "https://github.com/test/repo/pull/1"; exit 0"#;
+
+/// Build a mock `gh` script: shared `auth status` / `pr list` / `pr view`
+/// scaffolding plus the caller's `pr create` handler body appended. Keeps each
+/// test focused on the `pr create` behavior it exercises.
+fn gh_mock_with_create(create_handler: &str) -> String {
+    format!(
+        r#"#!/bin/bash
+if [[ "$1" == "auth" && "$2" == "status" ]]; then exit 0; fi
+if [[ "$1" == "pr" && "$2" == "list" ]]; then echo '[]'; exit 0; fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then echo "no pull requests found" >&2; exit 1; fi
+if [[ "$1" == "pr" && "$2" == "create" ]]; then
+{create_handler}
+fi
+echo "mock gh: unexpected: $@" >&2; exit 1
+"#
+    )
+}
+
+#[test]
+fn pr_create_failure_preserves_body_draft() {
+    let dir = setup_pushed_feature();
+
+    // gh that fails `pr create` (simulating e.g. a rejected base or network flake).
+    write_script(&dir.path().join("gh"), &gh_mock_with_create(GH_CREATE_FAIL));
+
+    // $EDITOR writes a body the user "typed".
+    let editor = write_script(
+        &dir.path().join("fake-editor.sh"),
+        "#!/bin/sh\nprintf 'MY PRECIOUS BODY\\n' > \"$1\"\n",
+    );
+
+    let output = kin_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("EDITOR", &editor)
+        .env("KIN_TEST_PR_BODY_ACTION", "editor")
+        .output()
+        .unwrap();
+
+    // The command surfaces the failure (non-zero, no panic).
+    let code = output.status.code().unwrap_or(-1);
+    assert!(
+        code != 0 && code != 101,
+        "kin pr should fail cleanly on create error, got code {code}. stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The body the user wrote must survive on disk for recovery.
+    let draft = feature_draft_path(dir.path());
+    assert!(
+        draft.exists(),
+        "draft should be preserved after a failed create"
+    );
+    let saved = std::fs::read_to_string(&draft).unwrap();
+    assert!(
+        saved.contains("MY PRECIOUS BODY"),
+        "preserved draft should hold the edited body, got:\n{saved}"
+    );
+
+    // And the user is told where it is.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("saved to") && stderr.contains("kindra-drafts"),
+        "abort should print the recovery path, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn pr_create_success_discards_body_draft() {
+    let dir = setup_pushed_feature();
+
+    let body_file = dir.path().join("captured_body.txt");
+    write_script(
+        &dir.path().join("gh"),
+        &gh_mock_with_create(GH_CREATE_CAPTURE),
+    );
+    let editor = write_script(
+        &dir.path().join("fake-editor.sh"),
+        "#!/bin/sh\nprintf 'BODY VIA EDITOR\\n' > \"$1\"\n",
+    );
+
+    let output = kin_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("EDITOR", &editor)
+        .env("KIN_TEST_PR_BODY_ACTION", "editor")
+        .env("MOCK_GH_BODY_FILE", &body_file)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr should succeed. stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // gh received the edited body...
+    let sent = std::fs::read_to_string(&body_file).unwrap();
+    assert!(
+        sent.contains("BODY VIA EDITOR"),
+        "gh pr create should get the edited body, got:\n{sent}"
+    );
+    // ...and the draft is cleaned up on success (nothing left to recover).
+    assert!(
+        !feature_draft_path(dir.path()).exists(),
+        "draft should be discarded after a successful create"
+    );
+}
+
+#[test]
+fn pr_resumes_saved_draft_on_next_run() {
+    let dir = setup_pushed_feature();
+    let path_env = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+
+    // ── Run 1: create fails, leaving a saved draft. ──
+    write_script(&dir.path().join("gh"), &gh_mock_with_create(GH_CREATE_FAIL));
+    let writer = write_script(
+        &dir.path().join("editor-write.sh"),
+        "#!/bin/sh\nprintf 'RESUMED DRAFT BODY\\n' > \"$1\"\n",
+    );
+    let run1 = kin_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env("PATH", &path_env)
+        .env("EDITOR", &writer)
+        .env("KIN_TEST_PR_BODY_ACTION", "editor")
+        .output()
+        .unwrap();
+    assert!(!run1.status.success(), "run 1 should fail");
+    assert!(
+        feature_draft_path(dir.path()).exists(),
+        "run 1 should leave a draft"
+    );
+
+    // ── Run 2: create succeeds. A no-op editor leaves the saved draft as-is,
+    // proving the resumed body came from disk, not a fresh template. ──
+    let body_file = dir.path().join("captured_body.txt");
+    write_script(
+        &dir.path().join("gh"),
+        &gh_mock_with_create(GH_CREATE_CAPTURE),
+    );
+    let noop = write_script(&dir.path().join("editor-noop.sh"), "#!/bin/sh\nexit 0\n");
+    let run2 = kin_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env("PATH", &path_env)
+        .env("EDITOR", &noop)
+        .env("KIN_TEST_PR_BODY_ACTION", "editor")
+        // The recovery prompt offers [Resume, Discard]; pick Resume (index 0).
+        .env("KIN_TEST_SELECTIONS", "0")
+        .env("MOCK_GH_BODY_FILE", &body_file)
+        .output()
+        .unwrap();
+
+    assert!(
+        run2.status.success(),
+        "run 2 should succeed. stderr:\n{}",
+        String::from_utf8_lossy(&run2.stderr)
+    );
+    let sent = std::fs::read_to_string(&body_file).unwrap();
+    assert!(
+        sent.contains("RESUMED DRAFT BODY"),
+        "resumed PR should carry the body saved in run 1, got:\n{sent}"
+    );
+    assert!(
+        !feature_draft_path(dir.path()).exists(),
+        "draft should be cleaned up after the successful resume"
+    );
+}
+
+#[test]
+fn pr_noninteractive_rerun_uses_saved_draft_not_template() {
+    // Regression: a non-interactive `kin pr` must not silently drop (and then
+    // discard on success) a body saved by an earlier failed/interrupted run.
+    let dir = setup_pushed_feature();
+
+    // Seed a draft as if a prior attempt had saved one.
+    let draft = feature_draft_path(dir.path());
+    std::fs::create_dir_all(draft.parent().unwrap()).unwrap();
+    std::fs::write(&draft, "SAVED_NONINTERACTIVE_BODY").unwrap();
+
+    let body_file = dir.path().join("captured_body.txt");
+    write_script(
+        &dir.path().join("gh"),
+        &gh_mock_with_create(GH_CREATE_CAPTURE),
+    );
+
+    // No EDITOR, no KIN_TEST_PR_BODY_ACTION: the pure non-interactive path.
+    let output = kin_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("MOCK_GH_BODY_FILE", &body_file)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr should succeed. stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let sent = std::fs::read_to_string(&body_file).unwrap();
+    assert!(
+        sent.contains("SAVED_NONINTERACTIVE_BODY"),
+        "the saved draft should be used as the body, got:\n{sent}"
+    );
+    assert!(
+        !sent.contains("Commits on"),
+        "the generated template must NOT be used when a draft exists, got:\n{sent}"
+    );
+    assert!(
+        !feature_draft_path(dir.path()).exists(),
+        "draft should be cleaned up after the successful create"
+    );
+}
+
+#[test]
+fn pr_recovery_discard_ignores_saved_draft() {
+    // The "Discard and start fresh" branch of the recovery prompt must drop the
+    // stale draft and use freshly entered content instead.
+    let dir = setup_pushed_feature();
+
+    let draft = feature_draft_path(dir.path());
+    std::fs::create_dir_all(draft.parent().unwrap()).unwrap();
+    std::fs::write(&draft, "OLD_DRAFT_BODY").unwrap();
+
+    let body_file = dir.path().join("captured_body.txt");
+    write_script(
+        &dir.path().join("gh"),
+        &gh_mock_with_create(GH_CREATE_CAPTURE),
+    );
+    let editor = write_script(
+        &dir.path().join("fresh-editor.sh"),
+        "#!/bin/sh\nprintf 'FRESH_BODY\\n' > \"$1\"\n",
+    );
+
+    let output = kin_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("EDITOR", &editor)
+        .env("KIN_TEST_PR_BODY_ACTION", "editor")
+        // Recovery prompt offers [Resume, Discard]; pick Discard (index 1).
+        .env("KIN_TEST_SELECTIONS", "1")
+        .env("MOCK_GH_BODY_FILE", &body_file)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr should succeed. stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let sent = std::fs::read_to_string(&body_file).unwrap();
+    assert!(
+        sent.contains("FRESH_BODY"),
+        "discarding should use the freshly entered body, got:\n{sent}"
+    );
+    assert!(
+        !sent.contains("OLD_DRAFT_BODY"),
+        "the discarded draft must not leak into the PR body, got:\n{sent}"
+    );
+    assert!(
+        !feature_draft_path(dir.path()).exists(),
+        "draft should be gone after a successful run"
+    );
+}
+
+#[test]
+fn pr_edit_rerun_save_directly_recovers_stale_draft() {
+    // Regression: a stale pr-edit draft must be recovered even when the user
+    // goes straight to "Save" without reopening the body editor (otherwise a
+    // successful save would silently discard it).
+    let dir = setup_pushed_feature();
+
+    // Seed a draft as if a prior edit had failed after writing the body.
+    let draft = edit_draft_path(dir.path(), 42);
+    std::fs::create_dir_all(draft.parent().unwrap()).unwrap();
+    std::fs::write(&draft, "RECOVERED_EDIT_BODY").unwrap();
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" && "$2" == "status" ]]; then exit 0; fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then
+    echo '{"number":42,"title":"Current title","body":"Current body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "edit" ]]; then
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--body" ]]; then printf "%s" "$2" > "$MOCK_GH_EDIT_BODY"; fi
+        shift
+    done
+    exit 0
+fi
+echo "mock gh: unexpected: $@" >&2; exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let edit_body = dir.path().join("edit_body.txt");
+    let output = kin_cmd()
+        .args(["pr", "edit"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        // Menu "PR edit options:" -> "Save" (index 0).
+        .env("KIN_TEST_SELECTIONS", "0,0")
+        .env("MOCK_GH_EDIT_BODY", &edit_body)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr edit should succeed. stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let sent = std::fs::read_to_string(&edit_body).unwrap_or_default();
+    assert!(
+        sent.contains("RECOVERED_EDIT_BODY"),
+        "the recovered draft body should be sent to gh pr edit, got:\n{sent}"
+    );
+    assert!(
+        !edit_draft_path(dir.path(), 42).exists(),
+        "the pr-edit draft should be cleaned up after a successful save"
+    );
+}
