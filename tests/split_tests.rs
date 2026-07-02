@@ -649,7 +649,7 @@ fn test_checkout_all_ignores_kin_test_selection_override() {
         .assert()
         .failure()
         .stderr(predicates::str::contains(
-            "Cannot choose between 2 options in a non-interactive session",
+            "Cannot choose between 2 options without a terminal",
         ));
 
     // The singular KIN_TEST_SELECTION var is not honored (only the plural

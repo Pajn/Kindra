@@ -9,8 +9,11 @@ pub struct WorktreeListRow {
     pub path: PathBuf,
 }
 
-pub fn confirm_or_abort(message: &str, assume_yes: bool) -> Result<()> {
-    if assume_yes || crate::commands::prompt_confirm(message)? {
+/// Confirm a destructive worktree action, or abort. `--yes` is honored via the
+/// global interaction mode (see [`crate::commands::prompt_confirm`]), so there is
+/// no separate skip-confirmation parameter.
+pub fn confirm_or_abort(message: &str) -> Result<()> {
+    if crate::commands::prompt_confirm(message, crate::commands::Fallback::Default(false))? {
         return Ok(());
     }
 

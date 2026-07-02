@@ -1,6 +1,7 @@
 mod commands;
 mod editor;
 mod gh;
+mod interaction;
 mod rebase_utils;
 mod repository;
 mod runtime;
@@ -36,6 +37,16 @@ use std::process::Command as ProcessCommand;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Never prompt; fail loudly if a prompt needs a real answer (for agents/CI).
+    /// To force interactive prompts without a TTY, set KIN_INTERACTIVE=1.
+    #[arg(long = "no-interactive", global = true, conflicts_with = "yes")]
+    no_interactive: bool,
+
+    /// Never prompt; auto-answer "yes" to every confirmation. Note this can
+    /// choose the non-default action, including for destructive prompts.
+    #[arg(long, global = true)]
+    yes: bool,
 }
 
 #[derive(Subcommand)]
@@ -57,6 +68,22 @@ enum Commands {
         /// Set labels on all created PRs (can be specified multiple times)
         #[arg(long)]
         label: Vec<String>,
+        /// Title for created PRs (required non-interactively when a branch has
+        /// multiple commits); applies to every new PR in the stack
+        #[arg(long)]
+        title: Option<String>,
+        /// Build PR bodies from the branch commits instead of prompting/template
+        #[arg(long)]
+        body_from_commits: bool,
+        /// Create new PRs as drafts
+        #[arg(long, overrides_with = "no_draft")]
+        draft: bool,
+        /// Create new PRs as ready for review (overrides --draft)
+        #[arg(long = "no-draft", overrides_with = "draft")]
+        no_draft: bool,
+        /// Request a reviewer on created PRs (can be specified multiple times)
+        #[arg(long = "reviewer")]
+        reviewer: Vec<String>,
     },
     /// Interactive branch checkout
     #[command(alias = "co")]
@@ -126,10 +153,33 @@ impl Drop for TerminalRestorer {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
+    std::process::exit(real_main());
+}
+
+/// Distinct exit code for "a prompt needed input that was unavailable in
+/// non-interactive mode", so scripts can tell it apart from a real failure (1).
+const EXIT_INPUT_REQUIRED: i32 = 3;
+
+fn real_main() -> i32 {
     let _restorer = TerminalRestorer;
 
-    // SAFETY: We are at the very beginning of main, before any threads are spawned.
+    match dispatch() {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("Error: {err:#}");
+            if err.downcast_ref::<interaction::InputRequired>().is_some() {
+                EXIT_INPUT_REQUIRED
+            } else {
+                1
+            }
+        }
+    }
+}
+
+fn dispatch() -> Result<()> {
+    // SAFETY: We are at the very beginning of the program, before any threads
+    // are spawned.
     unsafe {
         runtime::configure_runtime_tuning()?;
     }
@@ -140,6 +190,19 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Clap's `trailing_var_arg` on the `commit` subcommand captures global flags
+    // placed after `commit` (e.g. `kin commit --amend --yes`) into its
+    // pass-through args instead of binding them to `Cli`. Recover them here so
+    // the interaction mode still honours them; `parse_commit_args` strips them
+    // from what is forwarded to `git commit`.
+    let (no_interactive, yes) = match &cli.command {
+        Commands::Commit { args } => {
+            crate::commands::commit::recover_interaction_flags(args, cli.no_interactive, cli.yes)
+        }
+        _ => (cli.no_interactive, cli.yes),
+    };
+    interaction::init(interaction::resolve(no_interactive, yes));
+
     match &cli.command {
         Commands::Split => split()?,
         Commands::Push => push()?,
@@ -148,7 +211,32 @@ fn main() -> Result<()> {
             no_push,
             all,
             label,
-        } => pr(subcommand, *no_push, *all, label)?,
+            title,
+            body_from_commits,
+            draft,
+            no_draft,
+            reviewer,
+        } => {
+            let draft = if *draft {
+                Some(true)
+            } else if *no_draft {
+                Some(false)
+            } else {
+                None
+            };
+            pr(
+                subcommand,
+                *no_push,
+                *all,
+                crate::commands::pr::PrCreateOptions {
+                    title: title.clone(),
+                    body_from_commits: *body_from_commits,
+                    draft,
+                    reviewers: reviewer.clone(),
+                    labels: label.clone(),
+                },
+            )?
+        }
         Commands::Checkout { subcommand, all } => checkout(subcommand, *all)?,
         Commands::Move(args) => move_cmd(args)?,
         Commands::Reorder(args) => reorder(args)?,

@@ -10,7 +10,6 @@ use crate::stack::{
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Oid, Repository};
 use std::collections::HashMap;
-use std::io::IsTerminal;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -118,10 +117,13 @@ pub fn commit(args: &[String]) -> Result<()> {
         has_dependents_to_rebase(&target_branch, &upstream_name, &target_sub_stack);
 
     let should_rebase = if !target_in_current_context && on_flag && target_has_dependents {
-        crate::commands::prompt_confirm(&format!(
-            "Branch '{}' has dependent branches in another stack. Rebase that stack as well?",
-            target_branch
-        ))?
+        crate::commands::prompt_confirm(
+            &format!(
+                "Branch '{}' has dependent branches in another stack. Rebase that stack as well?",
+                target_branch
+            ),
+            crate::commands::Fallback::Default(false),
+        )?
     } else {
         true
     };
@@ -327,6 +329,45 @@ struct ParsedCommitArgs {
     git_commit_args: Vec<String>,
 }
 
+/// Global Kindra flags (`--yes` / `--no-interactive`) that clap's
+/// `trailing_var_arg` on the `commit` subcommand swallows into the pass-through
+/// args when they appear after `commit`. [`recover_interaction_flags`] folds
+/// them back into the interaction mode and [`parse_commit_args`] strips them
+/// from what is forwarded to `git commit`; keeping the list here keeps those two
+/// in sync.
+fn is_global_interaction_flag(arg: &str) -> bool {
+    matches!(arg, "--yes" | "--no-interactive")
+}
+
+/// The args a commit invocation forwards to `git`, i.e. those before the first
+/// `--` separator (everything after `--` is a literal git pathspec). Shared so
+/// [`recover_interaction_flags`] and [`parse_commit_args`] agree on where the
+/// global flags stop being meaningful (`kin commit -- --yes` leaves `--yes` as a
+/// pathspec).
+fn args_before_separator(args: &[String]) -> impl Iterator<Item = &String> {
+    args.iter().take_while(|a| a.as_str() != "--")
+}
+
+/// Recover the global `--yes` / `--no-interactive` flags that clap's
+/// `trailing_var_arg` on the `commit` subcommand captures into the pass-through
+/// args when they appear after `commit`. Returns `(no_interactive, yes)` OR'd
+/// with the values clap already bound to `Cli`. Only args before a `--`
+/// separator are considered, so `kin commit -- --yes` leaves `--yes` as a
+/// literal pathspec for `git`. `parse_commit_args` strips these same flags from
+/// what is forwarded to `git commit`.
+pub fn recover_interaction_flags(args: &[String], no_interactive: bool, yes: bool) -> (bool, bool) {
+    let mut no_interactive = no_interactive;
+    let mut yes = yes;
+    for arg in args_before_separator(args) {
+        match arg.as_str() {
+            "--no-interactive" => no_interactive = true,
+            "--yes" => yes = true,
+            _ => {}
+        }
+    }
+    (no_interactive, yes)
+}
+
 fn parse_commit_args(args: &[String]) -> Result<ParsedCommitArgs> {
     let mut parsed = ParsedCommitArgs::default();
     let mut idx = 0;
@@ -336,6 +377,15 @@ fn parse_commit_args(args: &[String]) -> Result<ParsedCommitArgs> {
         if arg == "--" {
             parsed.git_commit_args.extend(args[idx..].iter().cloned());
             break;
+        }
+
+        // Global Kindra flags swallowed here by clap's `trailing_var_arg`. Drop
+        // them so they are not forwarded to `git commit` (which rejects them);
+        // `main` folds them back into the resolved interaction mode via
+        // `recover_interaction_flags`.
+        if is_global_interaction_flag(arg) {
+            idx += 1;
+            continue;
         }
 
         if arg == "--interactive" {
@@ -453,8 +503,11 @@ fn select_target_branch(
             }
         })
         .collect();
-    let selected_display =
-        crate::commands::prompt_select("Select branch to commit onto:", display)?;
+    let selected_display = crate::commands::prompt_select(
+        "Select branch to commit onto:",
+        display,
+        crate::commands::Fallback::Require("Pass the target with --on <branch>."),
+    )?;
     options
         .iter()
         .find(|b| {
@@ -658,12 +711,19 @@ fn select_commit_interactive(commits: &[StackCommit]) -> Result<StackCommit> {
         return Err(anyhow!("No commits found in the stack."));
     }
 
-    if !std::io::stdin().is_terminal() {
-        if let Ok(idx_str) = std::env::var("KIN_TEST_SELECTION")
-            && let Ok(idx) = idx_str.parse::<usize>()
+    // The amend picker uses its own scripted seam (a single index) rather than
+    // the sequential `prompt_select` counter, so it is resolved here directly.
+    let mode = crate::interaction::current();
+    if !mode.is_interactive() {
+        if let Some(idx) = mode.scripted().and_then(|s| s.single_selection())
             && idx < commits.len()
         {
             return Ok(commits[idx].clone());
+        }
+        if mode.scripted().is_none() {
+            return Err(crate::interaction::input_required(
+                "Cannot pick a commit to amend without a terminal.",
+            ));
         }
         return Ok(commits[0].clone());
     }
@@ -678,7 +738,11 @@ fn select_commit_interactive(commits: &[StackCommit]) -> Result<StackCommit> {
         })
         .collect();
 
-    let selected_display = crate::commands::prompt_select("Select commit to amend:", display)?;
+    let selected_display = crate::commands::prompt_select(
+        "Select commit to amend:",
+        display,
+        crate::commands::Fallback::Require("Cannot pick a commit to amend without a terminal."),
+    )?;
 
     let index = commits
         .iter()
@@ -692,4 +756,81 @@ fn select_commit_interactive(commits: &[StackCommit]) -> Result<StackCommit> {
         .ok_or_else(|| anyhow!("Failed to resolve selected commit."))?;
 
     Ok(commits[index].clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_strips_global_yes_from_git_args() {
+        let parsed = parse_commit_args(&args(&["--amend", "--yes", "--no-edit"])).unwrap();
+        assert_eq!(parsed.git_commit_args, args(&["--amend", "--no-edit"]));
+    }
+
+    #[test]
+    fn parse_strips_global_no_interactive_from_git_args() {
+        let parsed = parse_commit_args(&args(&["--no-interactive", "-m", "msg"])).unwrap();
+        assert_eq!(parsed.git_commit_args, args(&["-m", "msg"]));
+    }
+
+    #[test]
+    fn parse_keeps_global_flags_after_double_dash_as_pathspecs() {
+        // Everything after `--` is a literal git pathspec and must be forwarded
+        // verbatim, including a file that happens to be named `--yes`.
+        let parsed =
+            parse_commit_args(&args(&["-m", "msg", "--", "--yes", "--no-interactive"])).unwrap();
+        assert_eq!(
+            parsed.git_commit_args,
+            args(&["-m", "msg", "--", "--yes", "--no-interactive"])
+        );
+    }
+
+    #[test]
+    fn recover_flags_defaults_to_cli_values() {
+        assert_eq!(
+            recover_interaction_flags(&args(&["--amend"]), false, false),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn recover_flags_picks_up_yes_after_subcommand() {
+        assert_eq!(
+            recover_interaction_flags(&args(&["--amend", "--yes"]), false, false),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn recover_flags_picks_up_no_interactive_after_subcommand() {
+        assert_eq!(
+            recover_interaction_flags(&args(&["--no-interactive", "--amend"]), false, false),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn recover_flags_ors_with_cli_values() {
+        // A flag already bound to `Cli` (before the subcommand) stays set even
+        // when absent from the pass-through args.
+        assert_eq!(
+            recover_interaction_flags(&args(&["--amend"]), false, true),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn recover_flags_ignores_tokens_after_double_dash() {
+        // `kin commit -- --yes` targets a pathspec named `--yes`; it must not be
+        // treated as the interaction flag.
+        assert_eq!(
+            recover_interaction_flags(&args(&["-m", "msg", "--", "--yes"]), false, false),
+            (false, false)
+        );
+    }
 }

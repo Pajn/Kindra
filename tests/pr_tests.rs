@@ -462,6 +462,97 @@ exit 1
 }
 
 #[test]
+fn test_pr_draft_reviewer_body_from_commits_flags() {
+    let (dir, _repo) = setup_simple_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    let gh_pr_args = dir.path().join("gh_pr_args.txt");
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        format!(
+            r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then exit 0; fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then echo '[]'; exit 0; fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo "no pull requests found for branch" >&2; exit 1
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
+    printf "%s\n" "$@" > "{}"
+    echo "https://github.com/test/repo/pull/1"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+            gh_pr_args.display()
+        ),
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = kin_cmd()
+        .args([
+            "pr",
+            "--no-interactive",
+            "--draft",
+            "--reviewer",
+            "alice",
+            "--body-from-commits",
+        ])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "kin pr with flags failed: {:?}",
+        output
+    );
+
+    let pr_args = std::fs::read_to_string(&gh_pr_args).unwrap();
+    // --draft and --reviewer must reach gh pr create...
+    assert!(
+        pr_args.contains("--draft"),
+        "expected --draft. Got:\n{}",
+        pr_args
+    );
+    assert!(
+        pr_args.contains("--reviewer") && pr_args.contains("alice"),
+        "expected --reviewer alice. Got:\n{}",
+        pr_args
+    );
+    // ...and --body-from-commits builds the body from the branch's commit.
+    assert!(
+        pr_args.contains("add feature"),
+        "body should be derived from commits. Got:\n{}",
+        pr_args
+    );
+}
+
+#[test]
 fn test_pr_pushes_by_default() {
     let (dir, _repo) = setup_simple_stack();
 
@@ -1586,38 +1677,56 @@ exit 1
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
 
+    let path_env = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+
+    // Non-interactive with multiple commits and no --title: rather than creating
+    // a PR with an empty title (which GitHub rejects, silently skipping the
+    // branch), the command must fail loudly with the input-required exit code.
     let output = kin_cmd()
         .arg("pr")
+        .arg("--no-interactive")
         .current_dir(dir.path())
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                dir.path().display(),
-                std::env::var("PATH").unwrap()
-            ),
-        )
+        .env("PATH", &path_env)
         .output()
         .unwrap();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let combined = format!("{}", stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Multi-commit branch should NOT have prefilled title (title: should be empty/prompt)
-    // Instead it should show commit list
+    // The commit list is still shown to help the user pick a title.
     assert!(
-        combined.contains("commit one") && combined.contains("commit two"),
+        stdout.contains("commit one") && stdout.contains("commit two"),
         "Multi-commit branch should show commit list. Got:\n{}",
-        combined
+        stdout
     );
-    // The title prompt should NOT have "commit one" as initial value
-    // (it should be empty since there are multiple commits)
-    let title_line = combined.lines().find(|l| l.contains("PR title"));
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "Missing title should use the input-required exit code. stdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr
+    );
     assert!(
-        title_line.is_some(),
-        "Should have PR title prompt. Got:\n{}",
-        combined
+        stderr.contains("title required") && stderr.contains("feature"),
+        "Error should name the branch needing a title. Got:\n{}",
+        stderr
     );
+
+    // Supplying --title lets the same command create the PR non-interactively.
+    kin_cmd()
+        .arg("pr")
+        .arg("--no-interactive")
+        .arg("--title")
+        .arg("My multi-commit PR")
+        .current_dir(dir.path())
+        .env("PATH", &path_env)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("PR created"));
 }
 
 #[test]

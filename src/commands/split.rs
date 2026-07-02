@@ -46,6 +46,9 @@ pub fn split() -> Result<()> {
             let selected = crate::commands::prompt_select(
                 "Multiple stack tips found. Which path are you splitting?",
                 tips,
+                crate::commands::Fallback::Require(
+                    "Checkout the tip branch you want to split and rerun.",
+                ),
             )?;
             let id = repo.revparse_single(&selected)?.id();
             (selected, id)
@@ -289,7 +292,10 @@ fn apply_split(
                         "Branch '{}' already exists and is NOT part of the stack. Do you want to overwrite it?",
                         name
                     );
-                    if !crate::commands::prompt_confirm(&confirm_msg)? {
+                    if !crate::commands::prompt_confirm(
+                        &confirm_msg,
+                        crate::commands::Fallback::Default(false),
+                    )? {
                         println!("Skipping branch '{}'", name);
                         skip_branches.insert(name.clone());
                         continue;

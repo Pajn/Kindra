@@ -186,8 +186,10 @@ pub(crate) fn pr_merge() -> Result<()> {
     );
 
     if assessment.repo_allows_merge {
-        let confirmed =
-            crate::commands::prompt_confirm("Merge anyway despite outstanding reviews/checks?")?;
+        let confirmed = crate::commands::prompt_confirm(
+            "Merge anyway despite outstanding reviews/checks?",
+            crate::commands::Fallback::Default(false),
+        )?;
         if confirmed {
             match merge_pr_and_retarget_children(
                 &repo,
