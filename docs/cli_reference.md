@@ -18,6 +18,7 @@ This document provides a detailed overview of the commands available in Kindra v
   - [pr](#pr)
   - [split](#split)
   - [Status & Control (status, continue, abort)](#status--control)
+  - [Undo & History (undo, redo, reflog)](#undo--history)
   - [Shell Completions](#shell-completions)
 
 ---
@@ -565,6 +566,52 @@ If a `kin commit`, `kin move`, `kin reorder`, `kin sync`, or `kin restack` opera
 - **`kin continue`**: Resumes the operation after you've resolved conflicts. It handles the underlying `git rebase --continue` and then proceeds with the remaining branches in the stack.
 - **`kin abort`**: Cancels the current operation and cleans up the state.
 - If there is no saved Kindra state and Git itself is in the middle of a native rebase, use `git rebase --continue` or `git rebase --abort`.
+
+---
+
+### Undo & History
+
+Kindra records every stack-rewriting operation — `sync`, `reorder`, `move`, `restack`, and `split` — in an operation log, so a bad reorder or an unexpected sync result is a single command away from being reversed rather than a manual `git reflog` archaeology session.
+
+Each recorded operation stores the tip of every affected branch both before and after it ran. Those commits are anchored as ordinary refs under `refs/kindra/undo/`, which keeps them alive against `git gc` even after a branch is deleted or rebased away. The log keeps the most recent operations and is safe to delete at any time — it stores only recovery information, never anything the stacks depend on.
+
+- **`kin undo`**: Reverts the most recent recorded operation, restoring every affected branch to its previous tip and returning `HEAD` to where it was. Run it again to step further back through history.
+- **`kin redo`**: Reapplies the most recently undone operation. Running any new stack-rewriting operation clears the redo history (the standard editor undo-stack behavior).
+- **`kin reflog`** (alias `kin oplog`): Lists recent operations, newest first, marking the current position (`*`) and any undone operations that can be redone (`↑`).
+
+**Safety:**
+
+- `undo`/`redo` refuse to run if a branch has changed since the operation was recorded, or if the working tree has uncommitted changes, so your work is never silently discarded. Pass `--force` to override either check.
+- Aborting an in-progress operation with `kin abort` usually records nothing, because the abort restores the pre-operation refs. The exception is when the repository has diverged from Kindra's saved state so those refs cannot be cleanly restored: `kin abort` then clears the state but leaves the operation's effects in place, recording an undo entry so `kin undo` can still reverse them.
+- A branch deleted by `kin sync` prints its old commit SHA, and `kin undo` can recreate it.
+
+**Usage:**
+
+```bash
+# Rebased the stack with kin sync but didn't like the result:
+kin undo
+
+# Changed your mind:
+kin redo
+
+# See what happened recently:
+kin reflog
+```
+
+**Example:**
+
+```text
+$ kin sync
+$ kin reflog
+Kindra operation log (newest first):
+* 3s ago  sync     feature-a, feature-b rebased
+
+$ kin undo
+Undid sync: feature-a, feature-b rebased
+Run 'kin redo' to reapply it.
+```
+
+**What is not tracked:** `kin commit` and `kin run` are not recorded, because `commit` creates ordinary commits recoverable with `git reset`/`git reflog`, and `run` executes your own commands. Their effects are still visible in Git's native reflog.
 
 ---
 

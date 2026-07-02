@@ -137,6 +137,11 @@ pub fn reorder(args: &ReorderArgs) -> Result<()> {
         cleanup_checkout_fallback: None,
     };
 
+    // Snapshot for undo only now that all no-op/validation checks have passed and
+    // we are about to mutate branches. The guard settles the snapshot on every
+    // exit from here on (including a failing `save_state`), so no path can leave
+    // a stale pending snapshot behind.
+    let _snapshot = crate::oplog::begin(&repo, "reorder")?;
     save_state(&repo, &state)?;
     run_rebase_loop(&repo, state)
 }

@@ -59,6 +59,13 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
     let (rebase_onto_name, fetch_remote) = resolve_sync_onto(&repo, &upstream_name)?;
     fetch_sync_remote(fetch_remote.as_deref())?;
 
+    // Snapshot for undo only after the preflight (upstream discovery, remote
+    // fetch) has succeeded, so a failed preflight never leaves a stale pending
+    // snapshot. The guard settles it on every exit below — the rebase path, the
+    // delete-only path, the up-to-date no-op, and `sync_upstream_branch` — unless
+    // a rebase is left in progress for `kin continue` / `kin abort` to settle.
+    let _snapshot = crate::oplog::begin(&repo, "sync")?;
+
     if current_branch_name.as_deref() == Some(&upstream_name) {
         return sync_upstream_branch(&repo, args, &upstream_name, &rebase_onto_name);
     }
@@ -191,6 +198,9 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
         delete_merged_branches(&repo, &boundary.merged_branches, &local_upstream)?;
     }
 
+    // The undo guard settles the pending snapshot on return: it records the
+    // merged-branch deletions (if any) or drops the snapshot when nothing
+    // changed. The rebase path above defers settling to the resuming process.
     Ok(())
 }
 
@@ -269,6 +279,8 @@ fn sync_upstream_branch(
         delete_merged_branches(repo, &merged_branches, upstream_name)?;
     }
 
+    // The undo guard held by the calling `sync` settles the pending snapshot on
+    // return (the rebase path defers to `finish_sync_after_rebase`).
     Ok(())
 }
 
@@ -305,9 +317,18 @@ fn delete_merged_branches(
     }
 
     for branch_name in branches {
+        // Capture the tip before deletion so it is recoverable from the printed
+        // SHA (and from `kin undo`) even after the branch ref is gone.
+        let old_tip = repo
+            .find_branch(branch_name, BranchType::Local)
+            .ok()
+            .and_then(|b| b.get().target())
+            .map(|oid| oid.to_string());
+
         let status = Command::new("git")
             .arg("branch")
             .arg("-D")
+            .arg("--quiet")
             .arg(branch_name)
             .status()?;
 
@@ -315,6 +336,14 @@ fn delete_merged_branches(
             println!(
                 "Warning: Failed to delete merged branch: {}. It might be checked out in another worktree.",
                 branch_name
+            );
+        } else if let Some(tip) = old_tip {
+            println!(
+                "Deleted merged branch: {} (was {}); run 'kin undo' or 'git branch {} {}' to restore",
+                branch_name,
+                &tip[..tip.len().min(12)],
+                branch_name,
+                tip,
             );
         } else {
             println!("Deleted merged branch: {}", branch_name);
@@ -358,7 +387,13 @@ pub(crate) fn finish_sync_after_rebase(repo: &git2::Repository, state: RebaseSta
         .cleanup_checkout_fallback
         .as_deref()
         .unwrap_or(state.target_branch.as_str());
-    delete_merged_branches(repo, &state.cleanup_merged_branches, checkout_fallback)
+    let delete_result =
+        delete_merged_branches(repo, &state.cleanup_merged_branches, checkout_fallback);
+    // Finalize from the post-rebase branch state even if deletion failed, so the
+    // pending snapshot is never orphaned after `clear_state`. Surface the deletion
+    // error afterwards.
+    crate::oplog::finalize(repo)?;
+    delete_result
 }
 
 fn ensure_sync_rebase_completed(repo: &git2::Repository, state: &RebaseState) -> Result<()> {

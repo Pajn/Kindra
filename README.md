@@ -75,6 +75,7 @@ cargo release 0.3.0 --execute
    - `kin pr review` to render PR review threads as markdown, optionally write them to a file, or copy them via OSC 52
    - `kin pr merge` to merge a stack PR only when reviews/checks are ready, or clearly explain/prompt when GitHub would still allow an override
 9. **Run across stack**: `kin run -c "cargo test"` to run tests on each branch in the stack.
+10. **Undo a mistake**: Didn't like the result of a `sync`, `reorder`, `move`, `restack`, or `split`? Run `kin undo` to restore the previous branch tips (and `kin redo` to reapply, or `kin reflog` to review recent operations).
 
 For a full list of commands and detailed examples, see the [CLI Reference](docs/cli_reference.md).
 

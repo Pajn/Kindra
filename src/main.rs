@@ -2,6 +2,7 @@ mod commands;
 mod editor;
 mod gh;
 mod interaction;
+mod oplog;
 mod rebase_utils;
 mod repository;
 mod runtime;
@@ -116,6 +117,21 @@ enum Commands {
     Abort,
     /// Show the status of an in-progress Kindra operation
     Status,
+    /// Undo the most recent stack-rewriting operation (sync, reorder, move, restack, split)
+    Undo {
+        /// Move branches even if they changed since the operation or the working tree is dirty
+        #[arg(long)]
+        force: bool,
+    },
+    /// Reapply the most recently undone operation
+    Redo {
+        /// Move branches even if they changed since the undo or the working tree is dirty
+        #[arg(long)]
+        force: bool,
+    },
+    /// List recent stack-rewriting operations and the current undo position
+    #[command(alias = "oplog")]
+    Reflog,
     /// Visualize the stack tree
     #[command(alias = "t")]
     Tree(TreeArgs),
@@ -247,6 +263,9 @@ fn dispatch() -> Result<()> {
         Commands::Continue => continue_cmd()?,
         Commands::Abort => abort_cmd()?,
         Commands::Status => status_cmd()?,
+        Commands::Undo { force } => oplog::undo(*force)?,
+        Commands::Redo { force } => oplog::redo(*force)?,
+        Commands::Reflog => oplog::reflog()?,
         Commands::Tree(args) => tree(args)?,
         Commands::Worktree { subcommand } => worktree(subcommand)?,
         Commands::Completions { shell } => match shell {

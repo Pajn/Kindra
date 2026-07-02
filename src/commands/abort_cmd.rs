@@ -13,6 +13,18 @@ pub fn abort_cmd() -> Result<()> {
     let path = state_path(&repo);
     let has_rebase_state = path.exists();
     let has_run_state = crate::commands::run::run_state_exists(&repo);
+    // Settle the pending oplog snapshot on *every* exit from here on, including
+    // the early `?` returns below. Default is `Leave`: only once we have actually
+    // finished handling the saved state do we switch to `Discard` (pre-operation
+    // refs were restored, nothing to undo) or `Finalize` (divergent state cleared
+    // without restoring refs, so the effects stay live and must remain undoable).
+    // Any error before that point leaves an orphaned snapshot untouched, so the
+    // next operation's `begin` can still flush it into an undo entry rather than
+    // this abort silently dropping it.
+    let mut settle = AbortOplogSettle {
+        repo: &repo,
+        action: SettleAction::Leave,
+    };
 
     if has_rebase_state && has_run_state {
         return Err(anyhow!(
@@ -55,6 +67,18 @@ pub fn abort_cmd() -> Result<()> {
         }
 
         std::fs::remove_file(path)?;
+        // State handled successfully: now it is safe to settle the snapshot.
+        settle.action = if kindra_owns_current_state {
+            SettleAction::Discard
+        } else if git_rebase_active {
+            // Divergent state, but a native rebase is still mid-flight, so the
+            // refs aren't the operation's final effects yet. Leave the snapshot
+            // for a later `begin` to flush rather than recording a half-applied
+            // entry now.
+            SettleAction::Leave
+        } else {
+            SettleAction::Finalize
+        };
         if kindra_owns_current_state {
             println!("Operation aborted (state cleared).");
         } else if git_rebase_active {
@@ -88,7 +112,39 @@ pub fn abort_cmd() -> Result<()> {
         println!("No operation in progress.");
     }
 
+    // `settle` drops here (and on every early return above), finalizing or
+    // discarding the pending snapshot.
     Ok(())
+}
+
+/// How `AbortOplogSettle` should settle the pending snapshot on drop.
+enum SettleAction {
+    /// Leave any pending snapshot in place (error path, or nothing to abort), so
+    /// the next operation's `begin` can flush it rather than losing it here.
+    Leave,
+    /// Drop the snapshot: pre-operation refs were restored, so there is nothing
+    /// to undo.
+    Discard,
+    /// Record the snapshot as an undo entry: divergent state was cleared without
+    /// restoring refs, so the operation's effects are still live.
+    Finalize,
+}
+
+/// Settles the pending oplog snapshot when `abort_cmd` returns, on success or via
+/// any early `?`. Best-effort, mirroring `oplog::finalize`/`discard`.
+struct AbortOplogSettle<'repo> {
+    repo: &'repo git2::Repository,
+    action: SettleAction,
+}
+
+impl Drop for AbortOplogSettle<'_> {
+    fn drop(&mut self) {
+        let _ = match self.action {
+            SettleAction::Leave => Ok(()),
+            SettleAction::Discard => crate::oplog::discard(self.repo),
+            SettleAction::Finalize => crate::oplog::finalize(self.repo),
+        };
+    }
 }
 
 fn restore_original_branch_tips(original_tip_map: &HashMap<String, String>) -> Result<()> {

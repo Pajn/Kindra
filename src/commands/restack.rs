@@ -128,6 +128,11 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
         cleanup_checkout_fallback: None,
     };
 
+    // Snapshot for undo only now that the no-op checks ("No floating children",
+    // "No branches selected") have passed and we are about to mutate branches.
+    // The guard settles the snapshot on every exit from here on, so no path can
+    // leave a stale pending snapshot behind.
+    let _snapshot = crate::oplog::begin(&repo, "restack")?;
     crate::rebase_utils::save_state(&repo, &state)?;
     run_rebase_loop(&repo, state)?;
 

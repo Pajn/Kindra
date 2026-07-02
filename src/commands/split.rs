@@ -17,6 +17,11 @@ pub fn split() -> Result<()> {
     }
     crate::commands::sync::ensure_no_native_git_operation(&repo)?;
 
+    // Snapshot for undo. The guard settles it on every exit — the "no commits"
+    // no-op, an editor/parse failure, a successful apply, or a rolled-back
+    // failure — so `split` can never leave a stale pending snapshot behind.
+    let _snapshot = crate::oplog::begin(&repo, "split")?;
+
     let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
         anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
     })?;
@@ -350,6 +355,9 @@ fn apply_split(
         if let Err(rollback_err) = head_snapshot.restore(repo) {
             eprintln!("Warning: rollback of HEAD was incomplete: {rollback_err:#}");
         }
+        // The undo guard in `split` finalizes on return: if rollback fully
+        // restored the pre-split refs it records nothing; if it was incomplete,
+        // the residual changes become an undoable entry.
         return Err(err.context("kin split was aborted and rolled back"));
     }
 
