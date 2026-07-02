@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::process::Command;
 
 /// Verify that the `gh` CLI is installed and authenticated.
@@ -21,14 +21,6 @@ pub fn check_gh() -> Result<()> {
             "`gh` CLI not found. Install it from https://cli.github.com/ and run `gh auth login`."
         )),
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct ExistingPr {
-    pub number: u64,
-    pub base_branch: String,
-    pub is_draft: bool,
-    pub author_login: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,56 +82,132 @@ pub struct PrReviewThread {
     pub comments: Vec<PrReviewComment>,
 }
 
-/// Check if an open PR exists for `branch`. Returns `Some(ExistingPr)` or `None`.
-pub fn find_open_pr(branch: &str) -> Result<Option<ExistingPr>> {
+/// A fully-detailed open PR as returned by a single `gh pr list` call. Carries
+/// enough to serve both existence/base checks and editable-metadata needs, so the
+/// whole `kin pr` flow can share one snapshot instead of querying per branch.
+#[derive(Debug, Clone)]
+pub struct OpenPr {
+    pub number: u64,
+    pub base_branch: String,
+    pub is_draft: bool,
+    pub author_login: Option<String>,
+    pub title: String,
+    pub body: String,
+    pub url: String,
+    pub labels: Vec<String>,
+    pub reviewers: Vec<String>,
+}
+
+impl OpenPr {
+    /// Project the editable subset of this PR's metadata.
+    pub fn to_editable(&self) -> EditablePr {
+        EditablePr {
+            number: self.number,
+            title: self.title.clone(),
+            body: self.body.clone(),
+            url: self.url.clone(),
+            labels: self.labels.clone(),
+            reviewers: self.reviewers.clone(),
+        }
+    }
+}
+
+/// Fetch every open PR in the repository in a single `gh pr list` call, keyed by
+/// head branch name. This replaces N per-branch `gh pr view` subprocesses with one.
+pub fn list_open_prs() -> Result<HashMap<String, OpenPr>> {
     #[derive(Deserialize)]
     struct User {
         login: String,
     }
     #[derive(Deserialize)]
-    struct PrView {
+    struct Label {
+        name: String,
+    }
+    // A requested reviewer can be a user (has `login`) or a team (no `login`).
+    // Keep `login` optional so a team reviewer does not fail the whole parse.
+    #[derive(Deserialize)]
+    struct Reviewer {
+        #[serde(default)]
+        login: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct ReviewRequest {
+        #[serde(rename = "requestedReviewer", default)]
+        requested_reviewer: Option<Reviewer>,
+    }
+    #[derive(Deserialize)]
+    struct PrListItem {
         number: u64,
+        #[serde(rename = "headRefName", default)]
+        head_ref_name: String,
         #[serde(rename = "baseRefName", default)]
         base_ref_name: String,
-        state: String,
         #[serde(rename = "isDraft", default)]
         is_draft: bool,
         #[serde(default)]
         author: Option<User>,
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        body: String,
+        #[serde(default)]
+        url: String,
+        #[serde(default)]
+        labels: Vec<Label>,
+        #[serde(rename = "reviewRequests", default)]
+        review_requests: Vec<ReviewRequest>,
     }
 
     let output = Command::new("gh")
         .args([
             "pr",
-            "view",
-            branch,
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "500",
             "--json",
-            "number,baseRefName,state,isDraft,author",
+            "number,headRefName,baseRefName,isDraft,author,title,body,url,labels,reviewRequests",
         ])
         .output()
-        .context("Failed to run `gh pr view`")?;
+        .context("Failed to run `gh pr list`")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("no pull requests found for branch") {
-            return Ok(None);
+        return Err(anyhow!("`gh pr list` failed: {}", stderr.trim()));
+    }
+
+    let items: Vec<PrListItem> =
+        serde_json::from_slice(&output.stdout).context("Failed to parse `gh pr list` output")?;
+
+    let mut map = HashMap::with_capacity(items.len());
+    for item in items {
+        if item.head_ref_name.is_empty() {
+            continue;
         }
-        return Err(anyhow!("`gh pr view` failed: {}", stderr.trim()));
+        let labels = item.labels.into_iter().map(|l| l.name).collect();
+        let reviewers = item
+            .review_requests
+            .into_iter()
+            .filter_map(|r| r.requested_reviewer.and_then(|reviewer| reviewer.login))
+            .collect();
+        map.insert(
+            item.head_ref_name.clone(),
+            OpenPr {
+                number: item.number,
+                base_branch: item.base_ref_name,
+                is_draft: item.is_draft,
+                author_login: item.author.map(|author| author.login),
+                title: item.title,
+                body: item.body,
+                url: item.url,
+                labels,
+                reviewers,
+            },
+        );
     }
 
-    let pr: PrView =
-        serde_json::from_slice(&output.stdout).context("Failed to parse `gh pr view` output")?;
-
-    if pr.state.to_uppercase() == "OPEN" {
-        Ok(Some(ExistingPr {
-            number: pr.number,
-            base_branch: pr.base_ref_name,
-            is_draft: pr.is_draft,
-            author_login: pr.author.map(|author| author.login),
-        }))
-    } else {
-        Ok(None)
-    }
+    Ok(map)
 }
 
 pub fn current_user_login() -> Result<String> {

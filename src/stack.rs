@@ -1764,6 +1764,22 @@ pub fn enumerate_stack_commits(
     Ok(commits)
 }
 
+/// Discover the stack for `head_id` relative to `upstream_id`, computing the
+/// merge base internally before delegating to [`get_stack_branches_from_merge_base`].
+///
+/// This is the shared entry point for callers that only have HEAD and the
+/// upstream (e.g. `push`, `pr`, `tree`) and would otherwise each repeat the
+/// `repo.merge_base(...)` + `get_stack_branches_from_merge_base(...)` boilerplate.
+pub fn get_stack_branches_for_head(
+    repo: &Repository,
+    head_id: Oid,
+    upstream_id: Oid,
+    upstream_name: &str,
+) -> Result<Vec<StackBranch>> {
+    let merge_base = repo.merge_base(head_id, upstream_id)?;
+    get_stack_branches_from_merge_base(repo, merge_base, head_id, upstream_id, upstream_name)
+}
+
 pub fn get_stack_branches_from_merge_base(
     repo: &Repository,
     merge_base: Oid,
