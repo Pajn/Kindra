@@ -6341,3 +6341,277 @@ if [[ "$1" == "pr" && "$2" == "merge" ]]; then exit 0; fi"#,
         "error must surface that the merge happened and how to finish. Got:\n{combined}"
     );
 }
+
+#[test]
+fn pr_merge_get_pr_status_paginates_review_threads_beyond_one_page() {
+    // Regression: get_pr_status must follow cursors, not stop at the first 100
+    // items. Page 1 and page 2 each carry an unresolved review thread; a working
+    // paginator counts both (2), a broken one only sees page 1 (1).
+    let (dir, _repo) = setup_simple_stack();
+
+    init_origin_and_push(dir.path(), &["main", "feature"]);
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    write_gh_mock(
+        dir.path(),
+        r#"if [[ "$1" == "pr" && "$2" == "view" ]]; then
+    echo '{"number":42,"title":"Feature title","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" && "$2" == "graphql" ]]; then
+    if printf '%s\n' "$@" | grep -q "cursor=thread-cursor-1"; then
+        # Page 2: one more unresolved thread, no further pages.
+        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"isResolved":false}]}}}}}'
+        exit 0
+    fi
+    # Page 1: one unresolved thread, hasNextPage -> forces a follow-up.
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":true,"endCursor":"thread-cursor-1"},"nodes":[{"isResolved":false}]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    exit 0
+fi"#,
+    );
+
+    let output = pr_merge_cmd(dir.path())
+        .arg("--no-interactive")
+        .output()
+        .unwrap();
+
+    // Merge is blocked by the unresolved threads; the summary must reflect BOTH
+    // pages (2), proving the second page was fetched.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Unresolved review comments: 2"),
+        "expected both paginated threads to be counted. Got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn pr_merge_get_pr_status_paginates_review_requests_beyond_one_page() {
+    // reviewRequests must paginate: a requested reviewer landing on page 2 must
+    // still be counted as an outstanding (waiting) reviewer that blocks merge.
+    let (dir, _repo) = setup_simple_stack();
+    init_origin_and_push(dir.path(), &["main", "feature"]);
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    write_gh_mock(
+        dir.path(),
+        r#"if [[ "$1" == "pr" && "$2" == "view" ]]; then
+    echo '{"number":42,"title":"F","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" && "$2" == "graphql" ]]; then
+    if printf '%s\n' "$@" | grep -q "cursor=req-cursor-1"; then
+        echo '{"data":{"repository":{"pullRequest":{"reviewRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"requestedReviewer":{"login":"bob"}}]}}}}}'
+        exit 0
+    fi
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"pageInfo":{"hasNextPage":true,"endCursor":"req-cursor-1"},"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    exit 0
+fi"#,
+    );
+
+    let output = pr_merge_cmd(dir.path())
+        .arg("--no-interactive")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("bob"),
+        "expected the page-2 requested reviewer to be counted. Got:\n{stdout}"
+    );
+}
+
+#[test]
+fn pr_merge_get_pr_status_paginates_latest_reviews_beyond_one_page() {
+    // latestReviews must paginate: a CHANGES_REQUESTED review on page 2 must be
+    // counted as an outstanding review that blocks merge.
+    let (dir, _repo) = setup_simple_stack();
+    init_origin_and_push(dir.path(), &["main", "feature"]);
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    write_gh_mock(
+        dir.path(),
+        r#"if [[ "$1" == "pr" && "$2" == "view" ]]; then
+    echo '{"number":42,"title":"F","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" && "$2" == "graphql" ]]; then
+    if printf '%s\n' "$@" | grep -q "cursor=rev-cursor-1"; then
+        echo '{"data":{"repository":{"pullRequest":{"latestReviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"state":"CHANGES_REQUESTED","author":{"login":"carol"}}]}}}}}'
+        exit 0
+    fi
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"pageInfo":{"hasNextPage":true,"endCursor":"rev-cursor-1"},"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    exit 0
+fi"#,
+    );
+
+    let output = pr_merge_cmd(dir.path())
+        .arg("--no-interactive")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("carol"),
+        "expected the page-2 changes-requested review to be counted. Got:\n{stdout}"
+    );
+}
+
+#[test]
+fn pr_merge_treats_neutral_checkrun_as_passing() {
+    // A COMPLETED CheckRun with a NEUTRAL conclusion is green, so an otherwise
+    // ready PR merges rather than being wrongly blocked as failed/running.
+    let (dir, _repo) = setup_simple_stack();
+    init_origin_and_push(dir.path(), &["main", "feature"]);
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    write_gh_mock(
+        dir.path(),
+        r#"if [[ "$1" == "pr" && "$2" == "view" ]]; then
+    if [[ "$3" == "42" ]]; then echo '{"state":"MERGED"}'; exit 0; fi
+    echo '{"number":42,"title":"F","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" && "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"NEUTRAL"}]}}}}]}}}}}'
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "merge" ]]; then exit 0; fi"#,
+    );
+
+    let output = pr_merge_cmd(dir.path())
+        .arg("--no-cascade")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "kin pr merge failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\u{2713} Merged PR #42"),
+        "a NEUTRAL check must be treated as passing so the PR merges. Got:\n{stdout}"
+    );
+}
+
+#[test]
+fn pr_merge_treats_unknown_checkrun_conclusion_as_failed() {
+    // A COMPLETED CheckRun with an unrecognized conclusion fails closed (blocks
+    // the merge) rather than being silently treated as passing.
+    let (dir, _repo) = setup_simple_stack();
+    init_origin_and_push(dir.path(), &["main", "feature"]);
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    write_gh_mock(
+        dir.path(),
+        r#"if [[ "$1" == "pr" && "$2" == "view" ]]; then
+    echo '{"number":42,"title":"F","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" && "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"UNSTABLE","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"flaky","status":"COMPLETED","conclusion":"MYSTERY"}]}}}}]}}}}}'
+    exit 0
+fi"#,
+    );
+
+    let output = pr_merge_cmd(dir.path())
+        .arg("--no-interactive")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("flaky") && stdout.contains("Failed checks"),
+        "an unknown CheckRun conclusion must block the merge as failed. Got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\u{2713} Merged PR #42"),
+        "the merge must not proceed with an unrecognized check conclusion. Got:\n{stdout}"
+    );
+}
+
+#[test]
+fn pr_merge_get_pr_status_paginates_status_checks_beyond_one_page() {
+    // Regression: the statusCheckRollup.contexts connection (rooted at
+    // object(oid:), a different query shape) must also paginate. A failing check
+    // that lands on page 2 must still be detected; a broken paginator sees only
+    // the passing page-1 check and would let the merge through.
+    let (dir, _repo) = setup_simple_stack();
+
+    init_origin_and_push(dir.path(), &["main", "feature"]);
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    write_gh_mock(
+        dir.path(),
+        r#"if [[ "$1" == "pr" && "$2" == "view" ]]; then
+    echo '{"number":42,"title":"Feature title","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" && "$2" == "graphql" ]]; then
+    if printf '%s\n' "$@" | grep -q "cursor=check-cursor-1"; then
+        # Page 2 of the checks: a FAILING context, no further pages.
+        echo '{"data":{"repository":{"object":{"statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"__typename":"StatusContext","context":"ci/page2","state":"FAILURE"}]}}}}}}'
+        exit 0
+    fi
+    # Base page: a passing check plus hasNextPage -> forces a checks follow-up.
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"oid":"commit-oid-1","statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":true,"endCursor":"check-cursor-1"},"nodes":[{"__typename":"StatusContext","context":"ci/page1","state":"SUCCESS"}]}}}}]}}}}}'
+    exit 0
+fi"#,
+    );
+
+    let output = pr_merge_cmd(dir.path())
+        .arg("--no-interactive")
+        .output()
+        .unwrap();
+
+    // The page-2 failing check must surface *as a failed check* — proving the
+    // checks connection was paginated past the first page AND the page-2 item was
+    // classified, not merely echoed somewhere in the output.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Failed checks: ci/page2"),
+        "expected the page-2 check to be counted under failed checks. Got:\n{combined}"
+    );
+}
+
+#[test]
+fn pr_merge_treats_unknown_check_state_as_not_ready() {
+    // Fail-closed: a required status still in the EXPECTED state (created but not
+    // yet reported) must block the merge, not be silently treated as passing.
+    // The PR is otherwise mergeable (approved, UNSTABLE which GitHub allows), so
+    // the ONLY thing that can hold it back is Kindra's own check scan.
+    let (dir, _repo) = setup_simple_stack();
+
+    init_origin_and_push(dir.path(), &["main", "feature"]);
+    run_ok("git", &["checkout", "feature"], dir.path());
+
+    write_gh_mock(
+        dir.path(),
+        r#"if [[ "$1" == "pr" && "$2" == "view" ]]; then
+    echo '{"number":42,"title":"Feature title","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" && "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"UNSTABLE","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"oid":"commit-oid-1","statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"__typename":"StatusContext","context":"ci/expected","state":"EXPECTED"}]}}}}]}}}}}'
+    exit 0
+fi"#,
+    );
+
+    let output = pr_merge_cmd(dir.path())
+        .arg("--no-interactive")
+        .output()
+        .unwrap();
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The EXPECTED check must be surfaced as still-running and block the merge.
+    assert!(
+        combined.contains("ci/expected") && combined.contains("not ready to merge"),
+        "expected the EXPECTED check to block the merge as not-ready. Got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Merging PR #42"),
+        "merge must not proceed while a check is in the EXPECTED state. Got:\n{combined}"
+    );
+}
