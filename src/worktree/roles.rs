@@ -126,14 +126,11 @@ pub fn ensure_review(
         let dirty = is_worktree_dirty(&path)?;
         let discard_local_changes = force || (dirty && ctx.config.review.clean_before_switch);
         if dirty && !force && ctx.config.review.clean_before_switch {
-            confirm_or_abort(
-                &format!(
-                    "Review worktree '{}' has uncommitted changes. Discard them and switch to '{}'?",
-                    path.display(),
-                    branch
-                ),
-                false,
-            )?;
+            confirm_or_abort(&format!(
+                "Review worktree '{}' has uncommitted changes. Discard them and switch to '{}'?",
+                path.display(),
+                branch
+            ))?;
         }
 
         let rollback = live
@@ -398,12 +395,7 @@ pub fn list_managed_worktrees(repo: &Repository) -> Result<Vec<WorktreeListRow>>
     Ok(rows)
 }
 
-pub fn remove_target(
-    repo: &Repository,
-    target: &str,
-    assume_yes: bool,
-    force: bool,
-) -> Result<RemoveResult> {
+pub fn remove_target(repo: &Repository, target: &str, force: bool) -> Result<RemoveResult> {
     let mut ctx = load_context(repo)?;
     let resolved = resolve_target(&ctx, target, true)?;
     let dirty = resolved
@@ -437,7 +429,7 @@ pub fn remove_target(
             resolved.path.display()
         )
     };
-    confirm_or_abort(&message, assume_yes)?;
+    confirm_or_abort(&message)?;
 
     let metadata_only =
         remove_resolved_target(repo, &ctx.config, &mut ctx.metadata, &resolved, force)?;
@@ -451,11 +443,7 @@ pub fn remove_target(
     })
 }
 
-pub fn cleanup_temp_worktrees(
-    repo: &Repository,
-    assume_yes: bool,
-    force: bool,
-) -> Result<CleanupSummary> {
+pub fn cleanup_temp_worktrees(repo: &Repository, force: bool) -> Result<CleanupSummary> {
     let mut ctx = load_context(repo)?;
     let candidates =
         find_cleanup_candidates(repo, &ctx.config, &ctx.metadata, &ctx.live_worktrees)?;
@@ -511,7 +499,7 @@ pub fn cleanup_temp_worktrees(
             dirty_count
         )
     };
-    confirm_or_abort(&confirmation, assume_yes)?;
+    confirm_or_abort(&confirmation)?;
 
     let mut removed = Vec::new();
     let mut skipped = 0usize;

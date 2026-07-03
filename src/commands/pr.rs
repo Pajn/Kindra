@@ -9,7 +9,7 @@ use clap::{Args, Subcommand};
 use git2::{BranchType, Repository};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Subcommand, Clone)]
@@ -59,11 +59,28 @@ impl PrReviewArgs {
     }
 }
 
+/// Values supplied on the `kin pr` command line to pre-fill the PR-creation
+/// wizard, so new PRs can be created without prompting (agents/CI).
+#[derive(Default, Clone)]
+pub struct PrCreateOptions {
+    /// Title for every new PR (see the non-interactive require-title rule in
+    /// [`prompt_title`]).
+    pub title: Option<String>,
+    /// Build the body deterministically from the branch commits.
+    pub body_from_commits: bool,
+    /// Force draft (`Some(true)`) or ready (`Some(false)`); `None` = ask/default.
+    pub draft: Option<bool>,
+    /// Reviewers to request on every new PR.
+    pub reviewers: Vec<String>,
+    /// Labels to set on every new PR.
+    pub labels: Vec<String>,
+}
+
 pub fn pr(
     subcommand: &Option<PrSubcommand>,
     no_push: bool,
     include_all: bool,
-    labels: &[String],
+    options: PrCreateOptions,
 ) -> Result<()> {
     match subcommand {
         Some(PrSubcommand::Open) => pr_open(),
@@ -72,7 +89,7 @@ pub fn pr(
         Some(PrSubcommand::Merge) => pr_merge(),
         Some(PrSubcommand::Status) => pr_status(),
         Some(PrSubcommand::Review(args)) => pr_review(args),
-        None => pr_create_or_update(no_push, include_all, labels),
+        None => pr_create_or_update(no_push, include_all, &options),
     }
 }
 
@@ -103,7 +120,11 @@ struct RenderItem {
     is_merged: bool,
 }
 
-fn pr_create_or_update(skip_preflight: bool, include_all: bool, labels: &[String]) -> Result<()> {
+fn pr_create_or_update(
+    skip_preflight: bool,
+    include_all: bool,
+    options: &PrCreateOptions,
+) -> Result<()> {
     gh::check_gh().context("GitHub CLI check failed")?;
 
     let repo = crate::open_repo()?;
@@ -169,7 +190,7 @@ fn pr_create_or_update(skip_preflight: bool, include_all: bool, labels: &[String
         let gh_base = normalize_base_for_gh(&git_base);
 
         if let Some(pr) =
-            process_branch_pr(&open_prs, &repo, &sb.name, &git_base, &gh_base, labels)?
+            process_branch_pr(&open_prs, &repo, &sb.name, &git_base, &gh_base, options)?
         {
             processed_prs.push(StackPr {
                 branch_name: sb.name.clone(),
@@ -351,7 +372,11 @@ fn pr_open() -> Result<()> {
         .map(|(branch, url)| format!("{} → {}", branch, url))
         .collect();
 
-    let selection = crate::commands::prompt_select("Select PR to open:", options)?;
+    let selection = crate::commands::prompt_select(
+        "Select PR to open:",
+        options,
+        crate::commands::Fallback::Require("Open the PR URL directly, or run in a terminal."),
+    )?;
     let selected_url = prs
         .iter()
         .find(|(branch, url)| format!("{} → {}", branch, url) == selection)
@@ -424,7 +449,11 @@ fn pr_edit() -> Result<()> {
         } else {
             menu_items.push(format!("Set reviewers [{}]", reviewers.join(", ")));
         }
-        let choice = crate::commands::prompt_select("PR edit options:", menu_items)?;
+        let choice = crate::commands::prompt_select(
+            "PR edit options:",
+            menu_items,
+            crate::commands::Fallback::Require("Run 'kin pr edit' in a terminal."),
+        )?;
         match choice.as_str() {
             "Save" => break,
             "Edit title" => {
@@ -711,7 +740,11 @@ pub(crate) fn select_stack_pr<'a>(prs: &'a [StackPr], prompt: &str) -> Result<&'
     }
 
     let options: Vec<String> = prs.iter().map(format_stack_pr_option).collect();
-    let selection = crate::commands::prompt_select(prompt, options)?;
+    let selection = crate::commands::prompt_select(
+        prompt,
+        options,
+        crate::commands::Fallback::Require("Run in a terminal to choose a PR."),
+    )?;
     prs.iter()
         .find(|pr| format_stack_pr_option(pr) == selection)
         .ok_or_else(|| anyhow!("Selected PR not found"))
@@ -1007,7 +1040,7 @@ fn process_branch_pr(
     branch_name: &str,
     git_base: &str,
     gh_base: &str,
-    labels: &[String],
+    options: &PrCreateOptions,
 ) -> Result<Option<crate::gh::EditablePr>> {
     println!("── {} ──", branch_name);
 
@@ -1025,8 +1058,8 @@ fn process_branch_pr(
             Ok(Some(existing.to_editable()))
         }
         None => {
-            // New PR: run the interactive wizard
-            create_pr_interactive(repo, branch_name, git_base, gh_base, labels)
+            // New PR: run the creation wizard (or apply supplied flags).
+            create_pr_interactive(repo, branch_name, git_base, gh_base, options)
         }
     }
 }
@@ -1040,7 +1073,7 @@ fn create_pr_interactive(
     branch_name: &str,
     git_base: &str,
     gh_base: &str,
-    labels: &[String],
+    options: &PrCreateOptions,
 ) -> Result<Option<crate::gh::EditablePr>> {
     let commits = get_branch_commits(repo, branch_name, git_base)?;
 
@@ -1053,7 +1086,12 @@ fn create_pr_interactive(
     }
 
     // ── Step 1: Title ────────────────────────────────────────────────────────
-    let title = prompt_title(&commits)?;
+    // A supplied --title wins; otherwise prompt (or apply the non-interactive
+    // require-title rule).
+    let title = match &options.title {
+        Some(title) => title.clone(),
+        None => prompt_title(branch_name, &commits)?,
+    };
     if title.is_empty() {
         println!("  PR title is empty. Skipping {}.", branch_name);
         return Ok(None);
@@ -1066,18 +1104,25 @@ fn create_pr_interactive(
         repo.path(),
         &format!("pr-body-{branch_name}"),
     ));
-    let body = prompt_body(branch_name, &commits, &draft)?;
+    let body = if options.body_from_commits {
+        build_body_from_commits(&commits)
+    } else {
+        prompt_body(branch_name, &commits, &draft)?
+    };
 
     // ── Step 3: Submit options ───────────────────────────────────────────────
-    let submission = if !labels.is_empty() {
-        let mut cli_labels = labels.to_vec();
-        let mut options = prompt_submit_options()?;
-        cli_labels.append(&mut options.labels);
-        options.labels = cli_labels;
-        options
-    } else {
-        prompt_submit_options()?
-    };
+    // Start from the wizard's answers (which are empty/default when
+    // non-interactive), then layer supplied flags on top.
+    let mut submission = prompt_submit_options()?;
+    let mut cli_labels = options.labels.clone();
+    cli_labels.append(&mut submission.labels);
+    submission.labels = cli_labels;
+    submission
+        .reviewers
+        .extend(options.reviewers.iter().cloned());
+    if let Some(draft_flag) = options.draft {
+        submission.draft = draft_flag;
+    }
     let reviewers = submission.reviewers.clone();
 
     println!("  Creating PR...");
@@ -1451,7 +1496,7 @@ pub(crate) fn get_branch_commits(
 // Helpers: interactive prompts
 // ────────────────────────────────────────────────────────────────────────────
 
-fn prompt_title(commits: &[CommitSummary]) -> Result<String> {
+fn prompt_title(branch_name: &str, commits: &[CommitSummary]) -> Result<String> {
     let prefill = if commits.len() == 1 {
         commits[0].subject.clone()
     } else {
@@ -1464,7 +1509,18 @@ fn prompt_title(commits: &[CommitSummary]) -> Result<String> {
         String::new()
     };
 
-    if !std::io::stdin().is_terminal() {
+    let mode = crate::interaction::current();
+    if !mode.is_interactive() {
+        // A single commit gives an unambiguous title. With multiple commits there
+        // is no safe default, so rather than creating a PR with an empty title
+        // (which GitHub rejects, silently skipping the branch), demand --title.
+        // The scripted seam keeps its historical behaviour so tests are stable.
+        if prefill.is_empty() && mode.scripted().is_none() {
+            return Err(crate::interaction::input_required(format!(
+                "PR title required for branch '{branch_name}': it has multiple commits and no \
+                 single subject to use. Pass --title \"...\" (or run in a terminal)."
+            )));
+        }
         println!(
             "  [non-interactive] Using title: {}",
             if prefill.is_empty() {
@@ -1482,6 +1538,31 @@ fn prompt_title(commits: &[CommitSummary]) -> Result<String> {
         .context("Title prompt failed")?;
 
     Ok(title)
+}
+
+/// Build a deterministic PR body from the branch's commits, used by
+/// `--body-from-commits` so non-interactive runs get a meaningful description
+/// instead of an editor template.
+fn build_body_from_commits(commits: &[CommitSummary]) -> String {
+    if commits.len() == 1 {
+        return commits[0].body.trim().to_string();
+    }
+
+    let mut body = String::new();
+    for commit in commits {
+        body.push_str("- ");
+        body.push_str(&commit.subject);
+        body.push('\n');
+        let trimmed = commit.body.trim();
+        if !trimmed.is_empty() {
+            for line in trimmed.lines() {
+                body.push_str("  ");
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+    }
+    body.trim_end().to_string()
 }
 
 fn prompt_body(
@@ -1506,12 +1587,13 @@ fn prompt_body(
     };
 
     // In a non-interactive session we normally can't prompt, so we fall back to
-    // the prefilled template. Integration tests set KIN_TEST_PR_BODY_ACTION to
-    // exercise the editor/draft/recovery machinery headlessly (mirroring the
-    // KIN_TEST_* seams used elsewhere); it emulates the menu choice a user would
-    // otherwise make with the keyboard.
-    let test_action = std::env::var("KIN_TEST_PR_BODY_ACTION").ok();
-    if !std::io::stdin().is_terminal() && test_action.is_none() {
+    // the prefilled template. The scripted seam emulates the menu choice a user
+    // would otherwise make with the keyboard, so integration tests can exercise
+    // the editor/draft/recovery machinery headlessly.
+    let test_action = crate::interaction::current()
+        .scripted()
+        .and_then(|s| s.pr_body_action().map(str::to_string));
+    if !crate::interaction::current().is_interactive() && test_action.is_none() {
         // Prefer a saved draft over the generated template: a body left by an
         // earlier failed/interrupted attempt must not be silently dropped (and
         // then discarded on the next success). We can't prompt here, so reuse it.
@@ -1531,6 +1613,7 @@ fn prompt_body(
                 "Resume in editor".to_string(),
                 "Discard and start fresh".to_string(),
             ],
+            crate::commands::Fallback::Require("Run in a terminal to resume the draft."),
         )?;
         if choice.starts_with("Resume") {
             return reopen_editor_for_body(draft);
@@ -1609,7 +1692,7 @@ enum SubmitRetry {
 fn prompt_submit_retry(err: &anyhow::Error, draft: &crate::editor::Draft) -> SubmitRetry {
     eprintln!("  ✗ Submission failed: {err:#}");
 
-    if !std::io::stdin().is_terminal() {
+    if !crate::interaction::current().is_interactive() {
         return SubmitRetry::Abort;
     }
 
@@ -1620,7 +1703,11 @@ fn prompt_submit_retry(err: &anyhow::Error, draft: &crate::editor::Draft) -> Sub
     }
     options.push("Save draft and quit".to_string());
 
-    match crate::commands::prompt_select("  How would you like to proceed?", options) {
+    match crate::commands::prompt_select(
+        "  How would you like to proceed?",
+        options,
+        crate::commands::Fallback::Require("Re-run in a terminal to retry."),
+    ) {
         Ok(choice) if choice == "Retry" => SubmitRetry::Retry,
         Ok(choice) if choice.starts_with("Re-edit") => SubmitRetry::Reedit,
         _ => SubmitRetry::Abort,
@@ -1672,10 +1759,11 @@ fn submit_with_retry<T>(
 }
 
 fn prompt_edit_title(current_title: &str) -> Result<String> {
-    if !std::io::stdin().is_terminal() {
-        if let Ok(test_title) = std::env::var("KIN_TEST_PR_EDIT_TITLE") {
+    let mode = crate::interaction::current();
+    if !mode.is_interactive() {
+        if let Some(test_title) = mode.scripted().and_then(|s| s.pr_edit_title()) {
             println!("  [non-interactive] Using title override: {}", test_title);
-            return Ok(test_title);
+            return Ok(test_title.to_string());
         }
         println!("  [non-interactive] Keeping title: {}", current_title);
         return Ok(current_title.to_string());
@@ -1702,7 +1790,7 @@ fn recover_edit_body(draft: &crate::editor::Draft) -> Result<Option<String>> {
         return Ok(None);
     };
 
-    if !std::io::stdin().is_terminal() {
+    if !crate::interaction::current().is_interactive() {
         return Ok(Some(saved));
     }
 
@@ -1713,6 +1801,7 @@ fn recover_edit_body(draft: &crate::editor::Draft) -> Result<Option<String>> {
             "Resume in editor".to_string(),
             "Discard and start fresh".to_string(),
         ],
+        crate::commands::Fallback::Require("Run in a terminal to resume the draft."),
     )?;
     if choice.starts_with("Resume") {
         Ok(Some(draft.reedit()?))
@@ -1723,9 +1812,26 @@ fn recover_edit_body(draft: &crate::editor::Draft) -> Result<Option<String>> {
 }
 
 fn prompt_edit_body(current_body: &str, draft: &crate::editor::Draft) -> Result<Option<String>> {
-    if !std::io::stdin().is_terminal() {
+    if !crate::interaction::current().is_interactive() {
         println!("  [non-interactive] Keeping body unchanged");
         return Ok(None);
+    }
+
+    // A leftover draft means an earlier edit failed after the body was written.
+    if draft.recover().is_some() {
+        println!("  Found an unsaved PR body draft from a previous attempt.");
+        let choice = crate::commands::prompt_select(
+            "  Resume it?",
+            vec![
+                "Resume in editor".to_string(),
+                "Discard and keep current body".to_string(),
+            ],
+            crate::commands::Fallback::Require("Run in a terminal to resume the draft."),
+        )?;
+        if choice.starts_with("Resume") {
+            return Ok(Some(draft.reedit()?));
+        }
+        draft.discard();
     }
 
     println!("  PR body: [e] open editor  [enter] keep unchanged");
@@ -1755,7 +1861,7 @@ fn prompt_labels_for_edit(current: &[String]) -> Result<Vec<String>> {
         return Ok(current.to_vec());
     }
 
-    if !std::io::stdin().is_terminal() {
+    if !crate::interaction::current().is_interactive() {
         println!("  [non-interactive] Keeping labels unchanged");
         return Ok(current.to_vec());
     }
@@ -1784,7 +1890,7 @@ fn prompt_reviewers_for_edit(current: &[String]) -> Result<Vec<String>> {
         return Ok(current.to_vec());
     }
 
-    if !std::io::stdin().is_terminal() {
+    if !crate::interaction::current().is_interactive() {
         println!("  [non-interactive] Keeping reviewers unchanged");
         return Ok(current.to_vec());
     }
@@ -1861,9 +1967,9 @@ struct Submission {
 fn prompt_submit_options() -> Result<Submission> {
     // The submit menu is an action prompt whose primary action is "Submit". In a
     // non-interactive session there is nothing to drive it, so default to Submit
-    // rather than erroring — this keeps `kin pr` usable in CI. Labels can still be
-    // supplied via the `--label` flag, which is applied by the caller.
-    if !std::io::stdin().is_terminal() {
+    // rather than erroring — this keeps `kin pr` usable in CI. Draft, labels, and
+    // reviewers can still be supplied via flags, which the caller merges in.
+    if !crate::interaction::current().is_interactive() {
         println!("  [non-interactive] Submitting with default options.");
         return Ok(Submission {
             draft: false,
@@ -1891,7 +1997,11 @@ fn prompt_submit_options() -> Result<Submission> {
             menu_items.push(format!("Assign reviewers [{}]", reviewers.join(", ")));
         }
 
-        let choice = crate::commands::prompt_select("  Ready to submit?", menu_items)?;
+        let choice = crate::commands::prompt_select(
+            "  Ready to submit?",
+            menu_items,
+            crate::commands::Fallback::Require("Run in a terminal to choose submit options."),
+        )?;
 
         match choice.as_str() {
             "Submit" => break false,
@@ -1924,6 +2034,7 @@ fn prompt_labels() -> Result<Vec<String>> {
     let selected = crate::commands::prompt_multi_select(
         "  Select labels (Space to toggle, Enter to confirm):",
         available,
+        crate::commands::Fallback::Default(Vec::new()),
     )?;
     Ok(selected)
 }
@@ -1939,6 +2050,7 @@ fn prompt_reviewers() -> Result<Vec<String>> {
     let selected = crate::commands::prompt_multi_select(
         "  Select reviewers (Space to toggle, Enter to confirm):",
         available,
+        crate::commands::Fallback::Default(Vec::new()),
     )?;
     Ok(selected)
 }

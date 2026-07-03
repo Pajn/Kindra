@@ -12,7 +12,6 @@ use anyhow::{Result, anyhow};
 use clap::Args;
 use git2::BranchType;
 use std::collections::HashMap;
-use std::io::IsTerminal;
 use std::process::Command;
 
 #[derive(Args)]
@@ -87,14 +86,13 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
             }
         }
         1 => tips[0].clone(),
-        _ => {
-            if !std::io::stdin().is_terminal() {
-                return Err(anyhow!(
-                    "Multiple stack tips found. Run 'kin sync' interactively to choose one, or checkout the desired tip branch and rerun."
-                ));
-            }
-            crate::commands::prompt_select("Multiple stack tips found. Select one:", tips)?
-        }
+        _ => crate::commands::prompt_select(
+            "Multiple stack tips found. Select one:",
+            tips,
+            crate::commands::Fallback::Require(
+                "Checkout the desired tip branch and rerun 'kin sync'.",
+            ),
+        )?,
     };
 
     let top_branch_tip = repo.revparse_single(&top_branch)?.id();

@@ -8,7 +8,6 @@ use anyhow::{Result, anyhow};
 use clap::Args;
 use git2::{BranchType, Commit, Oid, Repository};
 use std::collections::HashMap;
-use std::io::IsTerminal;
 
 #[derive(Args)]
 pub struct RestackArgs {
@@ -68,13 +67,18 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
     }
 
     let children = if args.pick {
-        if !std::io::stdin().is_terminal() {
-            return Err(anyhow!("--pick requires an interactive terminal"));
-        }
+        // prompt_multi_select resolves the selection per mode: interactive shows
+        // the picker, scripted uses the seeded selection, and non-interactive
+        // (no terminal, no script) is a hard error rather than a silent no-op —
+        // `--pick` inherently needs a chooser, so failing loudly (input-required
+        // exit code) beats exiting 0 having restacked nothing.
         let branch_names: Vec<String> = children.iter().map(|(name, _)| name.clone()).collect();
         let selected = prompt_multi_select(
             "Select branches to restack (Space to toggle, Enter to confirm):",
             branch_names,
+            crate::commands::Fallback::Require(
+                "Run without --pick to restack all floating children, or use a terminal to choose.",
+            ),
         )?;
         if selected.is_empty() {
             println!("No branches selected.");

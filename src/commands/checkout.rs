@@ -24,8 +24,11 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
             return Ok(());
         }
 
-        let selected_name =
-            crate::commands::prompt_select("Select branch to checkout:", branch_names)?;
+        let selected_name = crate::commands::prompt_select(
+            "Select branch to checkout:",
+            branch_names,
+            crate::commands::Fallback::Require("Run 'git checkout <branch>' instead."),
+        )?;
         return perform_git_checkout(&selected_name);
     }
 
@@ -63,6 +66,7 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
                     let selected = crate::commands::prompt_select(
                         "Multiple branches ahead. Select one:",
                         successors,
+                        crate::commands::Fallback::Require("Run 'git checkout <branch>' instead."),
                     )?;
                     perform_git_checkout(&selected)
                 }
@@ -80,6 +84,7 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
                     let selected = crate::commands::prompt_select(
                         "Multiple parent branches found. Select one:",
                         parent_branches,
+                        crate::commands::Fallback::Require("Run 'git checkout <branch>' instead."),
                     )?;
                     perform_git_checkout(&selected)
                 }
@@ -103,6 +108,7 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
                     let selected = crate::commands::prompt_select(
                         "Multiple stack tips found. Select one:",
                         tips,
+                        crate::commands::Fallback::Require("Run 'git checkout <branch>' instead."),
                     )?;
                     perform_git_checkout(&selected)
                 }
@@ -129,8 +135,11 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
             }
 
             let options: Vec<String> = visualized.iter().map(|v| v.display_name.clone()).collect();
-            let selected_display =
-                crate::commands::prompt_select("Select branch to checkout:", options)?;
+            let selected_display = crate::commands::prompt_select(
+                "Select branch to checkout:",
+                options,
+                crate::commands::Fallback::Require("Run 'git checkout <branch>' instead."),
+            )?;
 
             let selected_name = visualized
                 .iter()

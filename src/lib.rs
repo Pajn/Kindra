@@ -9,6 +9,7 @@
 pub mod commands;
 pub mod editor;
 pub mod gh;
+pub mod interaction;
 pub mod rebase_utils;
 pub mod repository;
 pub mod stack;

@@ -316,6 +316,53 @@ fn test_commit_short_i_is_forwarded_to_git() {
 }
 
 #[test]
+fn test_commit_global_flag_after_subcommand_not_forwarded_to_git() {
+    // Regression: `--yes` placed after `commit` is swallowed by clap's
+    // trailing_var_arg. It must be stripped before invoking `git commit`
+    // (which rejects `--yes`), not forwarded — otherwise the command fails.
+    let (dir, repo) = setup_repo();
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let feature_before = repo
+        .find_branch("feature", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+
+    fs::write(dir.path().join("feature.txt"), "amended feature").unwrap();
+
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .arg("--amend")
+        .arg("-a")
+        .arg("--no-edit")
+        .arg("--yes")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .assert()
+        .success();
+
+    // The amend actually ran: the tip was rewritten and `--no-edit` kept the
+    // original message (so `--no-edit` reached git, but `--yes` did not).
+    let feature_after = repo
+        .find_branch("feature", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    assert_ne!(feature_after, feature_before);
+    let feature_commit = repo.find_commit(feature_after).unwrap();
+    assert_eq!(feature_commit.summary().unwrap(), "feature commit");
+}
+
+#[test]
 fn test_commit_interactive_with_forwarded_short_i_uses_git_include() {
     let (dir, repo) = setup_repo();
     let feature_before = repo
@@ -364,6 +411,26 @@ fn test_commit_interactive_with_forwarded_short_i_uses_git_include() {
         feature_commit.summary().unwrap(),
         "interactive include tracked change"
     );
+}
+
+#[test]
+fn test_commit_interactive_without_terminal_errors() {
+    // The amend picker (`--interactive`) needs a real answer: with no terminal
+    // and no scripted selection it must fail loudly rather than guess a commit.
+    let (dir, repo) = setup_repo();
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    kin_cmd()
+        .arg("commit")
+        .arg("--interactive")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "Cannot pick a commit to amend without a terminal.",
+        ));
 }
 
 #[test]
@@ -1602,7 +1669,7 @@ fn test_commit_on_other_stack_default_just_commits() {
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
         .assert()
         .success()
-        .stdout(predicates::str::contains("auto-denying"));
+        .stdout(predicates::str::contains("non-interactive: declining"));
 
     assert_eq!(repo.head().unwrap().shorthand().unwrap(), "s1-b");
 

@@ -46,7 +46,7 @@ fn worktree_review_respects_dirty_state_unless_forced() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("auto-denying"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("non-interactive: declining"));
     assert_eq!(current_branch(&review_path), "feature-a");
 
     let output = kin_cmd()

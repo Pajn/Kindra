@@ -15,6 +15,7 @@ pub mod sync;
 pub mod tree;
 pub mod worktree;
 
+use crate::interaction::{Interaction, current as interaction, input_required};
 use anyhow::{Context, Result, anyhow};
 use clap::Subcommand;
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
@@ -22,11 +23,20 @@ use git2::{BranchType, Repository};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-static TEST_SELECTION_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// What a prompt helper should do when it cannot ask (non-interactive mode).
+///
+/// Every prompt call site must state this explicitly, so the behavior of a
+/// headless run is visible and reviewable at the point of the prompt rather than
+/// hidden in a shared default.
+pub enum Fallback<T> {
+    /// No sensible unattended answer: fail loudly with this hint. Maps to a
+    /// distinct exit code so callers can tell missing-input from real failure.
+    Require(&'static str),
+    /// Use this value when we cannot ask.
+    Default(T),
+}
 
 #[derive(Subcommand, Clone, Copy)]
 pub enum CheckoutSubcommand {
@@ -70,98 +80,127 @@ fn local_branch_candidates(current: &OsStr) -> Vec<CompletionCandidate> {
     candidates
 }
 
-pub fn prompt_select(message: &str, options: Vec<String>) -> Result<String> {
-    if !std::io::stdin().is_terminal() {
-        if options.is_empty() {
-            return Err(anyhow!("No options available for selection"));
-        }
-        // A single option is unambiguous: selecting it is deterministic and safe,
-        // so we do not need an interactive terminal (and it consumes no test index).
-        if options.len() == 1 {
-            println!(
-                "{} (only one option available, selecting: {})",
-                message, options[0]
-            );
-            return Ok(options[0].clone());
-        }
-        if let Ok(selection_values) = std::env::var("KIN_TEST_SELECTIONS") {
-            let call_index = TEST_SELECTION_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
-            let selected_idx = selection_values
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .nth(call_index)
-                .and_then(|s| s.parse::<usize>().ok());
-
-            if let Some(idx) = selected_idx
-                && idx < options.len()
-            {
-                println!("Options:");
-                for (i, opt) in options.iter().enumerate() {
-                    println!("{}: {}", i, opt);
-                }
-                println!(
-                    "{} (test override: auto-selecting option {})",
-                    message, options[idx]
-                );
-                return Ok(options[idx].clone());
-            }
-        }
-        // Multiple options with no way to ask: refuse rather than silently guessing.
-        return Err(anyhow!(
-            "Cannot choose between {} options in a non-interactive session (stdin is not a terminal): {} \
-             Re-run in an interactive terminal, or checkout/pass the desired branch explicitly so no prompt is needed.",
-            options.len(),
-            message
-        ));
+/// Prompt the user to pick one of `options`.
+///
+/// A single option is always unambiguous and returned directly (it consumes no
+/// scripted index). Otherwise behavior depends on the resolved interaction mode:
+/// interactive prompts, scripted uses the next test index, and non-interactive
+/// applies `fallback` — either a caller-supplied default or a hard error.
+pub fn prompt_select(
+    message: &str,
+    options: Vec<String>,
+    fallback: Fallback<String>,
+) -> Result<String> {
+    if options.is_empty() {
+        return Err(anyhow!("No options available for selection"));
     }
-    inquire::Select::new(message, options)
-        .prompt()
-        .context("Selection failed")
+
+    if let Interaction::Interactive = interaction() {
+        return inquire::Select::new(message, options)
+            .prompt()
+            .context("Selection failed");
+    }
+
+    // A single option is unambiguous: selecting it is deterministic and safe.
+    if options.len() == 1 {
+        println!(
+            "{} (only one option available, selecting: {})",
+            message, options[0]
+        );
+        return Ok(options[0].clone());
+    }
+
+    if let Some(scripted) = interaction().scripted()
+        && let Some(idx) = scripted.next_selection()
+        && idx < options.len()
+    {
+        println!("Options:");
+        for (i, opt) in options.iter().enumerate() {
+            println!("{}: {}", i, opt);
+        }
+        println!(
+            "{} (test override: auto-selecting option {})",
+            message, options[idx]
+        );
+        return Ok(options[idx].clone());
+    }
+
+    match fallback {
+        Fallback::Default(value) => Ok(value),
+        Fallback::Require(hint) => Err(input_required(format!(
+            "Cannot choose between {} options without a terminal: {} {}",
+            options.len(),
+            message,
+            hint
+        ))),
+    }
 }
 
+/// Prompt the user to pick zero or more of `options`.
+///
+/// Non-interactive runs apply `fallback` (label/reviewer prompts pass an empty
+/// default, since selecting none is benign).
 pub fn prompt_multi_select<T: std::fmt::Display + Clone>(
     message: &str,
     options: Vec<T>,
+    fallback: Fallback<Vec<T>>,
 ) -> Result<Vec<T>> {
-    if !std::io::stdin().is_terminal() {
-        if let Ok(selection_values) = std::env::var("KIN_TEST_MULTI_SELECTIONS") {
-            let selected = selection_values
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .filter_map(|s| s.parse::<usize>().ok())
-                .filter_map(|idx| options.get(idx).cloned())
-                .collect::<Vec<_>>();
-
-            println!("Options:");
-            for (i, opt) in options.iter().enumerate() {
-                println!("{}: {}", i, opt);
-            }
-            println!(
-                "{} (test override: auto-selecting {} option(s))",
-                message,
-                selected.len()
-            );
-            return Ok(selected);
-        }
-        println!("{} (non-interactive mode: auto-selecting NONE)", message);
-        return Ok(Vec::new());
+    if let Interaction::Interactive = interaction() {
+        return inquire::MultiSelect::new(message, options)
+            .prompt()
+            .context("Multi-selection failed");
     }
-    inquire::MultiSelect::new(message, options)
-        .prompt()
-        .context("Multi-selection failed")
+
+    if let Some(scripted) = interaction().scripted() {
+        let selected = scripted
+            .multi_selections()
+            .iter()
+            .filter_map(|&idx| options.get(idx).cloned())
+            .collect::<Vec<_>>();
+
+        println!("Options:");
+        for (i, opt) in options.iter().enumerate() {
+            println!("{}: {}", i, opt);
+        }
+        println!(
+            "{} (test override: auto-selecting {} option(s))",
+            message,
+            selected.len()
+        );
+        return Ok(selected);
+    }
+
+    match fallback {
+        Fallback::Default(value) => Ok(value),
+        Fallback::Require(hint) => Err(input_required(format!("{message} {hint}"))),
+    }
 }
 
-pub fn prompt_confirm(message: &str) -> Result<bool> {
-    if !std::io::stdin().is_terminal() {
-        println!("{} (non-interactive mode: auto-denying)", message);
-        return Ok(false);
+/// Prompt for a yes/no confirmation.
+///
+/// Under `--yes` the action is accepted (`true`). Otherwise non-interactive runs
+/// apply `fallback`.
+pub fn prompt_confirm(message: &str, fallback: Fallback<bool>) -> Result<bool> {
+    match interaction() {
+        Interaction::Interactive => inquire::Confirm::new(message)
+            .with_default(false)
+            .prompt()
+            .context("Confirmation failed"),
+        mode if mode.assume_yes() => {
+            println!("{message} (--yes: accepting)");
+            Ok(true)
+        }
+        _ => match fallback {
+            Fallback::Default(value) => {
+                println!(
+                    "{message} (non-interactive: {})",
+                    if value { "accepting" } else { "declining" }
+                );
+                Ok(value)
+            }
+            Fallback::Require(hint) => Err(input_required(format!("{message} {hint}"))),
+        },
     }
-    inquire::Confirm::new(message)
-        .with_default(false)
-        .prompt()
-        .context("Confirmation failed")
 }
 
 pub fn find_upstream(repo: &Repository) -> Result<Option<String>> {

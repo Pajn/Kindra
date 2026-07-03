@@ -82,7 +82,11 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
             return Ok(());
         }
 
-        crate::commands::prompt_select("Select target branch to move onto:", branch_names)?
+        crate::commands::prompt_select(
+            "Select target branch to move onto:",
+            branch_names,
+            crate::commands::Fallback::Require("Pass the target with --onto <branch>."),
+        )?
     } else {
         // Only here we MUST have an upstream
         let upstream_name = find_upstream(repo)?.ok_or_else(|| {
@@ -107,8 +111,11 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         }
 
         let options: Vec<String> = visualized.iter().map(|v| v.display_name.clone()).collect();
-        let selected_display =
-            crate::commands::prompt_select("Select target branch to move onto:", options)?;
+        let selected_display = crate::commands::prompt_select(
+            "Select target branch to move onto:",
+            options,
+            crate::commands::Fallback::Require("Pass the target with --onto <branch>."),
+        )?;
 
         visualized
             .iter()

@@ -73,6 +73,9 @@ pub(crate) fn push_stack_branches(repo: &Repository, branches: &[String]) -> Res
         let selected = crate::commands::prompt_multi_select(
             "Select branches to set upstream and push (Space to toggle, Enter to confirm):",
             options,
+            // Non-interactive: leave untracked branches alone; already-tracked
+            // branches still push below.
+            crate::commands::Fallback::Default(Vec::new()),
         )?;
 
         if selected.is_empty() && branches_to_push.is_empty() {

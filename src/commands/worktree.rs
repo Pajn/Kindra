@@ -58,10 +58,6 @@ pub struct RemoveArgs {
     /// `main`, `review`, or a temp worktree branch name (`branch:<name>` disambiguates)
     pub target: String,
 
-    /// Skip the confirmation prompt
-    #[arg(long)]
-    pub yes: bool,
-
     /// Force removal when git requires it (for example a dirty worktree)
     #[arg(long)]
     pub force: bool,
@@ -69,10 +65,6 @@ pub struct RemoveArgs {
 
 #[derive(Args, Clone, Debug)]
 pub struct CleanupArgs {
-    /// Skip the confirmation prompt
-    #[arg(long)]
-    pub yes: bool,
-
     /// Force removal when git requires it (for example a dirty worktree)
     #[arg(long)]
     pub force: bool,
@@ -108,7 +100,7 @@ pub fn worktree(subcommand: &Option<WorktreeSubcommand>) -> Result<()> {
             println!("{}", path.display());
         }
         Some(WorktreeSubcommand::Remove(args)) => {
-            let result = roles::remove_target(&repo, &args.target, args.yes, args.force)?;
+            let result = roles::remove_target(&repo, &args.target, args.force)?;
             if result.metadata_only {
                 println!(
                     "Removed stale metadata for {} worktree '{}' ({})",
@@ -126,7 +118,7 @@ pub fn worktree(subcommand: &Option<WorktreeSubcommand>) -> Result<()> {
             }
         }
         Some(WorktreeSubcommand::Cleanup(args)) => {
-            let summary = roles::cleanup_temp_worktrees(&repo, args.yes, args.force)?;
+            let summary = roles::cleanup_temp_worktrees(&repo, args.force)?;
             if summary.candidates == 0 {
                 println!("No temp worktrees are eligible for cleanup.");
             } else {

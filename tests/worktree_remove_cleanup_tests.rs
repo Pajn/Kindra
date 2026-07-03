@@ -65,7 +65,7 @@ fn worktree_remove_prompts_by_default_and_removes_with_yes() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("auto-denying"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("non-interactive: declining"));
     assert!(temp_path.exists());
 
     let output = kin_cmd()

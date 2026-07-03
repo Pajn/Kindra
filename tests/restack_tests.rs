@@ -63,6 +63,124 @@ fn test_restack_basic() {
 }
 
 #[test]
+fn test_restack_pick_scripted_selection() {
+    // Regression for the removed interactive-only guard: `--pick` must reach the
+    // selection prompt in scripted mode (previously it errored out before the
+    // prompt, since scripted mode is not "interactive").
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = repo_init(repo_path);
+
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    let head_oid = make_commit(&repo, "HEAD", "a.txt", "A", "feat: A", &[]);
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+
+    run_ok("git", &["checkout", "-b", "feat"], repo_path);
+    make_commit(
+        &repo,
+        "HEAD",
+        "b.txt",
+        "B",
+        "feat: B",
+        &[&repo.find_commit(head_oid).unwrap()],
+    );
+
+    // Amend A so feat's base floats.
+    run_ok("git", &["checkout", "main"], repo_path);
+    std::fs::write(repo_path.join("a.txt"), "A amended").unwrap();
+    run_ok("git", &["add", "a.txt"], repo_path);
+    run_ok("git", &["commit", "--amend", "-m", "feat: A"], repo_path);
+    let new_head_oid = repo.head().unwrap().target().unwrap();
+
+    // Scripted selection of the only floating child.
+    kin_cmd()
+        .current_dir(repo_path)
+        .arg("restack")
+        .arg("--pick")
+        .env("KIN_TEST_MULTI_SELECTIONS", "0")
+        .assert()
+        .success();
+
+    assert_no_rebase_in_progress(repo_path);
+
+    run_ok("git", &["checkout", "feat"], repo_path);
+    let feat_new_oid = repo.head().unwrap().target().unwrap();
+    let parent_oid = repo
+        .find_commit(feat_new_oid)
+        .unwrap()
+        .parent_id(0)
+        .unwrap();
+    assert_eq!(
+        parent_oid, new_head_oid,
+        "the picked branch should be restacked onto new main"
+    );
+}
+
+#[test]
+fn test_restack_pick_non_interactive_errors() {
+    // `--pick` needs a chooser; with no terminal and no scripted selection it
+    // must fail loudly with the input-required exit code (3) rather than exit 0
+    // having restacked nothing.
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = repo_init(repo_path);
+
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    let head_oid = make_commit(&repo, "HEAD", "a.txt", "A", "feat: A", &[]);
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+
+    run_ok("git", &["checkout", "-b", "feat"], repo_path);
+    make_commit(
+        &repo,
+        "HEAD",
+        "b.txt",
+        "B",
+        "feat: B",
+        &[&repo.find_commit(head_oid).unwrap()],
+    );
+
+    // Amend A so feat is a floating child (so --pick reaches the prompt).
+    run_ok("git", &["checkout", "main"], repo_path);
+    std::fs::write(repo_path.join("a.txt"), "A amended").unwrap();
+    run_ok("git", &["add", "a.txt"], repo_path);
+    run_ok("git", &["commit", "--amend", "-m", "feat: A"], repo_path);
+    let main_after = repo.head().unwrap().target().unwrap();
+
+    // No terminal, no KIN_TEST_* seed -> input-required.
+    kin_cmd()
+        .current_dir(repo_path)
+        .arg("restack")
+        .arg("--pick")
+        .assert()
+        .failure()
+        .code(3);
+
+    // Nothing was restacked: feat still points at the stale (pre-amend) base.
+    run_ok("git", &["checkout", "feat"], repo_path);
+    let feat_parent = repo
+        .find_commit(repo.head().unwrap().target().unwrap())
+        .unwrap()
+        .parent_id(0)
+        .unwrap();
+    assert_ne!(
+        feat_parent, main_after,
+        "no restack should have happened when --pick could not prompt"
+    );
+}
+
+#[test]
 fn test_restack_unrelated() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
