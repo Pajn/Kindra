@@ -406,11 +406,34 @@ fn remote_for_branch(repo: &Repository, branch: &str) -> Result<Option<String>> 
 #[cfg(test)]
 mod tests {
     use super::{
-        create_local_branch_from_start_point_strict, ensure_local_branch_exists,
-        list_live_worktrees, live_worktree_map,
+        add_worktree, create_local_branch_from_start_point_strict, ensure_local_branch_exists,
+        is_worktree_dirty, list_live_worktrees, live_worktree_map, remove_worktree,
     };
     use git2::BranchType;
     use tempfile::TempDir;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    /// A repo with one commit and user identity configured.
+    fn init_repo_with_commit(dir: &std::path::Path) -> git2::Repository {
+        git(dir, &["init", "--initial-branch=main"]);
+        let repo = git2::Repository::open(dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Test").unwrap();
+        cfg.set_str("user.email", "test@example.com").unwrap();
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+        git(dir, &["add", "a.txt"]);
+        git(dir, &["commit", "-m", "init"]);
+        repo
+    }
 
     #[test]
     fn lists_worktrees() {
@@ -603,5 +626,64 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn is_worktree_dirty_reports_untracked_modified_and_clean() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        init_repo_with_commit(root);
+
+        // Clean tree.
+        assert!(!is_worktree_dirty(root).unwrap(), "fresh commit is clean");
+
+        // Untracked file must count as dirty (the removal safety check relies on
+        // this — losing untracked work would be data loss).
+        std::fs::write(root.join("untracked.txt"), "x").unwrap();
+        assert!(
+            is_worktree_dirty(root).unwrap(),
+            "untracked file must be dirty"
+        );
+        std::fs::remove_file(root.join("untracked.txt")).unwrap();
+        assert!(!is_worktree_dirty(root).unwrap());
+
+        // Modified tracked file counts as dirty.
+        std::fs::write(root.join("a.txt"), "changed").unwrap();
+        assert!(
+            is_worktree_dirty(root).unwrap(),
+            "modified tracked file must be dirty"
+        );
+    }
+
+    #[test]
+    fn remove_worktree_refuses_dirty_without_force_and_succeeds_with_force() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let repo = init_repo_with_commit(root);
+
+        git(root, &["branch", "feature"]);
+        let wt_path = root.join("wt");
+        add_worktree(&repo, &wt_path, "feature").unwrap();
+        assert!(wt_path.join("a.txt").exists(), "worktree checked out");
+
+        // Dirty the worktree with uncommitted work.
+        std::fs::write(wt_path.join("a.txt"), "local edit").unwrap();
+
+        // Without --force, git refuses to remove a dirty worktree, so the
+        // directory (and the user's edit) survive.
+        assert!(
+            remove_worktree(&repo, &wt_path, false).is_err(),
+            "dirty worktree must not be removed without --force"
+        );
+        assert!(wt_path.exists(), "worktree preserved on refusal");
+
+        // With --force, it is removed and the admin entry pruned together.
+        remove_worktree(&repo, &wt_path, true).unwrap();
+        assert!(!wt_path.exists(), "worktree removed with --force");
+        let live = list_live_worktrees(&repo).unwrap();
+        assert!(
+            !live.iter().any(|w| w.path == wt_path),
+            "git worktree list no longer references the removed path"
+        );
     }
 }
