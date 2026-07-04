@@ -1,6 +1,6 @@
 mod common;
 
-use common::{current_branch, kin_cmd, setup_repo};
+use common::{current_branch, kin_cmd, run_ok, setup_repo};
 use std::process::Command;
 
 fn branch_exists(cwd: &std::path::Path, name: &str) -> bool {
@@ -240,4 +240,57 @@ fn rename_fails_fast_on_incompatible_metadata_without_renaming_ref() {
     // The ref must not have moved: the failure happened before `git branch -m`.
     assert!(branch_exists(dir.path(), "feature-a"));
     assert!(!branch_exists(dir.path(), "feature-a-renamed"));
+}
+
+#[test]
+fn rename_migrates_branch_tracking_config() {
+    // The docs and code promise that shelling out to `git branch -m` carries the
+    // branch's tracking config (`branch.<name>.*`) across the rename — the whole
+    // reason it's used instead of `git2::Branch::rename`, which drops it. Assert
+    // it, so a regression to the git2 rename can't pass silently.
+    let dir = setup_repo();
+    run_ok(
+        "git",
+        &["config", "branch.feature-a.remote", "origin"],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["config", "branch.feature-a.merge", "refs/heads/feature-a"],
+        dir.path(),
+    );
+
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["rename", "feature-a", "feature-a-renamed"])
+        .assert()
+        .success();
+
+    let git_config = |key: &str| -> Option<String> {
+        let out = Command::new("git")
+            .args(["config", "--get", key])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+
+    // The config section moved with the branch...
+    assert_eq!(
+        git_config("branch.feature-a-renamed.remote").as_deref(),
+        Some("origin"),
+        "tracking remote must migrate to the new branch name"
+    );
+    assert!(
+        git_config("branch.feature-a-renamed.merge").is_some(),
+        "tracking merge ref must migrate to the new branch name"
+    );
+    // ...and nothing is left behind under the old name.
+    assert!(
+        git_config("branch.feature-a.remote").is_none(),
+        "old tracking config must not linger after the rename"
+    );
+    assert!(git_config("branch.feature-a.merge").is_none());
 }

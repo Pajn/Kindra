@@ -274,6 +274,20 @@ pub fn find_upstream(repo: &Repository) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// The local branch name a base/upstream ref would shadow. [`find_upstream`] may
+/// return a remote-qualified ref (e.g. `origin/main`) when the base lives only on
+/// a remote; a new local `main` would then hijack the stack base. Strip a leading
+/// `<remote>/` only when `<remote>` is a real configured remote, so an ordinary
+/// branch like `feature/x` is left intact. Single source of truth for that
+/// reduction so callers don't each open-code a subtly different variant.
+pub(crate) fn base_short_name(repo: &Repository, upstream: &str) -> String {
+    upstream
+        .split_once('/')
+        .filter(|(remote, _)| repo.find_remote(remote).is_ok())
+        .map(|(_, rest)| rest.to_string())
+        .unwrap_or_else(|| upstream.to_string())
+}
+
 fn branch_exists(repo: &Repository, name: &str) -> bool {
     repo.find_branch(name, BranchType::Local).is_ok()
         || repo.find_branch(name, BranchType::Remote).is_ok()

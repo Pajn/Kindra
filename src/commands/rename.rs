@@ -73,11 +73,7 @@ fn rename_branch(repo: &Repository, old_name: &str, new_name: &str) -> Result<()
         // a local branch that `find_upstream` then prefers over a remote-only
         // base (e.g. `origin/main`), silently hijacking the stack base. Compare
         // against the base's short name so an `origin/main` base also blocks `main`.
-        let base_short = upstream
-            .split_once('/')
-            .filter(|(remote, _)| repo.find_remote(remote).is_ok())
-            .map(|(_, rest)| rest)
-            .unwrap_or(upstream.as_str());
+        let base_short = crate::commands::base_short_name(repo, &upstream);
         if new_name == upstream || new_name == base_short {
             return Err(anyhow!(
                 "Renaming to '{}' would shadow the stack base '{}'. Choose a different name.",
