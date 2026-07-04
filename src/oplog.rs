@@ -20,12 +20,19 @@
 //! # Lifecycle
 //!
 //! 1. A mutating command calls [`begin`] right after taking the repo lock. This
-//!    snapshots every local branch tip plus HEAD into a *pending* file.
-//! 2. On success the command calls [`finalize`], which diffs the current tips
-//!    against the pending snapshot, anchors the changed pre/post OIDs as refs,
-//!    appends an [`Entry`] to the log, and removes the pending file.
-//! 3. `kin abort` calls [`discard`], because aborting already restores the
-//!    original refs — there is nothing to undo.
+//!    snapshots every local branch tip plus HEAD into a *pending* file and returns
+//!    a [`PendingSnapshot`] RAII guard the command holds for the whole operation.
+//! 2. When the guard drops — on success, an early `return`, a `?` error, or an
+//!    unwind — it [`settle`]s the snapshot: [`finalize`] records an [`Entry`] if
+//!    branch tips moved (anchoring the changed pre/post OIDs as refs) or drops the
+//!    pending file if nothing changed. Commands never call [`finalize`]
+//!    themselves; dropping the guard is the single settle path.
+//! 3. The snapshot survives the guard only while an operation is still in progress
+//!    (a conflict-paused rebase). The resuming `kin continue` settles it on
+//!    completion; `kin abort` either [`discard`]s it (pre-operation refs were
+//!    restored, so there is nothing to undo) or, when it clears divergent state
+//!    *without* restoring refs, [`finalize`]s it (the effects are live and must
+//!    stay undoable).
 //!
 //! Because a conflict-interrupted operation finishes in a *later* `kin continue`
 //! process, the pre-image lives on disk in the pending file rather than in

@@ -125,6 +125,31 @@ fn undo_reverts_sync_and_redo_reapplies() {
 }
 
 #[test]
+fn new_operation_clears_redo_history() {
+    // Documented invariant: running a new stack-rewriting operation clears the
+    // redo history (finalize drains entries past the cursor). After an undo, a
+    // fresh operation must therefore make `redo` a no-op.
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    setup_stack_with_advanced_main(root);
+
+    // First operation, then undo it so a redo is available.
+    kin_cmd().current_dir(root).arg("sync").assert().success();
+    kin_cmd().current_dir(root).arg("undo").assert().success();
+
+    // A new recorded operation must truncate the redo tail. `main` is still
+    // advanced after undo (undo only restores branch tips), so sync has work.
+    kin_cmd().current_dir(root).arg("sync").assert().success();
+
+    kin_cmd()
+        .current_dir(root)
+        .arg("redo")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Nothing to redo."));
+}
+
+#[test]
 fn undo_survives_aggressive_gc() {
     let dir = tempdir().unwrap();
     let root = dir.path();
@@ -332,40 +357,87 @@ fn init_with_base_commit(root: &Path) {
 }
 
 #[test]
-fn reorder_on_upstream_leaves_no_pending_snapshot() {
+fn reorder_settles_snapshot_on_success() {
+    // A real reorder runs `begin` and rewrites branch tips, so the guard must
+    // settle the snapshot into a finalized (undoable) entry rather than leave a
+    // dangling pending file. Driving an actual reorder is what exercises the
+    // guard — a path that bails before `begin` could never leave one anyway.
     let dir = tempdir().unwrap();
     let root = dir.path();
     init_with_base_commit(root);
 
-    // Reordering the upstream branch itself is rejected before any mutation.
+    for (branch, file) in [
+        ("feature-a", "a.txt"),
+        ("feature-b", "b.txt"),
+        ("feature-c", "c.txt"),
+    ] {
+        run_ok("git", &["checkout", "-b", branch], root);
+        fs::write(root.join(file), file).unwrap();
+        run_ok("git", &["add", "."], root);
+        run_ok("git", &["commit", "-m", branch], root);
+    }
+    run_ok("git", &["checkout", "-f", "feature-a"], root);
+
+    // Reorder the stack to main -> feature-c -> feature-a -> feature-b.
+    let editor = root.join("reorder-editor.sh");
+    fs::write(
+        &editor,
+        "#!/bin/sh\n{\n  echo \"branch feature-c parent main\"\n  echo \"branch feature-a\"\n  echo \"branch feature-b\"\n} > \"$1\"\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     kin_cmd()
         .current_dir(root)
         .arg("reorder")
+        .env("GIT_EDITOR", &editor)
         .assert()
-        .failure();
+        .success();
+
     assert!(
         !pending_snapshot_exists(root),
-        "a rejected reorder must not leave a pending snapshot"
+        "a successful reorder must settle its snapshot, not leave it pending"
     );
+    // Settled means finalized into an undoable entry, not vacuously absent.
+    kin_cmd().current_dir(root).arg("undo").assert().success();
 }
 
 #[test]
-fn restack_no_op_leaves_no_pending_snapshot() {
+fn restack_settles_snapshot_on_success() {
+    // A real restack (a floating child reparented onto an amended main) runs
+    // `begin` and rewrites a tip, so the guard must settle the snapshot into a
+    // finalized (undoable) entry rather than leave a dangling pending file.
     let dir = tempdir().unwrap();
     let root = dir.path();
     init_with_base_commit(root);
 
-    // No floating children -> restack returns early without mutating.
+    // feature branches off main, then main is amended so feature floats.
+    run_ok("git", &["checkout", "-b", "feature"], root);
+    fs::write(root.join("f.txt"), "f").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "feature"], root);
+
+    run_ok("git", &["checkout", "main"], root);
+    fs::write(root.join("base.txt"), "base-amended").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "--amend", "-m", "base"], root);
+
     kin_cmd()
         .current_dir(root)
         .arg("restack")
         .assert()
-        .success()
-        .stdout(predicate::str::contains("No floating children found."));
+        .success();
+
     assert!(
         !pending_snapshot_exists(root),
-        "a no-op restack must not leave a pending snapshot"
+        "a successful restack must settle its snapshot, not leave it pending"
     );
+    // Settled means finalized into an undoable entry, not vacuously absent.
+    kin_cmd().current_dir(root).arg("undo").assert().success();
 }
 
 #[test]
@@ -389,17 +461,37 @@ fn split_no_op_leaves_no_pending_snapshot() {
 }
 
 #[test]
-fn move_on_upstream_leaves_no_pending_snapshot() {
+fn move_settles_snapshot_on_success() {
+    // A real move runs `begin` and rewrites a tip, so the guard must settle the
+    // snapshot into a finalized (undoable) entry rather than leave a dangling
+    // pending file.
     let dir = tempdir().unwrap();
     let root = dir.path();
     init_with_base_commit(root);
 
-    // Moving the upstream branch itself is rejected before any mutation.
-    kin_cmd().current_dir(root).arg("move").assert().failure();
+    run_ok("git", &["checkout", "-b", "feature-a"], root);
+    fs::write(root.join("a.txt"), "a").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "a1"], root);
+
+    run_ok("git", &["checkout", "-b", "feature-b"], root);
+    fs::write(root.join("b.txt"), "b").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "b1"], root);
+
+    // Move feature-b off feature-a directly onto main.
+    kin_cmd()
+        .current_dir(root)
+        .args(["move", "--onto", "main"])
+        .assert()
+        .success();
+
     assert!(
         !pending_snapshot_exists(root),
-        "a rejected move must not leave a pending snapshot"
+        "a successful move must settle its snapshot, not leave it pending"
     );
+    // Settled means finalized into an undoable entry, not vacuously absent.
+    kin_cmd().current_dir(root).arg("undo").assert().success();
 }
 
 #[test]
