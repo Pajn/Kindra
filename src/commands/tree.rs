@@ -6,6 +6,51 @@ use clap::Args;
 use crossterm::style::{Color, Stylize};
 use git2::BranchType;
 use std::collections::HashMap;
+use std::io::IsTerminal;
+
+/// Whether tree output should include ANSI color/attributes.
+///
+/// Precedence:
+/// 1. `NO_COLOR` set to a non-empty value (<https://no-color.org>) — never
+///    colorize (explicit opt-out wins). Per the spec, an *empty* `NO_COLOR` does
+///    not count, so `NO_COLOR=` can neutralize an inherited setting.
+/// 2. `CLICOLOR_FORCE` / `FORCE_COLOR` set and not `0` — colorize even when not a
+///    terminal (e.g. piping into `less -R`).
+/// 3. Otherwise, colorize only when stdout is a terminal, so piped/redirected
+///    output and CI logs stay plain text.
+fn color_enabled() -> bool {
+    if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    if env_flag_set("CLICOLOR_FORCE") || env_flag_set("FORCE_COLOR") {
+        return true;
+    }
+    std::io::stdout().is_terminal()
+}
+
+/// A "force" env var counts as enabled when it is present and set to anything
+/// other than empty or `0`.
+fn env_flag_set(key: &str) -> bool {
+    matches!(std::env::var(key), Ok(v) if !matches!(v.trim(), "" | "0"))
+}
+
+/// Apply `bold` to `s` only when color is enabled.
+fn bold_if(s: &str, color: bool) -> String {
+    if color {
+        s.bold().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Apply foreground `c` to `s` only when color is enabled.
+fn colored_if(s: &str, c: Color, color: bool) -> String {
+    if color {
+        s.with(c).to_string()
+    } else {
+        s.to_string()
+    }
+}
 
 /// CLI arguments for the tree command
 #[derive(Args, Debug)]
@@ -82,6 +127,7 @@ struct RenderOptions {
     show_commits: bool,
     show_remote: bool,
     show_pr: bool,
+    color: bool,
 }
 
 /// Render the tree with all configured options
@@ -139,6 +185,7 @@ pub fn tree(args: &TreeArgs) -> Result<()> {
         show_commits,
         show_remote,
         show_pr,
+        color: color_enabled(),
     };
 
     if show_commits || show_remote || show_pr {
@@ -428,7 +475,7 @@ fn render_tree(
     }
 
     let upstream_display = if current_branch_name.as_deref() == Some(upstream_name) {
-        upstream_name.bold().to_string()
+        bold_if(upstream_name, options.color)
     } else {
         upstream_name.to_string()
     };
@@ -476,15 +523,12 @@ fn render_branch_recursive(
         } else {
             format!("#{} OPEN", pr.number)
         };
-        status_parts.push(
-            pr_str
-                .with(if pr.is_draft {
-                    Color::Yellow
-                } else {
-                    Color::Green
-                })
-                .to_string(),
-        );
+        let pr_color = if pr.is_draft {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+        status_parts.push(colored_if(&pr_str, pr_color, options.color));
     }
 
     // Remote status
@@ -501,7 +545,7 @@ fn render_branch_recursive(
         } else {
             Color::Green
         };
-        status_parts.push(remote_str.with(color).to_string());
+        status_parts.push(colored_if(&remote_str, color, options.color));
     }
 
     // Sync status
@@ -518,7 +562,7 @@ fn render_branch_recursive(
             SyncStatus::NeedsRebase => Color::Red,
             SyncStatus::Merged => Color::DarkGrey,
         };
-        status_parts.push(sync_str.with(color).to_string());
+        status_parts.push(colored_if(sync_str, color, options.color));
     }
 
     // Commits
@@ -543,7 +587,7 @@ fn render_branch_recursive(
     // Determine branch name styling
     let is_current = current_branch_name.as_ref() == Some(&tb.branch.name);
     let branch_display = if is_current {
-        tb.branch.name.clone().bold().to_string()
+        bold_if(&tb.branch.name, options.color)
     } else {
         tb.branch.name.clone()
     };

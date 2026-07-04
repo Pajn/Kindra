@@ -99,7 +99,7 @@ fn reorder_linear_stack() {
     kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .assert()
         .success();
 
@@ -134,7 +134,7 @@ fn reorder_creates_fork() {
     kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .assert()
         .success();
 
@@ -170,7 +170,7 @@ fn reorder_preserves_existing_fork() {
     kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .assert()
         .success();
 
@@ -206,7 +206,7 @@ fn reorder_restores_original_branch_when_run_from_middle() {
     kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .assert()
         .success();
 
@@ -233,7 +233,7 @@ fn reorder_rejects_self_parent() {
     kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .assert()
         .failure()
         .stderr(predicates::str::contains(
@@ -257,7 +257,7 @@ fn reorder_rejects_shorthand_on_first_row() {
     kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .assert()
         .failure()
         .stderr(predicates::str::contains(
@@ -281,7 +281,7 @@ fn reorder_rejects_unknown_parent() {
     kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .assert()
         .failure()
         .stderr(predicates::str::contains("unknown parent"));
@@ -309,7 +309,7 @@ fn reorder_rejects_cycle() {
     kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .assert()
         .failure()
         .stderr(predicates::str::contains("contains a cycle"));
@@ -337,7 +337,7 @@ fn reorder_rejects_duplicate_or_missing_rows() {
     kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
-        .env("EDITOR", &duplicate_editor)
+        .env("GIT_EDITOR", &duplicate_editor)
         .assert()
         .failure()
         .stderr(predicates::str::contains("Duplicate branch row"));
@@ -346,7 +346,7 @@ fn reorder_rejects_duplicate_or_missing_rows() {
     kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
-        .env("EDITOR", &missing_editor)
+        .env("GIT_EDITOR", &missing_editor)
         .assert()
         .failure()
         .stderr(predicates::str::contains("missing branch rows"));
@@ -396,7 +396,7 @@ fn reorder_conflict_and_continue() {
     kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .assert()
         .failure()
         .stderr(predicates::str::contains("Resolve conflicts"));
@@ -464,7 +464,7 @@ fn reorder_conflict_and_abort_restores_original_graph_and_cleans_up() {
     kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .assert()
         .failure()
         .stderr(predicates::str::contains("Resolve conflicts"));
@@ -683,7 +683,7 @@ fn reorder_manual_git_continue_then_abort_clears_state_without_rewinding_refs() 
     kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .assert()
         .failure()
         .stderr(predicates::str::contains("Resolve conflicts"));
@@ -755,7 +755,7 @@ fn reorder_checks_worktrees() {
     kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .assert()
         .failure()
         .stderr(predicates::str::contains("feature-c is checked out in"));
@@ -828,7 +828,7 @@ fn reorder_success_discards_draft() {
     kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .assert()
         .success();
 
@@ -847,7 +847,7 @@ fn reorder_failure_preserves_draft_and_prints_guidance() {
     let output = kin_cmd()
         .arg("reorder")
         .current_dir(dir.path())
-        .env("EDITOR", &editor)
+        .env("GIT_EDITOR", &editor)
         .output()
         .unwrap();
 

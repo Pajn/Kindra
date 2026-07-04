@@ -607,12 +607,39 @@ fn test_move_continue_forwards_editor_env_to_git() {
     fs::write(dir.path().join("file.txt"), "resolved content").unwrap();
     run_ok("git", &["add", "file.txt"], dir.path());
 
+    // With no GIT_EDITOR, `kin continue` must resolve the editor the same way
+    // the rest of the CLI does and forward it to git — here that falls through
+    // to $EDITOR. A marker-writing editor proves it was actually invoked. A
+    // local empty `core.editor` neutralizes any machine-level `core.editor` (and
+    // VISUAL is cleared) so it can't shadow $EDITOR and make the fallback
+    // ambiguous; nothing else about the environment is altered.
+    run_ok("git", &["config", "core.editor", ""], dir.path());
+    let marker = dir.path().join("editor-was-invoked");
+    let editor = dir.path().join("fake-editor.sh");
+    fs::write(
+        &editor,
+        format!("#!/bin/sh\ntouch \"{}\"\n", marker.display()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     kin_cmd()
         .arg("continue")
         .current_dir(dir.path())
-        .env("EDITOR", "true")
+        .env_remove("GIT_EDITOR")
+        .env_remove("VISUAL")
+        .env("EDITOR", &editor)
         .assert()
         .success();
+
+    assert!(
+        marker.exists(),
+        "kin continue should resolve and invoke $EDITOR when GIT_EDITOR is unset"
+    );
 
     let feature_new = repo
         .find_branch("feature", git2::BranchType::Local)

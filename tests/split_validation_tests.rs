@@ -99,7 +99,7 @@ branch inv..alid/' "$file"
     let output = cmd
         .arg("split")
         .current_dir(dir.path())
-        .env("EDITOR", &editor_script)
+        .env("GIT_EDITOR", &editor_script)
         .output()
         .unwrap();
 
@@ -159,7 +159,7 @@ perl -i -pe 's/branch in-stack/branch outside/' "$file"
     let mut cmd = kin_cmd();
     cmd.arg("split")
         .current_dir(dir.path())
-        .env("EDITOR", &editor_script)
+        .env("GIT_EDITOR", &editor_script)
         .env("TERM", "dumb")
         .assert()
         .success()

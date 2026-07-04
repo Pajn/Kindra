@@ -181,6 +181,7 @@ fn main() {
 const EXIT_INPUT_REQUIRED: i32 = 3;
 
 fn real_main() -> i32 {
+    runtime::install_quiet_output_panic_hook();
     let _restorer = TerminalRestorer;
 
     match dispatch() {
