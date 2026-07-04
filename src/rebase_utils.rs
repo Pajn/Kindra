@@ -701,6 +701,7 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
     }
 
     clear_state(repo)?;
+    crate::oplog::finalize(repo)?;
 
     Ok(())
 }

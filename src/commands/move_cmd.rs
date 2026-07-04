@@ -247,6 +247,10 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         cleanup_checkout_fallback: None,
     };
 
+    // Snapshot for undo only now that all argument/target validation has passed
+    // and we are about to mutate branches. The guard settles the snapshot on
+    // every exit from here on, so no path can leave a stale pending snapshot.
+    let _snapshot = crate::oplog::begin(repo, "move")?;
     save_state(repo, &state)?;
     run_rebase_loop(repo, state)
 }
