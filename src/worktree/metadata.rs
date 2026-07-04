@@ -146,6 +146,21 @@ impl WorktreeMetadata {
         });
     }
 
+    /// Point any records tracking `old` at `new` after a branch rename.
+    /// Returns whether any record changed.
+    pub fn rename_branch(&mut self, old: &str, new: &str) -> bool {
+        // Renaming a branch is not "using" its worktree, so leave last_used_at
+        // untouched (only the branch name changes).
+        let mut changed = false;
+        for record in &mut self.file.worktrees {
+            if record.branch == old {
+                record.branch = new.to_string();
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn remove_role(&mut self, role: WorktreeRole) {
         self.file.worktrees.retain(|record| record.role != role);
     }
@@ -370,6 +385,24 @@ mod tests {
             metadata.records()[0].path_buf(),
             std::path::PathBuf::from("two")
         );
+    }
+
+    #[test]
+    fn rename_branch_renames_without_touching_last_used_at() {
+        let mut metadata = WorktreeMetadata::default();
+        metadata.upsert(WorktreeRole::Temp, "old", std::path::Path::new("p"));
+        let before = metadata.records()[0].last_used_at;
+
+        assert!(metadata.rename_branch("old", "new"));
+        assert_eq!(metadata.records()[0].branch, "new");
+        assert_eq!(
+            metadata.records()[0].last_used_at,
+            before,
+            "rename is not a use; last_used_at must be unchanged"
+        );
+
+        // Renaming a branch with no matching worktree record is a no-op.
+        assert!(!metadata.rename_branch("missing", "x"));
     }
 
     #[test]

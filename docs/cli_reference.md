@@ -8,6 +8,7 @@ This document provides a detailed overview of the commands available in Kindra v
 - [Command Reference](#command-reference)
   - [commit](#commit)
   - [move](#move)
+  - [rename](#rename)
   - [reorder](#reorder)
   - [sync](#sync)
   - [restack](#restack)
@@ -122,6 +123,35 @@ After kin move:
 main -> [M1] -> [A1'] -> (feature-A) -> [B1'] -> (feature-B)
       \-> [D1] -> (develop)
 ```
+
+---
+
+### `rename`
+
+**Description:** Renames a branch. Because Kindra derives stack relationships from commit topology rather than a stored parent map, renaming a branch preserves the entire stack automatically — descendants keep building on the same commits.
+
+**Usage:**
+
+```bash
+kin rename <new-name>
+kin rename <old-branch> <new-name>
+```
+
+- With a single argument, the **current** branch is renamed to `<new-name>`.
+- With two arguments, `<old-branch>` is renamed to `<new-name>` (mirrors `git branch -m <old> <new>`).
+
+**What it does:**
+
+- Runs `git branch -m`, so the branch's tracking configuration (`branch.<name>.*`) moves with it.
+- Updates any Kindra-managed worktree metadata that referenced the old branch name.
+- Leaves stack parent/child relationships untouched, since they are computed from commit history.
+
+**Restrictions:**
+
+- Refuses to rename the resolved upstream/base branch (e.g. `main`), because the stack is derived relative to it and `.git/kindra.toml` may pin it by name.
+- Refuses to overwrite an existing branch.
+
+**When to use it:** Use this to give a branch a better name without breaking the branches stacked on top of it. Renaming with plain `git branch -m` also works, but `kin rename` additionally keeps worktree metadata consistent and guards against renaming the base branch.
 
 ---
 
