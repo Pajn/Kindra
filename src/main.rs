@@ -21,7 +21,7 @@ use crate::commands::rename::{RenameArgs, rename};
 use crate::commands::reorder::{ReorderArgs, reorder};
 use crate::commands::restack::{RestackArgs, restack};
 use crate::commands::run::{RunArgs, run};
-use crate::commands::split::split;
+use crate::commands::split::{SplitArgs, split};
 use crate::commands::status_cmd::status_cmd;
 use crate::commands::sync::{SyncArgs, sync};
 use crate::commands::tree::{TreeArgs, tree};
@@ -54,7 +54,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Opens $EDITOR to manage branches in a stack of commits
-    Split,
+    Split(SplitArgs),
     /// Pushes all branches with upstreams (atomic, force-with-lease)
     Push,
     /// Create/update PRs for stack branches, or open existing PRs in the browser
@@ -224,7 +224,7 @@ fn dispatch() -> Result<()> {
     interaction::init(interaction::resolve(no_interactive, yes));
 
     match &cli.command {
-        Commands::Split => split()?,
+        Commands::Split(args) => split(args)?,
         Commands::Push => push()?,
         Commands::Pr {
             subcommand,

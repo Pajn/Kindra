@@ -415,7 +415,7 @@ impl Direction {
 fn restore(repo: &Repository, entry: &Entry, dir: Direction, force: bool) -> Result<()> {
     // A ref move that also rewinds the working tree must not silently discard
     // uncommitted work.
-    if !force && working_tree_dirty(repo)? {
+    if !force && crate::rebase_utils::working_tree_dirty(repo)? {
         return Err(anyhow!(
             "Working tree has uncommitted changes; refusing to move branches. \
              Commit or stash them, or rerun with --force to discard them."
@@ -704,15 +704,6 @@ fn summarize(op: &str, changes: &BTreeMap<String, Change>) -> String {
 // ---------------------------------------------------------------------------
 // Repository state helpers.
 // ---------------------------------------------------------------------------
-
-fn working_tree_dirty(repo: &Repository) -> Result<bool> {
-    let mut opts = git2::StatusOptions::new();
-    // Untracked/ignored files are safe across ref moves; only tracked changes
-    // would be lost.
-    opts.include_untracked(false).include_ignored(false);
-    let statuses = repo.statuses(Some(&mut opts))?;
-    Ok(!statuses.is_empty())
-}
 
 /// True when a Kindra-managed operation (or a raw git rebase) is mid-flight, so
 /// its saved state — and any pending undo snapshot — must survive for the

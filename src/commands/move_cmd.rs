@@ -1,4 +1,4 @@
-use crate::commands::{find_upstream, resolve_rebase_autostash};
+use crate::commands::find_upstream;
 use crate::rebase_utils::{
     Operation, RebaseState, passively_reconcile_rebase_state, run_rebase_loop, save_state,
 };
@@ -187,18 +187,14 @@ fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
         (sub_stack, remaining_branches, HashMap::new())
     };
 
-    let autostash = resolve_rebase_autostash(
-        repo,
-        if args.autostash {
-            Some(true)
-        } else if args.no_autostash {
-            Some(false)
-        } else {
-            None
-        },
-    )?;
-
+    // Check for worktree conflicts before the clean-or-autostash guard: a branch
+    // checked out in another worktree is a hard blocker that autostashing can't
+    // resolve, so surface it first rather than sending the user to clean their
+    // tree only to hit the worktree error afterwards.
     crate::rebase_utils::check_worktrees(&remaining_branches, args.force)?;
+
+    let autostash =
+        crate::commands::resolve_and_check_autostash(repo, args.autostash, args.no_autostash)?;
 
     let (parent_id_map, parent_name_map) = crate::stack::build_parent_maps(
         repo,

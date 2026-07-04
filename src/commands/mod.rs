@@ -312,6 +312,36 @@ pub fn resolve_restack_history_limit(
     Ok(DEFAULT_RESTACK_HISTORY_LIMIT)
 }
 
+/// Fold the mutually-exclusive `--autostash` / `--no-autostash` CLI flags into a
+/// single override for [`resolve_rebase_autostash`]: `Some(true)` / `Some(false)`
+/// when one is set, `None` to fall back to config. Centralized so the many
+/// command call sites can't drift on the flag→override mapping.
+pub fn autostash_override(autostash: bool, no_autostash: bool) -> Option<bool> {
+    if autostash {
+        Some(true)
+    } else if no_autostash {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Resolve the effective autostash setting for a rebase-style command and then
+/// enforce the clean-or-autostash contract up front, returning the resolved
+/// flag. Combines the [`autostash_override`] → [`resolve_rebase_autostash`] →
+/// [`crate::rebase_utils::ensure_rebase_working_tree`] sequence every rebase
+/// command shares, so a dirty tree with `--no-autostash` fails fast and
+/// identically everywhere.
+pub fn resolve_and_check_autostash(
+    repo: &Repository,
+    autostash: bool,
+    no_autostash: bool,
+) -> Result<bool> {
+    let resolved = resolve_rebase_autostash(repo, autostash_override(autostash, no_autostash))?;
+    crate::rebase_utils::ensure_rebase_working_tree(repo, resolved)?;
+    Ok(resolved)
+}
+
 pub fn resolve_rebase_autostash(repo: &Repository, cli_override: Option<bool>) -> Result<bool> {
     if let Some(autostash) = cli_override {
         return Ok(autostash);

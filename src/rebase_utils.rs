@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::stack::collect_first_parent_chain;
 
@@ -529,6 +530,75 @@ pub fn check_worktrees(branches: &[String], force: bool) -> Result<()> {
     Ok(())
 }
 
+/// True if the working tree has tracked changes that a rebase or checkout would
+/// disturb. Untracked and ignored files are intentionally ignored, matching
+/// `git rebase`'s own contract (they neither block a rebase nor get autostashed).
+pub fn working_tree_dirty(repo: &Repository) -> Result<bool> {
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(false).include_ignored(false);
+    let statuses = repo.statuses(Some(&mut opts))?;
+    Ok(!statuses.is_empty())
+}
+
+/// The uniform error returned when a command needs a clean working tree and
+/// autostash is off. Mirrors `git rebase`'s refusal but with Kindra guidance,
+/// so every command speaks with one voice.
+pub fn dirty_working_tree_error() -> anyhow::Error {
+    anyhow!(
+        "You have uncommitted changes.\n\
+         Commit or stash them, or re-run with --autostash (or set rebase.autostash=true)."
+    )
+}
+
+/// Pre-flight for commands that delegate stashing to `git rebase --autostash`
+/// (sync, move, reorder, restack). Surfaces Kindra's uniform message up front
+/// when the tree is dirty and autostash is off; when autostash is on, git does
+/// the stashing so this is a no-op.
+pub fn ensure_rebase_working_tree(repo: &Repository, autostash: bool) -> Result<()> {
+    if !autostash && working_tree_dirty(repo)? {
+        return Err(dirty_working_tree_error());
+    }
+    Ok(())
+}
+
+/// Enforce the clean-or-autostash contract for commands that manage the working
+/// tree themselves rather than via `git rebase` (run, split). Returns:
+/// - `Ok(None)` if the tree is clean (nothing stashed),
+/// - `Err(..)` if the tree is dirty and autostash is off,
+/// - `Ok(Some(stash_ref))` if the tree was dirty and autostash stashed it.
+///
+/// Restore the returned ref with [`apply_stash`] + [`drop_stash`].
+pub fn take_autostash(repo: &Repository, autostash: bool) -> Result<Option<String>> {
+    if !working_tree_dirty(repo)? {
+        return Ok(None);
+    }
+    if !autostash {
+        return Err(dirty_working_tree_error());
+    }
+
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let message = format!("kin-autostash-{}-{}", std::process::id(), ts);
+    // Capture (rather than inherit) git's output so the internal
+    // `kin-autostash-…` token doesn't leak onto the user's terminal via git's
+    // "Saved working directory and index state …" confirmation.
+    let output = Command::new("git")
+        .args(["stash", "push", "-m", &message])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!("Failed to autostash working tree changes."));
+    }
+
+    // `git stash push` exits 0 without creating an entry when it refreshes the
+    // index and finds nothing to save ("No local changes to save"). git2's
+    // status can report the tree dirty (e.g. a stat-dirty file whose content
+    // still matches HEAD) when git stash disagrees, so confirm an entry was
+    // actually created before claiming there's something to restore.
+    if find_stash_reference(&message)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(message))
+}
+
 pub fn apply_stash(stash_ref: &str) -> Result<()> {
     let resolved_ref = resolve_stash_reference(stash_ref)?;
     let status = Command::new("git")
@@ -563,6 +633,13 @@ fn resolve_stash_reference(stash_ref: &str) -> Result<String> {
         return Ok(stash_ref.to_string());
     }
 
+    find_stash_reference(stash_ref)?
+        .ok_or_else(|| anyhow!("Could not locate stash entry '{}'.", stash_ref))
+}
+
+/// Find the `stash@{N}` reference for a stash created with the given message,
+/// or `None` if no such entry exists.
+fn find_stash_reference(message: &str) -> Result<Option<String>> {
     let output = Command::new("git")
         .arg("stash")
         .arg("list")
@@ -577,15 +654,14 @@ fn resolve_stash_reference(stash_ref: &str) -> Result<String> {
         if let Some((reference, subject)) = line.split_once('\t') {
             let parsed_message = subject
                 .split_once(": ")
-                .map(|(_, message)| message.trim())
-                .unwrap_or_else(|| subject.trim());
-            if parsed_message == stash_ref {
-                return Ok(reference.to_string());
+                .map_or_else(|| subject.trim(), |(_, msg)| msg.trim());
+            if parsed_message == message {
+                return Ok(Some(reference.to_string()));
             }
         }
     }
 
-    Err(anyhow!("Could not locate stash entry '{}'.", stash_ref))
+    Ok(None)
 }
 
 pub fn unstage_all() -> Result<()> {

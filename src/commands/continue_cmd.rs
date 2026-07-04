@@ -50,7 +50,13 @@ pub fn continue_cmd() -> Result<()> {
     }
 
     if has_run_state {
-        return crate::commands::run::continue_run(&repo);
+        // `kin run` is not resumable: it restores the working tree and clears its
+        // state on every normal exit. Leftover state means a run was interrupted
+        // before it could restore (e.g. it failed to check the original branch
+        // back out), which `kin continue` cannot resolve.
+        return Err(anyhow!(
+            "A previous 'kin run' was interrupted before it could restore the working tree. Use 'kin abort' to restore it."
+        ));
     }
 
     println!("No operation in progress.");

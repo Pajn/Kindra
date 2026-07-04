@@ -181,6 +181,64 @@ fn test_restack_pick_non_interactive_errors() {
 }
 
 #[test]
+fn test_restack_refuses_dirty_working_tree_before_pick_prompt() {
+    // With --no-autostash and a dirty tree, restack must refuse up front — before
+    // the (interactive) --pick prompt — the same clean-or-autostash guard reorder
+    // and sync enforce, rather than prompting first and failing later.
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = repo_init(repo_path);
+
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    let head_oid = make_commit(&repo, "HEAD", "a.txt", "A", "feat: A", &[]);
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+    run_ok("git", &["checkout", "-b", "feat"], repo_path);
+    make_commit(
+        &repo,
+        "HEAD",
+        "b.txt",
+        "B",
+        "feat: B",
+        &[&repo.find_commit(head_oid).unwrap()],
+    );
+
+    // Amend A so feat is a floating child restack would otherwise pick up.
+    run_ok("git", &["checkout", "main"], repo_path);
+    std::fs::write(repo_path.join("a.txt"), "A amended").unwrap();
+    run_ok("git", &["add", "a.txt"], repo_path);
+    run_ok("git", &["commit", "--amend", "-m", "feat: A"], repo_path);
+
+    // Pin the config off, then dirty a tracked file.
+    run_ok("git", &["config", "rebase.autostash", "false"], repo_path);
+    std::fs::write(repo_path.join("a.txt"), "dirty").unwrap();
+
+    // `--pick` with no terminal would otherwise fail input-required (code 3); the
+    // dirty-tree guard must fire first with the clean-or-autostash error instead.
+    kin_cmd()
+        .current_dir(repo_path)
+        .arg("restack")
+        .arg("--no-autostash")
+        .arg("--pick")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("uncommitted changes"));
+
+    // The dirty change is untouched and no operation state was written.
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("a.txt")).unwrap(),
+        "dirty"
+    );
+    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    assert_no_rebase_in_progress(repo_path);
+}
+
+#[test]
 fn test_restack_unrelated() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
