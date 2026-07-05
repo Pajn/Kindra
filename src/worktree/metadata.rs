@@ -6,7 +6,6 @@ use git2::Repository;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -62,26 +61,11 @@ impl WorktreeMetadata {
         let mut latest = read_metadata(path.as_path())?;
         apply_delta(&self.original_file, &self.file, &mut latest);
         let raw = serde_json::to_string_pretty(&latest)?;
-        let temp_path = temp_metadata_path(&path);
-        match fs::remove_file(&temp_path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(anyhow!(
-                    "Failed to remove stale metadata temp file '{}': {}",
-                    temp_path.display(),
-                    err
-                ));
-            }
-        }
-        let mut temp = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)?;
-        temp.write_all(raw.as_bytes())?;
-        temp.sync_all()?;
-        drop(temp);
-        fs::rename(&temp_path, &path)?;
+        // Reuse the shared atomic writer: temp file + fsync + rename *plus* a
+        // directory fsync so the rename itself is durable (the hand-rolled
+        // version here omitted that, so a crash right after the rename could lose
+        // the update). The exclusive lock above still serializes writers.
+        crate::state_io::write_atomic(&path, &raw)?;
         Ok(())
     }
 
@@ -301,22 +285,6 @@ fn metadata_lock_path(path: &Path) -> PathBuf {
             .and_then(|name| name.to_str())
             .unwrap_or("metadata")
     ))
-}
-
-fn temp_metadata_path(path: &Path) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let filename = format!(
-        "{}.tmp.{}.{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("metadata"),
-        std::process::id(),
-        suffix
-    );
-    path.with_file_name(filename)
 }
 
 fn unix_timestamp() -> u64 {
