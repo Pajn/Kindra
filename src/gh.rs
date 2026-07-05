@@ -368,8 +368,17 @@ pub fn get_pr_status(owner: &str, repo: &str, pr_number: u64) -> Result<PrStatus
         is_draft: bool,
         commits: CommitConnection,
     }
+    #[derive(Default, Deserialize)]
+    struct PageInfo {
+        #[serde(rename = "hasNextPage")]
+        has_next_page: bool,
+        #[serde(rename = "endCursor")]
+        end_cursor: Option<String>,
+    }
     #[derive(Deserialize)]
     struct ReviewThreadConnection {
+        #[serde(rename = "pageInfo", default)]
+        page_info: PageInfo,
         nodes: Vec<ReviewThreadNode>,
     }
     #[derive(Deserialize)]
@@ -379,6 +388,8 @@ pub fn get_pr_status(owner: &str, repo: &str, pr_number: u64) -> Result<PrStatus
     }
     #[derive(Deserialize)]
     struct ReviewRequestConnection {
+        #[serde(rename = "pageInfo", default)]
+        page_info: PageInfo,
         nodes: Vec<ReviewRequestNode>,
     }
     #[derive(Deserialize)]
@@ -392,6 +403,8 @@ pub fn get_pr_status(owner: &str, repo: &str, pr_number: u64) -> Result<PrStatus
     }
     #[derive(Deserialize)]
     struct LatestReviewConnection {
+        #[serde(rename = "pageInfo", default)]
+        page_info: PageInfo,
         nodes: Vec<LatestReviewNode>,
     }
     #[derive(Deserialize)]
@@ -413,6 +426,7 @@ pub fn get_pr_status(owner: &str, repo: &str, pr_number: u64) -> Result<PrStatus
     }
     #[derive(Deserialize)]
     struct CommitStatusNode {
+        oid: Option<String>,
         #[serde(rename = "statusCheckRollup")]
         status_check_rollup: Option<StatusCheckRollup>,
     }
@@ -422,6 +436,8 @@ pub fn get_pr_status(owner: &str, repo: &str, pr_number: u64) -> Result<PrStatus
     }
     #[derive(Deserialize)]
     struct CheckContextConnection {
+        #[serde(rename = "pageInfo", default)]
+        page_info: PageInfo,
         nodes: Vec<CheckContextNode>,
     }
     #[derive(Deserialize)]
@@ -438,16 +454,97 @@ pub fn get_pr_status(owner: &str, repo: &str, pr_number: u64) -> Result<PrStatus
         },
     }
 
+    // Envelopes for the per-connection follow-up pagination queries.
+    #[derive(Deserialize)]
+    struct ThreadsPage {
+        data: ThreadsPageData,
+    }
+    #[derive(Deserialize)]
+    struct ThreadsPageData {
+        repository: Option<ThreadsPageRepo>,
+    }
+    #[derive(Deserialize)]
+    struct ThreadsPageRepo {
+        #[serde(rename = "pullRequest")]
+        pull_request: Option<ThreadsPagePr>,
+    }
+    #[derive(Deserialize)]
+    struct ThreadsPagePr {
+        #[serde(rename = "reviewThreads")]
+        review_threads: ReviewThreadConnection,
+    }
+    #[derive(Deserialize)]
+    struct RequestsPage {
+        data: RequestsPageData,
+    }
+    #[derive(Deserialize)]
+    struct RequestsPageData {
+        repository: Option<RequestsPageRepo>,
+    }
+    #[derive(Deserialize)]
+    struct RequestsPageRepo {
+        #[serde(rename = "pullRequest")]
+        pull_request: Option<RequestsPagePr>,
+    }
+    #[derive(Deserialize)]
+    struct RequestsPagePr {
+        #[serde(rename = "reviewRequests")]
+        review_requests: ReviewRequestConnection,
+    }
+    #[derive(Deserialize)]
+    struct ReviewsPage {
+        data: ReviewsPageData,
+    }
+    #[derive(Deserialize)]
+    struct ReviewsPageData {
+        repository: Option<ReviewsPageRepo>,
+    }
+    #[derive(Deserialize)]
+    struct ReviewsPageRepo {
+        #[serde(rename = "pullRequest")]
+        pull_request: Option<ReviewsPagePr>,
+    }
+    #[derive(Deserialize)]
+    struct ReviewsPagePr {
+        #[serde(rename = "latestReviews")]
+        latest_reviews: LatestReviewConnection,
+    }
+    #[derive(Deserialize)]
+    struct ContextsPage {
+        data: ContextsPageData,
+    }
+    #[derive(Deserialize)]
+    struct ContextsPageData {
+        repository: Option<ContextsPageRepo>,
+    }
+    #[derive(Deserialize)]
+    struct ContextsPageRepo {
+        object: Option<ContextsPageCommit>,
+    }
+    #[derive(Deserialize)]
+    struct ContextsPageCommit {
+        #[serde(rename = "statusCheckRollup")]
+        status_check_rollup: Option<StatusCheckRollup>,
+    }
+
     let query = r#"
 query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       reviewThreads(first: 100) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
           isResolved
         }
       }
       reviewRequests(first: 100) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
           requestedReviewer {
             ... on User {
@@ -457,6 +554,10 @@ query($owner: String!, $repo: String!, $number: Int!) {
         }
       }
       latestReviews(first: 100) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
           state
           author {
@@ -472,8 +573,13 @@ query($owner: String!, $repo: String!, $number: Int!) {
       commits(last: 1) {
         nodes {
           commit {
+            oid
             statusCheckRollup {
               contexts(first: 100) {
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
                 nodes {
                   __typename
                   ... on CheckRun {
@@ -496,40 +602,243 @@ query($owner: String!, $repo: String!, $number: Int!) {
 }
 "#;
 
-    let output = Command::new("gh")
-        .args(["api", "graphql", "-f", &format!("query={}", query)])
-        .args(["-F", &format!("owner={}", owner)])
-        .args(["-F", &format!("repo={}", repo)])
-        .args(["-F", &format!("number={}", pr_number)])
-        .output()
-        .context("Failed to run `gh api graphql`")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Failed to fetch PR status details: {}",
-            stderr.trim()
-        ));
+    // Follow-up queries page through each connection independently once the
+    // initial page reports hasNextPage.
+    let threads_query = r#"
+query($owner: String!, $repo: String!, $number: Int!, $cursor: String!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          isResolved
+        }
+      }
     }
+  }
+}
+"#;
+    let requests_query = r#"
+query($owner: String!, $repo: String!, $number: Int!, $cursor: String!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewRequests(first: 100, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          requestedReviewer {
+            ... on User {
+              login
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+    let reviews_query = r#"
+query($owner: String!, $repo: String!, $number: Int!, $cursor: String!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      latestReviews(first: 100, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          state
+          author {
+            login
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+    let contexts_query = r#"
+query($owner: String!, $repo: String!, $oid: GitObjectID!, $cursor: String!) {
+  repository(owner: $owner, name: $repo) {
+    object(oid: $oid) {
+      ... on Commit {
+        statusCheckRollup {
+          contexts(first: 100, after: $cursor) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            nodes {
+              __typename
+              ... on CheckRun {
+                name
+                status
+                conclusion
+              }
+              ... on StatusContext {
+                context
+                state
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
+    let number = pr_number.to_string();
+
+    // Runs a graphql query with the given fields, returning the raw stdout bytes
+    // for the caller to deserialize. The only Int variable is `number`, which must
+    // be passed typed (`-F`); every other variable (owner/repo/cursor are String,
+    // oid is GitObjectID) is passed raw (`-f`) so a numeric-looking cursor or oid
+    // can't be coerced to a non-string JSON type and rejected by the API.
+    let run_query = |query: &str, fields: &[(&str, &str)]| -> Result<Vec<u8>> {
+        let mut command = Command::new("gh");
+        command.args(["api", "graphql", "-f", &format!("query={query}")]);
+        for (key, value) in fields {
+            let flag = if *key == "number" { "-F" } else { "-f" };
+            command.args([flag, &format!("{key}={value}")]);
+        }
+        let output = command.output().context("Failed to run `gh api graphql`")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "Failed to fetch PR status details: {}",
+                stderr.trim()
+            ));
+        }
+        Ok(output.stdout)
+    };
+
+    let stdout = run_query(
+        query,
+        &[("owner", owner), ("repo", repo), ("number", &number)],
+    )?;
 
     let parsed: GraphQlResponse =
-        serde_json::from_slice(&output.stdout).context("Failed to parse graphql output")?;
+        serde_json::from_slice(&stdout).context("Failed to parse graphql output")?;
     let pr = parsed
         .data
         .repository
         .and_then(|r| r.pull_request)
         .ok_or_else(|| anyhow!("PR not found in graphql response"))?;
 
-    let unresolved_comments = pr
-        .review_threads
-        .nodes
+    // Follow a GraphQL connection's `pageInfo` cursors, starting from an
+    // already-fetched first page, until exhausted. `fetch` runs one more page for
+    // the given end-cursor and returns its (nodes, next page_info). Centralizes
+    // the cursor / has_next_page bookkeeping every paginated connection shares,
+    // so a fix to it can't miss one of them.
+    fn collect_all_pages<T>(
+        first_nodes: Vec<T>,
+        first_page: PageInfo,
+        mut fetch: impl FnMut(&str) -> Result<(Vec<T>, PageInfo)>,
+    ) -> Result<Vec<T>> {
+        let mut nodes = first_nodes;
+        let mut page = first_page;
+        while page.has_next_page {
+            let cursor = page
+                .end_cursor
+                .ok_or_else(|| anyhow!("Missing cursor while paginating GraphQL results"))?;
+            let (next_nodes, next_page) = fetch(&cursor)?;
+            nodes.extend(next_nodes);
+            page = next_page;
+        }
+        Ok(nodes)
+    }
+
+    // Collect the first page of each connection, then follow cursors until
+    // exhausted so the merge-readiness gate sees every thread/review/check.
+    let thread_nodes = collect_all_pages(
+        pr.review_threads.nodes,
+        pr.review_threads.page_info,
+        |cursor| {
+            let stdout = run_query(
+                threads_query,
+                &[
+                    ("owner", owner),
+                    ("repo", repo),
+                    ("number", &number),
+                    ("cursor", cursor),
+                ],
+            )?;
+            let page: ThreadsPage =
+                serde_json::from_slice(&stdout).context("Failed to parse graphql output")?;
+            let connection = page
+                .data
+                .repository
+                .and_then(|r| r.pull_request)
+                .map(|pr| pr.review_threads)
+                .ok_or_else(|| anyhow!("PR not found in graphql response"))?;
+            Ok((connection.nodes, connection.page_info))
+        },
+    )?;
+
+    let request_nodes = collect_all_pages(
+        pr.review_requests.nodes,
+        pr.review_requests.page_info,
+        |cursor| {
+            let stdout = run_query(
+                requests_query,
+                &[
+                    ("owner", owner),
+                    ("repo", repo),
+                    ("number", &number),
+                    ("cursor", cursor),
+                ],
+            )?;
+            let page: RequestsPage =
+                serde_json::from_slice(&stdout).context("Failed to parse graphql output")?;
+            let connection = page
+                .data
+                .repository
+                .and_then(|r| r.pull_request)
+                .map(|pr| pr.review_requests)
+                .ok_or_else(|| anyhow!("PR not found in graphql response"))?;
+            Ok((connection.nodes, connection.page_info))
+        },
+    )?;
+
+    let review_nodes = collect_all_pages(
+        pr.latest_reviews.nodes,
+        pr.latest_reviews.page_info,
+        |cursor| {
+            let stdout = run_query(
+                reviews_query,
+                &[
+                    ("owner", owner),
+                    ("repo", repo),
+                    ("number", &number),
+                    ("cursor", cursor),
+                ],
+            )?;
+            let page: ReviewsPage =
+                serde_json::from_slice(&stdout).context("Failed to parse graphql output")?;
+            let connection = page
+                .data
+                .repository
+                .and_then(|r| r.pull_request)
+                .map(|pr| pr.latest_reviews)
+                .ok_or_else(|| anyhow!("PR not found in graphql response"))?;
+            Ok((connection.nodes, connection.page_info))
+        },
+    )?;
+
+    let unresolved_comments = thread_nodes
         .into_iter()
         .filter(|thread| !thread.is_resolved)
         .count();
 
     let mut reviewer_map: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
-    for review in pr.latest_reviews.nodes {
+    for review in review_nodes {
         if let Some(author) = review.author {
             let status = match review.state.as_str() {
                 "APPROVED" => "approved",
@@ -540,7 +849,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
             reviewer_map.insert(author.login, status.to_string());
         }
     }
-    for req in pr.review_requests.nodes {
+    for req in request_nodes {
         if let Some(reviewer) = req.requested_reviewer {
             reviewer_map.insert(reviewer.login, "waiting".to_string());
         }
@@ -554,41 +863,74 @@ query($owner: String!, $repo: String!, $number: Int!) {
     let mut running_checks_set = BTreeSet::new();
     let mut failed_checks_set = BTreeSet::new();
 
-    if let Some(last_commit) = pr.commits.nodes.into_iter().last()
-        && let Some(rollup) = last_commit.commit.status_check_rollup
-    {
-        for node in rollup.contexts.nodes {
-            match node {
-                CheckContextNode::CheckRun {
-                    name,
-                    status,
-                    conclusion,
-                } => {
-                    let status_upper = status.unwrap_or_default().to_uppercase();
-                    let conclusion_upper = conclusion.unwrap_or_default().to_uppercase();
-                    if matches!(
-                        status_upper.as_str(),
-                        "IN_PROGRESS" | "PENDING" | "QUEUED" | "WAITING" | "REQUESTED"
-                    ) {
-                        running_checks_set.insert(name);
-                    } else if matches!(
-                        conclusion_upper.as_str(),
-                        "FAILURE"
-                            | "TIMED_OUT"
-                            | "CANCELLED"
-                            | "ACTION_REQUIRED"
-                            | "STARTUP_FAILURE"
-                            | "STALE"
-                    ) {
+    let mut context_nodes = Vec::new();
+    if let Some(last_commit) = pr.commits.nodes.into_iter().last() {
+        let commit_oid = last_commit.commit.oid;
+        if let Some(rollup) = last_commit.commit.status_check_rollup {
+            context_nodes =
+                collect_all_pages(rollup.contexts.nodes, rollup.contexts.page_info, |cursor| {
+                    let oid = commit_oid
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("Missing commit oid while paginating checks"))?;
+                    let stdout = run_query(
+                        contexts_query,
+                        &[
+                            ("owner", owner),
+                            ("repo", repo),
+                            ("oid", oid),
+                            ("cursor", cursor),
+                        ],
+                    )?;
+                    let page: ContextsPage = serde_json::from_slice(&stdout)
+                        .context("Failed to parse graphql output")?;
+                    let connection = page
+                        .data
+                        .repository
+                        .and_then(|r| r.object)
+                        .and_then(|commit| commit.status_check_rollup)
+                        .map(|rollup| rollup.contexts)
+                        .ok_or_else(|| anyhow!("Commit not found in graphql response"))?;
+                    Ok((connection.nodes, connection.page_info))
+                })?;
+        }
+    }
+
+    for node in context_nodes {
+        match node {
+            CheckContextNode::CheckRun {
+                name,
+                status,
+                conclusion,
+            } => {
+                let status_upper = status.unwrap_or_default().to_uppercase();
+                let conclusion_upper = conclusion.unwrap_or_default().to_uppercase();
+                // COMPLETED is the only terminal CheckRun status. Fail closed:
+                // a completed run is green only for an explicitly-passing
+                // conclusion; any other (including an unknown/future or empty
+                // conclusion) counts as failed, and any non-terminal or
+                // unrecognized status counts as still running. That way an
+                // unrecognized check state can never read as mergeable.
+                if status_upper == "COMPLETED" {
+                    if !matches!(conclusion_upper.as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED") {
                         failed_checks_set.insert(name);
                     }
+                } else {
+                    running_checks_set.insert(name);
                 }
-                CheckContextNode::StatusContext { context, state } => {
-                    let state_upper = state.to_uppercase();
-                    if state_upper == "PENDING" {
-                        running_checks_set.insert(context);
-                    } else if matches!(state_upper.as_str(), "ERROR" | "FAILURE") {
+            }
+            CheckContextNode::StatusContext { context, state } => {
+                // Fail closed: only an explicit SUCCESS is green; ERROR/FAILURE
+                // fail; PENDING, EXPECTED (a required status not yet reported),
+                // and any unknown/empty state block as still running rather than
+                // being silently treated as passing.
+                let state_upper = state.to_uppercase();
+                match state_upper.as_str() {
+                    "SUCCESS" => {}
+                    "ERROR" | "FAILURE" => {
                         failed_checks_set.insert(context);
+                    }
+                    _ => {
+                        running_checks_set.insert(context);
                     }
                 }
             }
