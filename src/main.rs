@@ -110,7 +110,7 @@ enum Commands {
     Run(RunArgs),
     /// Commits and rebases dependent branches
     Commit {
-        /// Arguments to pass to git commit. Supports --on <branch> and --force.
+        /// Arguments to pass to git commit. Supports --on <branch>, --fixup <sha>, and --force.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -294,15 +294,25 @@ fn dispatch() -> Result<()> {
 fn completion_command() -> Command {
     let mut cmd = Cli::command();
     if let Some(commit_cmd) = cmd.find_subcommand_mut("commit") {
-        let updated = std::mem::replace(commit_cmd, Command::new("commit")).arg(
-            Arg::new("on")
-                .long("on")
-                .value_name("branch")
-                .num_args(0..=1)
-                .action(ArgAction::Set)
-                .help("Commit onto another branch instead of the current one")
-                .add(crate::commands::local_branch_completer()),
-        );
+        let updated = std::mem::replace(commit_cmd, Command::new("commit"))
+            .arg(
+                Arg::new("on")
+                    .long("on")
+                    .value_name("branch")
+                    .num_args(0..=1)
+                    .action(ArgAction::Set)
+                    .help("Commit onto another branch instead of the current one")
+                    .add(crate::commands::local_branch_completer()),
+            )
+            .arg(
+                Arg::new("fixup")
+                    .long("fixup")
+                    .value_name("sha")
+                    .num_args(1)
+                    .action(ArgAction::Set)
+                    .help("Fix up a specific commit in the stack and auto-squash it")
+                    .add(crate::commands::fixup_commit_completer()),
+            );
         *commit_cmd = updated;
     }
     cmd

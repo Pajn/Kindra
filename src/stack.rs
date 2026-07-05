@@ -17,7 +17,6 @@ pub struct StackCommit {
     pub branch_name: String,
     pub position: (usize, usize),
     pub message: String,
-    pub is_tip: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1736,7 +1735,7 @@ pub fn enumerate_stack_commits(
         }
 
         let total = branch_commits.len();
-        // Reverse to tip-first so is_tip/position are computed from newest commit downward.
+        // Reverse to tip-first so position is computed from the newest commit downward.
         branch_commits.reverse();
 
         let mut chunk = Vec::new();
@@ -1747,7 +1746,6 @@ pub fn enumerate_stack_commits(
                 branch_name: branch.name.clone(),
                 position: (total - index, total),
                 message: commit.summary().unwrap_or("").to_string(),
-                is_tip: index == 0,
             });
         }
         branch_chunks.push(chunk);
@@ -1762,6 +1760,20 @@ pub fn enumerate_stack_commits(
     }
 
     Ok(commits)
+}
+
+/// Enumerate the commits in the current stack — the base branch through every
+/// branch tip reachable from HEAD, which is exactly the set a `--fixup` target
+/// must belong to. Centralizes the upstream / merge-base / stack-branch discovery
+/// so callers (e.g. the `--fixup` completer) don't re-assemble the stack context.
+pub fn enumerate_current_stack_commits(repo: &Repository) -> Result<Vec<StackCommit>> {
+    let Some(upstream_name) = crate::commands::find_upstream(repo)? else {
+        return Ok(Vec::new());
+    };
+    let upstream_id = repo.revparse_single(&upstream_name)?.id();
+    let head_id = repo.head()?.peel_to_commit()?.id();
+    let stack_branches = get_stack_branches_for_head(repo, head_id, upstream_id, &upstream_name)?;
+    enumerate_stack_commits(repo, &stack_branches, &upstream_name)
 }
 
 /// Discover the stack for `head_id` relative to `upstream_id`, computing the

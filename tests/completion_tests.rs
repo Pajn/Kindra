@@ -34,6 +34,38 @@ fn commit_on_completes_local_branch_names() {
 }
 
 #[test]
+fn commit_fixup_completes_stack_commit_shas() {
+    let dir = setup_repo();
+
+    // The tip commit (feature-b) is a valid fixup target, so its abbreviated SHA
+    // must be suggested for `--fixup`.
+    let head_short: String = git2::Repository::open(dir.path())
+        .unwrap()
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string()
+        .chars()
+        .take(12)
+        .collect();
+
+    let mut cmd = kin_cmd();
+    cmd.env("COMPLETE", "bash")
+        .env("_CLAP_COMPLETE_INDEX", "3")
+        .arg("--")
+        .arg("kin")
+        .arg("commit")
+        .arg("--fixup")
+        .arg("")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(head_short));
+}
+
+#[test]
 fn move_onto_completes_local_branch_names() {
     let dir = setup_repo();
 

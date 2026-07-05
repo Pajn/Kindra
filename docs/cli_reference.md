@@ -44,14 +44,16 @@ Kindra automatically identifies your stack by looking for local branches that ar
 kin commit [git-commit-args]
 kin commit --on [<branch>] [git-commit-args]
 kin commit --interactive [git-commit-args]
+kin commit --fixup <sha> [git-commit-args]
 ```
 
-Any arguments you pass to `kin commit` (e.g., `-m "my message"`) are passed directly to `git commit`.
+Any arguments you pass to `kin commit` (e.g., `-m "my message"`) are passed directly to `git commit`. This forwarding is the same for plain, `--interactive`, and `--fixup` invocations, and includes pathspecs after `--`.
 
 - `--on <branch>`: Commit onto another branch instead of the current one. The next token is consumed as the branch name.
 - `--on=`: Open an interactive branch picker for the current stack.
 - `--on`: Open the interactive branch picker only when `--on` is the final token.
-- `--interactive`: Open an interactive commit picker showing all commits in the stack. Select a tip commit to amend, or an intermediate commit to fixup.
+- `--interactive`: Open an interactive commit picker showing all commits in the stack. Squashes the staged changes into the selected commit.
+- `--fixup <sha>`: Non-interactive equivalent of `--interactive`, targeting a specific commit. Squashes the staged changes into the given commit (which must be in the current stack) and rebases the dependent branches. Accepts `--fixup=<sha>` as well. Mutually exclusive with `--interactive` and `--on`.
 - `--autostash`: Allow the descendant rebase phase to use Git autostash.
 - `--no-autostash`: Disable Git autostash even if configured globally or for the repo.
 
@@ -59,14 +61,15 @@ Any arguments you pass to `kin commit` (e.g., `-m "my message"`) are passed dire
 
 When using `--interactive`:
 - All commits across the stack are enumerated with their position (e.g., `feature-a 2/3`)
-- Selecting a tip commit amends it and rebases any dependent branches
-- Selecting an intermediate commit creates a fixup that is auto-squashed into the target
+- Whichever commit you select, the staged changes are squashed into it and the dependent branches are rebased — the same behavior for every commit, from anywhere in the stack
 - Conflicts during the rebase enter the continue/abort workflow
-- `--interactive` accepts and forwards trailing `git commit` args (including `-m` and pathspecs after `--`).
 
-Examples:
-- `kin commit --interactive -m "new subject"`
+Interactive examples (`--interactive`):
+- `kin commit --interactive` (stage your changes first, then pick the commit to squash them into)
 - `kin commit --interactive -- a3.txt`
+
+Non-interactive fixup example (`--fixup`, not part of the interactive behavior above):
+- `kin commit --fixup a1b2c3d` (stage your changes first, then squash them into commit `a1b2c3d`)
 
 Parser behavior:
 - `kin commit --on feature-a -m "msg"`: valid (`feature-a` is the target branch).
