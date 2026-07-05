@@ -89,19 +89,73 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
         children
     };
 
+    // Resolve every child's current tip once; needed for chaining below and the
+    // undo tip map.
+    let mut entries = Vec::with_capacity(children.len());
+    for (name, old_base) in children {
+        let tip = repo.revparse_single(&name)?.id();
+        entries.push((name, old_base, tip));
+    }
+
+    // Floating children can themselves be stacked on one another (e.g. the
+    // bottom branch of a stack was rewritten out from under the rest, setting
+    // the whole chain adrift). Rebasing each child directly onto the current
+    // branch would flatten that chain into parallel branches that each replay
+    // their ancestors' commits, so chain every child onto its nearest floating
+    // ancestor and only rebase chain roots onto the current branch.
+    let mut nearest_ancestor: Vec<Option<usize>> = vec![None; entries.len()];
+    let mut ancestor_count = vec![0usize; entries.len()];
+    for idx in 0..entries.len() {
+        for other_idx in 0..entries.len() {
+            if idx == other_idx || entries[idx].2 == entries[other_idx].2 {
+                continue;
+            }
+            if !repo.graph_descendant_of(entries[idx].2, entries[other_idx].2)? {
+                continue;
+            }
+            ancestor_count[idx] += 1;
+            let closer = match nearest_ancestor[idx] {
+                None => true,
+                Some(best) => repo.graph_descendant_of(entries[other_idx].2, entries[best].2)?,
+            };
+            if closer {
+                nearest_ancestor[idx] = Some(other_idx);
+            }
+        }
+    }
+
+    // Rebase ancestors before their descendants so each chained child lands on
+    // its parent's already-moved tip. Within a chain every branch has strictly
+    // more floating ancestors than its parent, so the ancestor count is a valid
+    // topological key.
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&idx| ancestor_count[idx]);
+
     // Construct RebaseState
     let mut parent_id_map = HashMap::new();
     let mut parent_name_map = HashMap::new();
     let mut original_tip_map = HashMap::new();
     let mut remaining = Vec::new();
 
-    for (name, old_base) in children {
-        println!(" - {} (matches old base {})", name, old_base);
+    for &idx in &order {
+        let (name, old_base, tip) = &entries[idx];
+        match nearest_ancestor[idx] {
+            Some(parent_idx) => {
+                let (parent_name, _, parent_tip) = &entries[parent_idx];
+                println!(" - {} (stacked on {})", name, parent_name);
+                // Cut at the parent's original tip so only this branch's own
+                // commits are replayed onto the parent's new position.
+                parent_id_map.insert(name.clone(), parent_tip.to_string());
+                parent_name_map.insert(name.clone(), parent_name.clone());
+            }
+            None => {
+                println!(" - {} (matches old base {})", name, old_base);
+                parent_id_map.insert(name.clone(), old_base.to_string());
+                parent_name_map.insert(name.clone(), current_branch_name.clone());
+            }
+        }
         remaining.push(name.clone());
-        parent_id_map.insert(name.clone(), old_base.to_string());
-        parent_name_map.insert(name.clone(), current_branch_name.clone());
-        let tip_id = repo.revparse_single(&name)?.id();
-        original_tip_map.insert(name.clone(), tip_id.to_string());
+        original_tip_map.insert(name.clone(), tip.to_string());
     }
 
     let state = RebaseState {

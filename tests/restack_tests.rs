@@ -363,6 +363,248 @@ fn test_restack_multiple_children() {
 }
 
 #[test]
+fn test_restack_preserves_chain_of_stacked_floating_children() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = repo_init(repo_path);
+
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    // main: A
+    let main_oid = make_commit(&repo, "HEAD", "a.txt", "A", "feat: A", &[]);
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+
+    // review: R on main, then a linear stack perf -> analyze -> docs above it.
+    run_ok("git", &["checkout", "-b", "review"], repo_path);
+    let review_oid = make_commit(
+        &repo,
+        "HEAD",
+        "r.txt",
+        "R",
+        "feat: R",
+        &[&repo.find_commit(main_oid).unwrap()],
+    );
+
+    run_ok("git", &["checkout", "-b", "perf"], repo_path);
+    let perf_oid = make_commit(
+        &repo,
+        "HEAD",
+        "p.txt",
+        "P",
+        "feat: P",
+        &[&repo.find_commit(review_oid).unwrap()],
+    );
+
+    run_ok("git", &["checkout", "-b", "analyze"], repo_path);
+    let analyze_oid = make_commit(
+        &repo,
+        "HEAD",
+        "q.txt",
+        "Q",
+        "feat: Q",
+        &[&repo.find_commit(perf_oid).unwrap()],
+    );
+
+    run_ok("git", &["checkout", "-b", "docs"], repo_path);
+    make_commit(
+        &repo,
+        "HEAD",
+        "d.txt",
+        "D",
+        "feat: D",
+        &[&repo.find_commit(analyze_oid).unwrap()],
+    );
+
+    // Rewrite review's commit out from under the stack (git-absorb style:
+    // same message, different content), setting the whole chain adrift.
+    run_ok("git", &["checkout", "review"], repo_path);
+    std::fs::write(repo_path.join("r.txt"), "R fixed").unwrap();
+    run_ok("git", &["add", "r.txt"], repo_path);
+    run_ok("git", &["commit", "--amend", "-m", "feat: R"], repo_path);
+    let new_review_oid = repo.head().unwrap().target().unwrap();
+
+    let mut cmd = kin_cmd();
+    let output = cmd.current_dir(repo_path).arg("restack").output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "restack failed\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert_no_rebase_in_progress(repo_path);
+
+    // The plan must chain stacked children onto each other; rebasing each one
+    // straight onto review replays its ancestors' commits and flattens the
+    // stack into parallel branches.
+    assert!(
+        stdout.contains("analyze (stacked on perf)"),
+        "analyze should be chained onto perf\nstdout:\n{}",
+        stdout,
+    );
+    assert!(
+        stdout.contains("docs (stacked on analyze)"),
+        "docs should be chained onto analyze\nstdout:\n{}",
+        stdout,
+    );
+
+    let tip = |name: &str| {
+        repo.find_branch(name, git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .target()
+            .unwrap()
+    };
+    let first_parent = |oid: git2::Oid| repo.find_commit(oid).unwrap().parent_id(0).unwrap();
+
+    // The stack must come back linear — review' <- perf' <- analyze' <- docs' —
+    // with each branch keeping only its own commit, not flattened into parallel
+    // branches that each replay their ancestors' commits.
+    let perf_tip = tip("perf");
+    let analyze_tip = tip("analyze");
+    let docs_tip = tip("docs");
+
+    assert_eq!(
+        first_parent(perf_tip),
+        new_review_oid,
+        "perf must sit on the rewritten review"
+    );
+    assert_eq!(
+        first_parent(analyze_tip),
+        perf_tip,
+        "analyze must sit on restacked perf, not directly on review"
+    );
+    assert_eq!(
+        first_parent(docs_tip),
+        analyze_tip,
+        "docs must sit on restacked analyze, not directly on review"
+    );
+}
+
+#[test]
+fn test_restack_chained_children_replay_only_their_own_commits_after_conflict() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = repo_init(repo_path);
+
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    // main: A
+    let main_oid = make_commit(&repo, "HEAD", "shared.txt", "base", "feat: A", &[]);
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+
+    // review: R on main, then a stack perf -> analyze -> docs above it. perf
+    // edits shared.txt so a rewritten review that also edits it conflicts with
+    // perf's commit when it is replayed.
+    run_ok("git", &["checkout", "-b", "review"], repo_path);
+    let review_oid = make_commit(
+        &repo,
+        "HEAD",
+        "r.txt",
+        "R",
+        "feat: R",
+        &[&repo.find_commit(main_oid).unwrap()],
+    );
+
+    run_ok("git", &["checkout", "-b", "perf"], repo_path);
+    let perf_oid = make_commit(
+        &repo,
+        "HEAD",
+        "shared.txt",
+        "P",
+        "feat: P",
+        &[&repo.find_commit(review_oid).unwrap()],
+    );
+
+    run_ok("git", &["checkout", "-b", "analyze"], repo_path);
+    let analyze_oid = make_commit(
+        &repo,
+        "HEAD",
+        "q.txt",
+        "Q",
+        "feat: Q",
+        &[&repo.find_commit(perf_oid).unwrap()],
+    );
+
+    run_ok("git", &["checkout", "-b", "docs"], repo_path);
+    make_commit(
+        &repo,
+        "HEAD",
+        "d.txt",
+        "D",
+        "feat: D",
+        &[&repo.find_commit(analyze_oid).unwrap()],
+    );
+
+    // Rewrite review's commit out from under the stack with a change that
+    // conflicts with perf's commit.
+    run_ok("git", &["checkout", "review"], repo_path);
+    std::fs::write(repo_path.join("shared.txt"), "R fixed").unwrap();
+    run_ok("git", &["add", "shared.txt"], repo_path);
+    run_ok("git", &["commit", "--amend", "-m", "feat: R"], repo_path);
+    let new_review_oid = repo.head().unwrap().target().unwrap();
+
+    // The chain root (perf) conflicts on shared.txt.
+    let mut cmd = kin_cmd();
+    cmd.current_dir(repo_path).arg("restack").assert().failure();
+
+    std::fs::write(repo_path.join("shared.txt"), "Resolved").unwrap();
+    run_ok("git", &["add", "shared.txt"], repo_path);
+
+    // A single continue must finish the whole stack: analyze and docs replay
+    // only their own commits on top of their restacked parent, so perf's
+    // conflicting commit is not replayed (and re-conflicted) once per branch.
+    let mut cmd = kin_cmd();
+    cmd.current_dir(repo_path)
+        .env("GIT_EDITOR", "cat")
+        .arg("continue")
+        .assert()
+        .success();
+
+    assert_no_rebase_in_progress(repo_path);
+
+    let tip = |name: &str| {
+        repo.find_branch(name, git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .target()
+            .unwrap()
+    };
+    let first_parent = |oid: git2::Oid| repo.find_commit(oid).unwrap().parent_id(0).unwrap();
+
+    let perf_tip = tip("perf");
+    let analyze_tip = tip("analyze");
+    let docs_tip = tip("docs");
+
+    assert_eq!(
+        first_parent(perf_tip),
+        new_review_oid,
+        "perf must sit on the rewritten review"
+    );
+    assert_eq!(
+        first_parent(analyze_tip),
+        perf_tip,
+        "analyze must sit on restacked perf, not directly on review"
+    );
+    assert_eq!(
+        first_parent(docs_tip),
+        analyze_tip,
+        "docs must sit on restacked analyze, not directly on review"
+    );
+}
+
+#[test]
 fn test_restack_ignores_stale_branch_pointing_at_old_base() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
