@@ -4138,3 +4138,110 @@ fn test_continue_recovers_from_failed_pick_commit_during_fold() {
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&status.stdout), "");
 }
+
+/// A conflicted restore of the set-aside stash at the end of `kin commit --on`
+/// must leave the operation resumable and abortable, not clear the state out
+/// from under the user.
+#[test]
+fn test_commit_on_conflicted_stash_restore_stays_resumable() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    let repo = repo_init(repo_path);
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    let main_oid = make_commit(&repo, "HEAD", "f.txt", "line1\nline2\n", "base", &[]);
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+    run_ok("git", &["checkout", "-b", "lower"], repo_path);
+    let lower_oid = make_commit(
+        &repo,
+        "HEAD",
+        "l.txt",
+        "l",
+        "lower work",
+        &[&repo.find_commit(main_oid).unwrap()],
+    );
+    run_ok("git", &["checkout", "-b", "upper"], repo_path);
+    make_commit(
+        &repo,
+        "HEAD",
+        "u.txt",
+        "u",
+        "upper work",
+        &[&repo.find_commit(lower_oid).unwrap()],
+    );
+
+    // Stage a change destined for 'lower', with an overlapping unstaged edit
+    // that gets set aside. After the commit lands and 'upper' is restacked,
+    // restoring the set-aside edit conflicts with the committed line.
+    fs::write(repo_path.join("f.txt"), "from-commit\nline2\n").unwrap();
+    run_ok("git", &["add", "f.txt"], repo_path);
+    fs::write(repo_path.join("f.txt"), "unstaged-edit\nline2\n").unwrap();
+
+    let mut cmd = kin_cmd();
+    let output = cmd
+        .current_dir(repo_path)
+        .args(["commit", "--on", "lower", "-m", "folded into lower"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "the conflicted stash restore must surface as an error\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("kin continue") && stderr.contains("kin abort"),
+        "the error must offer both continue and abort\nstderr:\n{}",
+        stderr
+    );
+
+    // The regression: the saved state must survive so continue/abort work.
+    assert!(
+        repo_path.join(".git/kindra_rebase_state.json").exists(),
+        "state must be preserved after a conflicted stash restore"
+    );
+    let stashes = std::process::Command::new("git")
+        .args(["stash", "list"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    assert!(
+        !stashes.stdout.is_empty(),
+        "the stash entry must be preserved as a backup"
+    );
+
+    // The commit itself landed and upper follows it.
+    let lower_tip_msg = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%s", "lower"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&lower_tip_msg.stdout).trim(),
+        "folded into lower"
+    );
+
+    // Resolve the conflict markers and finish with kin continue.
+    fs::write(repo_path.join("f.txt"), "resolved\nline2\n").unwrap();
+    run_ok("git", &["add", "f.txt"], repo_path);
+    let mut cmd = kin_cmd();
+    cmd.current_dir(repo_path)
+        .arg("continue")
+        .assert()
+        .success();
+    assert!(
+        !repo_path.join(".git/kindra_rebase_state.json").exists(),
+        "continue must complete the operation"
+    );
+    let head_name = repo.head().unwrap().shorthand().unwrap().to_string();
+    assert_eq!(
+        head_name, "upper",
+        "we must end up back on the caller branch"
+    );
+}

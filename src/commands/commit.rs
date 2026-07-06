@@ -735,12 +735,7 @@ fn insert_generated_commit_arg(args: &mut Vec<String>, value: String) {
 }
 
 fn has_staged_changes(_repo: &Repository) -> Result<bool> {
-    let output = Command::new("git")
-        .args(["diff", "--cached", "--name-only"])
-        .output()?;
-    // git diff --cached returns exit code 0 whether or not there are staged changes.
-    // Check both exit status (for errors) and stdout emptiness to determine presence of staged changes.
-    Ok(output.status.success() && !output.stdout.is_empty())
+    crate::rebase_utils::has_staged_changes()
 }
 
 fn has_forwarded_pathspec(args: &[String]) -> bool {

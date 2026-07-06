@@ -1,6 +1,6 @@
 use crate::rebase_utils::{
-    Operation, RebaseState, ReconcileMode, git_rebase_in_progress, reconcile_saved_rebase_state,
-    run_rebase_loop,
+    Operation, RebaseState, ReconcileMode, git_rebase_in_progress, has_staged_changes,
+    reconcile_saved_rebase_state, run_rebase_loop,
 };
 use anyhow::{Result, anyhow};
 use git2::Repository;
@@ -147,11 +147,4 @@ fn rebase_stopped_on_empty_pick(repo: &Repository) -> Result<bool> {
         return Ok(false);
     }
     Ok(!has_staged_changes()? && !crate::rebase_utils::unmerged_paths_exist()?)
-}
-
-fn has_staged_changes() -> Result<bool> {
-    let output = Command::new("git")
-        .args(["diff", "--cached", "--name-only"])
-        .output()?;
-    Ok(output.status.success() && !output.stdout.is_empty())
 }

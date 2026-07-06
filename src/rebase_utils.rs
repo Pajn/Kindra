@@ -653,6 +653,26 @@ pub fn unmerged_paths_exist() -> Result<bool> {
     Ok(output.status.success() && !output.stdout.is_empty())
 }
 
+pub fn has_staged_changes() -> Result<bool> {
+    let output = Command::new("git")
+        .args(["diff", "--cached", "--name-only"])
+        .output()?;
+    // Exit code 0 either way; presence of output is the signal.
+    Ok(output.status.success() && !output.stdout.is_empty())
+}
+
+/// Machine-readable snapshot of the working tree and index state, for
+/// detecting whether a failed operation touched anything.
+fn status_porcelain() -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "-z", "--untracked-files=all"])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!("Failed to read working tree status."));
+    }
+    Ok(output.stdout)
+}
+
 /// Apply a stash, optionally restoring its recorded index state (`--index`) so
 /// previously staged hunks come back staged. Distinguishes a conflicted merge
 /// (stash content delivered as conflict markers — retrying would double-apply)
@@ -660,6 +680,7 @@ pub fn unmerged_paths_exist() -> Result<bool> {
 pub fn apply_stash_with_outcome(stash_ref: &str, restore_index: bool) -> Result<StashApplyOutcome> {
     let resolved_ref = resolve_stash_reference(stash_ref)?;
     if restore_index {
+        let before = status_porcelain()?;
         let status = Command::new("git")
             .arg("stash")
             .arg("apply")
@@ -669,12 +690,20 @@ pub fn apply_stash_with_outcome(stash_ref: &str, restore_index: bool) -> Result<
         if status.success() {
             return Ok(StashApplyOutcome::Applied);
         }
-        // `--index` failures come in two shapes: the working-tree merge ran
-        // and left conflict markers (retrying any apply would stack the stash
-        // on top of itself), or the index restore was refused before touching
-        // the tree. Only the latter can safely fall back to a plain apply.
+        // `--index` failures come in shapes: the working-tree merge ran and
+        // left conflict markers (retrying any apply would stack the stash on
+        // top of itself), a partial application without conflicts (e.g.
+        // untracked files restored before the failure), or a refusal before
+        // touching anything. Only a provably untouched tree can safely fall
+        // back to a plain apply.
         if unmerged_paths_exist()? {
             return Ok(StashApplyOutcome::ConflictsLeftInTree);
+        }
+        if status_porcelain()? != before {
+            return Err(anyhow!(
+                "git stash apply --index failed after partially applying stash '{}'. The stash entry is preserved; clean up the partial application and restore it manually with 'git stash apply --index'.",
+                stash_ref
+            ));
         }
         eprintln!(
             "Warning: could not restore the staged state of the set-aside changes; restoring them unstaged."
@@ -746,7 +775,7 @@ pub fn restore_set_aside_changes(stash_ref: Option<String>) {
 /// handle, or `None` when there was nothing to stash. With `keep_index` the
 /// staged changes are kept in place (the `kin commit --on` contract); without
 /// it everything is set aside, in which case restoring with
-/// [`apply_stash_restoring_index`] brings staged hunks back staged.
+/// [`apply_state_stash`] brings staged hunks back staged.
 pub fn stash_push_changes(keep_index: bool, message_prefix: &str) -> Result<Option<String>> {
     let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let message = format!("{}-{}-{}", message_prefix, std::process::id(), ts);
@@ -987,14 +1016,14 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
             StashApplyOutcome::ConflictsLeftInTree => {
                 // The changes are in the tree as conflict markers; a later
                 // `kin continue` must not apply the stash a second time, so
-                // drop it from the state but keep the entry as a backup. The
-                // operation itself completed, so finish its bookkeeping.
+                // drop it from the state but keep the entry as a backup. Keep
+                // the saved state itself: the operation stays resumable
+                // (`kin continue` finishes its bookkeeping) and abortable
+                // (`kin abort` rolls the branches back).
                 state.stash_ref = None;
                 save_state(repo, &state)?;
-                clear_state(repo)?;
-                crate::oplog::finalize(repo)?;
                 return Err(anyhow!(
-                    "Restoring the set-aside changes hit conflicts; resolve the conflict markers in the working tree. The original changes are also preserved in stash entry '{}'.",
+                    "Restoring the set-aside changes hit conflicts; resolve the conflict markers in the working tree, then run 'kin continue' to finish (or 'kin abort' to roll the operation back). The original changes are also preserved in stash entry '{}'.",
                     stash_ref
                 ));
             }
