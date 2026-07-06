@@ -3993,3 +3993,148 @@ fn test_commit_fixup_and_interactive_are_mutually_exclusive() {
         .failure()
         .stderr(predicates::str::contains("mutually exclusive"));
 }
+
+/// A pick whose changes reach the index but whose commit fails (e.g. a
+/// transient signing failure) leaves git refusing to continue: "you have
+/// staged changes in your working tree". `kin continue` must repair that state
+/// and drive the fold to completion.
+#[cfg(unix)]
+#[test]
+fn test_continue_recovers_from_failed_pick_commit_during_fold() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    let repo = repo_init(repo_path);
+    run_ok("git", &["config", "user.name", "Test User"], repo_path);
+    run_ok(
+        "git",
+        &["config", "user.email", "test@example.com"],
+        repo_path,
+    );
+
+    // An SSH signer that fails on exactly the third signature: the fixup
+    // commit signs (1), the autosquash amend signs (2), and the follow-up
+    // pick's commit fails (3) — reproducing a mid-fold transient signing
+    // failure.
+    let sign_dir = repo_path.join(".git/signer");
+    fs::create_dir_all(&sign_dir).unwrap();
+    let key = sign_dir.join("key");
+    run_ok(
+        "ssh-keygen",
+        &["-q", "-t", "ed25519", "-N", "", "-f", key.to_str().unwrap()],
+        repo_path,
+    );
+    let count_file = sign_dir.join("count");
+    let wrapper = sign_dir.join("sshwrap");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncount=$(cat {count} 2>/dev/null || echo 0)\ncount=$((count+1))\necho $count > {count}\nif [ $count -eq 3 ]; then echo 'sign failure simulated' >&2; exit 1; fi\nexec ssh-keygen \"$@\"\n",
+            count = count_file.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    run_ok("git", &["config", "commit.gpgsign", "true"], repo_path);
+    run_ok("git", &["config", "gpg.format", "ssh"], repo_path);
+    run_ok(
+        "git",
+        &[
+            "config",
+            "user.signingkey",
+            &format!("{}.pub", key.display()),
+        ],
+        repo_path,
+    );
+    run_ok(
+        "git",
+        &["config", "gpg.ssh.program", wrapper.to_str().unwrap()],
+        repo_path,
+    );
+
+    // main: base, feat: target (f.txt) then clean-pick (g.txt).
+    let main_oid = make_commit(&repo, "HEAD", "f.txt", "a\n", "base", &[]);
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+    run_ok("git", &["checkout", "-b", "feat"], repo_path);
+    let target_oid = make_commit(
+        &repo,
+        "HEAD",
+        "f.txt",
+        "b\n",
+        "target",
+        &[&repo.find_commit(main_oid).unwrap()],
+    );
+    make_commit(
+        &repo,
+        "HEAD",
+        "g.txt",
+        "g\n",
+        "clean-pick",
+        &[&repo.find_commit(target_oid).unwrap()],
+    );
+
+    // Stage a change for the target commit and fold it. The fold's follow-up
+    // pick fails to commit (signature 3), stranding its changes staged.
+    fs::write(repo_path.join("f.txt"), "B\n").unwrap();
+    run_ok("git", &["add", "f.txt"], repo_path);
+    let mut cmd = kin_cmd();
+    cmd.current_dir(repo_path)
+        .args(["commit", "--fixup", &target_oid.to_string()])
+        .assert()
+        .failure();
+    assert!(
+        repo_path.join(".git/rebase-merge").exists(),
+        "the fold must be stranded mid-rebase"
+    );
+    assert!(
+        !repo_path.join(".git/rebase-merge/message").exists(),
+        "the stall must be the degenerate no-pending-commit state"
+    );
+
+    // Signing works again; kin continue must repair the state, commit the
+    // stranded pick, skip its empty replay, and finish.
+    fs::write(&count_file, "-100\n").unwrap();
+    let mut cmd = kin_cmd();
+    let output = cmd.current_dir(repo_path).arg("continue").output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "continue must recover\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        stdout.contains("Restored the rebase state"),
+        "recovery must announce itself\nstdout:\n{}",
+        stdout
+    );
+
+    // The fold completed: target contains the fixup content, clean-pick sits
+    // on top exactly once, nothing is left behind.
+    assert!(!repo_path.join(".git/rebase-merge").exists());
+    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    let log = std::process::Command::new("git")
+        .args(["log", "--format=%s", "main..feat"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&log.stdout).trim(),
+        "clean-pick\ntarget",
+        "the fold must complete with each commit exactly once"
+    );
+    let folded = std::process::Command::new("git")
+        .args(["show", "feat~1:f.txt"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&folded.stdout), "B\n");
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&status.stdout), "");
+}

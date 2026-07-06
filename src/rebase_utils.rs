@@ -645,7 +645,7 @@ pub enum StashApplyOutcome {
     ConflictsLeftInTree,
 }
 
-fn unmerged_paths_exist() -> Result<bool> {
+pub fn unmerged_paths_exist() -> Result<bool> {
     let output = Command::new("git")
         .arg("ls-files")
         .arg("--unmerged")
