@@ -49,9 +49,28 @@ pub struct RebaseState {
     /// branch_name -> tip commit id Kindra most recently left behind in a resumable state
     #[serde(default)]
     pub owned_tip_map: HashMap<String, String>,
-    /// Optional stash token created by `kin commit --on` to preserve non-staged files.
+    /// Optional stash token created by `kin commit --on` / `kin absorb` to
+    /// preserve files set aside for the operation.
     #[serde(default)]
     pub stash_ref: Option<String>,
+    /// Whether restoring `stash_ref` should also restore the recorded index
+    /// (staged) state. Only safe for full stashes (no `--keep-index`), whose
+    /// recorded index state was actually removed from the tree.
+    #[serde(default)]
+    pub stash_apply_index: bool,
+    /// Whether `kin abort` must preserve content the operation already
+    /// committed (absorb: the fixup/folded commits). When set, abort checks
+    /// out the original branch and applies the stash *before* restoring the
+    /// branch tips: the worktree keeps the committed content while the ref
+    /// moves back underneath it, so the discarded changes reappear as staged
+    /// changes instead of being lost.
+    #[serde(default)]
+    pub preserve_content_on_abort: bool,
+    /// Whether `kin continue` should pin GIT_EDITOR to `true` when resuming
+    /// this operation's rebase (absorb: squash! folds must never open a
+    /// commit-message editor).
+    #[serde(default)]
+    pub suppress_editor: bool,
     /// Whether to run `git reset` when returning to the original branch.
     #[serde(default)]
     pub unstage_on_restore: bool,
@@ -615,6 +634,180 @@ pub fn apply_stash(stash_ref: &str) -> Result<()> {
     Ok(())
 }
 
+/// How a stash apply ended when it didn't simply succeed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StashApplyOutcome {
+    /// The stash applied cleanly (staged state restored when requested).
+    Applied,
+    /// The apply merged the stash into the working tree but hit conflicts:
+    /// the changes ARE in the tree as conflict markers, so the stash must not
+    /// be applied again, but the entry should be preserved as a backup.
+    ConflictsLeftInTree,
+}
+
+pub fn unmerged_paths_exist() -> Result<bool> {
+    let output = Command::new("git")
+        .arg("ls-files")
+        .arg("--unmerged")
+        .output()?;
+    Ok(output.status.success() && !output.stdout.is_empty())
+}
+
+pub fn has_staged_changes() -> Result<bool> {
+    let output = Command::new("git")
+        .args(["diff", "--cached", "--name-only"])
+        .output()?;
+    // Exit code 0 either way; presence of output is the signal.
+    Ok(output.status.success() && !output.stdout.is_empty())
+}
+
+/// Machine-readable snapshot of the working tree and index state, for
+/// detecting whether a failed operation touched anything.
+fn status_porcelain() -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "-z", "--untracked-files=all"])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!("Failed to read working tree status."));
+    }
+    Ok(output.stdout)
+}
+
+/// Apply a stash, optionally restoring its recorded index state (`--index`) so
+/// previously staged hunks come back staged. Distinguishes a conflicted merge
+/// (stash content delivered as conflict markers — retrying would double-apply)
+/// from an apply that failed before touching the tree.
+pub fn apply_stash_with_outcome(stash_ref: &str, restore_index: bool) -> Result<StashApplyOutcome> {
+    let resolved_ref = resolve_stash_reference(stash_ref)?;
+    if restore_index {
+        let before = status_porcelain()?;
+        let status = Command::new("git")
+            .arg("stash")
+            .arg("apply")
+            .arg("--index")
+            .arg(&resolved_ref)
+            .status()?;
+        if status.success() {
+            return Ok(StashApplyOutcome::Applied);
+        }
+        // `--index` failures come in shapes: the working-tree merge ran and
+        // left conflict markers (retrying any apply would stack the stash on
+        // top of itself), a partial application without conflicts (e.g.
+        // untracked files restored before the failure), or a refusal before
+        // touching anything. Only a provably untouched tree can safely fall
+        // back to a plain apply.
+        if unmerged_paths_exist()? {
+            return Ok(StashApplyOutcome::ConflictsLeftInTree);
+        }
+        if status_porcelain()? != before {
+            return Err(anyhow!(
+                "git stash apply --index failed after partially applying stash '{}'. The stash entry is preserved; clean up the partial application and restore it manually with 'git stash apply --index'.",
+                stash_ref
+            ));
+        }
+        eprintln!(
+            "Warning: could not restore the staged state of the set-aside changes; restoring them unstaged."
+        );
+    }
+    let status = Command::new("git")
+        .arg("stash")
+        .arg("apply")
+        .arg(&resolved_ref)
+        .status()?;
+    if status.success() {
+        return Ok(StashApplyOutcome::Applied);
+    }
+    if unmerged_paths_exist()? {
+        return Ok(StashApplyOutcome::ConflictsLeftInTree);
+    }
+    Err(anyhow!(
+        "Failed to apply stashed changes from '{}'. Resolve conflicts and run 'kin continue' or 'kin abort'.",
+        stash_ref
+    ))
+}
+
+/// Restore `state.stash_ref` honoring `state.stash_apply_index`.
+pub fn apply_state_stash(state: &RebaseState, stash_ref: &str) -> Result<StashApplyOutcome> {
+    apply_stash_with_outcome(stash_ref, state.stash_apply_index)
+}
+
+/// Pop a stash taken by [`stash_push_changes`] back onto the working tree,
+/// best-effort. Used on error paths where no saved state will restore it later,
+/// so the user's changes aren't stranded in the stash list.
+pub fn restore_stashed_changes(stash_ref: Option<String>) {
+    let Some(stash_ref) = stash_ref else {
+        return;
+    };
+    if apply_stash(&stash_ref).is_ok() {
+        let _ = drop_stash(&stash_ref);
+    }
+}
+
+/// Best-effort restore of a *full* stash (taken without `--keep-index`) on an
+/// error path, bringing staged hunks back staged. Drops the stash entry only
+/// on a clean apply; a conflicted or failed apply keeps it and says where the
+/// changes are.
+pub fn restore_set_aside_changes(stash_ref: Option<String>) {
+    let Some(stash_ref) = stash_ref else {
+        return;
+    };
+    match apply_stash_with_outcome(&stash_ref, true) {
+        Ok(StashApplyOutcome::Applied) => {
+            let _ = drop_stash(&stash_ref);
+        }
+        Ok(StashApplyOutcome::ConflictsLeftInTree) => {
+            eprintln!(
+                "Warning: restoring the set-aside changes left conflicts in the working tree; the stash entry '{}' was preserved as a backup.",
+                stash_ref
+            );
+        }
+        Err(_) => {
+            eprintln!(
+                "Warning: could not restore the set-aside changes; they remain in stash entry '{}'.",
+                stash_ref
+            );
+        }
+    }
+}
+
+/// Stash working-tree changes (including untracked files) under a unique
+/// `<prefix>-<pid>-<nanos>` message and return that message as the stash
+/// handle, or `None` when there was nothing to stash. With `keep_index` the
+/// staged changes are kept in place (the `kin commit --on` contract); without
+/// it everything is set aside, in which case restoring with
+/// [`apply_state_stash`] brings staged hunks back staged.
+pub fn stash_push_changes(keep_index: bool, message_prefix: &str) -> Result<Option<String>> {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let message = format!("{}-{}-{}", message_prefix, std::process::id(), ts);
+    let mut cmd = Command::new("git");
+    cmd.arg("stash").arg("push");
+    if keep_index {
+        cmd.arg("--keep-index");
+    }
+    // Capture (rather than inherit) git's output so the internal stash token
+    // doesn't leak onto the user's terminal via git's "Saved working directory
+    // and index state …" confirmation.
+    let output = cmd
+        .arg("--include-untracked")
+        .arg("-m")
+        .arg(&message)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Failed to stash working tree changes: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    // `git stash push` exits 0 without creating an entry when there is nothing
+    // to save; confirm an entry was actually created before claiming there's
+    // something to restore.
+    if find_stash_reference(&message)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(message))
+}
+
 pub fn drop_stash(stash_ref: &str) -> Result<()> {
     let resolved_ref = resolve_stash_reference(stash_ref)?;
     let status = Command::new("git")
@@ -662,6 +855,54 @@ fn find_stash_reference(message: &str) -> Result<Option<String>> {
     }
 
     Ok(None)
+}
+
+/// List every local branch whose tip lies inside the range `base..head`
+/// (`head` included, `base` excluded; a `None` base hides nothing). These are
+/// the refs a `git rebase --update-refs` over that range moves along with the
+/// rewrite.
+pub fn local_branch_tips_in_range(
+    repo: &Repository,
+    base: Option<Oid>,
+    head: Oid,
+) -> Result<Vec<(String, Oid)>> {
+    let mut walk = repo.revwalk()?;
+    walk.push(head)?;
+    if let Some(base) = base {
+        walk.hide(base)?;
+    }
+    let rewritten: HashSet<Oid> = walk.filter_map(|id| id.ok()).collect();
+
+    let mut tips = Vec::new();
+    for (branch, _) in repo.branches(Some(git2::BranchType::Local))?.flatten() {
+        let Some(oid) = branch.get().target() else {
+            continue;
+        };
+        if !rewritten.contains(&oid) {
+            continue;
+        }
+        let Ok(Some(name)) = branch.name() else {
+            continue;
+        };
+        tips.push((name.to_string(), oid));
+    }
+    Ok(tips)
+}
+
+/// Record, into `original_tip_map`, the pre-rewrite tip of every local branch
+/// whose tip lies inside the range a `--update-refs` rebase over `base..head`
+/// rewrites. Existing entries are preserved. This is what lets `kin abort`
+/// roll a completed fold back off such a branch.
+pub fn record_branch_tips_in_range(
+    repo: &Repository,
+    base: Option<Oid>,
+    head: Oid,
+    original_tip_map: &mut HashMap<String, String>,
+) -> Result<()> {
+    for (name, oid) in local_branch_tips_in_range(repo, base, head)? {
+        original_tip_map.entry(name).or_insert(oid.to_string());
+    }
+    Ok(())
 }
 
 pub fn unstage_all() -> Result<()> {
@@ -763,12 +1004,29 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
     })?;
 
     if let Some(stash_ref) = state.stash_ref.clone() {
-        println!("Restoring stashed non-staged files...");
-        apply_stash(&stash_ref)?;
-        state.stash_ref = None;
-        save_state(repo, &state)?;
-        if let Err(err) = drop_stash(&stash_ref) {
-            eprintln!("Warning: {}", err);
+        println!("Restoring set-aside changes...");
+        match apply_state_stash(&state, &stash_ref)? {
+            StashApplyOutcome::Applied => {
+                state.stash_ref = None;
+                save_state(repo, &state)?;
+                if let Err(err) = drop_stash(&stash_ref) {
+                    eprintln!("Warning: {}", err);
+                }
+            }
+            StashApplyOutcome::ConflictsLeftInTree => {
+                // The changes are in the tree as conflict markers; a later
+                // `kin continue` must not apply the stash a second time, so
+                // drop it from the state but keep the entry as a backup. Keep
+                // the saved state itself: the operation stays resumable
+                // (`kin continue` finishes its bookkeeping) and abortable
+                // (`kin abort` rolls the branches back).
+                state.stash_ref = None;
+                save_state(repo, &state)?;
+                return Err(anyhow!(
+                    "Restoring the set-aside changes hit conflicts; resolve the conflict markers in the working tree, then run 'kin continue' to finish (or 'kin abort' to roll the operation back). The original changes are also preserved in stash entry '{}'.",
+                    stash_ref
+                ));
+            }
         }
     }
 

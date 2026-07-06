@@ -1,7 +1,8 @@
 use crate::commands::{find_upstream, resolve_rebase_autostash};
 use crate::rebase_utils::{
     RebaseState, apply_stash, check_worktrees, checkout_branch, clear_state, drop_stash,
-    git_rebase_in_progress, passively_reconcile_rebase_state, run_rebase_loop, save_state,
+    git_rebase_in_progress, passively_reconcile_rebase_state, record_branch_tips_in_range,
+    restore_stashed_changes, run_rebase_loop, save_state, stash_push_changes,
 };
 use crate::stack::{
     StackBranch, StackCommit, collect_descendants, enumerate_stack_commits,
@@ -9,9 +10,8 @@ use crate::stack::{
 };
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Oid, Repository};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn commit(args: &[String]) -> Result<()> {
     let repo = crate::open_repo()?;
@@ -250,6 +250,9 @@ pub fn commit(args: &[String]) -> Result<()> {
             original_tip_map,
             owned_tip_map: HashMap::new(),
             stash_ref: None,
+            stash_apply_index: false,
+            preserve_content_on_abort: false,
+            suppress_editor: false,
             unstage_on_restore: switching_branches,
             autostash,
             cleanup_merged_branches: Vec::new(),
@@ -701,30 +704,14 @@ fn record_below_head_rewritten_tips(
     original_tip_map: &mut HashMap<String, String>,
 ) -> Result<()> {
     let fixup_commit = repo.find_commit(Oid::from_str(fixup_commit_id)?)?;
-    let mut walk = repo.revwalk()?;
-    walk.push(head_id)?;
-    // Hide everything at/below the autosquash base so only the rewritten range
-    // (base..HEAD) remains; a root fixup has no base, so hide nothing.
-    if let Some(base) = autosquash_base(&fixup_commit)? {
-        walk.hide(base)?;
-    }
-    let rewritten: HashSet<Oid> = walk.filter_map(|id| id.ok()).collect();
-
-    for (branch, _) in repo.branches(Some(BranchType::Local))?.flatten() {
-        let Some(oid) = branch.get().target() else {
-            continue;
-        };
-        if !rewritten.contains(&oid) {
-            continue;
-        }
-        let Ok(Some(name)) = branch.name() else {
-            continue;
-        };
-        original_tip_map
-            .entry(name.to_string())
-            .or_insert_with(|| oid.to_string());
-    }
-    Ok(())
+    // The rewritten range is base..HEAD; a root fixup has no base, so the
+    // whole history is in range.
+    record_branch_tips_in_range(
+        repo,
+        autosquash_base(&fixup_commit)?,
+        head_id,
+        original_tip_map,
+    )
 }
 
 fn has_dependents_to_rebase(
@@ -739,25 +726,6 @@ fn has_dependents_to_rebase(
     }
 }
 
-fn stash_head_ref() -> Result<Option<String>> {
-    let output = Command::new("git")
-        .arg("rev-parse")
-        .arg("--verify")
-        .arg("-q")
-        .arg("refs/stash")
-        .output()?;
-    if output.status.success() {
-        let ref_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if ref_name.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(ref_name))
-        }
-    } else {
-        Ok(None)
-    }
-}
-
 fn insert_generated_commit_arg(args: &mut Vec<String>, value: String) {
     let insert_at = args
         .iter()
@@ -767,12 +735,7 @@ fn insert_generated_commit_arg(args: &mut Vec<String>, value: String) {
 }
 
 fn has_staged_changes(_repo: &Repository) -> Result<bool> {
-    let output = Command::new("git")
-        .args(["diff", "--cached", "--name-only"])
-        .output()?;
-    // git diff --cached returns exit code 0 whether or not there are staged changes.
-    // Check both exit status (for errors) and stdout emptiness to determine presence of staged changes.
-    Ok(output.status.success() && !output.stdout.is_empty())
+    crate::rebase_utils::has_staged_changes()
 }
 
 fn has_forwarded_pathspec(args: &[String]) -> bool {
@@ -843,18 +806,6 @@ fn option_takes_value(arg: &str) -> bool {
     )
 }
 
-/// Pop a stash taken by `stash_non_staged_changes` back onto the working tree,
-/// best-effort. Used on error paths where no saved state will restore it later,
-/// so the user's unstaged changes aren't stranded in the stash list.
-fn restore_stashed_changes(stash_ref: Option<String>) {
-    let Some(stash_ref) = stash_ref else {
-        return;
-    };
-    if apply_stash(&stash_ref).is_ok() {
-        let _ = drop_stash(&stash_ref);
-    }
-}
-
 /// Reapply the autostash recorded in `state` (if any), drop it, and only then
 /// clear the `stash_ref` / `in_progress_branch` fields and persist.
 ///
@@ -877,26 +828,16 @@ fn restore_autostash(repo: &Repository, state: &mut RebaseState) -> Result<()> {
 }
 
 fn stash_non_staged_changes() -> Result<Option<String>> {
-    let before = stash_head_ref()?;
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let message = format!("kin-commit-on-{}-{}", std::process::id(), ts);
-    let status = Command::new("git")
-        .arg("stash")
-        .arg("push")
-        .arg("--keep-index")
-        .arg("--include-untracked")
-        .arg("-m")
-        .arg(&message)
-        .status()?;
-    if !status.success() {
-        return Err(anyhow!("Failed to stash non-staged files."));
+    let stash_ref = stash_push_changes(true, "kin-commit-on")?;
+    if stash_ref.is_some() {
+        // stash_push_changes captures git's own "Saved working directory…"
+        // confirmation (it would leak the internal stash token), so tell the
+        // user their non-staged work was set aside, not lost.
+        println!(
+            "Set aside non-staged changes; they will be restored when the operation completes."
+        );
     }
-    let after = stash_head_ref()?;
-    if after != before {
-        Ok(Some(message))
-    } else {
-        Ok(None)
-    }
+    Ok(stash_ref)
 }
 
 fn resolve_fixup_commit(

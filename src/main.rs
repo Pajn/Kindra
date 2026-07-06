@@ -11,6 +11,7 @@ mod state_io;
 mod worktree;
 
 use crate::commands::abort_cmd::abort_cmd;
+use crate::commands::absorb_cmd::{AbsorbArgs, absorb};
 use crate::commands::checkout::checkout;
 use crate::commands::commit::commit;
 use crate::commands::continue_cmd::continue_cmd;
@@ -108,6 +109,8 @@ enum Commands {
     Restack(RestackArgs),
     /// Run a command on each branch in the stack
     Run(RunArgs),
+    /// Absorb staged changes into the current branch's commits and restack dependents
+    Absorb(AbsorbArgs),
     /// Commits and rebases dependent branches
     Commit {
         /// Arguments to pass to git commit. Supports --on <branch>, --fixup <sha>, and --force.
@@ -264,6 +267,7 @@ fn dispatch() -> Result<()> {
         Commands::Sync(args) => sync(args)?,
         Commands::Restack(args) => restack(args)?,
         Commands::Run(args) => run(args)?,
+        Commands::Absorb(args) => absorb(args)?,
         Commands::Commit { args } => commit(args)?,
         Commands::Continue => continue_cmd()?,
         Commands::Abort => abort_cmd()?,

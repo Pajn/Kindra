@@ -1,4 +1,5 @@
 pub mod abort_cmd;
+pub mod absorb_cmd;
 pub mod checkout;
 pub mod commit;
 pub mod continue_cmd;

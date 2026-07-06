@@ -1,5 +1,5 @@
 use crate::rebase_utils::{
-    apply_stash, checkout_branch, drop_stash, git_rebase_in_progress, load_state,
+    StashApplyOutcome, checkout_branch, drop_stash, git_rebase_in_progress, load_state,
     owned_tip_state_matches, save_state, state_path, unstage_all,
 };
 use anyhow::{Result, anyhow};
@@ -46,21 +46,31 @@ pub fn abort_cmd() -> Result<()> {
         }
 
         if kindra_owns_current_state {
-            restore_original_branch_tips(&parsed_state.original_tip_map)?;
-
             let restore_branch = parsed_state
                 .caller_branch
                 .clone()
                 .unwrap_or_else(|| parsed_state.original_branch.clone());
-            checkout_branch(&restore_branch)?;
-            if let Some(stash_ref) = parsed_state.stash_ref.clone() {
-                apply_stash(&stash_ref)?;
-                parsed_state.stash_ref = None;
-                save_state(&repo, &parsed_state)?;
-                if let Err(err) = drop_stash(&stash_ref) {
-                    eprintln!("Warning: {}", err);
+
+            if parsed_state.preserve_content_on_abort {
+                // Content the operation already committed (absorb's fixup or
+                // folded commits) is only reachable from the original branch's
+                // current tip, and the set-aside stash is based on that
+                // content. Check the branch out and apply the stash *now*,
+                // while the worktree matches the stash's base; the tip restore
+                // below then moves the ref out from underneath, so the
+                // discarded content reappears as staged changes.
+                checkout_branch(&parsed_state.original_branch)?;
+                apply_abort_stash(&repo, &mut parsed_state)?;
+                restore_original_branch_tips(&parsed_state.original_tip_map)?;
+                if restore_branch != parsed_state.original_branch {
+                    checkout_branch(&restore_branch)?;
                 }
+            } else {
+                restore_original_branch_tips(&parsed_state.original_tip_map)?;
+                checkout_branch(&restore_branch)?;
+                apply_abort_stash(&repo, &mut parsed_state)?;
             }
+
             if parsed_state.unstage_on_restore {
                 unstage_all()?;
             }
@@ -145,6 +155,38 @@ impl Drop for AbortOplogSettle<'_> {
             SettleAction::Finalize => crate::oplog::finalize(self.repo),
         };
     }
+}
+
+/// Apply the state's stash (if any), honoring `stash_apply_index`, and settle
+/// it in the saved state. A conflicted apply keeps the entry as a backup and
+/// warns instead of failing the abort.
+fn apply_abort_stash(
+    repo: &git2::Repository,
+    parsed_state: &mut crate::rebase_utils::RebaseState,
+) -> Result<()> {
+    let Some(stash_ref) = parsed_state.stash_ref.clone() else {
+        return Ok(());
+    };
+    match crate::rebase_utils::apply_state_stash(parsed_state, &stash_ref)? {
+        StashApplyOutcome::Applied => {
+            parsed_state.stash_ref = None;
+            save_state(repo, parsed_state)?;
+            if let Err(err) = drop_stash(&stash_ref) {
+                eprintln!("Warning: {}", err);
+            }
+        }
+        StashApplyOutcome::ConflictsLeftInTree => {
+            // The changes are in the tree as conflict markers; do not reapply,
+            // keep the entry as a backup.
+            parsed_state.stash_ref = None;
+            save_state(repo, parsed_state)?;
+            eprintln!(
+                "Warning: restoring the set-aside changes left conflicts in the working tree; the stash entry '{}' was preserved as a backup.",
+                stash_ref
+            );
+        }
+    }
+    Ok(())
 }
 
 fn restore_original_branch_tips(original_tip_map: &HashMap<String, String>) -> Result<()> {
