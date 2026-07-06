@@ -2,14 +2,14 @@ use crate::commands::find_upstream;
 use crate::rebase_utils::{
     RebaseState, check_worktrees, clear_state, ensure_git_supports_update_refs,
     git_rebase_in_progress, local_branch_tips_in_range, passively_reconcile_rebase_state,
-    restore_stashed_changes, run_rebase_loop, save_state, stash_push_changes,
+    restore_set_aside_changes, run_rebase_loop, save_state, stash_push_changes,
 };
 use crate::stack::{collect_descendants, get_stack_branches_from_merge_base};
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
-use git2::{Oid, Repository};
+use git2::{BranchType, Oid, Repository};
 use slog::Drain;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 
 #[derive(Args)]
@@ -142,13 +142,23 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
     // moving every branch tip inside that range along with it — not just the
     // dependents restacked afterwards. Both sets must pass the worktree safety
     // check, or a branch checked out elsewhere would be skipped by
-    // `--update-refs` and silently left on pre-fold history.
+    // `--update-refs` and silently left on pre-fold history. A branch that
+    // *forks* from inside the range would be moved by neither mechanism, so
+    // that is refused up front.
     ensure_git_supports_update_refs()?;
     let in_range_tips: Vec<(String, Oid)> =
         local_branch_tips_in_range(&repo, Some(base_id), head_before)?
             .into_iter()
             .filter(|(name, _)| name != &current_branch_name)
             .collect();
+    ensure_no_forks_from_rewritten_range(
+        &repo,
+        &current_branch_name,
+        &sub_stack,
+        &in_range_tips,
+        base_id,
+        head_before,
+    )?;
     let mut guarded_branches = remaining_branches.clone();
     for (name, _) in &in_range_tips {
         if !guarded_branches.contains(name) {
@@ -164,7 +174,15 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
     // snapshot on every exit; a no-change exit leaves no oplog entry.
     let _snapshot = crate::oplog::begin(&repo, "absorb")?;
 
-    run_absorb_engine(args, base_id)?;
+    if let Err(err) = run_absorb_engine(args, base_id) {
+        // The engine may have created some fixup commits before failing; roll
+        // them back so a partial absorb doesn't linger at HEAD.
+        let repo = crate::open_repo()?;
+        if repo.revparse_single("HEAD")?.id() != head_before {
+            return Err(rollback_fixups(head_before, None, err));
+        }
+        return Err(err);
+    }
 
     if args.dry_run {
         return Ok(());
@@ -200,10 +218,10 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
         )?
     };
 
-    // Record the pre-fold tip of every branch the fold's `--update-refs` may
-    // move — the current branch, its dependents, and the in-range tips checked
-    // above (e.g. a branch created by `kin split` pointing at a mid-branch
-    // commit) — so `kin abort` can restore all of them.
+    // Record the pre-fold tip of every branch this operation may move — the
+    // current branch, its dependents, and the in-range tips moved by the
+    // fold's `--update-refs` (e.g. a sibling branch sharing HEAD's commit) —
+    // so `kin abort` can restore all of them.
     let mut original_tip_map = HashMap::new();
     original_tip_map.insert(current_branch_name.clone(), head_before.to_string());
     original_tip_map.extend(
@@ -234,6 +252,13 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
         // The stash below is a full stash (no --keep-index), so restoring it
         // with --index brings unabsorbable staged hunks back *staged*.
         stash_apply_index: true,
+        // The absorbed changes live only in the fixup/folded commits; if `kin
+        // abort` discards that history, it must first let the worktree keep
+        // the content so it reappears as staged changes instead of being lost.
+        preserve_content_on_abort: true,
+        // squash! folds must never open a commit-message editor, including
+        // when `kin continue` resumes one after a conflict.
+        suppress_editor: true,
         unstage_on_restore: false,
         // The stash below empties the working tree, so the rebases never have
         // anything to autostash.
@@ -270,8 +295,9 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
     // rewritten range with the fold; branches stacked above are restacked
     // afterwards by the rebase loop, which skips any this already moved.
     // GIT_EDITOR is pinned so `--squash` folds don't open a commit-message
-    // editor per squash (the combined message is accepted as-is), matching how
-    // `kin continue` resumes rebases.
+    // editor per squash (the combined message is accepted as-is); the
+    // suppress_editor flag in the saved state makes `kin continue` do the same
+    // when resuming after a conflict.
     let status = Command::new("git")
         .env("GIT_SEQUENCE_EDITOR", "true")
         .env("GIT_EDITOR", "true")
@@ -309,15 +335,18 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
     run_rebase_loop(&repo, state)
 }
 
-/// Error-path rollback: soft-reset the just-created fixup commits off HEAD
-/// (returning their content to the index) and pop the set-aside stash back, so
-/// the failure leaves the repository as it was before the absorb. If the reset
+/// Error-path rollback: pop the set-aside stash back (its base is the current
+/// fixup tip, so it applies cleanly and its staged hunks come back staged),
+/// then soft-reset the fixup commits off HEAD — the index and working tree
+/// keep everything, so the absorbed content returns to the index and the
+/// failure leaves the repository as it was before the absorb. If the reset
 /// itself fails, that is surfaced on the returned error instead of guessing.
 fn rollback_fixups(
     head_before: Oid,
     stash_ref: Option<String>,
     err: anyhow::Error,
 ) -> anyhow::Error {
+    restore_set_aside_changes(stash_ref);
     let reset_ok = matches!(
         Command::new("git")
             .args(["reset", "--soft", &head_before.to_string()])
@@ -330,8 +359,60 @@ fn rollback_fixups(
             head_before
         ));
     }
-    restore_stashed_changes(stash_ref);
     err
+}
+
+/// Refuse the absorb when any local branch forks from a commit strictly inside
+/// the rewritten range (base..HEAD). Such a branch would be moved by neither
+/// the fold's `--update-refs` (its tip is outside the range) nor the dependent
+/// restack (it does not descend from the current branch's tip), silently
+/// stranding it on pre-fold history.
+///
+/// No branch can *point at* the fork point: any branch tip that is an ancestor
+/// of HEAD is in `stack_branches`, so the closest one becomes the stack parent
+/// and the base never lands below it — which is also why branches forking at
+/// the base boundary carry nothing that the fold rewrites.
+fn ensure_no_forks_from_rewritten_range(
+    repo: &Repository,
+    current_branch_name: &str,
+    sub_stack: &[crate::stack::StackBranch],
+    in_range_tips: &[(String, Oid)],
+    base_id: Oid,
+    head_before: Oid,
+) -> Result<()> {
+    let covered: HashSet<&str> = sub_stack
+        .iter()
+        .map(|branch| branch.name.as_str())
+        .chain(in_range_tips.iter().map(|(name, _)| name.as_str()))
+        .chain(std::iter::once(current_branch_name))
+        .collect();
+
+    for (branch, _) in repo.branches(Some(BranchType::Local))?.flatten() {
+        let Ok(Some(name)) = branch.name() else {
+            continue;
+        };
+        if covered.contains(name) {
+            continue;
+        }
+        let Some(tip) = branch.get().target() else {
+            continue;
+        };
+        if tip == base_id || !repo.graph_descendant_of(tip, base_id)? {
+            continue;
+        }
+        let fork_point = repo.merge_base(tip, head_before)?;
+        if fork_point == base_id {
+            // Forks at the range boundary: nothing it carries is rewritten.
+            continue;
+        }
+        return Err(anyhow!(
+            "Branch '{}' forks from commit {} inside the absorbed range, so its commits cannot follow the fold. Rebase '{}' onto a branch first, or pass --base to keep the fork point out of the absorb range.",
+            name,
+            fork_point,
+            name
+        ));
+    }
+    Ok(())
 }
 
 /// Run the git-absorb engine with `and_rebase` disabled: it only creates

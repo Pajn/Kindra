@@ -251,6 +251,8 @@ pub fn commit(args: &[String]) -> Result<()> {
             owned_tip_map: HashMap::new(),
             stash_ref: None,
             stash_apply_index: false,
+            preserve_content_on_abort: false,
+            suppress_editor: false,
             unstage_on_restore: switching_branches,
             autostash,
             cleanup_merged_branches: Vec::new(),
@@ -831,7 +833,16 @@ fn restore_autostash(repo: &Repository, state: &mut RebaseState) -> Result<()> {
 }
 
 fn stash_non_staged_changes() -> Result<Option<String>> {
-    stash_push_changes(true, "kin-commit-on")
+    let stash_ref = stash_push_changes(true, "kin-commit-on")?;
+    if stash_ref.is_some() {
+        // stash_push_changes captures git's own "Saved working directory…"
+        // confirmation (it would leak the internal stash token), so tell the
+        // user their non-staged work was set aside, not lost.
+        println!(
+            "Set aside non-staged changes; they will be restored when the operation completes."
+        );
+    }
+    Ok(stash_ref)
 }
 
 fn resolve_fixup_commit(

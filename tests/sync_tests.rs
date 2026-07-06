@@ -1255,6 +1255,8 @@ fn status_blocks_and_preserves_state_when_active_git_rebase_mismatches_kindra_st
         owned_tip_map: HashMap::from([("feature-a".to_string(), a_id.to_string())]),
         stash_ref: Some("stash@{0}".to_string()),
         stash_apply_index: false,
+        preserve_content_on_abort: false,
+        suppress_editor: false,
         unstage_on_restore: false,
         autostash: false,
         cleanup_merged_branches: vec!["feature-b".to_string()],

@@ -27,11 +27,20 @@ pub fn continue_cmd() -> Result<()> {
         println!("Continuing git rebase...");
         let mut git = Command::new("git");
         git.envs(std::env::vars_os());
-        // If the caller didn't pin GIT_EDITOR, resolve the editor the same way
-        // the rest of the CLI does (GIT_EDITOR > core.editor > VISUAL > EDITOR >
-        // vi) and hand it to git, so `kin continue` never picks a different
-        // editor than the original interactive command would have.
-        if std::env::var_os("GIT_EDITOR").is_none() {
+        if rebase_state
+            .as_ref()
+            .is_some_and(|state| state.suppress_editor)
+        {
+            // The paused operation ran its rebase editor-less (absorb pins
+            // GIT_EDITOR so squash! folds never open a commit-message editor);
+            // resuming must do the same or the remaining squashes open the
+            // real editor — hanging scripted runs.
+            git.env("GIT_EDITOR", "true");
+        } else if std::env::var_os("GIT_EDITOR").is_none() {
+            // If the caller didn't pin GIT_EDITOR, resolve the editor the same
+            // way the rest of the CLI does (GIT_EDITOR > core.editor > VISUAL >
+            // EDITOR > vi) and hand it to git, so `kin continue` never picks a
+            // different editor than the original interactive command would have.
             git.env("GIT_EDITOR", crate::editor::resolve_editor());
         }
         let status = git.arg("rebase").arg("--continue").status()?;

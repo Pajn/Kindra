@@ -379,8 +379,12 @@ fn test_absorb_rolls_back_when_the_fold_fails_before_starting() {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    // An absorbable staged change, a staged edit the engine cannot place (a.txt
+    // belongs to a commit below the absorb range), and an untracked file.
     std::fs::write(repo_path.join("code.txt"), "line1 FIXED\nline2\nline3\n").unwrap();
     run_ok("git", &["add", "code.txt"], repo_path);
+    std::fs::write(repo_path.join("a.txt"), "A staged leftover").unwrap();
+    run_ok("git", &["add", "a.txt"], repo_path);
     std::fs::write(repo_path.join("untracked.txt"), "untracked").unwrap();
 
     let tips_before = (tip(&repo, "review"), tip(&repo, "perf"), tip(&repo, "docs"));
@@ -399,9 +403,9 @@ fn test_absorb_rolls_back_when_the_fold_fails_before_starting() {
         stderr
     );
 
-    // Every branch is back where it was, the fixup commits are gone, the
-    // absorbed content is back in the index, the untracked leftover is back,
-    // and no resumable state was left behind.
+    // Every branch is back where it was, the fixup commits are gone, both
+    // staged changes are back *staged*, the untracked leftover is back, and no
+    // resumable state was left behind.
     let tips_after = (tip(&repo, "review"), tip(&repo, "perf"), tip(&repo, "docs"));
     assert_eq!(tips_before, tips_after, "rollback must restore every tip");
     let staged = std::process::Command::new("git")
@@ -409,7 +413,11 @@ fn test_absorb_rolls_back_when_the_fold_fails_before_starting() {
         .current_dir(repo_path)
         .output()
         .unwrap();
-    assert_eq!(String::from_utf8_lossy(&staged.stdout).trim(), "code.txt");
+    assert_eq!(
+        String::from_utf8_lossy(&staged.stdout).trim(),
+        "a.txt\ncode.txt",
+        "both the absorbed hunk and the set-aside staged hunk must come back staged"
+    );
     assert_eq!(
         std::fs::read_to_string(repo_path.join("untracked.txt")).unwrap(),
         "untracked"
@@ -417,6 +425,174 @@ fn test_absorb_rolls_back_when_the_fold_fails_before_starting() {
     assert!(
         !repo_path.join(".git/kindra_rebase_state.json").exists(),
         "no resumable state may remain after a rollback"
+    );
+}
+
+#[test]
+fn test_absorb_abort_restores_tips_and_absorbed_changes() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = setup_stack(repo_path);
+
+    // Give perf a commit that conflicts with the fixup so the dependent
+    // restack stops after the fold has already completed.
+    run_ok("git", &["checkout", "perf"], repo_path);
+    let perf_old_tip = tip(&repo, "perf");
+    make_commit(
+        &repo,
+        "HEAD",
+        "code.txt",
+        "line1 PERF\nline2\nline3\n",
+        "perf: edit line1",
+        &[&repo.find_commit(perf_old_tip).unwrap()],
+    );
+    run_ok("git", &["checkout", "review"], repo_path);
+
+    // An absorbable staged change, a staged edit the engine cannot place, and
+    // an untracked file.
+    std::fs::write(repo_path.join("code.txt"), "line1 REVIEW\nline2\nline3\n").unwrap();
+    run_ok("git", &["add", "code.txt"], repo_path);
+    std::fs::write(repo_path.join("a.txt"), "A staged leftover").unwrap();
+    run_ok("git", &["add", "a.txt"], repo_path);
+    std::fs::write(repo_path.join("untracked.txt"), "untracked").unwrap();
+
+    let tips_before = (tip(&repo, "review"), tip(&repo, "perf"), tip(&repo, "docs"));
+
+    let mut cmd = kin_cmd();
+    cmd.current_dir(repo_path).arg("absorb").assert().failure();
+
+    let mut cmd = kin_cmd();
+    cmd.current_dir(repo_path).arg("abort").assert().success();
+
+    // Every branch is back at its pre-absorb tip.
+    let tips_after = (tip(&repo, "review"), tip(&repo, "perf"), tip(&repo, "docs"));
+    assert_eq!(tips_before, tips_after, "abort must restore every tip");
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "review");
+
+    // The absorbed change was already folded into now-discarded history; abort
+    // must bring it back as a staged change, alongside the set-aside staged
+    // leftover, instead of losing it.
+    let staged = std::process::Command::new("git")
+        .args(["diff", "--cached", "--name-only"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&staged.stdout).trim(),
+        "a.txt\ncode.txt",
+        "abort must restage the absorbed change and the set-aside staged hunk"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("code.txt")).unwrap(),
+        "line1 REVIEW\nline2\nline3\n",
+        "the absorbed content must be back in the working tree"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("untracked.txt")).unwrap(),
+        "untracked"
+    );
+
+    // Bookkeeping: no resumable state, no leftover stash entry.
+    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    let stashes = std::process::Command::new("git")
+        .args(["stash", "list"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&stashes.stdout), "");
+}
+
+#[test]
+fn test_absorb_refuses_branch_forking_from_inside_the_range() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = setup_stack(repo_path);
+
+    // A branch forked from review's first commit (which no branch points at)
+    // with its own work on top. The fold would rewrite the fork point, and
+    // nothing would move this branch, so absorb must refuse up front.
+    let review_tip = tip(&repo, "review");
+    let code_commit = first_parent(&repo, review_tip);
+    run_ok(
+        "git",
+        &["checkout", "-b", "loose", &code_commit.to_string()],
+        repo_path,
+    );
+    make_commit(
+        &repo,
+        "HEAD",
+        "loose.txt",
+        "L",
+        "loose: work",
+        &[&repo.find_commit(code_commit).unwrap()],
+    );
+    run_ok("git", &["checkout", "review"], repo_path);
+
+    std::fs::write(repo_path.join("code.txt"), "line1 FIXED\nline2\nline3\n").unwrap();
+    run_ok("git", &["add", "code.txt"], repo_path);
+
+    let tips_before = (tip(&repo, "review"), tip(&repo, "loose"));
+    let mut cmd = kin_cmd();
+    let output = cmd.current_dir(repo_path).arg("absorb").output().unwrap();
+    assert!(
+        !output.status.success(),
+        "fork inside the range must refuse"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("forks from commit"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Refusal happens before the engine runs: nothing moved, staging intact.
+    let tips_after = (tip(&repo, "review"), tip(&repo, "loose"));
+    assert_eq!(tips_before, tips_after);
+    let staged = std::process::Command::new("git")
+        .args(["diff", "--cached", "--name-only"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&staged.stdout).trim(), "code.txt");
+}
+
+#[test]
+fn test_absorb_moves_shared_head_sibling_and_undo_restores_it() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = setup_stack(repo_path);
+
+    // A sibling branch sharing review's tip commit: not a descendant (same
+    // tip), so only the fold's --update-refs moves it.
+    let review_tip_before = tip(&repo, "review");
+    run_ok(
+        "git",
+        &["branch", "sibling", &review_tip_before.to_string()],
+        repo_path,
+    );
+
+    std::fs::write(repo_path.join("code.txt"), "line1 FIXED\nline2\nline3\n").unwrap();
+    run_ok("git", &["add", "code.txt"], repo_path);
+
+    let mut cmd = kin_cmd();
+    cmd.current_dir(repo_path).arg("absorb").assert().success();
+
+    // The sibling must follow the fold onto the rewritten tip.
+    let review_tip = tip(&repo, "review");
+    assert_ne!(review_tip, review_tip_before);
+    assert_eq!(
+        tip(&repo, "sibling"),
+        review_tip,
+        "shared-head sibling must be moved with the fold"
+    );
+
+    // And undo must restore it along with the rest of the stack.
+    let mut cmd = kin_cmd();
+    cmd.current_dir(repo_path).arg("undo").assert().success();
+    assert_eq!(tip(&repo, "review"), review_tip_before);
+    assert_eq!(
+        tip(&repo, "sibling"),
+        review_tip_before,
+        "undo must restore the sibling's pre-fold tip"
     );
 }
 
@@ -492,12 +668,15 @@ fn test_absorb_conflicting_dependent_completes_via_continue() {
     let mut cmd = kin_cmd();
     cmd.current_dir(repo_path).arg("absorb").assert().failure();
 
-    // Resolve the conflict on perf's commit and continue.
+    // Resolve the conflict on perf's commit and continue. A bogus editor
+    // proves the resume honors the state's suppress_editor flag: git rebase
+    // --continue after a conflicted pick opens the commit-message editor, so
+    // without the pin this fails.
     std::fs::write(repo_path.join("code.txt"), "line1 RESOLVED\nline2\nline3\n").unwrap();
     run_ok("git", &["add", "code.txt"], repo_path);
     let mut cmd = kin_cmd();
     cmd.current_dir(repo_path)
-        .env("GIT_EDITOR", "cat")
+        .env("GIT_EDITOR", "false")
         .arg("continue")
         .assert()
         .success();

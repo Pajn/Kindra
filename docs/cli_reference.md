@@ -57,7 +57,9 @@ kin absorb [options]
 
 The absorb range is scoped to the current branch's own commits: everything below the branch's stack parent (or the merge base for a stack root) is out of range, so a fixup can never target another branch's commit. The engine also honours your existing `absorb.*` git config (for example `absorb.autoStageIfNothingStaged` and `absorb.oneFixupPerCommit`).
 
-Changes the engine cannot place — unabsorbable hunks, unstaged edits, untracked files — are always set aside for the rebases and restored when the operation completes (including through a conflict stop resolved with `kin continue`); previously staged hunks come back staged. Because everything is set aside up front, `absorb` takes no `--autostash` flag. The whole operation is undoable with `kin undo`.
+Changes the engine cannot place — unabsorbable hunks, unstaged edits, untracked files — are always set aside for the rebases and restored when the operation completes (including through a conflict stop resolved with `kin continue`); previously staged hunks come back staged. Because everything is set aside up front, `absorb` takes no `--autostash` flag.
+
+The whole operation is undoable with `kin undo`, and `kin abort` after a conflict stop restores the pre-absorb branch tips with the absorbed content back as staged changes — nothing is lost either way. A branch that forks from a commit inside the absorbed range (one no branch points at) cannot follow the rewrite, so absorb refuses up front rather than stranding it.
 
 **When to use it:** Use this instead of the standalone `git absorb` when working in a stack. Running plain `git absorb --and-rebase` rewrites the current branch without moving its descendants, leaving the stack floating (recoverable with `kin restack`). `kin absorb` performs the same absorb but keeps the stack intact in one pass.
 

@@ -79,6 +79,8 @@ fn write_commit_rebase_state_fixture(repo: &Repository, stash_ref: &str) {
         owned_tip_map: HashMap::from([("main".to_string(), main_tip)]),
         stash_ref: Some(stash_ref.to_string()),
         stash_apply_index: false,
+        preserve_content_on_abort: false,
+        suppress_editor: false,
         unstage_on_restore: false,
         autostash: false,
         cleanup_merged_branches: Vec::new(),
