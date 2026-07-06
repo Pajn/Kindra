@@ -5,6 +5,7 @@ Kindra is a CLI tool for managing **stacked git branches**. Its `kin` command au
 ## Key Features
 
 - **Stacked Commits**: Automatically rebase all descendant branches when you commit in the middle of a stack.
+- **Stack-Aware Absorb**: Distribute staged changes into the commits that introduced the touched lines (via the git-absorb engine), fold them, and restack descendants in one pass.
 - **Atomic Stack Moves**: Move a branch and all its descendants onto a new base branch in one pass using `--update-refs`.
 - **Fork-Aware Reordering**: Edit branch parent relationships in your `$EDITOR`, including creating or preserving forks.
 - **Smart Sync**: Rebase the current stack onto `main`/`master` in one pass using `--update-refs`, while skipping already-landed lower PRs.
@@ -222,7 +223,7 @@ history_limit = 250
 
 ## Rebase Autostash
 
-Commands that start a Git rebase (`commit`, `move`, `sync`, and `restack`) default to `--no-autostash` so dirty tracked changes do not get hidden implicitly.
+Commands that start a Git rebase (`absorb`, `commit`, `move`, `sync`, and `restack`) default to `--no-autostash` so dirty tracked changes do not get hidden implicitly.
 
 Resolution order:
 

@@ -6,6 +6,7 @@ This document provides a detailed overview of the commands available in Kindra v
 
 - [Core Concepts](#core-concepts)
 - [Command Reference](#command-reference)
+  - [absorb](#absorb)
   - [commit](#commit)
   - [move](#move)
   - [rename](#rename)
@@ -33,6 +34,49 @@ Kindra automatically identifies your stack by looking for local branches that ar
 ---
 
 ## Command Reference
+
+### `absorb`
+
+**Description:** Automatically distributes your staged changes into the commits of the current branch that introduced the touched lines (powered by the [git-absorb](https://github.com/tummychow/git-absorb) engine), folds the generated `fixup!` commits with an autosquash rebase, and rebases descendant branches in the same pass — so an absorb never sets the stack adrift.
+
+**Usage:**
+
+```bash
+kin absorb [options]
+```
+
+- `-n, --dry-run`: Show which commits the staged changes would be absorbed into without changing anything.
+- `-b, --base <ref>`: Absorb into commits above this base instead of the stack parent.
+- `--force-author`: Generate fixups to commits not made by you.
+- `-w, --whole-file`: Match changes against the complete file instead of individual hunks.
+- `-F, --one-fixup-per-commit`: Only generate one fixup per target commit.
+- `-s, --squash`: Create `squash!` commits instead of `fixup!` commits.
+- `-m, --message <body>`: Commit message body given to all fixup commits.
+- `-v, --verbose`: Display more output from the absorb engine.
+- `--force`: Skip the checked-out-in-another-worktree safety check for dependent branches.
+- `--autostash` / `--no-autostash`: Control Git autostash for the descendant rebase phase.
+
+The absorb range is scoped to the current branch's own commits: everything below the branch's stack parent (or the merge base for a stack root) is out of range, so a fixup can never target another branch's commit. The engine also honours your existing `absorb.*` git config (for example `absorb.autoStageIfNothingStaged` and `absorb.oneFixupPerCommit`).
+
+Changes the engine cannot place — unabsorbable hunks, unstaged edits, untracked files — are set aside for the rebases and restored when the operation completes (including through a conflict stop resolved with `kin continue`). The whole operation is undoable with `kin undo`.
+
+**When to use it:** Use this instead of the standalone `git absorb` when working in a stack. Running plain `git absorb --and-rebase` rewrites the current branch without moving its descendants, leaving the stack floating (recoverable with `kin restack`). `kin absorb` performs the same absorb but keeps the stack intact in one pass.
+
+**ASCII-Art Visualization:**
+
+```text
+Before absorb on 'feature-A' (staged fix belongs in A1):
+main -> [A1] -> [A2] -> (feature-A) -> [B1] -> (feature-B)
+
+$ kin absorb
+
+After kin absorb:
+main -> [A1'] -> [A2'] -> (feature-A) -> [B1'] -> (feature-B)
+```
+
+*(The staged change is folded into `A1`, and `feature-B` follows the rewritten history automatically.)*
+
+---
 
 ### `commit`
 
