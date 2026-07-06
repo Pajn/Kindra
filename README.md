@@ -223,7 +223,7 @@ history_limit = 250
 
 ## Rebase Autostash
 
-Commands that start a Git rebase (`absorb`, `commit`, `move`, `sync`, and `restack`) default to `--no-autostash` so dirty tracked changes do not get hidden implicitly.
+Commands that start a Git rebase (`commit`, `move`, `sync`, and `restack`) default to `--no-autostash` so dirty tracked changes do not get hidden implicitly.
 
 Resolution order:
 

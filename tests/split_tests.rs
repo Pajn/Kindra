@@ -725,6 +725,7 @@ fn test_split_refuses_when_kindra_operation_in_progress() {
         original_tip_map: HashMap::new(),
         owned_tip_map: HashMap::new(),
         stash_ref: None,
+        stash_apply_index: false,
         unstage_on_restore: false,
         autostash: false,
         cleanup_merged_branches: Vec::new(),

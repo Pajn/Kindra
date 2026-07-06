@@ -1,6 +1,6 @@
 use crate::rebase_utils::{
-    apply_stash, checkout_branch, drop_stash, git_rebase_in_progress, load_state,
-    owned_tip_state_matches, save_state, state_path, unstage_all,
+    checkout_branch, drop_stash, git_rebase_in_progress, load_state, owned_tip_state_matches,
+    save_state, state_path, unstage_all,
 };
 use anyhow::{Result, anyhow};
 use git2::Oid;
@@ -54,7 +54,7 @@ pub fn abort_cmd() -> Result<()> {
                 .unwrap_or_else(|| parsed_state.original_branch.clone());
             checkout_branch(&restore_branch)?;
             if let Some(stash_ref) = parsed_state.stash_ref.clone() {
-                apply_stash(&stash_ref)?;
+                crate::rebase_utils::apply_state_stash(&parsed_state, &stash_ref)?;
                 parsed_state.stash_ref = None;
                 save_state(&repo, &parsed_state)?;
                 if let Err(err) = drop_stash(&stash_ref) {

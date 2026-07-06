@@ -49,9 +49,15 @@ pub struct RebaseState {
     /// branch_name -> tip commit id Kindra most recently left behind in a resumable state
     #[serde(default)]
     pub owned_tip_map: HashMap<String, String>,
-    /// Optional stash token created by `kin commit --on` to preserve non-staged files.
+    /// Optional stash token created by `kin commit --on` / `kin absorb` to
+    /// preserve files set aside for the operation.
     #[serde(default)]
     pub stash_ref: Option<String>,
+    /// Whether restoring `stash_ref` should also restore the recorded index
+    /// (staged) state. Only safe for full stashes (no `--keep-index`), whose
+    /// recorded index state was actually removed from the tree.
+    #[serde(default)]
+    pub stash_apply_index: bool,
     /// Whether to run `git reset` when returning to the original branch.
     #[serde(default)]
     pub unstage_on_restore: bool,
@@ -615,6 +621,83 @@ pub fn apply_stash(stash_ref: &str) -> Result<()> {
     Ok(())
 }
 
+/// Apply a stash created without `--keep-index`, restoring its recorded index
+/// state too so previously staged hunks come back staged. `--index` refuses to
+/// apply when the index restore would conflict, so fall back to a plain apply
+/// (with a warning) rather than failing the whole restore.
+pub fn apply_stash_restoring_index(stash_ref: &str) -> Result<()> {
+    let resolved_ref = resolve_stash_reference(stash_ref)?;
+    let status = Command::new("git")
+        .arg("stash")
+        .arg("apply")
+        .arg("--index")
+        .arg(&resolved_ref)
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+    eprintln!(
+        "Warning: could not restore the staged state of the set-aside changes; restoring them unstaged."
+    );
+    apply_stash(stash_ref)
+}
+
+/// Restore `state.stash_ref` honoring `state.stash_apply_index`.
+pub fn apply_state_stash(state: &RebaseState, stash_ref: &str) -> Result<()> {
+    if state.stash_apply_index {
+        apply_stash_restoring_index(stash_ref)
+    } else {
+        apply_stash(stash_ref)
+    }
+}
+
+/// Pop a stash taken by [`stash_push_changes`] back onto the working tree,
+/// best-effort. Used on error paths where no saved state will restore it later,
+/// so the user's changes aren't stranded in the stash list.
+pub fn restore_stashed_changes(stash_ref: Option<String>) {
+    let Some(stash_ref) = stash_ref else {
+        return;
+    };
+    if apply_stash(&stash_ref).is_ok() {
+        let _ = drop_stash(&stash_ref);
+    }
+}
+
+/// Stash working-tree changes (including untracked files) under a unique
+/// `<prefix>-<pid>-<nanos>` message and return that message as the stash
+/// handle, or `None` when there was nothing to stash. With `keep_index` the
+/// staged changes are kept in place (the `kin commit --on` contract); without
+/// it everything is set aside, in which case restoring with
+/// [`apply_stash_restoring_index`] brings staged hunks back staged.
+pub fn stash_push_changes(keep_index: bool, message_prefix: &str) -> Result<Option<String>> {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let message = format!("{}-{}-{}", message_prefix, std::process::id(), ts);
+    let mut cmd = Command::new("git");
+    cmd.arg("stash").arg("push");
+    if keep_index {
+        cmd.arg("--keep-index");
+    }
+    // Capture (rather than inherit) git's output so the internal stash token
+    // doesn't leak onto the user's terminal via git's "Saved working directory
+    // and index state …" confirmation.
+    let output = cmd
+        .arg("--include-untracked")
+        .arg("-m")
+        .arg(&message)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!("Failed to stash working tree changes."));
+    }
+
+    // `git stash push` exits 0 without creating an entry when there is nothing
+    // to save; confirm an entry was actually created before claiming there's
+    // something to restore.
+    if find_stash_reference(&message)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(message))
+}
+
 pub fn drop_stash(stash_ref: &str) -> Result<()> {
     let resolved_ref = resolve_stash_reference(stash_ref)?;
     let status = Command::new("git")
@@ -662,6 +745,54 @@ fn find_stash_reference(message: &str) -> Result<Option<String>> {
     }
 
     Ok(None)
+}
+
+/// List every local branch whose tip lies inside the first-parent range
+/// `base..head` (`head` included, `base` excluded; a `None` base hides
+/// nothing). These are the refs a `git rebase --update-refs` over that range
+/// moves along with the rewrite.
+pub fn local_branch_tips_in_range(
+    repo: &Repository,
+    base: Option<Oid>,
+    head: Oid,
+) -> Result<Vec<(String, Oid)>> {
+    let mut walk = repo.revwalk()?;
+    walk.push(head)?;
+    if let Some(base) = base {
+        walk.hide(base)?;
+    }
+    let rewritten: HashSet<Oid> = walk.filter_map(|id| id.ok()).collect();
+
+    let mut tips = Vec::new();
+    for (branch, _) in repo.branches(Some(git2::BranchType::Local))?.flatten() {
+        let Some(oid) = branch.get().target() else {
+            continue;
+        };
+        if !rewritten.contains(&oid) {
+            continue;
+        }
+        let Ok(Some(name)) = branch.name() else {
+            continue;
+        };
+        tips.push((name.to_string(), oid));
+    }
+    Ok(tips)
+}
+
+/// Record, into `original_tip_map`, the pre-rewrite tip of every local branch
+/// whose tip lies inside the range a `--update-refs` rebase over `base..head`
+/// rewrites. Existing entries are preserved. This is what lets `kin abort`
+/// roll a completed fold back off such a branch.
+pub fn record_branch_tips_in_range(
+    repo: &Repository,
+    base: Option<Oid>,
+    head: Oid,
+    original_tip_map: &mut HashMap<String, String>,
+) -> Result<()> {
+    for (name, oid) in local_branch_tips_in_range(repo, base, head)? {
+        original_tip_map.entry(name).or_insert(oid.to_string());
+    }
+    Ok(())
 }
 
 pub fn unstage_all() -> Result<()> {
@@ -763,8 +894,8 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
     })?;
 
     if let Some(stash_ref) = state.stash_ref.clone() {
-        println!("Restoring stashed non-staged files...");
-        apply_stash(&stash_ref)?;
+        println!("Restoring set-aside changes...");
+        apply_state_stash(&state, &stash_ref)?;
         state.stash_ref = None;
         save_state(repo, &state)?;
         if let Err(err) = drop_stash(&stash_ref) {

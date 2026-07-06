@@ -1,23 +1,24 @@
-use crate::commands::{find_upstream, resolve_rebase_autostash};
+use crate::commands::find_upstream;
 use crate::rebase_utils::{
-    RebaseState, check_worktrees, ensure_git_supports_update_refs, git_rebase_in_progress,
-    passively_reconcile_rebase_state, run_rebase_loop, save_state,
+    RebaseState, check_worktrees, clear_state, ensure_git_supports_update_refs,
+    git_rebase_in_progress, local_branch_tips_in_range, passively_reconcile_rebase_state,
+    restore_stashed_changes, run_rebase_loop, save_state, stash_push_changes,
 };
 use crate::stack::{collect_descendants, get_stack_branches_from_merge_base};
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
-use git2::{BranchType, Oid, Repository};
+use git2::{Oid, Repository};
 use slog::Drain;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Args)]
 pub struct AbsorbArgs {
     /// Don't make any actual changes
     #[arg(long, short = 'n')]
     pub dry_run: bool,
-    /// Use this commit as the base of the absorb stack instead of the stack parent
+    /// Use this commit as the base of the absorb stack instead of the stack
+    /// parent (must be on the current branch, at or above the stack parent)
     #[arg(long, short)]
     pub base: Option<String>,
     /// Generate fixups to commits not made by you
@@ -38,15 +39,9 @@ pub struct AbsorbArgs {
     /// Display more output from the absorb engine
     #[arg(long, short)]
     pub verbose: bool,
-    /// Skip the checked-out-in-another-worktree safety check for dependent branches
+    /// Skip the checked-out-in-another-worktree safety check for affected branches
     #[arg(long)]
     pub force: bool,
-    /// Allow git rebase to autostash tracked worktree changes
-    #[arg(long, overrides_with = "no_autostash")]
-    pub autostash: bool,
-    /// Disable git rebase autostash even if configured
-    #[arg(long, overrides_with = "autostash")]
-    pub no_autostash: bool,
 }
 
 /// Absorb staged changes into the current branch's commits (via the git-absorb
@@ -99,37 +94,69 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
         .map(|sb| sb.name.clone())
         .collect();
 
-    // The fold below rewrites branch tips with `--update-refs` (git >= 2.38).
-    // Verify support up front, before the absorb engine creates any `fixup!`
-    // commits, so an unsupported git fails cleanly with nothing to undo.
-    ensure_git_supports_update_refs()?;
-    if !remaining_branches.is_empty() {
-        check_worktrees(&remaining_branches, args.force)?;
-    }
-    let autostash = resolve_rebase_autostash(
-        &repo,
-        crate::commands::autostash_override(args.autostash, args.no_autostash),
-    )?;
-
     // Scope the absorb to the current branch's own commits: everything below the
     // stack parent (or the merge base for a stack root) is out of range, so a
-    // fixup can never target another branch's commit.
+    // fixup can never target another branch's commit. An explicit --base must
+    // stay inside that range — an ancestor of HEAD at or above the stack parent
+    // — because the fold rebases onto it: a base outside the branch's history
+    // would relocate the branch, and one below the stack parent would rewrite
+    // ancestor branches whose siblings this command does not restack.
+    let stack_parent_id = crate::stack::find_parent_in_stack(
+        &repo,
+        &current_branch_name,
+        &stack_branches,
+        merge_base,
+    )?;
     let base_id = match &args.base {
-        Some(base) => repo
-            .revparse_single(base)
-            .with_context(|| format!("Could not resolve --base '{}' to a commit.", base))?
-            .peel_to_commit()?
-            .id(),
-        None => crate::stack::find_parent_in_stack(
-            &repo,
-            &current_branch_name,
-            &stack_branches,
-            merge_base,
-        )?,
+        Some(base) => {
+            let base_id = repo
+                .revparse_single(base)
+                .with_context(|| format!("Could not resolve --base '{}' to a commit.", base))?
+                .peel_to_commit()?
+                .id();
+            if base_id != head_before && !repo.graph_descendant_of(head_before, base_id)? {
+                return Err(anyhow!(
+                    "--base '{}' is not an ancestor of the current branch '{}'.",
+                    base,
+                    current_branch_name
+                ));
+            }
+            if base_id != stack_parent_id && !repo.graph_descendant_of(base_id, stack_parent_id)? {
+                return Err(anyhow!(
+                    "--base '{}' is below the current branch's own commits (its stack parent is {}). \
+                     To absorb into an ancestor branch's commits, run 'kin absorb' on that branch.",
+                    base,
+                    stack_parent_id
+                ));
+            }
+            base_id
+        }
+        None => stack_parent_id,
     };
     if base_id == head_before {
         println!("No commits on '{}' to absorb into.", current_branch_name);
         return Ok(());
+    }
+
+    // The fold below rewrites base..HEAD with `--update-refs` (git >= 2.38),
+    // moving every branch tip inside that range along with it — not just the
+    // dependents restacked afterwards. Both sets must pass the worktree safety
+    // check, or a branch checked out elsewhere would be skipped by
+    // `--update-refs` and silently left on pre-fold history.
+    ensure_git_supports_update_refs()?;
+    let in_range_tips: Vec<(String, Oid)> =
+        local_branch_tips_in_range(&repo, Some(base_id), head_before)?
+            .into_iter()
+            .filter(|(name, _)| name != &current_branch_name)
+            .collect();
+    let mut guarded_branches = remaining_branches.clone();
+    for (name, _) in &in_range_tips {
+        if !guarded_branches.contains(name) {
+            guarded_branches.push(name.clone());
+        }
+    }
+    if !guarded_branches.is_empty() {
+        check_worktrees(&guarded_branches, args.force)?;
     }
 
     // Snapshot for undo before the absorb engine commits anything, so `kin undo`
@@ -154,8 +181,9 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
     let fixup_count =
         count_commits(&repo, base_id, head_after)? - count_commits(&repo, base_id, head_before)?;
     println!(
-        "Absorbed staged changes into {} fixup commit{}. Folding...",
+        "Absorbed staged changes into {} {} commit{}. Folding...",
         fixup_count,
+        if args.squash { "squash" } else { "fixup" },
         if fixup_count == 1 { "" } else { "s" }
     );
 
@@ -172,11 +200,10 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
         )?
     };
 
-    // Record the pre-fold tip of every branch the autosquash `--update-refs`
-    // may move: the current branch, its dependents, and any other branch whose
-    // tip sits inside the rewritten range (base..HEAD], e.g. a branch created
-    // by `kin split` pointing at a mid-branch commit. Without these, `kin
-    // abort` could strand such a branch on the folded history.
+    // Record the pre-fold tip of every branch the fold's `--update-refs` may
+    // move — the current branch, its dependents, and the in-range tips checked
+    // above (e.g. a branch created by `kin split` pointing at a mid-branch
+    // commit) — so `kin abort` can restore all of them.
     let mut original_tip_map = HashMap::new();
     original_tip_map.insert(current_branch_name.clone(), head_before.to_string());
     original_tip_map.extend(
@@ -184,7 +211,11 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
             .iter()
             .map(|branch| (branch.name.clone(), branch.id.to_string())),
     );
-    record_tips_in_range(&repo, base_id, head_before, &mut original_tip_map)?;
+    original_tip_map.extend(
+        in_range_tips
+            .iter()
+            .map(|(name, oid)| (name.clone(), oid.to_string())),
+    );
 
     let mut state = RebaseState {
         operation: crate::rebase_utils::Operation::Commit,
@@ -200,8 +231,13 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
         original_tip_map,
         owned_tip_map: HashMap::new(),
         stash_ref: None,
+        // The stash below is a full stash (no --keep-index), so restoring it
+        // with --index brings unabsorbable staged hunks back *staged*.
+        stash_apply_index: true,
         unstage_on_restore: false,
-        autostash,
+        // The stash below empties the working tree, so the rebases never have
+        // anything to autostash.
+        autostash: false,
         cleanup_merged_branches: Vec::new(),
         cleanup_checkout_fallback: None,
     };
@@ -210,41 +246,35 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
     // left (unabsorbable hunks, unstaged edits, untracked files) must be set
     // aside for the rebases below. Stash it all and restore at the end via the
     // saved state, so `kin continue`/`abort` recover it after a conflict stop.
-    state.stash_ref = match stash_all_remaining_changes() {
-        Ok(stash_ref) => stash_ref,
-        Err(err) => {
-            // Roll the fixup commits back off HEAD; a soft reset returns their
-            // content to the index, so nothing is lost.
-            match Command::new("git")
-                .args(["reset", "--soft", &head_before.to_string()])
-                .status()
-            {
-                Ok(status) if status.success() => return Err(err),
-                _ => {
-                    return Err(err.context(format!(
-                        "Additionally, failed to roll back the fixup commits; they remain at HEAD. Remove them with 'git reset --soft {}'.",
-                        head_before
-                    )));
-                }
+    state.stash_ref = match stash_push_changes(false, "kin-absorb") {
+        Ok(stash_ref) => {
+            if stash_ref.is_some() {
+                println!(
+                    "Set aside remaining changes; they will be restored when the operation completes."
+                );
             }
+            stash_ref
+        }
+        Err(err) => {
+            return Err(rollback_fixups(head_before, None, err));
         }
     };
     if let Err(err) = save_state(&repo, &state) {
         // Persisting failed, so no later `kin continue`/`abort` knows about the
-        // stash; pop it back rather than stranding the user's changes.
-        if let Some(stash_ref) = state.stash_ref.take()
-            && crate::rebase_utils::apply_stash(&stash_ref).is_ok()
-        {
-            let _ = crate::rebase_utils::drop_stash(&stash_ref);
-        }
-        return Err(err);
+        // stash; roll the fixups back and pop it rather than stranding the
+        // user's changes.
+        return Err(rollback_fixups(head_before, state.stash_ref.take(), err));
     }
 
     // Fold the fixup commits. `--update-refs` moves every branch tip inside the
     // rewritten range with the fold; branches stacked above are restacked
     // afterwards by the rebase loop, which skips any this already moved.
+    // GIT_EDITOR is pinned so `--squash` folds don't open a commit-message
+    // editor per squash (the combined message is accepted as-is), matching how
+    // `kin continue` resumes rebases.
     let status = Command::new("git")
         .env("GIT_SEQUENCE_EDITOR", "true")
+        .env("GIT_EDITOR", "true")
         .arg("rebase")
         .arg("-i")
         .arg("--autosquash")
@@ -257,15 +287,51 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
             // mid-rebase so `kin continue` matches the saved state.
             state.in_progress_branch = Some(current_branch_name.clone());
             save_state(&repo, &state)?;
+            return Err(anyhow!(
+                "git rebase --autosquash failed. Resolve conflicts and run 'kin continue', or run 'kin abort'."
+            ));
         }
-        return Err(anyhow!(
-            "git rebase --autosquash failed. Resolve conflicts and run 'kin continue', or run 'kin abort'."
+        // The fold failed without starting a rebase (e.g. a pre-rebase hook
+        // rejected it). Nothing was folded, so leaving the saved state behind
+        // would only invite `kin continue` to restack dependents onto the raw
+        // fixup commits. Roll the fixups back and restore the set-aside
+        // changes instead.
+        let _ = clear_state(&repo);
+        return Err(rollback_fixups(
+            head_before,
+            state.stash_ref.take(),
+            anyhow!("git rebase --autosquash failed before starting. The absorb was rolled back."),
         ));
     }
 
     // Restack dependents; also restores the stash, clears the saved state, and
     // finalizes the undo snapshot (a no-dependents run only does the latter).
     run_rebase_loop(&repo, state)
+}
+
+/// Error-path rollback: soft-reset the just-created fixup commits off HEAD
+/// (returning their content to the index) and pop the set-aside stash back, so
+/// the failure leaves the repository as it was before the absorb. If the reset
+/// itself fails, that is surfaced on the returned error instead of guessing.
+fn rollback_fixups(
+    head_before: Oid,
+    stash_ref: Option<String>,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    let reset_ok = matches!(
+        Command::new("git")
+            .args(["reset", "--soft", &head_before.to_string()])
+            .status(),
+        Ok(status) if status.success()
+    );
+    if !reset_ok {
+        return err.context(format!(
+            "Additionally, failed to roll back the fixup commits; they remain at HEAD. Remove them with 'git reset --soft {}'.",
+            head_before
+        ));
+    }
+    restore_stashed_changes(stash_ref);
+    err
 }
 
 /// Run the git-absorb engine with `and_rebase` disabled: it only creates
@@ -311,83 +377,4 @@ fn count_commits(repo: &Repository, base: Oid, tip: Oid) -> Result<usize> {
     walk.push(tip)?;
     walk.hide(base)?;
     Ok(walk.count())
-}
-
-/// Record, into `original_tip_map`, the pre-fold tip of every local branch whose
-/// tip lies in the range the autosquash rewrites with `--update-refs`
-/// (base..head). Existing entries are preserved.
-fn record_tips_in_range(
-    repo: &Repository,
-    base: Oid,
-    head: Oid,
-    original_tip_map: &mut HashMap<String, String>,
-) -> Result<()> {
-    let mut walk = repo.revwalk()?;
-    walk.push(head)?;
-    walk.hide(base)?;
-    let rewritten: HashSet<Oid> = walk.filter_map(|id| id.ok()).collect();
-
-    for (branch, _) in repo.branches(Some(BranchType::Local))?.flatten() {
-        let Some(oid) = branch.get().target() else {
-            continue;
-        };
-        if !rewritten.contains(&oid) {
-            continue;
-        }
-        let Ok(Some(name)) = branch.name() else {
-            continue;
-        };
-        original_tip_map
-            .entry(name.to_string())
-            .or_insert_with(|| oid.to_string());
-    }
-    Ok(())
-}
-
-/// Stash everything left in the working tree and index (the absorb engine's
-/// leftovers) so the rebases below run on a clean tree. Returns the stash
-/// message used as its handle, or `None` when there was nothing to stash.
-fn stash_all_remaining_changes() -> Result<Option<String>> {
-    let before = stash_head_ref()?;
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let message = format!("kin-absorb-{}-{}", std::process::id(), ts);
-    let status = Command::new("git")
-        .arg("stash")
-        .arg("push")
-        .arg("--quiet")
-        .arg("--include-untracked")
-        .arg("-m")
-        .arg(&message)
-        .status()?;
-    if !status.success() {
-        return Err(anyhow!("Failed to stash remaining changes."));
-    }
-    let after = stash_head_ref()?;
-    if after != before {
-        println!(
-            "Set aside remaining changes; they will be restored when the operation completes."
-        );
-        Ok(Some(message))
-    } else {
-        Ok(None)
-    }
-}
-
-fn stash_head_ref() -> Result<Option<String>> {
-    let output = Command::new("git")
-        .arg("rev-parse")
-        .arg("--verify")
-        .arg("-q")
-        .arg("refs/stash")
-        .output()?;
-    if output.status.success() {
-        let ref_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if ref_name.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(ref_name))
-        }
-    } else {
-        Ok(None)
-    }
 }

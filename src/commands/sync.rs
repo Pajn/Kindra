@@ -145,6 +145,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
             original_tip_map: HashMap::from([(top_branch.clone(), top_branch_tip.to_string())]),
             owned_tip_map: HashMap::new(),
             stash_ref: None,
+            stash_apply_index: false,
             unstage_on_restore: false,
             autostash,
             cleanup_merged_branches: if args.no_delete {
@@ -235,6 +236,7 @@ fn sync_upstream_branch(
             original_tip_map: HashMap::from([(upstream_name.to_string(), upstream_id.to_string())]),
             owned_tip_map: HashMap::new(),
             stash_ref: None,
+            stash_apply_index: false,
             unstage_on_restore: false,
             autostash,
             cleanup_merged_branches: merged_branches.clone(),

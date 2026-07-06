@@ -198,10 +198,13 @@ fn test_absorb_restores_leftover_changes_after_completion() {
     let repo_path = temp.path();
     let repo = setup_stack(repo_path);
 
-    // An absorbable staged change plus leftovers the engine cannot place: an
-    // unstaged edit and an untracked file.
+    // An absorbable staged change plus leftovers the engine cannot place: a
+    // staged edit to a file whose commit is below the absorb range, an
+    // unstaged edit, and an untracked file.
     std::fs::write(repo_path.join("code.txt"), "line1 FIXED\nline2\nline3\n").unwrap();
     run_ok("git", &["add", "code.txt"], repo_path);
+    std::fs::write(repo_path.join("a.txt"), "A staged leftover").unwrap();
+    run_ok("git", &["add", "a.txt"], repo_path);
     std::fs::write(repo_path.join("extra.txt"), "extra\nunstaged edit\n").unwrap();
     std::fs::write(repo_path.join("untracked.txt"), "untracked").unwrap();
 
@@ -219,6 +222,19 @@ fn test_absorb_restores_leftover_changes_after_completion() {
         "untracked"
     );
 
+    // The staged-but-unabsorbable edit must come back *staged*, so a follow-up
+    // `git commit` still includes it.
+    let staged = std::process::Command::new("git")
+        .args(["diff", "--cached", "--name-only"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&staged.stdout).trim(),
+        "a.txt",
+        "staged leftover must be restored staged"
+    );
+
     // Nothing may be left in the stash list.
     let stashes = std::process::Command::new("git")
         .args(["stash", "list"])
@@ -231,6 +247,222 @@ fn test_absorb_restores_leftover_changes_after_completion() {
     let perf_tip = tip(&repo, "perf");
     assert_eq!(first_parent(&repo, docs_tip), perf_tip);
     assert_eq!(first_parent(&repo, perf_tip), tip(&repo, "review"));
+}
+
+#[test]
+fn test_absorb_rejects_base_that_is_not_an_ancestor() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = setup_stack(repo_path);
+
+    // A sibling commit off main that is not in review's history.
+    run_ok("git", &["checkout", "-b", "sibling", "main"], repo_path);
+    let main_tip = tip(&repo, "main");
+    let sibling_oid = make_commit(
+        &repo,
+        "HEAD",
+        "sibling.txt",
+        "S",
+        "sibling: work",
+        &[&repo.find_commit(main_tip).unwrap()],
+    );
+    run_ok("git", &["checkout", "review"], repo_path);
+
+    std::fs::write(repo_path.join("code.txt"), "line1 FIXED\nline2\nline3\n").unwrap();
+    run_ok("git", &["add", "code.txt"], repo_path);
+
+    let tips_before = (tip(&repo, "review"), tip(&repo, "perf"), tip(&repo, "docs"));
+    let mut cmd = kin_cmd();
+    let output = cmd
+        .current_dir(repo_path)
+        .args(["absorb", "--base", &sibling_oid.to_string()])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "non-ancestor --base must fail");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not an ancestor"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let tips_after = (tip(&repo, "review"), tip(&repo, "perf"), tip(&repo, "docs"));
+    assert_eq!(tips_before, tips_after, "no branch may move");
+}
+
+#[test]
+fn test_absorb_rejects_base_below_the_stack_parent() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = setup_stack(repo_path);
+
+    // From perf, review's commits are below the stack parent; absorbing past
+    // them would rewrite review without restacking review's other dependents.
+    run_ok("git", &["checkout", "perf"], repo_path);
+    std::fs::write(repo_path.join("perf.txt"), "perf FIXED").unwrap();
+    run_ok("git", &["add", "perf.txt"], repo_path);
+
+    let main_tip = tip(&repo, "main").to_string();
+    let mut cmd = kin_cmd();
+    let output = cmd
+        .current_dir(repo_path)
+        .args(["absorb", "--base", &main_tip])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "--base below the stack parent must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("below the current branch"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_absorb_squash_folds_without_an_editor() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = setup_stack(repo_path);
+
+    std::fs::write(repo_path.join("code.txt"), "line1 FIXED\nline2\nline3\n").unwrap();
+    run_ok("git", &["add", "code.txt"], repo_path);
+
+    // A bogus editor proves the fold never opens one for the squash messages.
+    let mut cmd = kin_cmd();
+    let output = cmd
+        .current_dir(repo_path)
+        .env("GIT_EDITOR", "false")
+        .env("EDITOR", "false")
+        .args(["absorb", "--squash", "--message", "squash body"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "squash absorb failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("squash commit"),
+        "completion message must say squash, not fixup\nstdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_no_rebase_in_progress(repo_path);
+
+    // Folded into the target with no squash! commit left behind, stack linear.
+    let review_tip = tip(&repo, "review");
+    let code_commit = first_parent(&repo, review_tip);
+    assert_eq!(commit_summary(&repo, code_commit), "review: add code");
+    assert_eq!(
+        file_in_commit(&repo, code_commit, "code.txt"),
+        "line1 FIXED\nline2\nline3\n"
+    );
+    assert_eq!(first_parent(&repo, tip(&repo, "perf")), review_tip);
+}
+
+#[test]
+fn test_absorb_rolls_back_when_the_fold_fails_before_starting() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = setup_stack(repo_path);
+
+    // A rejecting pre-rebase hook makes the fold fail without leaving a rebase
+    // in progress.
+    let hook_dir = repo_path.join(".git/hooks");
+    std::fs::create_dir_all(&hook_dir).unwrap();
+    let hook = hook_dir.join("pre-rebase");
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    std::fs::write(repo_path.join("code.txt"), "line1 FIXED\nline2\nline3\n").unwrap();
+    run_ok("git", &["add", "code.txt"], repo_path);
+    std::fs::write(repo_path.join("untracked.txt"), "untracked").unwrap();
+
+    let tips_before = (tip(&repo, "review"), tip(&repo, "perf"), tip(&repo, "docs"));
+    let mut cmd = kin_cmd();
+    let output = cmd.current_dir(repo_path).arg("absorb").output().unwrap();
+    assert!(!output.status.success(), "rejected fold must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("rolled back"),
+        "error must say the absorb was rolled back, not invite kin continue\nstderr:\n{}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("kin continue"),
+        "a fold that never started must not invite kin continue\nstderr:\n{}",
+        stderr
+    );
+
+    // Every branch is back where it was, the fixup commits are gone, the
+    // absorbed content is back in the index, the untracked leftover is back,
+    // and no resumable state was left behind.
+    let tips_after = (tip(&repo, "review"), tip(&repo, "perf"), tip(&repo, "docs"));
+    assert_eq!(tips_before, tips_after, "rollback must restore every tip");
+    let staged = std::process::Command::new("git")
+        .args(["diff", "--cached", "--name-only"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&staged.stdout).trim(), "code.txt");
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("untracked.txt")).unwrap(),
+        "untracked"
+    );
+    assert!(
+        !repo_path.join(".git/kindra_rebase_state.json").exists(),
+        "no resumable state may remain after a rollback"
+    );
+}
+
+#[test]
+fn test_absorb_refuses_when_in_range_branch_is_checked_out_elsewhere() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = setup_stack(repo_path);
+
+    // A sibling branch sharing review's tip commit, checked out in another
+    // worktree. It is not a descendant (same tip, so it is not in the
+    // restacked sub-stack), but the fold's --update-refs would move it, so
+    // absorb must refuse up front instead of silently skipping it.
+    let review_tip = tip(&repo, "review");
+    run_ok(
+        "git",
+        &["branch", "shared-head", &review_tip.to_string()],
+        repo_path,
+    );
+    let wt_path = temp.path().join("../absorb-wt-shared");
+    run_ok(
+        "git",
+        &["worktree", "add", wt_path.to_str().unwrap(), "shared-head"],
+        repo_path,
+    );
+
+    std::fs::write(repo_path.join("code.txt"), "line1 FIXED\nline2\nline3\n").unwrap();
+    run_ok("git", &["add", "code.txt"], repo_path);
+
+    let mut cmd = kin_cmd();
+    let output = cmd.current_dir(repo_path).arg("absorb").output().unwrap();
+    let _ = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force", wt_path.to_str().unwrap()])
+        .current_dir(repo_path)
+        .output();
+    assert!(
+        !output.status.success(),
+        "absorb must refuse while an in-range branch is checked out in another worktree\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        tip(&repo, "review"),
+        review_tip,
+        "no branch may move when the worktree check refuses"
+    );
 }
 
 #[test]

@@ -680,6 +680,7 @@ fn abort_with_divergent_state_finalizes_oplog_for_recovery() {
         original_commit_count_map: HashMap::new(),
         original_tip_map: HashMap::new(),
         stash_ref: None,
+        stash_apply_index: false,
         unstage_on_restore: false,
         autostash: false,
         cleanup_merged_branches: Vec::new(),

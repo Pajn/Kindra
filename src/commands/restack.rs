@@ -172,6 +172,7 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
         original_tip_map,
         owned_tip_map: HashMap::new(),
         stash_ref: None,
+        stash_apply_index: false,
         unstage_on_restore: false,
         autostash,
         cleanup_merged_branches: Vec::new(),
