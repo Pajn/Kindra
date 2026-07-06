@@ -88,6 +88,7 @@ main -> [A1'] -> [A2'] -> (feature-A) -> [B1'] -> (feature-B)
 ```bash
 kin commit [git-commit-args]
 kin commit --on [<branch>] [git-commit-args]
+kin commit -b [<name>] [--insert] [git-commit-args]
 kin commit --interactive [git-commit-args]
 kin commit --fixup <sha> [git-commit-args]
 ```
@@ -97,6 +98,8 @@ Any arguments you pass to `kin commit` (e.g., `-m "my message"`) are passed dire
 - `--on <branch>`: Commit onto another branch instead of the current one. The next token is consumed as the branch name.
 - `--on=`: Open an interactive branch picker for the current stack.
 - `--on`: Open the interactive branch picker only when `--on` is the final token.
+- `-b, --new-branch [name]`: Create a new branch forked from the current commit and commit onto it (the `git checkout -b <name> && git commit` shortcut). The name is optional: if omitted, it is derived by slugifying the commit-message subject, so a message must be supplied inline (e.g. `-m`) in that case. The derived name is deduped against existing branches (`fix-parser`, `fix-parser-2`, …). Ends on the new branch. Mutually exclusive with `--on`, `--interactive`, and `--fixup`. Accepts `--new-branch=<name>`.
+- `--insert`: With `-b`, splice the new branch *into* the stack instead of forking a sibling: after the commit, the current branch's children are restacked onto the new branch, forming `current -> new -> children`. Requires `-b`. Without it, `-b` leaves existing children in place.
 - `--interactive`: Open an interactive commit picker showing all commits in the stack. Squashes the staged changes into the selected commit.
 - `--fixup <sha>`: Non-interactive equivalent of `--interactive`, targeting a specific commit. Squashes the staged changes into the given commit (which must be in the current stack) and rebases the dependent branches. Accepts `--fixup=<sha>` as well. Mutually exclusive with `--interactive` and `--on`.
 - `--autostash`: Allow the descendant rebase phase to use Git autostash.
@@ -115,6 +118,11 @@ Interactive examples (`--interactive`):
 
 Non-interactive fixup example (`--fixup`, not part of the interactive behavior above):
 - `kin commit --fixup a1b2c3d` (stage your changes first, then squash them into commit `a1b2c3d`)
+
+New-branch examples (`-b` / `--new-branch`):
+- `kin commit -b feature-x -m "start feature x"` (fork `feature-x` off the current commit and commit onto it)
+- `kin commit -b -m "Add null-deref guard"` (derive the branch name `add-null-deref-guard` from the subject)
+- `kin commit -b refactor --insert -m "extract helper"` (create `refactor` and splice it below the current branch's children, restacking them onto it)
 
 Parser behavior:
 - `kin commit --on feature-a -m "msg"`: valid (`feature-a` is the target branch).
@@ -138,6 +146,18 @@ main -> [A1] -> [A2] -> (feature-A) -> [B1'] -> (feature-B) -> [C1'] -> (feature
 ```
 
 *(All descendant branches `feature-B` and `feature-C` are updated automatically.)*
+
+```text
+Inserting a branch on 'feature-A' with --insert:
+main -> [A1] -> (feature-A) -> [B1] -> (feature-B)
+
+$ kin commit -b refactor --insert -m "extract helper"
+
+After kin commit -b --insert:
+main -> [A1] -> (feature-A) -> [R1] -> (refactor) -> [B1'] -> (feature-B)
+```
+
+*(Without `--insert`, `refactor` would instead fork as a sibling off `feature-A` and `feature-B` would stay put.)*
 
 ---
 
@@ -611,7 +631,7 @@ kin pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--reviewe
 kin split
 ```
 
-It generates a list of commits and branches. You can move the `branch <name>` lines to reassign branches to different commits, or add/remove them to create/delete branches.
+It generates a list of commits and branches. You can move the `branch <name>` lines to reassign branches to different commits, or add/remove them to create/delete branches. Leaving a row's name blank (a bare `branch` line) auto-names the branch by slugifying the summary of the commit it sits on, deduped against existing branches.
 
 **When to use it:** Use this when you've made a long series of commits on a single branch and want to "split" them into multiple separate, dependent branches for easier review.
 
@@ -622,16 +642,16 @@ Before split (one branch, multiple commits):
 main -> [C1] -> [C2] -> [C3] -> (my-feature)
 
 $ kin split
-# In $EDITOR:
+# In $EDITOR (the bare "branch" row under C2 is auto-named from its summary):
 [C1] Initial work
 branch feature-part-1
 [C2] More work
-branch feature-part-2
+branch
 [C3] Final work
 branch my-feature
 
 After split:
-main -> [C1] -> (feature-part-1) -> [C2] -> (feature-part-2) -> [C3] -> (my-feature)
+main -> [C1] -> (feature-part-1) -> [C2] -> (more-work) -> [C3] -> (my-feature)
 ```
 
 ---

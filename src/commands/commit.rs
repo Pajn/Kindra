@@ -5,12 +5,12 @@ use crate::rebase_utils::{
     restore_stashed_changes, run_rebase_loop, save_state, stash_push_changes,
 };
 use crate::stack::{
-    StackBranch, StackCommit, collect_descendants, enumerate_stack_commits,
-    get_stack_branches_from_merge_base,
+    StackBranch, StackCommit, build_parent_maps, collect_descendants, collect_descendants_of_id,
+    enumerate_stack_commits, get_stack_branches_from_merge_base, sort_branches_topologically,
 };
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Oid, Repository};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 
 pub fn commit(args: &[String]) -> Result<()> {
@@ -40,6 +40,22 @@ pub fn commit(args: &[String]) -> Result<()> {
     let mut parsed = parse_commit_args(args)?;
     let autostash = resolve_rebase_autostash(&repo, parsed.autostash)?;
     let on_flag = parsed.on_target.is_some();
+
+    // `-b`/`--new-branch` commits onto a freshly created branch rather than an
+    // existing one, so it has its own flow (branch creation, name slugging, and
+    // the optional `--insert` restack) separate from the target-resolution logic
+    // below.
+    if parsed.new_branch.is_some() {
+        return commit_on_new_branch(
+            &repo,
+            &current_branch_name,
+            &upstream_name,
+            upstream_id,
+            head_id,
+            &parsed,
+            autostash,
+        );
+    }
 
     let current_stack = build_stack_context(&repo, head_id, upstream_id, &upstream_name)
         .with_context(|| {
@@ -103,12 +119,10 @@ pub fn commit(args: &[String]) -> Result<()> {
 
     // A picked commit folds the staged changes into the target, so a non-empty
     // index is required unless `-a`/`-p`/a pathspec supplies the content instead.
-    let requires_staged_changes = !parsed
-        .git_commit_args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "-a" | "--all" | "-p" | "--patch"))
-        && !has_forwarded_pathspec(&parsed.git_commit_args);
-    if interactive_selection.is_some() && requires_staged_changes && !has_staged_changes(&repo)? {
+    if interactive_selection.is_some()
+        && requires_staged_changes(&parsed.git_commit_args)
+        && !has_staged_changes(&repo)?
+    {
         return Err(anyhow!("nothing to commit, working tree clean"));
     }
 
@@ -407,18 +421,300 @@ pub fn commit(args: &[String]) -> Result<()> {
     }
 }
 
+/// Commit staged changes onto a newly created branch forked from HEAD.
+///
+/// Without `--insert` this is a fork: the new branch is a sibling created off the
+/// current commit and the current branch's existing children stay put — the
+/// equivalent of `git checkout -b <name> && git commit`, plus name slugging. With
+/// `--insert` the new branch is spliced into the stack: after the commit, every
+/// branch that descended from HEAD is restacked onto the new branch, so the chain
+/// becomes `<current> -> <new> -> <children>`.
+fn commit_on_new_branch(
+    repo: &Repository,
+    current_branch_name: &str,
+    upstream_name: &str,
+    upstream_id: Oid,
+    head_id: Oid,
+    parsed: &ParsedCommitArgs,
+    autostash: bool,
+) -> Result<()> {
+    // Creating a branch for an empty commit is never the intent, so require
+    // content up front unless `-a`/`-p`/a pathspec will supply it — mirroring the
+    // interactive path's guard.
+    if requires_staged_changes(&parsed.git_commit_args) && !has_staged_changes(repo)? {
+        return Err(anyhow!("nothing to commit, working tree clean"));
+    }
+
+    let branch_name = resolve_new_branch_name(repo, parsed)?;
+
+    // For `--insert`, snapshot the children (branches descending from HEAD) and
+    // preflight the restack *before* creating the branch or committing, so a
+    // failure leaves nothing half-done.
+    let insert_plan = if parsed.insert {
+        let merge_base = repo.merge_base(upstream_id, head_id)?;
+        let all_branches = get_stack_branches_from_merge_base(
+            repo,
+            merge_base,
+            head_id,
+            upstream_id,
+            upstream_name,
+        )?;
+        let mut children = Vec::new();
+        collect_descendants_of_id(repo, head_id, &all_branches, &mut children)?;
+        sort_branches_topologically(repo, &mut children)?;
+
+        if !children.is_empty() {
+            crate::rebase_utils::ensure_git_supports_update_refs()?;
+            let names: Vec<String> = children.iter().map(|c| c.name.clone()).collect();
+            check_worktrees(&names, parsed.force)?;
+        }
+        Some((merge_base, all_branches, children))
+    } else {
+        None
+    };
+
+    // Create the branch at HEAD and switch to it, then commit. This is the only
+    // failure-prone mutation, and it rolls back cleanly (return to the original
+    // branch, delete the new one) because no stash or state file exists yet.
+    let head_commit = repo.find_commit(head_id)?;
+    repo.branch(&branch_name, &head_commit, false)
+        .with_context(|| format!("Failed to create branch '{branch_name}'."))?;
+
+    if let Err(err) = checkout_branch(&branch_name) {
+        // Checkout failed, so we are still on the original branch; drop the
+        // branch we just created. Surface a rollback failure rather than hiding it.
+        let err = err.context(format!("Failed to check out new branch '{branch_name}'."));
+        if let Err(delete_err) = delete_local_branch(repo, &branch_name) {
+            return Err(err.context(format!(
+                "Additionally, failed to delete '{branch_name}' during rollback ({delete_err}); remove it manually with 'git branch -D {branch_name}'."
+            )));
+        }
+        return Err(err);
+    }
+
+    let status = Command::new("git")
+        .arg("commit")
+        .args(&parsed.git_commit_args)
+        .status()?;
+    if !status.success() {
+        // Nothing else has mutated yet, so undo the branch creation entirely.
+        // Return to the original branch *first* — only then is the new branch
+        // safe to delete. If a rollback step fails, surface it (with the commit
+        // failure as context) instead of swallowing it and reporting a clean
+        // failure while stranded on the new branch.
+        if let Err(checkout_err) = checkout_branch(current_branch_name) {
+            return Err(checkout_err.context(format!(
+                "git commit failed, and returning to '{current_branch_name}' also failed; you are left on '{branch_name}'. Switch back and delete it manually."
+            )));
+        }
+        if let Err(delete_err) = delete_local_branch(repo, &branch_name) {
+            return Err(delete_err.context(format!(
+                "git commit failed; additionally, the created branch '{branch_name}' could not be deleted. Remove it manually with 'git branch -D {branch_name}'."
+            )));
+        }
+        return Err(anyhow!(
+            "git commit failed; branch '{branch_name}' was not created."
+        ));
+    }
+
+    // Fork, or `--insert` with no children to move: the commit landed on the new
+    // branch and any existing children stay on the original branch. Done.
+    let Some((merge_base, all_branches, children)) = insert_plan else {
+        println!("Created branch '{branch_name}' with your commit.");
+        return Ok(());
+    };
+    if children.is_empty() {
+        println!("Created branch '{branch_name}' with your commit.");
+        return Ok(());
+    }
+
+    // `--insert`: restack the captured children onto the new branch. Build the
+    // rebase state the way `--on` does — parents resolved against the pre-insert
+    // HEAD, with the new branch standing in as the parent of anything that hung
+    // directly off it — then drive it through the shared rebase loop.
+    //
+    // The branch and its commit already exist at this point, so if preparing the
+    // restack fails, say so: nothing is lost — the user is on the new branch with
+    // the commit applied and can reattach the dependents with `kin restack`.
+    let inserted_note = format!(
+        "Created branch '{branch_name}' with your commit and switched to it, but starting the restack of its dependents failed. The commit is applied; reattach the dependent branches with 'kin restack'."
+    );
+
+    let (parent_id_map, parent_name_map) = build_parent_maps(
+        repo,
+        &children,
+        &all_branches,
+        merge_base,
+        head_id,
+        &branch_name,
+    )
+    .with_context(|| inserted_note.clone())?;
+
+    let new_branch_tip = repo
+        .revparse_single(&branch_name)
+        .with_context(|| inserted_note.clone())?
+        .id();
+    let mut original_tip_map = HashMap::new();
+    original_tip_map.insert(branch_name.clone(), new_branch_tip.to_string());
+    original_tip_map.extend(children.iter().map(|c| (c.name.clone(), c.id.to_string())));
+
+    let mut state = RebaseState {
+        operation: crate::rebase_utils::Operation::Commit,
+        original_branch: branch_name.clone(),
+        target_branch: branch_name.clone(),
+        // End on the new branch, not the branch we started on.
+        caller_branch: None,
+        remaining_branches: children.iter().map(|c| c.name.clone()).collect(),
+        in_progress_branch: None,
+        parent_id_map,
+        parent_name_map,
+        new_base_map: HashMap::new(),
+        original_commit_count_map: HashMap::new(),
+        original_tip_map,
+        owned_tip_map: HashMap::new(),
+        stash_ref: None,
+        stash_apply_index: false,
+        preserve_content_on_abort: false,
+        suppress_editor: false,
+        unstage_on_restore: false,
+        autostash,
+        cleanup_merged_branches: Vec::new(),
+        cleanup_checkout_fallback: None,
+    };
+
+    // Set aside unstaged changes so the child rebases run on a clean tree; the
+    // rebase loop restores them and returns us to the new branch when it finishes.
+    state.stash_ref = stash_non_staged_changes().with_context(|| inserted_note.clone())?;
+    if let Err(err) = save_state(repo, &state) {
+        restore_stashed_changes(state.stash_ref.take());
+        return Err(err.context(inserted_note));
+    }
+
+    println!(
+        "Created branch '{branch_name}' and inserting it into the stack; restacking dependents..."
+    );
+    run_rebase_loop(repo, state)
+}
+
+/// Resolve the branch name for `-b`/`--new-branch`: an explicit name is validated
+/// and required to be free; an omitted name is slugified from the commit message
+/// subject (which must therefore be supplied via `-m`).
+fn resolve_new_branch_name(repo: &Repository, parsed: &ParsedCommitArgs) -> Result<String> {
+    match parsed.new_branch.clone().flatten() {
+        Some(name) => {
+            if !git2::Branch::name_is_valid(&name)? {
+                return Err(anyhow!("'{name}' is not a valid git branch name."));
+            }
+            if repo.find_branch(&name, BranchType::Local).is_ok() {
+                return Err(anyhow!("Branch '{name}' already exists."));
+            }
+            Ok(name)
+        }
+        None => {
+            let subject = message_subject_from_args(&parsed.git_commit_args).ok_or_else(|| {
+                anyhow!(
+                    "kin commit -b needs a branch name, or a commit message (via -m) to derive one from."
+                )
+            })?;
+            let base = crate::commands::slugify_subject(&subject).ok_or_else(|| {
+                anyhow!(
+                    "Could not derive a branch name from the commit message '{subject}'; pass a name explicitly."
+                )
+            })?;
+            crate::commands::disambiguate_branch_name(repo, &base, &HashSet::new())
+        }
+    }
+}
+
+/// Extract the subject (first line) of the commit message from forwarded git
+/// args, reading the first `-m`/`--message` value. Returns `None` when no inline
+/// message is present (e.g. the message would come from an editor or `-F` file),
+/// in which case the caller requires an explicit branch name.
+fn message_subject_from_args(args: &[String]) -> Option<String> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if arg == "--" {
+            break;
+        }
+        let message = if arg == "-m" || arg == "--message" {
+            idx += 1;
+            args.get(idx).cloned()
+        } else if let Some(value) = arg.strip_prefix("--message=") {
+            Some(value.to_string())
+        } else if let Some((value, consumed_next)) = short_cluster_message(arg, args.get(idx + 1)) {
+            // A short-option cluster containing `-m` (e.g. `-m`, `-mFix`, `-am`,
+            // `-amFix`), where the value is glued after `m` or is the next arg.
+            if consumed_next {
+                idx += 1;
+            }
+            Some(value)
+        } else {
+            None
+        };
+        if let Some(message) = message {
+            return message.lines().next().map(|line| line.to_string());
+        }
+        idx += 1;
+    }
+    None
+}
+
+/// Extract the `-m` value from a short-option cluster like `-m`, `-mFix`, `-am`,
+/// or `-amFix`. Short flags parse left to right; `-m` takes the rest of the token
+/// as its value, or the following arg when it is the last character. A
+/// value-taking flag before `m` (`-C`/`-c`/`-F`) would consume the remainder, so
+/// there is no message in that case. Returns `(value, consumed_next_arg)`.
+fn short_cluster_message(arg: &str, next: Option<&String>) -> Option<(String, bool)> {
+    if arg.starts_with("--") {
+        return None;
+    }
+    let body = arg.strip_prefix('-').filter(|body| !body.is_empty())?;
+    for (offset, ch) in body.char_indices() {
+        match ch {
+            'm' => {
+                let rest = &body[offset + ch.len_utf8()..];
+                return if rest.is_empty() {
+                    next.map(|value| (value.clone(), true))
+                } else {
+                    Some((rest.to_string(), false))
+                };
+            }
+            // These short options take a value, which swallows the rest of the
+            // token (or the next arg); an `m` after them is part of that value.
+            'C' | 'c' | 'F' => return None,
+            // Any other char is a value-less boolean flag; keep scanning.
+            _ => {}
+        }
+    }
+    None
+}
+
+fn delete_local_branch(repo: &Repository, name: &str) -> Result<()> {
+    if let Ok(mut branch) = repo.find_branch(name, BranchType::Local) {
+        branch.delete()?;
+    }
+    Ok(())
+}
+
 struct StackContext {
     merge_base: Oid,
     stack_branches: Vec<StackBranch>,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct ParsedCommitArgs {
     on_target: Option<Option<String>>,
     interactive: bool,
     fixup_target: Option<String>,
     force: bool,
     autostash: Option<bool>,
+    // `-b`/`--new-branch`: `Some(Some(name))` is an explicit name, `Some(None)`
+    // means derive one by slugifying the commit message.
+    new_branch: Option<Option<String>>,
+    // `--insert`: restack the current branch's children onto the new branch
+    // instead of forking a sibling. Only meaningful with `new_branch`.
+    insert: bool,
     git_commit_args: Vec<String>,
 }
 
@@ -483,6 +779,42 @@ fn parse_commit_args(args: &[String]) -> Result<ParsedCommitArgs> {
 
         if arg == "--interactive" {
             parsed.interactive = true;
+            idx += 1;
+            continue;
+        }
+
+        if arg == "-b" || arg == "--new-branch" {
+            if parsed.new_branch.is_some() {
+                return Err(anyhow!("--new-branch can only be specified once."));
+            }
+            // The name is optional: consume the next token only when it is a
+            // plain value (not another flag or the `--` pathspec separator);
+            // otherwise the name is derived from the commit message.
+            if idx + 1 < args.len() && args[idx + 1] != "--" && !args[idx + 1].starts_with('-') {
+                parsed.new_branch = Some(Some(args[idx + 1].clone()));
+                idx += 2;
+            } else {
+                parsed.new_branch = Some(None);
+                idx += 1;
+            }
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--new-branch=") {
+            if parsed.new_branch.is_some() {
+                return Err(anyhow!("--new-branch can only be specified once."));
+            }
+            parsed.new_branch = Some(if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            });
+            idx += 1;
+            continue;
+        }
+
+        if arg == "--insert" {
+            parsed.insert = true;
             idx += 1;
             continue;
         }
@@ -584,6 +916,26 @@ fn parse_commit_args(args: &[String]) -> Result<ParsedCommitArgs> {
     if parsed.fixup_target.is_some() && parsed.on_target.is_some() {
         return Err(anyhow!(
             "--fixup and --on are mutually exclusive. --fixup determines the target branch from the commit."
+        ));
+    }
+
+    if parsed.new_branch.is_some() {
+        if parsed.on_target.is_some() {
+            return Err(anyhow!(
+                "--new-branch and --on are mutually exclusive: one commits onto a new branch, the other onto an existing one."
+            ));
+        }
+        if parsed.interactive {
+            return Err(anyhow!(
+                "--new-branch and --interactive are mutually exclusive."
+            ));
+        }
+        if parsed.fixup_target.is_some() {
+            return Err(anyhow!("--new-branch and --fixup are mutually exclusive."));
+        }
+    } else if parsed.insert {
+        return Err(anyhow!(
+            "--insert requires --new-branch: it inserts a newly created branch into the stack."
         ));
     }
 
@@ -736,6 +1088,16 @@ fn insert_generated_commit_arg(args: &mut Vec<String>, value: String) {
 
 fn has_staged_changes(_repo: &Repository) -> Result<bool> {
     crate::rebase_utils::has_staged_changes()
+}
+
+/// Whether a commit needs a non-empty index: true unless `-a`/`--all`/`-p`/
+/// `--patch` or a forwarded pathspec will supply the content instead. Shared by
+/// the interactive-fold guard and the new-branch guard so both stay in sync.
+fn requires_staged_changes(git_commit_args: &[String]) -> bool {
+    !git_commit_args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-a" | "--all" | "-p" | "--patch"))
+        && !has_forwarded_pathspec(git_commit_args)
 }
 
 fn has_forwarded_pathspec(args: &[String]) -> bool {
@@ -993,6 +1355,94 @@ mod tests {
         assert_eq!(
             recover_interaction_flags(&args(&["-m", "msg", "--", "--yes"]), false, false),
             (false, false)
+        );
+    }
+
+    #[test]
+    fn parse_new_branch_with_explicit_name() {
+        let parsed = parse_commit_args(&args(&["-b", "topic", "-m", "msg"])).unwrap();
+        assert_eq!(parsed.new_branch, Some(Some("topic".to_string())));
+        assert!(!parsed.insert);
+        assert_eq!(parsed.git_commit_args, args(&["-m", "msg"]));
+    }
+
+    #[test]
+    fn parse_new_branch_without_name_derives_from_message() {
+        // A following flag is not consumed as the branch name.
+        let parsed = parse_commit_args(&args(&["-b", "-m", "msg"])).unwrap();
+        assert_eq!(parsed.new_branch, Some(None));
+        assert_eq!(parsed.git_commit_args, args(&["-m", "msg"]));
+    }
+
+    #[test]
+    fn parse_new_branch_equals_form_and_insert() {
+        let parsed =
+            parse_commit_args(&args(&["--new-branch=mid", "--insert", "-m", "x"])).unwrap();
+        assert_eq!(parsed.new_branch, Some(Some("mid".to_string())));
+        assert!(parsed.insert);
+        assert_eq!(parsed.git_commit_args, args(&["-m", "x"]));
+    }
+
+    #[test]
+    fn parse_insert_without_new_branch_is_rejected() {
+        let err = parse_commit_args(&args(&["--insert", "-m", "x"])).unwrap_err();
+        assert!(err.to_string().contains("--insert requires --new-branch"));
+    }
+
+    #[test]
+    fn parse_new_branch_conflicts_with_on() {
+        let err = parse_commit_args(&args(&["-b", "topic", "--on", "main"])).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn message_subject_reads_first_message() {
+        assert_eq!(
+            message_subject_from_args(&args(&["-m", "First line", "-m", "body"])).as_deref(),
+            Some("First line")
+        );
+        assert_eq!(
+            message_subject_from_args(&args(&["--message=Hello there"])).as_deref(),
+            Some("Hello there")
+        );
+        // Glued short form `-mSubject`.
+        assert_eq!(
+            message_subject_from_args(&args(&["-mGlued subject"])).as_deref(),
+            Some("Glued subject")
+        );
+    }
+
+    #[test]
+    fn message_subject_reads_clustered_short_options() {
+        // `-am msg` — the `-m` is bundled after `-a`, value in the next arg.
+        assert_eq!(
+            message_subject_from_args(&args(&["-am", "Bundled subject"])).as_deref(),
+            Some("Bundled subject")
+        );
+        // `-amGlued` — bundled with a glued value.
+        assert_eq!(
+            message_subject_from_args(&args(&["-amGlued"])).as_deref(),
+            Some("Glued")
+        );
+        // A value-taking flag before `m` swallows the rest, so it is not a message.
+        assert_eq!(message_subject_from_args(&args(&["-Cmaybe"])), None);
+    }
+
+    #[test]
+    fn message_subject_takes_only_first_line() {
+        assert_eq!(
+            message_subject_from_args(&args(&["-m", "subject\n\nbody"])).as_deref(),
+            Some("subject")
+        );
+    }
+
+    #[test]
+    fn message_subject_absent_without_inline_message() {
+        assert_eq!(message_subject_from_args(&args(&["--amend"])), None);
+        // A `-m` after `--` is a pathspec, not a message.
+        assert_eq!(
+            message_subject_from_args(&args(&["--", "-m", "file"])),
+            None
         );
     }
 }

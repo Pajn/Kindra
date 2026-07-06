@@ -10,7 +10,14 @@ pub fn kin_cmd() -> Command {
     cmd.env("GIT_AUTHOR_NAME", "Test User")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test User")
-        .env("GIT_COMMITTER_EMAIL", "test@example.com");
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        // Never let a subprocess (git commit, git rebase --continue, kin's own
+        // file editor) fall through to an interactive editor: on CI there is no
+        // $EDITOR and no core.editor, so it would resolve to `vi` and hang
+        // forever waiting on a TTY. Tests that script edits set their own
+        // GIT_EDITOR/GIT_SEQUENCE_EDITOR after this, which overrides these.
+        .env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true");
     cmd
 }
 
