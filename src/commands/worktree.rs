@@ -101,21 +101,12 @@ pub fn worktree(subcommand: &Option<WorktreeSubcommand>) -> Result<()> {
         }
         Some(WorktreeSubcommand::Remove(args)) => {
             let result = roles::remove_target(&repo, &args.target, args.force)?;
-            if result.metadata_only {
-                println!(
-                    "Removed stale metadata for {} worktree '{}' ({})",
-                    result.role,
-                    result.branch,
-                    result.path.display()
-                );
-            } else {
-                println!(
-                    "Removed {} worktree '{}' ({})",
-                    result.role,
-                    result.branch,
-                    result.path.display()
-                );
-            }
+            println!(
+                "Removed {} worktree '{}' ({})",
+                result.role,
+                result.branch,
+                result.path.display()
+            );
         }
         Some(WorktreeSubcommand::Cleanup(args)) => {
             let summary = roles::cleanup_temp_worktrees(&repo, args.force)?;

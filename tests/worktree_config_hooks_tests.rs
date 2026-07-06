@@ -264,7 +264,6 @@ fn failing_create_hook_rolls_back_created_worktree() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Worktree on_create hook failed"));
     assert!(!dir.path().join(".git/kindra-worktrees/main").exists());
-    assert!(!dir.path().join(".git/kindra_worktrees.json").exists());
 }
 
 #[test]
@@ -403,4 +402,69 @@ fn run_ok_output(program: &str, args: &[&str], cwd: &std::path::Path) -> std::pr
         String::from_utf8_lossy(&output.stderr),
     );
     output
+}
+
+/// A disabled `[worktrees.temp]` with an invalid template must not break
+/// classification of main/review worktrees (which `kin wt list` derives via
+/// `role_for_path`).
+#[test]
+fn list_resolves_main_when_temp_disabled_with_invalid_template() {
+    let dir = setup_repo();
+    write_repo_config(
+        dir.path(),
+        "[worktrees.temp]\nenabled = false\npath_template = \"no-placeholder\"\n",
+    );
+
+    let out = kin_cmd()
+        .args(["wt", "main"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "kin wt main failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = kin_cmd()
+        .args(["wt", "list"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "kin wt list failed with a disabled/invalid temp template:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout
+            .lines()
+            .skip(1)
+            .any(|line| line.split_whitespace().next() == Some("main")),
+        "expected a main row in `kin wt list`:\n{stdout}"
+    );
+}
+
+/// A temp template whose `{branch}` is not the trailing path component is
+/// rejected, so such worktrees are never (mis)classified as temp.
+#[test]
+fn rejects_temp_template_with_non_trailing_branch() {
+    let dir = setup_repo();
+    write_repo_config(
+        dir.path(),
+        "[worktrees.temp]\npath_template = \".git/kindra-worktrees/temp/{branch}/nested\"\n",
+    );
+
+    let out = kin_cmd()
+        .args(["wt", "list"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("final path component"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

@@ -1,5 +1,5 @@
 use crate::worktree::WorktreeRole;
-use crate::worktree::cleanup::{CleanupReason, find_cleanup_candidates};
+use crate::worktree::cleanup::find_cleanup_candidates;
 use crate::worktree::config::{WorktreeConfig, load_worktree_config};
 use crate::worktree::git::{
     LiveWorktree, add_worktree, checkout_worktree_branch, checkout_worktree_detached,
@@ -9,7 +9,6 @@ use crate::worktree::git::{
     live_worktree_map, remove_worktree,
 };
 use crate::worktree::hooks::{HookEvent, run_hooks};
-use crate::worktree::metadata::{ManagedWorktreeRecord, WorktreeMetadata};
 use crate::worktree::path_resolver::{
     WorktreeTarget, expand_path_template, normalize_path, parse_target, temp_template_root,
 };
@@ -18,6 +17,34 @@ use anyhow::{Result, anyhow};
 use git2::{BranchType, ErrorCode, Oid, Repository};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+/// Classify a worktree by its path, using the configured layout as the single
+/// source of truth: the managed set and each worktree's role are *derived* from
+/// git's own worktree list plus config, never stored. Returns `None` for a
+/// worktree that isn't Kindra-managed (its path is outside every configured
+/// location).
+pub(crate) fn role_for_path(
+    config: &WorktreeConfig,
+    normalized: &Path,
+) -> Result<Option<WorktreeRole>> {
+    if normalized == normalize_path(&config.main.path).as_path() {
+        return Ok(Some(WorktreeRole::Main));
+    }
+    if normalized == normalize_path(&config.review.path).as_path() {
+        return Ok(Some(WorktreeRole::Review));
+    }
+    // Only consult the temp template when temp worktrees are enabled: a disabled
+    // `[worktrees.temp]` may carry an invalid `path_template` that
+    // `temp_template_root` would reject, and that must not break main/review
+    // classification.
+    if config.temp.enabled {
+        let temp_root = temp_template_root(&config.temp.path_template)?;
+        if normalized.starts_with(&temp_root) {
+            return Ok(Some(WorktreeRole::Temp));
+        }
+    }
+    Ok(None)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnsureResult {
@@ -31,7 +58,6 @@ pub struct RemoveResult {
     pub role: WorktreeRole,
     pub branch: String,
     pub path: PathBuf,
-    pub metadata_only: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -42,7 +68,7 @@ pub struct CleanupSummary {
 }
 
 pub fn ensure_main(repo: &Repository) -> Result<EnsureResult> {
-    let mut ctx = load_context(repo)?;
+    let ctx = load_context(repo)?;
     if !ctx.config.main.enabled {
         return Err(anyhow!("Main worktrees are disabled in .git/kindra.toml."));
     }
@@ -62,8 +88,6 @@ pub fn ensure_main(repo: &Repository) -> Result<EnsureResult> {
             ));
         }
 
-        ctx.metadata.upsert(WorktreeRole::Main, &branch, &path);
-        ctx.metadata.save(repo)?;
         return Ok(EnsureResult {
             path,
             created: false,
@@ -80,8 +104,6 @@ pub fn ensure_main(repo: &Repository) -> Result<EnsureResult> {
 
     add_worktree(repo, &path, &branch)?;
     run_create_hooks(repo, &ctx.config, WorktreeRole::Main, &path, &branch)?;
-    ctx.metadata.upsert(WorktreeRole::Main, &branch, &path);
-    ctx.metadata.save(repo)?;
 
     Ok(EnsureResult {
         path,
@@ -95,7 +117,7 @@ pub fn ensure_review(
     requested_branch: Option<&str>,
     force: bool,
 ) -> Result<EnsureResult> {
-    let mut ctx = load_context(repo)?;
+    let ctx = load_context(repo)?;
     if !ctx.config.review.enabled {
         return Err(anyhow!(
             "Review worktrees are disabled in .git/kindra.toml."
@@ -114,8 +136,6 @@ pub fn ensure_review(
 
     if let Some(live) = live {
         if live.branch.as_deref() == Some(branch.as_str()) {
-            ctx.metadata.upsert(WorktreeRole::Review, &branch, &path);
-            ctx.metadata.save(repo)?;
             return Ok(EnsureResult {
                 path,
                 created: false,
@@ -147,8 +167,6 @@ pub fn ensure_review(
             discard_local_changes,
             &rollback,
         )?;
-        ctx.metadata.upsert(WorktreeRole::Review, &branch, &path);
-        ctx.metadata.save(repo)?;
         return Ok(EnsureResult {
             path,
             created: false,
@@ -165,8 +183,6 @@ pub fn ensure_review(
 
     add_worktree(repo, &path, &branch)?;
     run_create_hooks(repo, &ctx.config, WorktreeRole::Review, &path, &branch)?;
-    ctx.metadata.upsert(WorktreeRole::Review, &branch, &path);
-    ctx.metadata.save(repo)?;
 
     Ok(EnsureResult {
         path,
@@ -176,25 +192,40 @@ pub fn ensure_review(
 }
 
 pub fn ensure_temp(repo: &Repository, requested_branch: Option<&str>) -> Result<EnsureResult> {
-    let mut ctx = load_context(repo)?;
+    let ctx = load_context(repo)?;
     if !ctx.config.temp.enabled {
         return Err(anyhow!("Temp worktrees are disabled in .git/kindra.toml."));
     }
 
     let branch = resolve_requested_branch(repo, requested_branch)?;
     ensure_local_branch_exists(repo, &branch)?;
-    let path = ctx.metadata.find_temp_branch(&branch).map_or_else(
-        || expand_path_template(&ctx.config.temp.path_template, &branch),
-        |record| Ok(record.path_buf()),
-    )?;
 
-    ensure_temp_path_available(
-        &ctx.config,
-        &ctx.metadata,
-        &ctx.live_worktrees,
-        &branch,
-        &path,
-    )?;
+    // A managed temp worktree may already exist for this branch at a differently
+    // named path — e.g. it was created as `old` and then `git branch -m`'d to
+    // `new`, leaving the directory at the old sanitized path. Reuse it (matched by
+    // branch, restricted to worktrees that classify as temp) instead of
+    // force-creating a duplicate. Classifying by role (not just the temp root)
+    // avoids reusing the primary or a main/review worktree that merely has the
+    // branch checked out.
+    if let Some(existing) = ctx.live_worktrees.iter().find(|worktree| {
+        worktree.branch.as_deref() == Some(branch.as_str())
+            && role_for_path(&ctx.config, &worktree.normalized_path())
+                .ok()
+                .flatten()
+                == Some(WorktreeRole::Temp)
+    }) {
+        return Ok(EnsureResult {
+            path: existing.path.clone(),
+            created: false,
+            switched: false,
+        });
+    }
+
+    // The temp path is a deterministic function of the branch, so it is recomputed
+    // rather than remembered.
+    let path = expand_path_template(&ctx.config.temp.path_template, &branch)?;
+
+    ensure_temp_path_available(&ctx.config, &ctx.live_worktrees, &branch, &path)?;
     let live = ctx.live_by_path().get(&normalize_path(&path)).cloned();
 
     if let Some(live) = live {
@@ -206,8 +237,6 @@ pub fn ensure_temp(repo: &Repository, requested_branch: Option<&str>) -> Result<
             ));
         }
 
-        ctx.metadata.upsert(WorktreeRole::Temp, &branch, &path);
-        ctx.metadata.save(repo)?;
         return Ok(EnsureResult {
             path,
             created: false,
@@ -224,8 +253,6 @@ pub fn ensure_temp(repo: &Repository, requested_branch: Option<&str>) -> Result<
 
     add_worktree(repo, &path, &branch)?;
     run_create_hooks(repo, &ctx.config, WorktreeRole::Temp, &path, &branch)?;
-    ctx.metadata.upsert(WorktreeRole::Temp, &branch, &path);
-    ctx.metadata.save(repo)?;
 
     Ok(EnsureResult {
         path,
@@ -239,25 +266,16 @@ pub fn ensure_temp_new_branch(
     branch: &str,
     requested_start_point: Option<&str>,
 ) -> Result<EnsureResult> {
-    let mut ctx = load_context(repo)?;
+    let ctx = load_context(repo)?;
     if !ctx.config.temp.enabled {
         return Err(anyhow!("Temp worktrees are disabled in .git/kindra.toml."));
     }
 
     ensure_local_branch_is_new(repo, branch)?;
     let start_point = resolve_requested_start_point(repo, requested_start_point)?;
-    let path = ctx.metadata.find_temp_branch(branch).map_or_else(
-        || expand_path_template(&ctx.config.temp.path_template, branch),
-        |record| Ok(record.path_buf()),
-    )?;
+    let path = expand_path_template(&ctx.config.temp.path_template, branch)?;
 
-    ensure_temp_path_available(
-        &ctx.config,
-        &ctx.metadata,
-        &ctx.live_worktrees,
-        branch,
-        &path,
-    )?;
+    ensure_temp_path_available(&ctx.config, &ctx.live_worktrees, branch, &path)?;
 
     if path.exists() {
         return Err(anyhow!(
@@ -290,8 +308,6 @@ pub fn ensure_temp_new_branch(
             &path,
             branch,
         )?;
-        ctx.metadata.upsert(WorktreeRole::Temp, branch, &path);
-        ctx.metadata.save(repo)?;
         Ok(())
     })() {
         return Err(rollback_created_temp_branch(
@@ -313,7 +329,7 @@ pub fn ensure_temp_new_branch(
 
 pub fn resolve_existing_path(repo: &Repository, target: &str) -> Result<PathBuf> {
     let ctx = load_context(repo)?;
-    let resolved = resolve_target(&ctx, target, false)?;
+    let resolved = resolve_target(&ctx, target)?;
     Ok(resolved.path)
 }
 
@@ -323,7 +339,6 @@ pub fn list_managed_worktrees(repo: &Repository) -> Result<Vec<WorktreeListRow>>
         normalize_path(repo.workdir().ok_or_else(|| {
             anyhow!("Kindra worktree management requires a non-bare repository.")
         })?);
-    let live_by_path = ctx.live_by_path();
     let merged_branches = if ctx.config.temp.delete_merged {
         crate::stack::collect_merged_local_branches(
             repo,
@@ -336,54 +351,44 @@ pub fn list_managed_worktrees(repo: &Repository) -> Result<Vec<WorktreeListRow>>
         HashSet::new()
     };
 
+    // Derive the managed set straight from git's worktree list, classifying each
+    // by its path. There is no separate record to fall out of sync, so the old
+    // `stale-meta` / `missing` states (both drift artifacts) no longer exist —
+    // `missing` here means git lists a worktree whose directory is gone.
     let mut rows = Vec::new();
-    let mut seen_paths = HashSet::new();
+    for live in &ctx.live_worktrees {
+        let normalized = live.normalized_path();
+        let Some(role) = role_for_path(&ctx.config, &normalized)? else {
+            continue;
+        };
 
-    for record in ctx.metadata.records() {
-        let path = record.path_buf();
-        let normalized = record.normalized_path();
-        let live = live_by_path.get(&normalized);
         let mut state = Vec::new();
-
-        if let Some(live) = live {
-            if is_worktree_dirty(&path)? {
+        if !live.path.exists() {
+            state.push("missing".to_string());
+        } else {
+            if is_worktree_dirty(&live.path)? {
                 state.push("dirty".to_string());
             }
             if normalized == current_path {
                 state.push("current".to_string());
             }
-            if live.branch.as_deref() != Some(record.branch.as_str()) {
-                state.push("stale-meta".to_string());
-            }
-        } else if !path.exists() {
-            state.push("missing".to_string());
-        } else {
-            state.push("stale-meta".to_string());
         }
-
-        if record.role == WorktreeRole::Temp && merged_branches.contains(&record.branch) {
+        if role == WorktreeRole::Temp
+            && let Some(branch) = &live.branch
+            && merged_branches.contains(branch)
+        {
             state.push("merged".to_string());
         }
 
         rows.push(WorktreeListRow {
-            role: record.role.to_string(),
-            branch: record.branch.clone(),
+            role: role.to_string(),
+            branch: live
+                .branch
+                .clone()
+                .unwrap_or_else(|| "<detached>".to_string()),
             state,
-            path: path.clone(),
+            path: live.path.clone(),
         });
-        seen_paths.insert(normalized);
-    }
-
-    let inferred = inferred_live_rows(
-        &ctx.config,
-        &ctx.live_worktrees,
-        &merged_branches,
-        &current_path,
-    )?;
-    for row in inferred {
-        if seen_paths.insert(normalize_path(&row.path)) {
-            rows.push(row);
-        }
     }
 
     rows.sort_by(|left, right| {
@@ -396,8 +401,8 @@ pub fn list_managed_worktrees(repo: &Repository) -> Result<Vec<WorktreeListRow>>
 }
 
 pub fn remove_target(repo: &Repository, target: &str, force: bool) -> Result<RemoveResult> {
-    let mut ctx = load_context(repo)?;
-    let resolved = resolve_target(&ctx, target, true)?;
+    let ctx = load_context(repo)?;
+    let resolved = resolve_target(&ctx, target)?;
     let dirty = resolved
         .live
         .as_ref()
@@ -431,34 +436,25 @@ pub fn remove_target(repo: &Repository, target: &str, force: bool) -> Result<Rem
     };
     confirm_or_abort(&message)?;
 
-    let metadata_only =
-        remove_resolved_target(repo, &ctx.config, &mut ctx.metadata, &resolved, force)?;
-    ctx.metadata.save(repo)?;
+    remove_resolved_target(repo, &ctx.config, &resolved, force)?;
 
     Ok(RemoveResult {
         role: resolved.role,
         branch: resolved.branch,
         path: resolved.path,
-        metadata_only,
     })
 }
 
 pub fn cleanup_temp_worktrees(repo: &Repository, force: bool) -> Result<CleanupSummary> {
-    let mut ctx = load_context(repo)?;
-    let candidates =
-        find_cleanup_candidates(repo, &ctx.config, &ctx.metadata, &ctx.live_worktrees)?;
+    let ctx = load_context(repo)?;
+    let candidates = find_cleanup_candidates(repo, &ctx.config, &ctx.live_worktrees)?;
     if candidates.is_empty() {
         return Ok(CleanupSummary::default());
     }
     let candidates_with_dirty = candidates
         .into_iter()
         .map(|candidate| {
-            let dirty = candidate
-                .live
-                .as_ref()
-                .map(|_| is_worktree_dirty(&candidate.record.path_buf()))
-                .transpose()?
-                .unwrap_or(false);
+            let dirty = is_worktree_dirty(&candidate.path)?;
             Ok((candidate, dirty))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -471,12 +467,9 @@ pub fn cleanup_temp_worktrees(repo: &Repository, force: bool) -> Result<CleanupS
     for (candidate, dirty) in &candidates_with_dirty {
         println!(
             "  temp {:<20} {:<14} {}{}",
-            candidate.record.branch,
-            match candidate.reason {
-                CleanupReason::Merged => "merged",
-                CleanupReason::StaleMetadata => "stale-meta",
-            },
-            candidate.record.path,
+            candidate.branch,
+            "merged",
+            candidate.path.display(),
             if *dirty { " [dirty]" } else { "" }
         );
     }
@@ -506,9 +499,9 @@ pub fn cleanup_temp_worktrees(repo: &Repository, force: bool) -> Result<CleanupS
     for (candidate, dirty) in candidates_with_dirty {
         let resolved = ResolvedTarget {
             role: WorktreeRole::Temp,
-            branch: candidate.record.branch.clone(),
-            path: candidate.record.path_buf(),
-            live: candidate.live.clone(),
+            branch: candidate.branch.clone(),
+            path: candidate.path.clone(),
+            live: Some(candidate.live.clone()),
         };
 
         if dirty && !force {
@@ -520,16 +513,12 @@ pub fn cleanup_temp_worktrees(repo: &Repository, force: bool) -> Result<CleanupS
             skipped += 1;
             continue;
         }
-        let metadata_only =
-            remove_resolved_target(repo, &ctx.config, &mut ctx.metadata, &resolved, force)?;
+        remove_resolved_target(repo, &ctx.config, &resolved, force)?;
         removed.push(RemoveResult {
             role: resolved.role,
             branch: resolved.branch,
             path: resolved.path,
-            metadata_only,
         });
-        std::mem::take(&mut ctx.metadata).save(repo)?;
-        ctx.metadata = WorktreeMetadata::load(repo)?;
     }
 
     Ok(CleanupSummary {
@@ -537,59 +526,6 @@ pub fn cleanup_temp_worktrees(repo: &Repository, force: bool) -> Result<CleanupS
         removed,
         skipped,
     })
-}
-
-fn inferred_live_rows(
-    config: &WorktreeConfig,
-    live_worktrees: &[LiveWorktree],
-    merged_branches: &HashSet<String>,
-    current_path: &Path,
-) -> Result<Vec<WorktreeListRow>> {
-    let temp_root = temp_template_root(&config.temp.path_template)?;
-    let mut rows = Vec::new();
-
-    for live in live_worktrees {
-        let normalized = live.normalized_path();
-        let role = if normalized == normalize_path(&config.main.path) {
-            Some(WorktreeRole::Main)
-        } else if normalized == normalize_path(&config.review.path) {
-            Some(WorktreeRole::Review)
-        } else if normalized.starts_with(&temp_root) {
-            Some(WorktreeRole::Temp)
-        } else {
-            None
-        };
-
-        let Some(role) = role else {
-            continue;
-        };
-
-        let mut state = vec!["stale-meta".to_string()];
-        if is_worktree_dirty(&live.path)? {
-            state.push("dirty".to_string());
-        }
-        if normalized == normalize_path(current_path) {
-            state.push("current".to_string());
-        }
-        if role == WorktreeRole::Temp
-            && let Some(branch) = &live.branch
-            && merged_branches.contains(branch)
-        {
-            state.push("merged".to_string());
-        }
-
-        rows.push(WorktreeListRow {
-            role: role.to_string(),
-            branch: live
-                .branch
-                .clone()
-                .unwrap_or_else(|| "<detached>".to_string()),
-            state,
-            path: live.path.clone(),
-        });
-    }
-
-    Ok(rows)
 }
 
 fn resolve_requested_branch(repo: &Repository, requested_branch: Option<&str>) -> Result<String> {
@@ -630,188 +566,132 @@ fn local_branch_tip(repo: &Repository, branch: &str) -> Result<Oid> {
 
 fn ensure_temp_path_available(
     config: &WorktreeConfig,
-    metadata: &WorktreeMetadata,
     live_worktrees: &[LiveWorktree],
     branch: &str,
     path: &Path,
 ) -> Result<()> {
     let normalized = normalize_path(path);
-    let existing_metadata = metadata.find_by_path(path);
-    if let Some(other) = existing_metadata
-        && (other.role != WorktreeRole::Temp || other.branch != branch)
-    {
-        return Err(anyhow!(
+    let live_by_path = live_worktree_map(live_worktrees);
+    let Some(other_live) = live_by_path.get(&normalized) else {
+        return Ok(());
+    };
+
+    // A live worktree already occupies this path. It is only acceptable when the
+    // path resolves to the temp slot for *this* branch (the reuse case). Branch
+    // names can collide once sanitized into a path (`feature/x` and `feature-x`),
+    // and a misconfigured temp template can overlap the main/review path — both
+    // are genuine collisions, reported by the role the path actually belongs to.
+    let role = role_for_path(config, &normalized)?;
+    if role == Some(WorktreeRole::Temp) && other_live.branch.as_deref() == Some(branch) {
+        return Ok(());
+    }
+
+    let occupant = other_live
+        .branch
+        .clone()
+        .unwrap_or_else(|| "<detached>".to_string());
+    match role {
+        Some(role) => Err(anyhow!(
             "Temp worktree path '{}' is already reserved for {} '{}'.",
             path.display(),
-            other.role,
-            other.branch
-        ));
+            role,
+            occupant
+        )),
+        None => Err(anyhow!(
+            "Temp worktree path '{}' is already in use by branch '{}'.",
+            path.display(),
+            occupant
+        )),
     }
-
-    if let Some(other_live) = live_worktree_map(live_worktrees).get(&normalized) {
-        let reserved_role = existing_metadata.map(|record| record.role).or_else(|| {
-            if normalize_path(&config.main.path) == normalized {
-                Some(WorktreeRole::Main)
-            } else if normalize_path(&config.review.path) == normalized {
-                Some(WorktreeRole::Review)
-            } else {
-                None
-            }
-        });
-        let is_matching_temp = matches!(
-            existing_metadata,
-            Some(record) if record.role == WorktreeRole::Temp && record.branch == branch
-        );
-
-        if !is_matching_temp {
-            return Err(anyhow!(
-                "Temp worktree path '{}' is already in use by {}.",
-                path.display(),
-                reserved_role
-                    .map(|role| format!(
-                        "{} '{}'",
-                        role,
-                        other_live.branch.clone().unwrap_or_default()
-                    ))
-                    .unwrap_or_else(|| {
-                        format!(
-                            "branch '{}'",
-                            other_live
-                                .branch
-                                .clone()
-                                .unwrap_or_else(|| "<detached>".to_string())
-                        )
-                    })
-            ));
-        }
-
-        if other_live.branch.as_deref() != Some(branch) {
-            return Err(anyhow!(
-                "Temp worktree path '{}' is already in use by branch '{}'.",
-                path.display(),
-                other_live
-                    .branch
-                    .clone()
-                    .unwrap_or_else(|| "<detached>".to_string())
-            ));
-        }
-    }
-
-    Ok(())
 }
 
 fn remove_resolved_target(
     repo: &Repository,
     config: &WorktreeConfig,
-    metadata: &mut WorktreeMetadata,
     resolved: &ResolvedTarget,
     force: bool,
-) -> Result<bool> {
-    if let Some(_live) = &resolved.live {
-        run_hooks(
-            config,
-            resolved.role,
-            HookEvent::Remove,
-            &resolved.path,
-            &resolved.branch,
-        )?;
-        remove_worktree(repo, &resolved.path, force)?;
-    } else if resolved.path.exists() {
-        return Err(anyhow!(
-            "Managed worktree path '{}' exists on disk but git does not recognize it as a live worktree.",
-            resolved.path.display()
-        ));
-    }
-
-    match resolved.role {
-        WorktreeRole::Main => metadata.remove_role(WorktreeRole::Main),
-        WorktreeRole::Review => metadata.remove_role(WorktreeRole::Review),
-        WorktreeRole::Temp => metadata.remove_temp_branch(&resolved.branch),
-    }
-
-    Ok(resolved.live.is_none())
+) -> Result<()> {
+    // `resolve_target` only yields targets backed by a live worktree, so there is
+    // always a tree to remove; git's own worktree list is the record.
+    run_hooks(
+        config,
+        resolved.role,
+        HookEvent::Remove,
+        &resolved.path,
+        &resolved.branch,
+    )?;
+    remove_worktree(repo, &resolved.path, force)?;
+    Ok(())
 }
 
-fn resolve_target(
-    ctx: &LoadedContext,
-    target: &str,
-    allow_missing_path_metadata: bool,
-) -> Result<ResolvedTarget> {
+fn resolve_target(ctx: &LoadedContext, target: &str) -> Result<ResolvedTarget> {
     let live_by_path = ctx.live_by_path();
+    // Each target maps to a deterministic path from config; a target exists only
+    // if git has a live worktree there.
     match parse_target(target) {
         WorktreeTarget::Role(WorktreeRole::Main) => {
-            let metadata = ctx.metadata.find_role(WorktreeRole::Main).cloned();
-            let path = metadata
-                .as_ref()
-                .map(ManagedWorktreeRecord::path_buf)
-                .unwrap_or_else(|| ctx.config.main.path.clone());
+            let path = ctx.config.main.path.clone();
             let live = live_by_path.get(&normalize_path(&path)).cloned();
-            if live.is_none() && metadata.is_none() {
+            let Some(live) = live else {
                 return Err(anyhow!("No managed main worktree exists."));
-            }
-            if live.is_none() && !allow_missing_path_metadata {
-                return Err(anyhow!("No managed main worktree exists."));
-            }
+            };
             Ok(ResolvedTarget {
                 role: WorktreeRole::Main,
                 branch: live
-                    .as_ref()
-                    .and_then(|worktree| worktree.branch.clone())
-                    .or_else(|| metadata.as_ref().map(|record| record.branch.clone()))
+                    .branch
+                    .clone()
                     .unwrap_or_else(|| ctx.config.main.branch.clone()),
                 path,
-                live,
+                live: Some(live),
             })
         }
         WorktreeTarget::Role(WorktreeRole::Review) => {
-            let metadata = ctx.metadata.find_role(WorktreeRole::Review).cloned();
-            let path = metadata
-                .as_ref()
-                .map(ManagedWorktreeRecord::path_buf)
-                .unwrap_or_else(|| ctx.config.review.path.clone());
+            let path = ctx.config.review.path.clone();
             let live = live_by_path.get(&normalize_path(&path)).cloned();
-            if live.is_none() && metadata.is_none() {
+            let Some(live) = live else {
                 return Err(anyhow!("No managed review worktree exists."));
-            }
-            if live.is_none() && !allow_missing_path_metadata {
-                return Err(anyhow!("No managed review worktree exists."));
-            }
+            };
             Ok(ResolvedTarget {
                 role: WorktreeRole::Review,
-                branch: live
-                    .as_ref()
-                    .and_then(|worktree| worktree.branch.clone())
-                    .or_else(|| metadata.as_ref().map(|record| record.branch.clone()))
-                    .unwrap_or_else(|| "review".to_string()),
+                branch: live.branch.clone().unwrap_or_else(|| "review".to_string()),
                 path,
-                live,
+                live: Some(live),
             })
         }
-        WorktreeTarget::Role(WorktreeRole::Temp) => unreachable!(),
+        WorktreeTarget::Role(WorktreeRole::Temp) => unreachable!(
+            "parse_target only yields Role(Main), Role(Review), or TempBranch — there is no bare `temp` keyword"
+        ),
         WorktreeTarget::TempBranch(branch) => {
-            let metadata = ctx.metadata.find_temp_branch(&branch).cloned();
-            let path = metadata.as_ref().map_or_else(
-                || expand_path_template(&ctx.config.temp.path_template, &branch),
-                |record| Ok(record.path_buf()),
-            )?;
-            let live = live_by_path.get(&normalize_path(&path)).cloned();
-            if live.is_none() && metadata.is_none() {
+            let path = expand_path_template(&ctx.config.temp.path_template, &branch)?;
+            let live = live_by_path
+                .get(&normalize_path(&path))
+                .cloned()
+                .or_else(|| {
+                    // After `git branch -m` the worktree keeps its old (differently
+                    // named) temp path, so the recomputed path won't find it. Fall
+                    // back to matching by branch among worktrees that classify as temp.
+                    ctx.live_worktrees
+                        .iter()
+                        .find(|worktree| {
+                            worktree.branch.as_deref() == Some(branch.as_str())
+                                && role_for_path(&ctx.config, &worktree.normalized_path())
+                                    .ok()
+                                    .flatten()
+                                    == Some(WorktreeRole::Temp)
+                        })
+                        .cloned()
+                });
+            let Some(live) = live else {
                 return Err(anyhow!(
                     "No managed temp worktree exists for branch '{}'.",
                     branch
                 ));
-            }
-            if live.is_none() && !allow_missing_path_metadata {
-                return Err(anyhow!(
-                    "No managed temp worktree exists for branch '{}'.",
-                    branch
-                ));
-            }
+            };
             Ok(ResolvedTarget {
                 role: WorktreeRole::Temp,
                 branch,
-                path,
-                live,
+                path: live.path.clone(),
+                live: Some(live),
             })
         }
     }
@@ -820,14 +700,12 @@ fn resolve_target(
 fn load_context(repo: &Repository) -> Result<LoadedContext> {
     Ok(LoadedContext {
         config: load_worktree_config(repo)?,
-        metadata: WorktreeMetadata::load(repo)?,
         live_worktrees: list_live_worktrees(repo)?,
     })
 }
 
 struct LoadedContext {
     config: WorktreeConfig,
-    metadata: WorktreeMetadata,
     live_worktrees: Vec<LiveWorktree>,
 }
 

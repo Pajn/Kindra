@@ -220,29 +220,6 @@ fn rename_refuses_when_operation_in_progress() {
 }
 
 #[test]
-fn rename_fails_fast_on_incompatible_metadata_without_renaming_ref() {
-    let dir = setup_repo();
-    // A worktree-metadata file written by a newer, incompatible Kindra. Loading
-    // it must fail *before* the irreversible `git branch -m`, so the branch ref
-    // is left untouched rather than renamed against a stale/unreadable record.
-    std::fs::write(
-        dir.path().join(".git/kindra_worktrees.json"),
-        r#"{"version": 999, "worktrees": []}"#,
-    )
-    .unwrap();
-
-    kin_cmd()
-        .current_dir(dir.path())
-        .args(["rename", "feature-a", "feature-a-renamed"])
-        .assert()
-        .failure();
-
-    // The ref must not have moved: the failure happened before `git branch -m`.
-    assert!(branch_exists(dir.path(), "feature-a"));
-    assert!(!branch_exists(dir.path(), "feature-a-renamed"));
-}
-
-#[test]
 fn rename_migrates_branch_tracking_config() {
     // The docs and code promise that shelling out to `git branch -m` carries the
     // branch's tracking config (`branch.<name>.*`) across the rename — the whole

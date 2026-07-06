@@ -1,6 +1,5 @@
 use crate::commands::find_upstream;
 use crate::rebase_utils::passively_reconcile_rebase_state;
-use crate::worktree::metadata::WorktreeMetadata;
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
 use git2::{BranchType, Repository};
@@ -103,16 +102,12 @@ fn rename_branch(repo: &Repository, old_name: &str, new_name: &str) -> Result<()
         return Err(anyhow!("A branch named '{}' already exists.", new_name));
     }
 
-    // Load (and thereby validate) the worktree metadata *before* the irreversible
-    // `git branch -m`. An incompatible on-disk version or unreadable file must
-    // fail fast here, not after the branch has already been renamed — otherwise
-    // the ref would move while the worktree record still pointed at the old name.
-    let mut metadata = WorktreeMetadata::load(repo)?;
-
     // Shell out to `git branch -m` so tracking config (branch.<name>.*) migrates
     // with the branch; git2's Branch::rename leaves those sections behind. Stack
-    // parent/child relationships are derived from commit topology, so they follow
-    // the rename automatically with no metadata to rewrite.
+    // parent/child relationships are derived from commit topology, and managed
+    // worktrees are derived from git's own worktree list plus config paths, so
+    // both follow the rename automatically with nothing of ours to rewrite. (git
+    // repoints a checked-out branch's worktree HEAD as part of `branch -m`.)
     let output = Command::new("git")
         .arg("branch")
         .arg("-m")
@@ -127,29 +122,6 @@ fn rename_branch(repo: &Repository, old_name: &str, new_name: &str) -> Result<()
             new_name,
             String::from_utf8_lossy(&output.stderr).trim()
         ));
-    }
-
-    // Keep managed-worktree metadata consistent if the renamed branch is tracked.
-    // If persisting fails, roll the ref rename back so we never leave the branch
-    // renamed with a stale worktree record pointing at the old name.
-    if metadata.rename_branch(old_name, new_name)
-        && let Err(save_err) = metadata.save(repo)
-    {
-        let rollback = Command::new("git")
-            .args(["branch", "-m", new_name, old_name])
-            .output();
-        return match rollback {
-            Ok(out) if out.status.success() => Err(save_err.context(format!(
-                "Failed to update worktree metadata; rolled the rename of '{}' back",
-                old_name
-            ))),
-            _ => Err(save_err.context(format!(
-                "Failed to update worktree metadata AND failed to roll back the rename. \
-                 Branch is now '{}' but its worktree record still says '{}'; \
-                 rename it back manually or fix the metadata.",
-                new_name, old_name
-            ))),
-        };
     }
 
     println!("Renamed '{}' to '{}'.", old_name, new_name);

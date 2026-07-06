@@ -1,6 +1,6 @@
 mod common;
 
-use common::{kin_cmd, managed_worktree_path, read_worktree_metadata, repo_init, run_ok};
+use common::{kin_cmd, managed_worktree_path, repo_init, run_ok};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -75,14 +75,6 @@ fn worktree_remove_prompts_by_default_and_removes_with_yes() {
         .unwrap();
     assert!(output.status.success());
     assert!(!temp_path.exists());
-    let metadata = read_worktree_metadata(dir.path());
-    assert!(
-        !metadata["worktrees"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|record| record["branch"] == "feature-a")
-    );
 }
 
 #[test]
@@ -120,47 +112,6 @@ fn worktree_cleanup_removes_merged_temp_worktrees_but_not_persistent_ones() {
     assert!(output.status.success());
     assert!(main_path.exists());
     assert!(!temp_path.exists());
-    let metadata = read_worktree_metadata(dir.path());
-    assert!(
-        !metadata["worktrees"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|record| record["role"] == "temp" && record["branch"] == "feature-a")
-    );
-}
-
-#[test]
-fn worktree_cleanup_can_prune_stale_temp_metadata() {
-    let dir = setup_repo();
-    let temp_path = dir.path().join(".git/kindra-worktrees/temp/feature-a");
-
-    assert!(
-        kin_cmd()
-            .args(["wt", "temp", "feature-a"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
-    fs::remove_dir_all(&temp_path).unwrap();
-    run_ok("git", &["worktree", "prune"], dir.path());
-
-    let output = kin_cmd()
-        .args(["wt", "cleanup", "--yes"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let metadata = read_worktree_metadata(dir.path());
-    assert!(
-        !metadata["worktrees"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|record| record["branch"] == "feature-a")
-    );
 }
 
 #[test]

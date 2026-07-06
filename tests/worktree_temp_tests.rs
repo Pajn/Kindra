@@ -1,13 +1,34 @@
 mod common;
 
 use common::{
-    canonical_output_path, current_branch, kin_cmd, read_worktree_metadata, repo_init, run_ok,
-    write_repo_config,
+    canonical_output_path, current_branch, kin_cmd, repo_init, run_ok, write_repo_config,
 };
 use git2::{BranchType, Repository};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
+
+/// Assert `kin wt list` reports a row whose ROLE and BRANCH *columns* match. The
+/// managed set is derived from git's worktree list, so this is the observable
+/// stand-in for the old metadata-file check. Columns are parsed the same way as
+/// `tests/worktree_list_tests.rs` so a mismatch can't hide behind a substring.
+fn assert_listed(dir: &Path, role: &str, branch: &str) {
+    let output = kin_cmd()
+        .args(["wt", "list"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let found = stdout.lines().skip(1).any(|line| {
+        let cols = line.split_whitespace().collect::<Vec<_>>();
+        cols.len() >= 2 && cols[0] == role && cols[1] == branch
+    });
+    assert!(
+        found,
+        "expected a row with role '{role}' and branch '{branch}' in `kin wt list`:\n{stdout}"
+    );
+}
 
 fn setup_repo() -> TempDir {
     let dir = TempDir::new().unwrap();
@@ -123,14 +144,7 @@ fn worktree_temp_sanitizes_branch_names_and_reuses_existing_worktree() {
         fs::canonicalize(&expected_path).unwrap()
     );
 
-    let metadata = read_worktree_metadata(dir.path());
-    assert!(
-        metadata["worktrees"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|record| record["role"] == "temp" && record["branch"] == "feature/auth")
-    );
+    assert_listed(dir.path(), "temp", "feature/auth");
 }
 
 #[test]
@@ -209,14 +223,7 @@ fn worktree_temp_b_creates_new_branch_from_current_branch() {
     assert_eq!(current_branch(&expected_path), "feature/spike");
     assert_eq!(rev_parse(dir.path(), "feature/spike"), expected_oid);
 
-    let metadata = read_worktree_metadata(dir.path());
-    assert!(
-        metadata["worktrees"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|record| record["role"] == "temp" && record["branch"] == "feature/spike")
-    );
+    assert_listed(dir.path(), "temp", "feature/spike");
 }
 
 #[test]
@@ -350,7 +357,6 @@ fn worktree_temp_b_failing_create_hook_rolls_back_created_branch() {
             .is_err(),
         "failed temp branch should be removed after hook failure"
     );
-    assert!(!dir.path().join(".git/kindra_worktrees.json").exists());
 }
 
 #[test]
@@ -379,7 +385,6 @@ fn worktree_temp_b_failing_create_hook_rolls_back_branch_from_divergent_local_st
             .is_err(),
         "failed temp branch from a divergent local start-point should be removed after hook failure"
     );
-    assert!(!dir.path().join(".git/kindra_worktrees.json").exists());
 }
 
 #[test]
@@ -432,5 +437,79 @@ fn worktree_temp_b_failing_create_hook_after_commit_keeps_branch_for_manual_clea
         stderr.contains("Left branch 'feature/spike' in place"),
         "expected manual cleanup guidance in stderr\nstderr:\n{stderr}"
     );
-    assert!(!dir.path().join(".git/kindra_worktrees.json").exists());
+}
+
+/// After a branch rename, its temp worktree keeps its old (differently named)
+/// path. `kin wt temp <new>` must reuse that worktree rather than force-create a
+/// duplicate, and `kin wt path <new>` must resolve to it.
+#[test]
+fn worktree_temp_reused_after_branch_rename_instead_of_duplicated() {
+    let dir = setup_repo();
+    // A branch with its own temp worktree, with the primary left on `main` so the
+    // duplicate count below reflects only managed temp worktrees.
+    run_ok("git", &["checkout", "main"], dir.path());
+    run_ok("git", &["branch", "topic-old"], dir.path());
+
+    let out = kin_cmd()
+        .args(["wt", "temp", "topic-old"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let created_path = canonical_output_path(&out.stdout, dir.path());
+
+    // git branch -m repoints the worktree's HEAD but leaves its directory in place.
+    kin_cmd()
+        .args(["rename", "topic-old", "topic-new"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let out = kin_cmd()
+        .args(["wt", "temp", "topic-new"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        canonical_output_path(&out.stdout, dir.path()),
+        created_path,
+        "temp must reuse the existing worktree after rename"
+    );
+
+    let list = String::from_utf8_lossy(
+        &std::process::Command::new("git")
+            .args(["worktree", "list"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .to_string();
+    let count = list.lines().filter(|l| l.contains("[topic-new]")).count();
+    assert_eq!(
+        count, 1,
+        "rename must not leave a duplicate worktree:\n{list}"
+    );
+
+    // Resolution finds it by branch too, even at the old path.
+    let out = kin_cmd()
+        .args(["wt", "path", "topic-new"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(canonical_output_path(&out.stdout, dir.path()), created_path);
 }

@@ -290,6 +290,25 @@ fn validate_config(config: &WorktreeConfig) -> Result<()> {
 
     if config.temp.enabled {
         expand_path_template(&config.temp.path_template, "validation-branch")?;
+        // `{branch}` must be the final path component. Temp worktrees are
+        // recognized by matching a live path against the template root (everything
+        // before `{branch}`) on component boundaries, so the placeholder embedded
+        // inside a component (`.../temp-{branch}`) or followed by more components
+        // (`.../temp/{branch}/nested`) can't be classified reliably.
+        let branch_is_trailing_component = config
+            .temp
+            .path_template
+            .components()
+            .next_back()
+            .and_then(|component| component.as_os_str().to_str())
+            == Some("{branch}");
+        if !branch_is_trailing_component {
+            return Err(anyhow!(
+                "worktrees.temp.path_template must end with `{{branch}}` as its final path component \
+                 (e.g. `.../temp/{{branch}}`); `{}` does not.",
+                config.temp.path_template.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -393,6 +412,60 @@ mod tests {
 
         let err = load_worktree_config(&repo).unwrap_err();
         assert!(err.to_string().contains("main/review/temp worktree paths"));
+    }
+
+    #[test]
+    fn rejects_temp_template_with_branch_not_on_a_component_boundary() {
+        let dir = TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        // `{branch}` embedded inside a component (`temp-{branch}`) can't be
+        // classified reliably by component-boundary matching, so it is rejected.
+        std::fs::write(
+            repo.commondir().join("kindra.toml"),
+            "[worktrees]\nroot = \".git/kindra-worktrees\"\n\n[worktrees.temp]\npath_template = \".git/kindra-worktrees/temp-{branch}\"\n",
+        )
+        .unwrap();
+
+        let err = load_worktree_config(&repo).unwrap_err();
+        assert!(
+            err.to_string().contains("final path component"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_temp_template_with_branch_not_trailing() {
+        let dir = TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        // `{branch}` is a standalone component but not the last one, so the
+        // template root is a parent dir and classification would be too loose.
+        std::fs::write(
+            repo.commondir().join("kindra.toml"),
+            "[worktrees]\nroot = \".git/kindra-worktrees\"\n\n[worktrees.temp]\npath_template = \".git/kindra-worktrees/temp/{branch}/nested\"\n",
+        )
+        .unwrap();
+
+        let err = load_worktree_config(&repo).unwrap_err();
+        assert!(
+            err.to_string().contains("final path component"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn disabled_temp_with_invalid_template_still_loads() {
+        let dir = TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        // A disabled temp section carrying an invalid template (no `{branch}`)
+        // must not block loading — the temp checks are skipped.
+        std::fs::write(
+            repo.commondir().join("kindra.toml"),
+            "[worktrees.temp]\nenabled = false\npath_template = \"no-placeholder\"\n",
+        )
+        .unwrap();
+
+        let config = load_worktree_config(&repo).unwrap();
+        assert!(!config.temp.enabled);
     }
 
     #[test]

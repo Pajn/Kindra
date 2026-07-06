@@ -2,7 +2,6 @@ pub mod cleanup;
 pub mod config;
 pub mod git;
 pub mod hooks;
-pub mod metadata;
 pub mod path_resolver;
 pub mod roles;
 pub mod ui;
