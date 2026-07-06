@@ -612,7 +612,10 @@ fn test_absorb_refuses_when_in_range_branch_is_checked_out_elsewhere() {
         &["branch", "shared-head", &review_tip.to_string()],
         repo_path,
     );
-    let wt_path = temp.path().join("../absorb-wt-shared");
+    // A uniquely-scoped sibling directory: a fixed shared path would leak
+    // across failed runs and make the next `git worktree add` refuse.
+    let wt_temp = TempDir::new().unwrap();
+    let wt_path = wt_temp.path().join("shared-head-wt");
     run_ok(
         "git",
         &["worktree", "add", wt_path.to_str().unwrap(), "shared-head"],

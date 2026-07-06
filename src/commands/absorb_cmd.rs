@@ -196,8 +196,13 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
         // The engine already explained why nothing was absorbable.
         return Ok(());
     }
-    let fixup_count =
-        count_commits(&repo, base_id, head_after)? - count_commits(&repo, base_id, head_before)?;
+    // Saturating: the engine only adds commits on HEAD, but a surprise HEAD
+    // move must not turn the report into an underflow panic.
+    let fixup_count = count_commits(&repo, base_id, head_after)?.saturating_sub(count_commits(
+        &repo,
+        base_id,
+        head_before,
+    )?);
     println!(
         "Absorbed staged changes into {} {} commit{}. Folding...",
         fixup_count,
@@ -298,6 +303,9 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
     // editor per squash (the combined message is accepted as-is); the
     // suppress_editor flag in the saved state makes `kin continue` do the same
     // when resuming after a conflict.
+    // A spawn error means no rebase started at all, so it takes the same
+    // rollback path as a pre-start rejection below rather than `?`-returning
+    // past the cleanup with the fixups and saved state left behind.
     let status = Command::new("git")
         .env("GIT_SEQUENCE_EDITOR", "true")
         .env("GIT_EDITOR", "true")
@@ -306,8 +314,18 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
         .arg("--autosquash")
         .arg("--update-refs")
         .arg(base_id.to_string())
-        .status()?;
-    if !status.success() {
+        .status();
+    let failure = match status {
+        Ok(status) if status.success() => None,
+        Ok(_) => Some(anyhow!(
+            "git rebase --autosquash failed before starting. The absorb was rolled back."
+        )),
+        Err(err) => Some(
+            anyhow::Error::from(err)
+                .context("failed to run git rebase --autosquash. The absorb was rolled back."),
+        ),
+    };
+    if let Some(err) = failure {
         if git_rebase_in_progress(&repo) {
             // The autosquash paused on a conflict. Record which branch is
             // mid-rebase so `kin continue` matches the saved state.
@@ -318,16 +336,12 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
             ));
         }
         // The fold failed without starting a rebase (e.g. a pre-rebase hook
-        // rejected it). Nothing was folded, so leaving the saved state behind
-        // would only invite `kin continue` to restack dependents onto the raw
-        // fixup commits. Roll the fixups back and restore the set-aside
-        // changes instead.
+        // rejected it, or git could not be run). Nothing was folded, so
+        // leaving the saved state behind would only invite `kin continue` to
+        // restack dependents onto the raw fixup commits. Roll the fixups back
+        // and restore the set-aside changes instead.
         let _ = clear_state(&repo);
-        return Err(rollback_fixups(
-            head_before,
-            state.stash_ref.take(),
-            anyhow!("git rebase --autosquash failed before starting. The absorb was rolled back."),
-        ));
+        return Err(rollback_fixups(head_before, state.stash_ref.take(), err));
     }
 
     // Restack dependents; also restores the stash, clears the saved state, and
