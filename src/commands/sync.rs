@@ -92,13 +92,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
             }
         }
         1 => tips[0].clone(),
-        _ => crate::commands::prompt_select(
-            "Multiple stack tips found. Select one:",
-            tips,
-            crate::commands::Fallback::Require(
-                "Checkout the desired tip branch and rerun 'kin sync'.",
-            ),
-        )?,
+        _ => resolve_sync_tip(&tips, &stack_branches, current_branch_name.as_deref())?,
     };
 
     let top_branch_tip = repo.revparse_single(&top_branch)?.id();
@@ -196,6 +190,56 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
     // merged-branch deletions (if any) or drops the snapshot when nothing
     // changed. The rebase path above defers settling to the resuming process.
     Ok(())
+}
+
+/// Choose which stack tip drives the sync rebase when more than one tip exists.
+///
+/// Multiple tips are only genuinely ambiguous when they point at *different*
+/// commits (a real fork in the stack). When every tip is the same commit — e.g.
+/// two branches parked on one HEAD — `git rebase --update-refs` rewrites that
+/// commit once and carries all co-located refs along, so the driving branch has
+/// no bearing on the outcome. In that case we auto-select and skip the prompt,
+/// preferring the currently checked-out branch to avoid a needless checkout.
+/// Only when the tips actually diverge do we fall back to prompting.
+fn resolve_sync_tip(
+    tips: &[String],
+    stack_branches: &[crate::stack::StackBranch],
+    current_branch_name: Option<&str>,
+) -> Result<String> {
+    let tip_oid = |name: &str| -> Result<git2::Oid> {
+        stack_branches
+            .iter()
+            .find(|b| b.name == name)
+            .map(|b| b.id)
+            .ok_or_else(|| anyhow!("Stack tip '{}' not found in stack.", name))
+    };
+
+    let first_oid = tip_oid(&tips[0])?;
+    let mut all_same = true;
+    for tip in &tips[1..] {
+        if tip_oid(tip)? != first_oid {
+            all_same = false;
+            break;
+        }
+    }
+
+    if all_same {
+        // Every tip is the same commit; the choice is immaterial. Prefer the
+        // current branch so the checkout below is a no-op, else take the first
+        // (tips are sorted, so this is deterministic).
+        if let Some(current) = current_branch_name
+            && tips.iter().any(|t| t == current)
+        {
+            return Ok(current.to_string());
+        }
+        return Ok(tips[0].clone());
+    }
+
+    crate::commands::prompt_select(
+        "Multiple stack tips found. Select one:",
+        tips.to_vec(),
+        crate::commands::Fallback::Require("Checkout the desired tip branch and rerun 'kin sync'."),
+    )
 }
 
 fn sync_upstream_branch(

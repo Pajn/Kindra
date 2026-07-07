@@ -287,3 +287,174 @@ fn sync_does_not_treat_rename_only_branch_as_integrated_when_target_keeps_source
         "sync should preserve the destination path from the rename commit"
     );
 }
+
+/// Two branches parked on the same commit are both reported as stack tips, but
+/// the choice between them is immaterial: `git rebase --update-refs` rewrites
+/// that commit once and carries every co-located ref along. Sync must skip the
+/// "Multiple stack tips" prompt here (proven by success in a non-interactive
+/// run, where an unavoidable prompt would hard-error) and move both refs.
+#[test]
+fn sync_skips_tip_prompt_when_tips_share_a_commit() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let remote_dir = dir.path().join("remote.git");
+    fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    run_ok("git", &["push", "-u", "origin", "main:main"], dir.path());
+
+    // `analyze` carries one commit; `perf` is parked on the exact same commit.
+    make_commit(
+        &repo,
+        "refs/heads/analyze",
+        "a.txt",
+        "a",
+        "feature work",
+        &[&repo.find_commit(base_id).unwrap()],
+    );
+    run_ok("git", &["branch", "perf", "analyze"], dir.path());
+
+    // Advance origin/main so sync has real work to do (a rebase, not a no-op).
+    let remote_worktree = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote_dir.to_str().unwrap(),
+            remote_worktree.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "main"], remote_worktree.path());
+    fs::write(remote_worktree.path().join("remote.txt"), "remote").unwrap();
+    run_ok("git", &["add", "remote.txt"], remote_worktree.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "remote advanced"],
+        remote_worktree.path(),
+    );
+    run_ok("git", &["push", "origin", "main"], remote_worktree.path());
+
+    run_ok("git", &["checkout", "-f", "analyze"], dir.path());
+
+    // Non-interactive: a genuinely required prompt would fail the command.
+    let mut cmd = kin_cmd();
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let origin_main = repo.revparse_single("origin/main").unwrap().id();
+    let analyze_tip = repo.revparse_single("analyze").unwrap().id();
+    let perf_tip = repo.revparse_single("perf").unwrap().id();
+
+    assert!(
+        repo.graph_descendant_of(analyze_tip, origin_main).unwrap(),
+        "analyze should be rebased onto the advanced origin/main"
+    );
+    assert!(
+        repo.graph_descendant_of(perf_tip, origin_main).unwrap(),
+        "perf should be carried onto origin/main by --update-refs"
+    );
+    assert_eq!(
+        analyze_tip, perf_tip,
+        "co-located tips must remain co-located after the sync"
+    );
+}
+
+/// When the tips point at *different* commits (a real fork above a shared
+/// branch), the choice matters and sync must still prompt. In a non-interactive
+/// run that prompt surfaces as a hard error rather than silently picking a side.
+#[test]
+fn sync_still_prompts_when_tips_diverge() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let remote_dir = dir.path().join("remote.git");
+    fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    run_ok("git", &["push", "-u", "origin", "main:main"], dir.path());
+
+    // A shared branch `mid`, then two diverging children on distinct commits.
+    let mid_id = make_commit(
+        &repo,
+        "refs/heads/mid",
+        "mid.txt",
+        "mid",
+        "mid",
+        &[&repo.find_commit(base_id).unwrap()],
+    );
+    make_commit(
+        &repo,
+        "refs/heads/analyze",
+        "a.txt",
+        "a",
+        "analyze work",
+        &[&repo.find_commit(mid_id).unwrap()],
+    );
+    make_commit(
+        &repo,
+        "refs/heads/perf",
+        "p.txt",
+        "p",
+        "perf work",
+        &[&repo.find_commit(mid_id).unwrap()],
+    );
+
+    // Advance origin/main so sync gets past preflight to tip selection.
+    let remote_worktree = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote_dir.to_str().unwrap(),
+            remote_worktree.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "main"], remote_worktree.path());
+    fs::write(remote_worktree.path().join("remote.txt"), "remote").unwrap();
+    run_ok("git", &["add", "remote.txt"], remote_worktree.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "remote advanced"],
+        remote_worktree.path(),
+    );
+    run_ok("git", &["push", "origin", "main"], remote_worktree.path());
+
+    // Sit on the shared branch so both children are seen as divergent tips.
+    run_ok("git", &["checkout", "-f", "mid"], dir.path());
+
+    let mut cmd = kin_cmd();
+    cmd.arg("sync")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Multiple stack tips found"));
+}
