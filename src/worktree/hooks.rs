@@ -44,11 +44,47 @@ pub fn run_hooks(
     worktree_path: &Path,
     branch: &str,
 ) -> Result<()> {
-    for hook in hooks_for_role(config, role, event) {
+    run_hook_list(
+        hooks_for_role(config, role, event),
+        role.as_str(),
+        event,
+        worktree_path,
+        branch,
+    )
+}
+
+/// Run only the top-level `[worktrees.hooks]` for a plain (roleless) worktree —
+/// `kin wt add` on create, or removing a worktree that matches no role. Role
+/// hooks do not apply; `role_label` is what surfaces in `KINDRA_WORKTREE_ROLE`
+/// and hook-failure messages (`"add"` on create, `"-"` on remove).
+pub fn run_global_hooks(
+    config: &WorktreeConfig,
+    role_label: &str,
+    event: HookEvent,
+    worktree_path: &Path,
+    branch: &str,
+) -> Result<()> {
+    run_hook_list(
+        hooks_from_list(&config.hooks, event),
+        role_label,
+        event,
+        worktree_path,
+        branch,
+    )
+}
+
+fn run_hook_list(
+    hooks: Vec<String>,
+    role_label: &str,
+    event: HookEvent,
+    worktree_path: &Path,
+    branch: &str,
+) -> Result<()> {
+    for hook in hooks {
         eprintln!("Running {} hook: {}...", event.as_str(), hook);
         let status = shell_command(&hook)
             .current_dir(worktree_path)
-            .env("KINDRA_WORKTREE_ROLE", role.as_str())
+            .env("KINDRA_WORKTREE_ROLE", role_label)
             .env("KINDRA_WORKTREE_BRANCH", branch)
             .env("KINDRA_WORKTREE_PATH", worktree_path)
             .stdout(Stdio::inherit())
@@ -62,7 +98,7 @@ pub fn run_hooks(
             return Err(anyhow!(
                 "Worktree {} hook failed for role '{}' at '{}': {}\nexit code: {}",
                 event.as_str(),
-                role,
+                role_label,
                 worktree_path.display(),
                 hook,
                 exit_code,
@@ -143,6 +179,7 @@ mod tests {
                 delete_merged: true,
                 hooks: HookListConfig::default(),
             },
+            add_path_template: PathBuf::from("../repo-worktrees/{branch}"),
         }
     }
 

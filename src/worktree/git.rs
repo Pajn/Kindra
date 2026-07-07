@@ -105,24 +105,25 @@ pub fn live_worktree_map(worktrees: &[LiveWorktree]) -> HashMap<PathBuf, LiveWor
         .collect()
 }
 
-pub fn add_worktree(repo: &Repository, path: &Path, branch: &str) -> Result<()> {
+pub fn add_worktree(repo: &Repository, path: &Path, branch: &str, force: bool) -> Result<()> {
     ensure_local_branch_exists(repo, branch)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    // Kindra's managed worktrees intentionally allow role-based reuse even when the same branch
-    // is already checked out elsewhere, so we always pass `git worktree add --force` here.
-    // If worktree creation semantics become user-configurable later, this flag should follow that
-    // explicit policy instead of being unconditional.
-    let status = Command::new("git")
+    // The role worktrees (main/review/temp) force-add so a branch already checked
+    // out elsewhere can still be materialized in its slot. `kin wt add` passes
+    // `force = false` so git refuses to check a branch out twice — the correct
+    // safety, and it keeps branch -> worktree a unique mapping for target lookup.
+    let mut command = Command::new("git");
+    command
         .current_dir(repo_root(repo)?)
         .arg("worktree")
-        .arg("add")
-        .arg("--force")
-        .arg(path)
-        .arg(branch)
-        .output()?;
+        .arg("add");
+    if force {
+        command.arg("--force");
+    }
+    let status = command.arg(path).arg(branch).output()?;
     if !status.status.success() {
         return Err(anyhow!(
             "Failed to create worktree at '{}' for branch '{}': {}",
@@ -663,7 +664,7 @@ mod tests {
 
         git(root, &["branch", "feature"]);
         let wt_path = root.join("wt");
-        add_worktree(&repo, &wt_path, "feature").unwrap();
+        add_worktree(&repo, &wt_path, "feature", true).unwrap();
         assert!(wt_path.join("a.txt").exists(), "worktree checked out");
 
         // Dirty the worktree with uncommitted work.

@@ -105,7 +105,27 @@ fn worktree_path_fails_for_unknown_target() {
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("No managed temp worktree exists for branch 'missing-branch'.")
+            .contains("No worktree found for branch 'missing-branch'.")
+    );
+}
+
+#[test]
+fn worktree_path_falls_back_to_live_branch_when_temp_is_disabled() {
+    let dir = setup_repo();
+    write_repo_config(
+        dir.path(),
+        "[worktrees.temp]\nenabled = false\npath_template = \"no-placeholder\"\n",
+    );
+
+    let output = kin_cmd()
+        .args(["wt", "path", "feature-a"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        canonical_output_path(&output.stdout, dir.path()),
+        fs::canonicalize(dir.path()).unwrap()
     );
 }
 

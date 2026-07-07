@@ -105,6 +105,7 @@ mod tests {
                 delete_merged: true,
                 hooks: HookListConfig::default(),
             },
+            add_path_template: dir.join("worktrees").join("{branch}"),
         }
     }
 

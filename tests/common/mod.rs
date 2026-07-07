@@ -128,6 +128,28 @@ pub fn setup_repo() -> tempfile::TempDir {
 }
 
 #[allow(dead_code)]
+/// Creates a repo with `main` and `feature-a`, leaving `HEAD` on `main`.
+pub fn setup_worktree_repo() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = repo_init(dir.path());
+    let mut config = repo.config().unwrap();
+    config.set_str("user.name", "Test User").unwrap();
+    config.set_str("user.email", "test@example.com").unwrap();
+
+    fs::write(dir.path().join("file.txt"), "main").unwrap();
+    run_ok("git", &["add", "file.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "initial"], dir.path());
+
+    run_ok("git", &["checkout", "-b", "feature-a"], dir.path());
+    fs::write(dir.path().join("feature.txt"), "feature").unwrap();
+    run_ok("git", &["add", "feature.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "feature"], dir.path());
+    run_ok("git", &["checkout", "main"], dir.path());
+
+    dir
+}
+
+#[allow(dead_code)]
 pub fn write_repo_config(repo_root: &Path, contents: &str) {
     fs::write(repo_root.join(".git").join("kindra.toml"), contents).unwrap();
 }

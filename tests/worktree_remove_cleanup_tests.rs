@@ -1,29 +1,8 @@
 mod common;
 
-use common::{kin_cmd, managed_worktree_path, repo_init, run_ok};
+use common::{kin_cmd, managed_worktree_path, run_ok, setup_worktree_repo};
 use std::fs;
 use std::path::Path;
-use tempfile::TempDir;
-
-fn setup_repo() -> TempDir {
-    let dir = TempDir::new().unwrap();
-    let repo = repo_init(dir.path());
-    let mut config = repo.config().unwrap();
-    config.set_str("user.name", "Test User").unwrap();
-    config.set_str("user.email", "test@example.com").unwrap();
-
-    fs::write(dir.path().join("file.txt"), "main").unwrap();
-    run_ok("git", &["add", "file.txt"], dir.path());
-    run_ok("git", &["commit", "-m", "initial"], dir.path());
-
-    run_ok("git", &["checkout", "-b", "feature-a"], dir.path());
-    fs::write(dir.path().join("feature.txt"), "feature").unwrap();
-    run_ok("git", &["add", "feature.txt"], dir.path());
-    run_ok("git", &["commit", "-m", "feature"], dir.path());
-    run_ok("git", &["checkout", "main"], dir.path());
-
-    dir
-}
 
 fn worktree_git_dir(worktree_path: &Path) -> std::path::PathBuf {
     let dot_git = worktree_path.join(".git");
@@ -46,7 +25,7 @@ fn worktree_git_dir(worktree_path: &Path) -> std::path::PathBuf {
 
 #[test]
 fn worktree_remove_prompts_by_default_and_removes_with_yes() {
-    let dir = setup_repo();
+    let dir = setup_worktree_repo();
     let temp_path = dir.path().join(".git/kindra-worktrees/temp/feature-a");
 
     assert!(
@@ -79,7 +58,7 @@ fn worktree_remove_prompts_by_default_and_removes_with_yes() {
 
 #[test]
 fn worktree_cleanup_removes_merged_temp_worktrees_but_not_persistent_ones() {
-    let dir = setup_repo();
+    let dir = setup_worktree_repo();
     let main_path = dir.path().join(".git/kindra-worktrees/main");
     let temp_path = dir.path().join(".git/kindra-worktrees/temp/feature-a");
 
@@ -116,7 +95,7 @@ fn worktree_cleanup_removes_merged_temp_worktrees_but_not_persistent_ones() {
 
 #[test]
 fn worktree_remove_requires_force_for_dirty_worktrees_even_with_yes() {
-    let dir = setup_repo();
+    let dir = setup_worktree_repo();
     let temp_path = managed_worktree_path(dir.path(), "temp/feature-a");
 
     assert!(
@@ -150,7 +129,7 @@ fn worktree_remove_requires_force_for_dirty_worktrees_even_with_yes() {
 
 #[test]
 fn worktree_remove_requires_force_for_incomplete_git_operations() {
-    let dir = setup_repo();
+    let dir = setup_worktree_repo();
     let temp_path = managed_worktree_path(dir.path(), "temp/feature-a");
 
     assert!(
@@ -204,7 +183,7 @@ fn worktree_remove_requires_force_for_incomplete_git_operations() {
 
 #[test]
 fn worktree_cleanup_yes_skips_dirty_candidates_without_force() {
-    let dir = setup_repo();
+    let dir = setup_worktree_repo();
     let temp_path = managed_worktree_path(dir.path(), "temp/feature-a");
 
     assert!(
@@ -242,15 +221,12 @@ fn worktree_cleanup_yes_skips_dirty_candidates_without_force() {
 
 #[test]
 fn worktree_remove_rejects_missing_targets_even_with_yes() {
-    let dir = setup_repo();
+    let dir = setup_worktree_repo();
 
     for (target, expected) in [
         ("main", "No managed main worktree exists."),
         ("review", "No managed review worktree exists."),
-        (
-            "feature-a",
-            "No managed temp worktree exists for branch 'feature-a'.",
-        ),
+        ("feature-a", "No worktree found for branch 'feature-a'."),
     ] {
         let output = kin_cmd()
             .args(["wt", "remove", target, "--yes"])

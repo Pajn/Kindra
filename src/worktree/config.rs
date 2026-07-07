@@ -49,6 +49,12 @@ pub struct WorktreeConfig {
     pub main: MainWorktreeConfig,
     pub review: ReviewWorktreeConfig,
     pub temp: TempWorktreeConfig,
+    /// Default `{branch}` template for `kin wt add`. Unlike the role paths this is
+    /// deliberately *not* constrained under `root` — added worktrees default to a
+    /// visible sibling directory when possible, fall back to `<repo>/worktrees`
+    /// when the repo has no parent directory, and `add` also accepts an explicit
+    /// path that overrides it.
+    pub add_path_template: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +80,8 @@ struct RawWorktreeConfig {
     review: Option<RawReviewWorktreeConfig>,
     #[serde(default)]
     temp: Option<RawTempWorktreeConfig>,
+    #[serde(default)]
+    add_path_template: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -160,6 +168,21 @@ pub fn load_worktree_config(repo: &Repository) -> Result<WorktreeConfig> {
     let default_main_path = root.join("main");
     let default_review_path = root.join("review");
     let default_temp_template = root.join("temp").join("{branch}");
+    // `kin wt add` defaults to a sibling directory next to the repo (e.g.
+    // `../<repo>-worktrees/{branch}`), or `<repo>/worktrees/{branch}` when the
+    // repo has no parent directory, so added worktrees are visible to editors
+    // and `git status`, unlike the role worktrees tucked under `.git`.
+    let default_add_template = {
+        let repo_name = config_base
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "repo".to_string());
+        let siblings = config_base
+            .parent()
+            .map(|parent| parent.join(format!("{repo_name}-worktrees")))
+            .unwrap_or_else(|| config_base.join("worktrees"));
+        siblings.join("{branch}")
+    };
 
     let trunk = match raw
         .trunk
@@ -217,6 +240,11 @@ pub fn load_worktree_config(repo: &Repository) -> Result<WorktreeConfig> {
         hooks: role_hook_list(temp_raw.on_create, temp_raw.on_checkout, temp_raw.on_remove),
     };
 
+    let add_path_template = raw
+        .add_path_template
+        .map(|value| resolve_config_path(config_base, &value))
+        .unwrap_or_else(|| normalize_path(default_add_template));
+
     let config = WorktreeConfig {
         root: normalize_path(root),
         trunk,
@@ -224,6 +252,7 @@ pub fn load_worktree_config(repo: &Repository) -> Result<WorktreeConfig> {
         main,
         review,
         temp,
+        add_path_template,
     };
     validate_config(&config)?;
     Ok(config)
@@ -310,6 +339,9 @@ fn validate_config(config: &WorktreeConfig) -> Result<()> {
             ));
         }
     }
+    // The add template is unconstrained in location but must still be branch-
+    // templated so `kin wt add` can derive a distinct path per branch.
+    expand_path_template(&config.add_path_template, "validation-branch")?;
     Ok(())
 }
 
