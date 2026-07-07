@@ -1,6 +1,5 @@
 use assert_cmd::Command;
 use git2::{Repository, Signature};
-use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -131,12 +130,6 @@ pub fn setup_repo() -> tempfile::TempDir {
 #[allow(dead_code)]
 pub fn write_repo_config(repo_root: &Path, contents: &str) {
     fs::write(repo_root.join(".git").join("kindra.toml"), contents).unwrap();
-}
-
-#[allow(dead_code)]
-pub fn read_worktree_metadata(repo_root: &Path) -> Value {
-    let raw = fs::read_to_string(repo_root.join(".git").join("kindra_worktrees.json")).unwrap();
-    serde_json::from_str(&raw).unwrap()
 }
 
 #[allow(dead_code)]
