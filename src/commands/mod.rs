@@ -11,6 +11,7 @@ pub mod rename;
 pub mod reorder;
 pub mod restack;
 pub mod run;
+pub mod shell_init;
 pub mod split;
 pub mod status_cmd;
 pub mod sync;

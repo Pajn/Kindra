@@ -15,6 +15,7 @@ This document provides a detailed overview of the commands available in Kindra v
   - [restack](#restack)
   - [checkout (co)](#checkout-alias-co)
   - [worktree (wt)](#worktree-alias-wt)
+  - [shell-init](#shell-init)
   - [push](#push)
   - [run](#run)
   - [pr](#pr)
@@ -403,6 +404,7 @@ kin wt temp -b <new-branch> [<start-point>]
 kin wt add [<branch>] [--path <path>]
 kin wt add -b <new-branch> [<start-point>] [--path <path>]
 kin wt path <main|review|branch>
+kin wt cd <main|review|branch>
 kin wt remove <main|review|branch> [--yes] [--force]
 kin wt cleanup [--yes] [--force]
 ```
@@ -445,6 +447,7 @@ The `kin wt temp` and `kin wt add` synopses have two forms: without `-b`, the op
 - `kin wt add -b <new-branch> [<start-point>]`: Creates a new local branch and a durable worktree for it. On failure — including a failing create hook — the worktree and the newly created branch are rolled back.
 - `kin wt add ... --path <path>`: Places the worktree at an explicit path instead of the configured default.
 - `kin wt path <target>`: Prints only the resolved path for `main`, `review`, or whichever worktree is checked out on the named branch. Intended for scripts and editor integrations.
+- `kin wt cd <target>`: Changes the shell's directory to the resolved worktree — but only with shell integration active (see [`shell-init`](#shell-init)). It prints the path like `kin wt path`; the shell wrapper captures that and runs `cd`. Run directly in a terminal without integration, it prints the path and a note explaining how to enable it.
 - `kin wt remove <target>`: Removes a worktree — a role keyword, or a branch name (resolving to whichever worktree is on that branch, whether temp, added, or plain). By default Kindra asks for confirmation; use `--yes` to skip the prompt.
 - `kin wt remove --force <target>`: Forces `git worktree remove` when Git would otherwise refuse, such as for a dirty worktree.
 - `kin wt cleanup`: Finds temp worktrees whose branch is merged into trunk, prints the candidates, and removes the selected ones. It only ever touches temp worktrees — `main`, `review`, and plain/added worktrees are never auto-removed.
@@ -466,6 +469,10 @@ The `kin wt temp` and `kin wt add` synopses have two forms: without `-b`, the op
 - `kin wt add` does not force the checkout: Git refuses to check out a branch already live in another worktree, which keeps the branch → worktree mapping unique.
 - `kin wt path` and `kin wt remove` fail if no worktree currently exists for that target.
 - Worktree management requires a non-bare repository.
+
+**Shell integration (`kin wt cd`):**
+
+A CLI process cannot change its parent shell's directory, so `kin wt cd` relies on a small wrapper function that captures the path the binary prints and runs `cd` for you. Enable it once in your shell config with the top-level [`kin shell-init`](#shell-init) command. Once loaded, `kin wt cd main`, `kin wt cd review`, and `kin wt cd <branch>` move you into the corresponding worktree.
 
 **Configuration:**
 
@@ -513,6 +520,41 @@ Configuration notes:
 - Hook commands run in the target worktree directory, and a failing hook aborts the action (rolling back a create). Role worktrees run the global `worktrees.hooks` plus their role-specific hooks; `kin wt add` runs only the global `worktrees.hooks` (added worktrees have no role).
 
 **When to use it:** Use this when you want stable, scriptable worktree locations for trunk and review, disposable branch worktrees Kindra can clean up safely, or durable sibling worktrees for branches you want to keep checked out.
+
+---
+
+### `shell-init`
+
+**Description:** Prints a shell snippet that enables Kindra's shell integration: **completions plus the `kin wt cd` wrapper**, so a single line in your shell config sets up both. It is a top-level command (not under `wt`) so future integration can be folded into the same snippet without changing how you load it.
+
+**Usage:**
+
+```bash
+kin shell-init <bash|zsh|fish> [--no-completions]
+```
+
+Load it once from your shell config:
+
+```bash
+# bash / zsh (~/.bashrc, ~/.zshrc)
+eval "$(kin shell-init zsh)"
+```
+
+```fish
+# fish (~/.config/fish/config.fish)
+kin shell-init fish | source
+```
+
+The snippet does two things:
+
+- Registers Kindra's dynamic shell completions (the same output as `kin completions <shell>`).
+- Shadows `kin` with a function that special-cases `kin wt cd` — capturing the path the binary prints and running `cd` — and forwards every other invocation unchanged to the real binary via `command kin`.
+
+It emits static text and does not require being inside a repository, so it is safe to load unconditionally.
+
+- `--no-completions`: Emit only the `cd` wrapper, for users who install completions separately (e.g. via a package). The standalone `kin completions <shell>` command remains available either way.
+
+**When to use it:** Add it to your shell config once to get completions and make `kin wt cd <target>` actually change directory instead of just printing the path.
 
 ---
 

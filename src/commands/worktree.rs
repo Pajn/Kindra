@@ -3,6 +3,7 @@ use crate::worktree::roles;
 use crate::worktree::ui::print_list;
 use anyhow::Result;
 use clap::{Args, Subcommand};
+use std::io::IsTerminal;
 
 #[derive(Subcommand, Clone, Debug)]
 pub enum WorktreeSubcommand {
@@ -18,6 +19,8 @@ pub enum WorktreeSubcommand {
     Add(AddArgs),
     /// Print the path for a managed worktree target
     Path(PathArgs),
+    /// Change directory to a worktree (requires shell integration; see `kin shell-init`)
+    Cd(PathArgs),
     /// Remove a managed worktree target
     Remove(RemoveArgs),
     /// Clean up merged or stale temp worktrees
@@ -127,6 +130,21 @@ pub fn worktree(subcommand: &Option<WorktreeSubcommand>) -> Result<()> {
         Some(WorktreeSubcommand::Path(args)) => {
             let path = roles::resolve_existing_path(&repo, &args.target)?;
             println!("{}", path.display());
+        }
+        Some(WorktreeSubcommand::Cd(args)) => {
+            let path = roles::resolve_existing_path(&repo, &args.target)?;
+            println!("{}", path.display());
+            // When stdout is a terminal, the shell wrapper isn't capturing us, so
+            // this printed the path but didn't actually change directory. Nudge
+            // the user toward enabling integration. Under the wrapper, stdout is a
+            // pipe, so this stays quiet.
+            if std::io::stdout().is_terminal() {
+                eprintln!(
+                    "note: 'kin wt cd' only changes directory with shell integration active. \
+                     Enable it by adding `eval \"$(kin shell-init <shell>)\"` (bash/zsh) or \
+                     `kin shell-init fish | source` to your shell config."
+                );
+            }
         }
         Some(WorktreeSubcommand::Remove(args)) => {
             let result = roles::remove_target(&repo, &args.target, args.force)?;
