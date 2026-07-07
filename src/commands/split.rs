@@ -131,6 +131,7 @@ pub fn split(args: &SplitArgs) -> Result<()> {
     buffer.push_str("\n# kin split\n");
     buffer.push_str("# Move 'branch <name>' rows to reassign branches to commits.\n");
     buffer.push_str("# Add new 'branch <name>' rows to create branches.\n");
+    buffer.push_str("# Leave the name blank ('branch') to auto-name it from the commit summary.\n");
     buffer.push_str("# Remove 'branch <name>' rows to delete branches.\n");
     buffer.push_str("# DO NOT edit commit lines (SHA + summary).\n");
     buffer.push_str(&format!("# Base branch: {}\n", upstream_name));
@@ -169,6 +170,31 @@ pub fn split(args: &SplitArgs) -> Result<()> {
     }
 }
 
+/// Resolve a short commit id from the edited buffer to the unique matching
+/// commit, applying the same validation as the full-buffer pass: a prefix that
+/// matches no commit was moved/modified, and one matching several is ambiguous.
+fn resolve_commit_prefix<'a>(commits: &'a [CommitInfo], id_short: &str) -> Result<&'a CommitInfo> {
+    let matches: Vec<&CommitInfo> = commits
+        .iter()
+        .filter(|commit| commit.id.starts_with(id_short))
+        .collect();
+    match matches.as_slice() {
+        [] => Err(anyhow!(
+            "Commit '{}' was modified or moved. kin split only supports branch management.",
+            id_short
+        )),
+        [only] => Ok(only),
+        many => {
+            let candidates: Vec<_> = many.iter().map(|commit| &commit.id[..7]).collect();
+            Err(anyhow!(
+                "Ambiguous commit prefix {}. Candidates: {:?}",
+                id_short,
+                candidates
+            ))
+        }
+    }
+}
+
 /// Parse the edited split buffer, validate it against the original commit list,
 /// and apply the resulting branch layout.
 fn split_from_buffer(
@@ -182,6 +208,9 @@ fn split_from_buffer(
     // Parse and Validate
     let mut new_commits_short = Vec::new();
     let mut new_branch_map: Vec<(String, String)> = Vec::new(); // (branch_name, commit_id_short)
+    // Names already claimed in this buffer, so an auto-named row does not collide
+    // with a name assigned to another row.
+    let mut chosen_names: HashSet<String> = HashSet::new();
     let mut last_commit_id: Option<String> = None;
 
     for line in edited_buffer.lines() {
@@ -190,22 +219,38 @@ fn split_from_buffer(
             continue;
         }
 
-        if line.starts_with("branch ") {
-            let branch_name = line.strip_prefix("branch ").unwrap().trim().to_string();
+        // A branch row is `branch <name>`, or bare `branch` to auto-name the
+        // branch from the commit it sits on. (Commit rows always start with a SHA,
+        // so they never match here.)
+        if line == "branch" || line.starts_with("branch ") {
+            let rest = line["branch".len()..].trim();
+            let Some(id) = last_commit_id.clone() else {
+                return Err(anyhow!("A branch row must follow a commit line"));
+            };
+
+            let branch_name = if rest.is_empty() {
+                // Derive the name only from a uniquely-resolved commit; a missing
+                // or ambiguous prefix is a real error, not an empty summary.
+                let commit = resolve_commit_prefix(commits, &id)?;
+                let base = crate::commands::slugify_subject(&commit.summary).ok_or_else(|| {
+                    anyhow!(
+                        "Cannot derive a branch name from commit '{}' (empty summary); name the branch explicitly.",
+                        id
+                    )
+                })?;
+                crate::commands::disambiguate_branch_name(repo, &base, &chosen_names)?
+            } else {
+                rest.to_string()
+            };
+
             if branch_name.is_empty() || !git2::Branch::name_is_valid(&branch_name)? {
                 return Err(anyhow!(
                     "Invalid branch name '{}' in split editor buffer",
                     branch_name
                 ));
             }
-            if let Some(id) = &last_commit_id {
-                new_branch_map.push((branch_name, id.clone()));
-            } else {
-                return Err(anyhow!(
-                    "Branch '{}' must follow a commit line",
-                    branch_name
-                ));
-            }
+            chosen_names.insert(branch_name.clone());
+            new_branch_map.push((branch_name, id));
         } else {
             let parts: Vec<&str> = line.splitn(2, ' ').collect();
             if parts.is_empty() {

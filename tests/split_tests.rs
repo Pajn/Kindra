@@ -1148,3 +1148,151 @@ perl -i -pe 's/(commit 2)/$1\nbranch feature-x/' "$file"
     );
     assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
 }
+
+/// A bare `branch` row (no name) is auto-named by slugifying the commit it sits
+/// on. Here the row under "commit 2" produces a branch named `commit-2`.
+#[test]
+fn test_split_auto_names_branch_from_commit() {
+    let (dir, repo) = setup_repo();
+
+    let editor_script = dir.path().join("editor.sh");
+    fs::write(
+        &editor_script,
+        r#"#!/bin/sh
+file=$1
+perl -i -pe 's/(commit 2)/$1\nbranch/' "$file"
+"#,
+    )
+    .unwrap();
+    make_executable(&editor_script);
+
+    let mut cmd = kin_cmd();
+    cmd.arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor_script)
+        .assert()
+        .success();
+
+    let branch = repo
+        .find_branch("commit-2", git2::BranchType::Local)
+        .expect("bare 'branch' row should auto-create a branch slugged from the commit");
+    let commit = repo.find_commit(branch.get().target().unwrap()).unwrap();
+    assert_eq!(commit.summary().unwrap(), "commit 2");
+}
+
+/// Build a repo with `main` at "initial" and a linear `feature` branch carrying
+/// one commit per message (HEAD left on `feature`). Uses `make_commit` so commit
+/// messages can be arbitrary, including duplicates or empty.
+fn linear_feature_repo(messages: &[&str]) -> (tempfile::TempDir, Repository) {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    {
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Test User").unwrap();
+        config.set_str("user.email", "test@example.com").unwrap();
+    }
+
+    let base = make_commit(&repo, "refs/heads/main", "base.txt", "base", "initial", &[]);
+    let mut parent_id = base;
+    for (i, message) in messages.iter().enumerate() {
+        let parent = repo.find_commit(parent_id).unwrap();
+        parent_id = make_commit(
+            &repo,
+            "refs/heads/feature",
+            &format!("f{i}.txt"),
+            &format!("c{i}"),
+            message,
+            &[&parent],
+        );
+    }
+
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+    (dir, repo)
+}
+
+fn write_editor(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+    let editor = dir.join("editor.sh");
+    fs::write(&editor, format!("#!/bin/sh\n{body} \"$1\"\n")).unwrap();
+    make_executable(&editor);
+    editor
+}
+
+/// Two bare `branch` rows whose commits slug to the same base name are
+/// disambiguated with numeric suffixes (`dup`, `dup-2`).
+#[test]
+fn test_split_auto_name_disambiguates_colliding_slugs() {
+    let (dir, repo) = linear_feature_repo(&["dup", "dup"]);
+    let editor = write_editor(dir.path(), "perl -i -pe 's/ dup$/ dup\\nbranch/'");
+
+    kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .assert()
+        .success();
+
+    assert!(
+        repo.find_branch("dup", git2::BranchType::Local).is_ok(),
+        "first colliding slug should take the base name"
+    );
+    assert!(
+        repo.find_branch("dup-2", git2::BranchType::Local).is_ok(),
+        "second colliding slug should be disambiguated to dup-2"
+    );
+}
+
+/// A bare `branch` row before any commit line is rejected.
+#[test]
+fn test_split_bare_branch_row_without_commit_errors() {
+    let (dir, _repo) = linear_feature_repo(&["work one", "work two"]);
+    // Prepend a bare `branch` row before the first commit line.
+    let editor = write_editor(dir.path(), "perl -i -pe 'print \"branch\\n\" if $. == 1'");
+
+    kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("must follow a commit line"));
+}
+
+/// A bare `branch` row on a commit whose summary yields no slug is rejected.
+#[test]
+fn test_split_bare_branch_row_on_empty_summary_errors() {
+    let (dir, _repo) = linear_feature_repo(&[""]);
+    // The empty-summary commit renders as "<sha> " (trailing space); add a bare
+    // `branch` row after it.
+    let editor = write_editor(dir.path(), "perl -i -pe 's/^([0-9a-f]{7} )$/$1\\nbranch/'");
+
+    kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Cannot derive a branch name"));
+}
+
+/// A bare `branch` row whose preceding commit id no longer resolves reports the
+/// commit-resolution error, not a misleading "empty summary".
+#[test]
+fn test_split_bare_branch_row_on_unresolvable_commit_errors() {
+    let (dir, _repo) = setup_repo();
+    // Tamper the first commit's SHA to a non-matching prefix and drop a bare
+    // `branch` row under it.
+    let editor = write_editor(
+        dir.path(),
+        "perl -i -pe 's/^[0-9a-f]{7}( commit 1)$/0000000$1\\nbranch/'",
+    );
+
+    kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("was modified or moved"));
+}

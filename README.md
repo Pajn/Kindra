@@ -58,7 +58,7 @@ cargo release 0.3.0 --execute
 
 ## Quick Start
 
-1. **Start a stack**: Create several branches, each building on the previous one.
+1. **Start a stack**: Create several branches, each building on the previous one — with plain `git checkout -b`, or `kin commit -b <name>` to fork a branch and commit onto it in one step (add `--insert` to splice it into the middle of an existing stack).
 2. **Make a change**: Checkout a branch in the middle of the stack and run `kin commit`.
 3. **Watch the magic**: Kindra will automatically rebase all branches that depend on your change.
 4. **Move the stack**: Ready to target a different feature? `kin move --onto main` to relocate the entire stack.

@@ -4245,3 +4245,469 @@ fn test_commit_on_conflicted_stash_restore_stays_resumable() {
         "we must end up back on the caller branch"
     );
 }
+
+/// Stage `content` into `file` under `dir`.
+fn stage(dir: &Path, file: &str, content: &str) {
+    fs::write(dir.join(file), content).unwrap();
+    run_ok("git", &["add", file], dir);
+}
+
+/// A `kin commit` invocation with the git identity/editor env pinned so it never
+/// blocks on an editor.
+fn kin_commit(dir: &Path) -> assert_cmd::Command {
+    let mut cmd = kin_cmd();
+    cmd.arg("commit")
+        .current_dir(dir)
+        .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com");
+    cmd
+}
+
+fn checkout(repo: &Repository, branch: &str) {
+    repo.set_head(&format!("refs/heads/{branch}")).unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+}
+
+/// `kin commit -b <name>` forks a new branch off the current commit: the new
+/// branch carries the commit, the current branch is untouched, and HEAD ends on
+/// the new branch — the `git checkout -b && commit` shortcut.
+#[test]
+fn test_commit_new_branch_forks_from_current() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+
+    stage(dir.path(), "x.txt", "x");
+    kin_commit(dir.path())
+        .arg("-b")
+        .arg("topic")
+        .arg("-m")
+        .arg("add x")
+        .assert()
+        .success();
+
+    let topic_id = repo.revparse_single("topic").unwrap().id();
+    let topic = repo.find_commit(topic_id).unwrap();
+    assert_eq!(
+        topic.parent_id(0).unwrap(),
+        main_id,
+        "new branch forks off the current commit"
+    );
+    assert_eq!(
+        repo.revparse_single("main").unwrap().id(),
+        main_id,
+        "the current branch must not move"
+    );
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "topic");
+}
+
+/// With no explicit name, the branch is slugified from the commit subject.
+#[test]
+fn test_commit_new_branch_slugifies_message() {
+    let (dir, _repo) = setup_repo();
+
+    stage(dir.path(), "x.txt", "x");
+    kin_commit(dir.path())
+        .arg("--new-branch")
+        .arg("-m")
+        .arg("Add cool parser!")
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert!(
+        repo.find_branch("add-cool-parser", git2::BranchType::Local)
+            .is_ok(),
+        "branch name should be slugified from the subject"
+    );
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "add-cool-parser");
+}
+
+/// `--insert` splices the new branch into the stack: children of the current
+/// branch are restacked onto it, forming current -> new -> children.
+#[test]
+fn test_commit_new_branch_insert_restacks_children() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "commit a",
+        &[&main_commit],
+    );
+    let a_commit = repo.find_commit(a_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "commit b",
+        &[&a_commit],
+    );
+
+    checkout(&repo, "feature-a");
+    stage(dir.path(), "mid.txt", "mid");
+    kin_commit(dir.path())
+        .arg("-b")
+        .arg("mid")
+        .arg("--insert")
+        .arg("-m")
+        .arg("mid commit")
+        .assert()
+        .success();
+
+    // feature-a stays put; mid forks off it; feature-b is restacked onto mid.
+    assert_eq!(
+        repo.revparse_single("feature-a").unwrap().id(),
+        a_id,
+        "the branch we inserted below must not move"
+    );
+    let mid_id = repo.revparse_single("mid").unwrap().id();
+    let mid = repo.find_commit(mid_id).unwrap();
+    assert_eq!(mid.parent_id(0).unwrap(), a_id);
+
+    let new_b_id = repo.revparse_single("feature-b").unwrap().id();
+    let new_b = repo.find_commit(new_b_id).unwrap();
+    assert_eq!(
+        new_b.parent_id(0).unwrap(),
+        mid_id,
+        "child must be restacked onto the inserted branch"
+    );
+    assert_eq!(new_b.message().unwrap(), "commit b");
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "mid");
+}
+
+/// `--insert` on a branch with no children takes the "nothing to move" early
+/// return: it creates the branch with the commit, runs no restack, and leaves no
+/// saved operation state.
+#[test]
+fn test_commit_new_branch_insert_with_no_children_just_commits() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "commit a",
+        &[&main_commit],
+    );
+
+    checkout(&repo, "feature-a");
+    stage(dir.path(), "mid.txt", "mid");
+    kin_commit(dir.path())
+        .arg("-b")
+        .arg("mid")
+        .arg("--insert")
+        .arg("-m")
+        .arg("mid commit")
+        .assert()
+        .success();
+
+    let mid_id = repo.revparse_single("mid").unwrap().id();
+    assert_eq!(
+        repo.find_commit(mid_id).unwrap().parent_id(0).unwrap(),
+        a_id,
+        "mid forks off the childless branch"
+    );
+    assert_eq!(
+        repo.revparse_single("feature-a").unwrap().id(),
+        a_id,
+        "feature-a must not move"
+    );
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "mid");
+    assert!(
+        !dir.path().join(".git/kindra_rebase_state.json").exists(),
+        "no children means no restack, so no state is saved"
+    );
+}
+
+/// Set up an `--insert` whose child restack conflicts, and stop mid-rebase.
+/// Returns feature-a's commit id (feature-b's original parent).
+fn setup_insert_conflict(dir: &Path, repo: &Repository) -> git2::Oid {
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+    let a_id = make_commit(
+        repo,
+        "refs/heads/feature-a",
+        "shared.txt",
+        "original\n",
+        "commit a",
+        &[&main_commit],
+    );
+    let a_commit = repo.find_commit(a_id).unwrap();
+    make_commit(
+        repo,
+        "refs/heads/feature-b",
+        "shared.txt",
+        "feature b\n",
+        "commit b",
+        &[&a_commit],
+    );
+
+    checkout(repo, "feature-a");
+    // The inserted commit rewrites shared.txt, so restacking feature-b onto it
+    // conflicts on that file.
+    stage(dir, "shared.txt", "mid change\n");
+    kin_commit(dir)
+        .arg("-b")
+        .arg("mid")
+        .arg("--insert")
+        .arg("-m")
+        .arg("mid commit")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Resolve conflicts"));
+    assert!(
+        dir.join(".git/kindra_rebase_state.json").exists(),
+        "a conflicting insert restack must leave resumable state"
+    );
+    a_id
+}
+
+/// A conflict during the `--insert` restack is resumable: resolve it, `kin
+/// continue`, and the child lands on the inserted branch.
+#[test]
+fn test_commit_new_branch_insert_conflict_recovers_with_continue() {
+    let (dir, repo) = setup_repo();
+    setup_insert_conflict(dir.path(), &repo);
+
+    fs::write(dir.path().join("shared.txt"), "resolved\n").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+    kin_cmd()
+        .arg("continue")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    let mid_id = repo.revparse_single("mid").unwrap().id();
+    let new_b = repo
+        .find_commit(repo.revparse_single("feature-b").unwrap().id())
+        .unwrap();
+    assert_eq!(
+        new_b.parent_id(0).unwrap(),
+        mid_id,
+        "feature-b must be restacked onto the inserted branch after continue"
+    );
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "mid");
+}
+
+/// A conflict during the `--insert` restack is abortable: `kin abort` clears the
+/// state and restores the child to its pre-insert parent.
+#[test]
+fn test_commit_new_branch_insert_conflict_recovers_with_abort() {
+    let (dir, repo) = setup_repo();
+    let a_id = setup_insert_conflict(dir.path(), &repo);
+
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    let new_b = repo
+        .find_commit(repo.revparse_single("feature-b").unwrap().id())
+        .unwrap();
+    assert_eq!(
+        new_b.parent_id(0).unwrap(),
+        a_id,
+        "abort must restore feature-b to its pre-insert parent"
+    );
+
+    // Only the restack is rolled back: the inserted branch survives with the
+    // already-applied commit on top of feature-a, and we end up on it (it is
+    // the operation's original_branch).
+    assert_eq!(
+        repo.head().unwrap().shorthand().unwrap(),
+        "mid",
+        "abort must leave HEAD on the inserted branch"
+    );
+    let mid = repo
+        .find_commit(repo.revparse_single("mid").unwrap().id())
+        .unwrap();
+    assert_eq!(
+        mid.summary().unwrap(),
+        "mid commit",
+        "the inserted branch must keep the applied commit"
+    );
+    assert_eq!(
+        mid.parent_id(0).unwrap(),
+        a_id,
+        "the inserted commit must remain on top of feature-a"
+    );
+}
+
+/// Without `--insert`, a new branch is a sibling fork: existing children stay on
+/// the current branch and are not moved.
+#[test]
+fn test_commit_new_branch_fork_leaves_children_in_place() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "commit a",
+        &[&main_commit],
+    );
+    let a_commit = repo.find_commit(a_id).unwrap();
+    let b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "commit b",
+        &[&a_commit],
+    );
+
+    checkout(&repo, "feature-a");
+    stage(dir.path(), "sib.txt", "sib");
+    kin_commit(dir.path())
+        .arg("-b")
+        .arg("sibling")
+        .arg("-m")
+        .arg("sibling commit")
+        .assert()
+        .success();
+
+    assert_eq!(repo.revparse_single("feature-a").unwrap().id(), a_id);
+    assert_eq!(
+        repo.revparse_single("feature-b").unwrap().id(),
+        b_id,
+        "a fork must not restack existing children"
+    );
+    let sibling_id = repo.revparse_single("sibling").unwrap().id();
+    assert_eq!(
+        repo.find_commit(sibling_id).unwrap().parent_id(0).unwrap(),
+        a_id,
+    );
+}
+
+/// `--insert` without `--new-branch` is rejected up front.
+#[test]
+fn test_commit_insert_without_new_branch_errors() {
+    let (dir, _repo) = setup_repo();
+    stage(dir.path(), "x.txt", "x");
+    kin_commit(dir.path())
+        .arg("--insert")
+        .arg("-m")
+        .arg("x")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--insert requires --new-branch"));
+}
+
+/// `-b` with neither an explicit name nor a message to slugify is rejected before
+/// any branch is created.
+#[test]
+fn test_commit_new_branch_without_name_or_message_errors() {
+    let (dir, repo) = setup_repo();
+    stage(dir.path(), "x.txt", "x");
+    kin_commit(dir.path())
+        .arg("-b")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("needs a branch name"));
+    // No stray branch was created and HEAD is untouched.
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "main");
+}
+
+/// `-b` onto an existing branch name is rejected.
+#[test]
+fn test_commit_new_branch_existing_name_errors() {
+    let (dir, _repo) = setup_repo();
+    stage(dir.path(), "x.txt", "x");
+    kin_commit(dir.path())
+        .arg("-b")
+        .arg("feature")
+        .arg("-m")
+        .arg("x")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("already exists"));
+}
+
+/// When `git commit` fails after the branch is created, the branch creation is
+/// rolled back: HEAD returns to the original branch and the new branch is gone.
+#[cfg(unix)]
+#[test]
+fn test_commit_new_branch_rolls_back_on_failed_commit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, repo) = setup_repo();
+    // A failing pre-commit hook makes `git commit` fail *after* the branch exists.
+    let hook = dir.path().join(".git/hooks/pre-commit");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    stage(dir.path(), "x.txt", "x");
+    kin_commit(dir.path())
+        .arg("-b")
+        .arg("topic")
+        .arg("-m")
+        .arg("x")
+        .assert()
+        .failure();
+
+    assert!(
+        repo.find_branch("topic", git2::BranchType::Local).is_err(),
+        "failed commit must not leave the created branch behind"
+    );
+    assert_eq!(
+        repo.head().unwrap().shorthand().unwrap(),
+        "main",
+        "rollback must return to the original branch"
+    );
+}
+
+/// When a slugified branch name already exists, the derived name is
+/// disambiguated with a numeric suffix (base, base-2, …).
+#[test]
+fn test_commit_new_branch_slug_collision_gets_numeric_suffix() {
+    let (dir, repo) = setup_repo();
+
+    stage(dir.path(), "one.txt", "one");
+    kin_commit(dir.path())
+        .arg("-b")
+        .arg("-m")
+        .arg("Shared subject")
+        .assert()
+        .success();
+    assert!(
+        repo.find_branch("shared-subject", git2::BranchType::Local)
+            .is_ok()
+    );
+
+    // A second commit whose subject slugs to the same base must not collide with
+    // the first branch; it should be disambiguated to `shared-subject-2`.
+    checkout(&repo, "main");
+    stage(dir.path(), "two.txt", "two");
+    kin_commit(dir.path())
+        .arg("-b")
+        .arg("-m")
+        .arg("Shared subject")
+        .assert()
+        .success();
+    assert!(
+        repo.find_branch("shared-subject-2", git2::BranchType::Local)
+            .is_ok(),
+        "second slug collision should be disambiguated to shared-subject-2"
+    );
+    assert_eq!(
+        repo.head().unwrap().shorthand().unwrap(),
+        "shared-subject-2"
+    );
+}

@@ -411,6 +411,76 @@ pub fn resolve_rebase_autostash(repo: &Repository, cli_override: Option<bool>) -
     Ok(false)
 }
 
+/// Turn a commit-message subject into a git-safe branch slug: ASCII-lowercased,
+/// with every run of non-alphanumeric characters collapsed to a single `-`,
+/// trimmed of leading/trailing `-`, and capped in length. Returns `None` when
+/// nothing usable remains (an empty or all-punctuation subject) so callers can
+/// fall back to requiring an explicit name.
+pub fn slugify_subject(subject: &str) -> Option<String> {
+    const MAX_LEN: usize = 50;
+
+    let mut slug = String::new();
+    let mut pending_separator = false;
+    for ch in subject.chars() {
+        if ch.is_ascii_alphanumeric() {
+            // Only emit a separator once we know a real character follows, so
+            // leading punctuation never produces a leading `-`.
+            if pending_separator && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_separator = false;
+            slug.push(ch.to_ascii_lowercase());
+        } else {
+            pending_separator = true;
+        }
+    }
+
+    // The slug is pure ASCII, so truncating on a byte boundary is safe; drop any
+    // separator the cut leaves dangling at the end.
+    if slug.len() > MAX_LEN {
+        slug.truncate(MAX_LEN);
+        while slug.ends_with('-') {
+            slug.pop();
+        }
+    }
+
+    if slug.is_empty() { None } else { Some(slug) }
+}
+
+/// Return the first of `base`, `base-2`, `base-3`, … that is neither an existing
+/// local branch nor already present in `taken` (names claimed earlier in the
+/// same operation). Errors if the chosen name is not a valid git branch name.
+pub fn disambiguate_branch_name(
+    repo: &Repository,
+    base: &str,
+    taken: &HashSet<String>,
+) -> Result<String> {
+    let is_taken = |name: &str| -> Result<bool> {
+        if taken.contains(name) {
+            return Ok(true);
+        }
+        match repo.find_branch(name, BranchType::Local) {
+            Ok(_) => Ok(true),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(false),
+            Err(e) => Err(anyhow!(e)),
+        }
+    };
+
+    let mut candidate = base.to_string();
+    let mut suffix = 2;
+    while is_taken(&candidate)? {
+        candidate = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+
+    if !git2::Branch::name_is_valid(&candidate)? {
+        return Err(anyhow!(
+            "Derived branch name '{candidate}' is not a valid git branch name; pass a name explicitly."
+        ));
+    }
+    Ok(candidate)
+}
+
 fn read_repo_upstream_override(repo: &Repository) -> Result<Option<String>> {
     let cfg = read_repo_config(repo)?;
 
@@ -477,4 +547,55 @@ fn read_toml_config<T: for<'de> Deserialize<'de>>(
 
 fn global_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|dir| dir.join("kindra").join("config.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slugify_subject;
+
+    #[test]
+    fn slugify_basic() {
+        assert_eq!(
+            slugify_subject("Add cool parser").as_deref(),
+            Some("add-cool-parser")
+        );
+    }
+
+    #[test]
+    fn slugify_collapses_and_trims_punctuation() {
+        assert_eq!(
+            slugify_subject("  Fix: the (null) deref!!  ").as_deref(),
+            Some("fix-the-null-deref")
+        );
+    }
+
+    #[test]
+    fn slugify_drops_non_ascii() {
+        // Each non-ASCII char is a separator boundary, so accented letters split
+        // the surrounding word rather than being transliterated.
+        assert_eq!(
+            slugify_subject("café déjà vu").as_deref(),
+            Some("caf-d-j-vu")
+        );
+    }
+
+    #[test]
+    fn slugify_empty_and_punctuation_only_yield_none() {
+        assert_eq!(slugify_subject(""), None);
+        assert_eq!(slugify_subject("   "), None);
+        assert_eq!(slugify_subject("!!! ---"), None);
+    }
+
+    #[test]
+    fn slugify_truncates_without_trailing_dash() {
+        let long = "a".repeat(60);
+        let slug = slugify_subject(&long).unwrap();
+        assert_eq!(slug.len(), 50);
+
+        // A cut landing on a separator must not leave a dangling '-'.
+        let subject = format!("{} more words here", "word ".repeat(10));
+        let slug = slugify_subject(&subject).unwrap();
+        assert!(!slug.ends_with('-'), "slug ended with '-': {slug}");
+        assert!(slug.len() <= 50);
+    }
 }

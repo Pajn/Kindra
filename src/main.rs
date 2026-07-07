@@ -113,7 +113,14 @@ enum Commands {
     Absorb(AbsorbArgs),
     /// Commits and rebases dependent branches
     Commit {
-        /// Arguments to pass to git commit. Supports --on <branch>, --fixup <sha>, and --force.
+        /// Arguments forwarded to `git commit` (e.g. -m, --amend, pathspecs after --).
+        ///
+        /// Kindra intercepts a few flags before forwarding: --on <branch> commits
+        /// onto another branch, --fixup <sha> folds into a stack commit, and
+        /// --force overrides worktree/dirty checks. Separately, -b/--new-branch
+        /// [name] commits onto a new branch created off HEAD (name derived from the
+        /// message if omitted); add --insert to splice it into the stack, restacking
+        /// the current branch's children onto it.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
