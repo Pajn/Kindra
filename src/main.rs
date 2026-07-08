@@ -22,6 +22,7 @@ use crate::commands::rename::{RenameArgs, rename};
 use crate::commands::reorder::{ReorderArgs, reorder};
 use crate::commands::restack::{RestackArgs, restack};
 use crate::commands::run::{RunArgs, run};
+use crate::commands::shell_init::{ShellInitArgs, shell_init};
 use crate::commands::split::{SplitArgs, split};
 use crate::commands::status_cmd::status_cmd;
 use crate::commands::sync::{SyncArgs, sync};
@@ -159,6 +160,8 @@ enum Commands {
         /// The shell to generate completions for
         shell: ShellChoice,
     },
+    /// Print shell integration (e.g. the `kin wt cd` wrapper) to eval in your shell config
+    ShellInit(ShellInitArgs),
 }
 
 #[derive(clap::ValueEnum, Clone, Copy)]
@@ -297,6 +300,7 @@ fn dispatch() -> Result<()> {
                 &mut std::io::stdout(),
             ),
         },
+        Commands::ShellInit(args) => shell_init(args)?,
     }
 
     Ok(())

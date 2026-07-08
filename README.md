@@ -127,6 +127,8 @@ Kindra now includes an opinionated `kin wt` workflow for managed git worktrees:
 - `kin wt add [branch]` creates (or reuses) a durable worktree for a branch in a sibling directory, or in `<repo>/worktrees/{branch}` when the repository has no parent directory, and `kin wt add -b <new-branch> [start-point]` creates a new branch in one. Unlike `temp`, added worktrees are never auto-cleaned.
 - `kin wt list` shows every git worktree and its current state (role, or `-` for plain worktrees).
 - `kin wt path <target>` prints just the worktree path for shell/editor integrations.
+- `kin wt cd <target>` changes directory into a worktree (needs shell integration — see below).
+- `kin shell-init <bash|zsh|fish>` (top-level) prints the shell snippet that enables `kin wt cd`.
 - `kin wt remove <target>` removes a worktree (by role or branch) with confirmation by default.
 - `kin wt cleanup` removes merged Kindra-managed temp worktrees.
 
@@ -165,12 +167,33 @@ kin wt add feature/auth
 # Use the resolved path in shell tooling
 cd "$(kin wt path review)"
 
+# Or, with shell integration enabled, cd straight into a worktree
+kin wt cd feature/auth
+
 # Remove a single managed temp worktree
 kin wt remove feature/auth
 
 # Clean up merged temp worktrees
 kin wt cleanup
 ```
+
+### Shell integration (`kin wt cd`)
+
+`kin wt cd <target>` moves your shell into a worktree. Because a CLI process can't change its parent shell's directory, this needs a one-time wrapper (from the top-level `kin shell-init`) in your shell config:
+
+```bash
+# bash / zsh
+eval "$(kin shell-init zsh)"
+```
+
+```fish
+# fish
+kin shell-init fish | source
+```
+
+The wrapper intercepts `kin wt cd` and forwards everything else straight to `kin`. Without it, `kin wt cd` just prints the path (and tells you how to enable the integration).
+
+`kin shell-init` also registers Kindra's shell completions by default, so that one line sets up both. Pass `--no-completions` if you install completions separately.
 
 ### Worktree config
 
