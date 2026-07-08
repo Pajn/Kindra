@@ -14,6 +14,8 @@ pub enum WorktreeSubcommand {
     Review(ReviewArgs),
     /// Create or reuse a temp worktree for a branch, or create a new branch with `-b`
     Temp(TempArgs),
+    /// Create (or reuse) a durable worktree for a branch in a sibling directory
+    Add(AddArgs),
     /// Print the path for a managed worktree target
     Path(PathArgs),
     /// Remove a managed worktree target
@@ -33,9 +35,11 @@ pub struct ReviewArgs {
     pub force: bool,
 }
 
+/// The shared `[-b <new-branch>] [<branch-or-start-point>]` argument shape used
+/// by both `kin wt temp` and `kin wt add`.
 #[derive(Args, Clone, Debug)]
-pub struct TempArgs {
-    /// Create and check out a new branch in the temp worktree
+pub struct NewBranchOrTargetArgs {
+    /// Create and check out a new branch in the worktree
     #[arg(short = 'b', long = "branch", value_name = "NEW_BRANCH")]
     pub new_branch: Option<String>,
 
@@ -45,6 +49,22 @@ pub struct TempArgs {
         add = crate::commands::local_branch_completer()
     )]
     pub target: Option<String>,
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct TempArgs {
+    #[command(flatten)]
+    pub branch: NewBranchOrTargetArgs,
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct AddArgs {
+    #[command(flatten)]
+    pub branch: NewBranchOrTargetArgs,
+
+    /// Explicit path for the worktree, overriding the configured default location
+    #[arg(long, value_name = "PATH")]
+    pub path: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -87,12 +107,21 @@ pub fn worktree(subcommand: &Option<WorktreeSubcommand>) -> Result<()> {
             println!("{}", result.path.display());
         }
         Some(WorktreeSubcommand::Temp(args)) => {
-            let result = match args.new_branch.as_deref() {
+            let result = match args.branch.new_branch.as_deref() {
                 Some(new_branch) => {
-                    roles::ensure_temp_new_branch(&repo, new_branch, args.target.as_deref())?
+                    roles::ensure_temp_new_branch(&repo, new_branch, args.branch.target.as_deref())?
                 }
-                None => roles::ensure_temp(&repo, args.target.as_deref())?,
+                None => roles::ensure_temp(&repo, args.branch.target.as_deref())?,
             };
+            println!("{}", result.path.display());
+        }
+        Some(WorktreeSubcommand::Add(args)) => {
+            let result = roles::ensure_added(
+                &repo,
+                args.branch.new_branch.as_deref(),
+                args.branch.target.as_deref(),
+                args.path.as_deref(),
+            )?;
             println!("{}", result.path.display());
         }
         Some(WorktreeSubcommand::Path(args)) => {

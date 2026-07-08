@@ -124,18 +124,19 @@ Kindra now includes an opinionated `kin wt` workflow for managed git worktrees:
 - `kin wt main` ensures a stable trunk worktree exists.
 - `kin wt review [branch]` creates or reuses a fixed review worktree and repoints it safely.
 - `kin wt temp [branch]` creates or reuses a branch-scoped disposable worktree, and `kin wt temp -b <new-branch> [start-point]` creates a new branch in one.
-- `kin wt list` shows all Kindra-managed worktrees and their current state.
-- `kin wt path <target>` prints just the managed path for shell/editor integrations.
-- `kin wt remove <target>` removes an explicit managed worktree with confirmation by default.
-- `kin wt cleanup` removes merged or stale Kindra-managed temp worktrees.
+- `kin wt add [branch]` creates (or reuses) a durable worktree for a branch in a sibling directory, or in `<repo>/worktrees/{branch}` when the repository has no parent directory, and `kin wt add -b <new-branch> [start-point]` creates a new branch in one. Unlike `temp`, added worktrees are never auto-cleaned.
+- `kin wt list` shows every git worktree and its current state (role, or `-` for plain worktrees).
+- `kin wt path <target>` prints just the worktree path for shell/editor integrations.
+- `kin wt remove <target>` removes a worktree (by role or branch) with confirmation by default.
+- `kin wt cleanup` removes merged Kindra-managed temp worktrees.
 
-By default Kindra stores managed worktrees under:
+By default Kindra stores the role worktrees (`main`/`review`/`temp`) under:
 
 ```text
 .git/kindra-worktrees/
 ```
 
-That keeps extra working trees out of the repo root while still making them easy to find and clean up.
+That keeps disposable working trees out of the repo root while still making them easy to find and clean up. Durable `kin wt add` worktrees instead default to a sibling directory (`../<repo>-worktrees/{branch}`), or to `<repo>/worktrees/{branch}` when the repository has no parent directory, so they're visible to editors and `git status`.
 
 ### Examples
 
@@ -158,6 +159,9 @@ kin wt temp -b feature/spike
 # Create a new temp worktree branch from origin/main
 kin wt temp -b hotfix/main origin/main
 
+# Create a durable sibling worktree for a branch you want to keep checked out
+kin wt add feature/auth
+
 # Use the resolved path in shell tooling
 cd "$(kin wt path review)"
 
@@ -175,6 +179,9 @@ Managed worktrees use repo-local config in `.git/kindra.toml`:
 ```toml
 [worktrees]
 trunk = "main"
+# Default location for `kin wt add` ({branch} required; sibling dir by default,
+# falling back to <repo>/worktrees when the repo has no parent directory).
+add_path_template = "../myrepo-worktrees/{branch}"
 
 [worktrees.hooks]
 on_create = []
@@ -196,10 +203,11 @@ Notes:
 
 - `main` is pinned to the configured trunk branch.
 - `review` reuses a fixed path and refuses to discard local changes unless you confirm or pass `--force`.
-- `cleanup` only targets Kindra-managed `temp` worktrees, never `main` or `review`.
+- `add` worktrees default to `add_path_template`; by default that is a sibling directory, or `<repo>/worktrees/{branch}` when the repo has no parent directory. Pass `--path` to override. Unlike the role paths it isn't required to live under the managed root.
+- `cleanup` only targets Kindra-managed `temp` worktrees, never `main`, `review`, or plain/added worktrees.
 - `kin wt path` is the script-friendly command: it prints only the resolved path on success.
-- Use `branch:<name>` with `kin wt path` or `kin wt remove` to target a temp branch literally named `main` or `review`.
-- Hooks run in the managed worktree directory and stop the action if they fail.
+- Use `branch:<name>` with `kin wt path` or `kin wt remove` to target a branch literally named `main` or `review`.
+- Hooks run in the worktree directory and stop the action if they fail. `kin wt add` runs only the global `[worktrees.hooks]`; role worktrees run global plus role-specific hooks.
 
 ## Restack History Limit
 

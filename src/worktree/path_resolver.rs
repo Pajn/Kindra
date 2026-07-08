@@ -5,18 +5,18 @@ use std::path::{Component, Path, PathBuf};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorktreeTarget {
     Role(WorktreeRole),
-    TempBranch(String),
+    Branch(String),
 }
 
 pub fn parse_target(target: &str) -> WorktreeTarget {
     if let Some(branch) = target.strip_prefix("branch:") {
-        return WorktreeTarget::TempBranch(branch.to_string());
+        return WorktreeTarget::Branch(branch.to_string());
     }
 
     match target {
         "main" => WorktreeTarget::Role(WorktreeRole::Main),
         "review" => WorktreeTarget::Role(WorktreeRole::Review),
-        _ => WorktreeTarget::TempBranch(target.to_string()),
+        _ => WorktreeTarget::Branch(target.to_string()),
     }
 }
 
@@ -145,11 +145,11 @@ mod tests {
         );
         assert_eq!(
             parse_target("feature/a"),
-            super::WorktreeTarget::TempBranch("feature/a".to_string())
+            super::WorktreeTarget::Branch("feature/a".to_string())
         );
         assert_eq!(
             parse_target("branch:main"),
-            super::WorktreeTarget::TempBranch("main".to_string())
+            super::WorktreeTarget::Branch("main".to_string())
         );
     }
 
