@@ -387,6 +387,22 @@ pub fn delete_local_branch_if_tip_matches(
     }
 }
 
+pub fn force_delete_local_branch(repo: &Repository, branch: &str) -> Result<()> {
+    let output = Command::new("git")
+        .current_dir(repo_root(repo)?)
+        .args(["branch", "-D", "--quiet", branch])
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "Failed to force-delete branch '{}': {}",
+            branch,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 fn remote_for_branch(repo: &Repository, branch: &str) -> Result<Option<String>> {
     let branches = repo.branches(Some(BranchType::Remote))?;
     for branch_result in branches {
