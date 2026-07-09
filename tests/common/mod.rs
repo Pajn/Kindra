@@ -171,6 +171,16 @@ pub fn current_branch(cwd: &Path) -> String {
 }
 
 #[allow(dead_code)]
+pub fn branch_exists(repo_root: &Path, branch: &str) -> bool {
+    git_command(repo_root)
+        .args(["rev-parse", "--verify", "--quiet", branch])
+        .output()
+        .expect("git rev-parse failed")
+        .status
+        .success()
+}
+
+#[allow(dead_code)]
 pub fn managed_worktree_path(repo_root: &Path, relative: &str) -> PathBuf {
     repo_root.join(".git/kindra-worktrees").join(relative)
 }

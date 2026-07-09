@@ -84,6 +84,15 @@ pub struct RemoveArgs {
     /// Force removal when git requires it (for example a dirty worktree)
     #[arg(long)]
     pub force: bool,
+
+    /// Also delete the associated local branch (default when the branch is
+    /// merged into trunk for temp or plain worktrees)
+    #[arg(long, conflicts_with = "keep_branch")]
+    pub with_branch: bool,
+
+    /// Do not delete the associated local branch
+    #[arg(long)]
+    pub keep_branch: bool,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -91,6 +100,11 @@ pub struct CleanupArgs {
     /// Force removal when git requires it (for example a dirty worktree)
     #[arg(long)]
     pub force: bool,
+
+    /// Do not delete the merged local branches (by default cleanup deletes
+    /// branches for merged temp worktrees)
+    #[arg(long)]
+    pub keep_branch: bool,
 }
 
 pub fn worktree(subcommand: &Option<WorktreeSubcommand>) -> Result<()> {
@@ -147,25 +161,45 @@ pub fn worktree(subcommand: &Option<WorktreeSubcommand>) -> Result<()> {
             }
         }
         Some(WorktreeSubcommand::Remove(args)) => {
-            let result = roles::remove_target(&repo, &args.target, args.force)?;
-            println!(
+            let result = roles::remove_target(
+                &repo,
+                &args.target,
+                args.force,
+                args.keep_branch,
+                args.with_branch,
+            )?;
+            let mut msg = format!(
                 "Removed {} worktree '{}' ({})",
                 result.role,
                 result.branch,
                 result.path.display()
             );
+            if result.branch_deleted {
+                if let Some(tip) = &result.deleted_branch_tip {
+                    let short: String = tip.chars().take(12).collect();
+                    msg.push_str(&format!(" and deleted branch (was {})", short));
+                } else {
+                    msg.push_str(" and deleted branch");
+                }
+            }
+            println!("{}", msg);
         }
         Some(WorktreeSubcommand::Cleanup(args)) => {
-            let summary = roles::cleanup_temp_worktrees(&repo, args.force)?;
+            let summary = roles::cleanup_temp_worktrees(&repo, args.force, args.keep_branch)?;
             if summary.candidates == 0 {
                 println!("No temp worktrees are eligible for cleanup.");
             } else {
-                println!(
+                let branches_deleted = summary.removed.iter().filter(|r| r.branch_deleted).count();
+                let mut msg = format!(
                     "Cleanup complete: found {} temp worktree candidate(s), removed {}, skipped {}.",
                     summary.candidates,
                     summary.removed.len(),
                     summary.skipped
                 );
+                if branches_deleted > 0 {
+                    msg.push_str(&format!(" Deleted {} branch(es).", branches_deleted));
+                }
+                println!("{}", msg);
             }
         }
     }

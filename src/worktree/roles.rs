@@ -1,12 +1,12 @@
 use crate::worktree::WorktreeRole;
-use crate::worktree::cleanup::find_cleanup_candidates;
+use crate::worktree::cleanup::{CleanupCandidate, find_cleanup_candidates};
 use crate::worktree::config::{WorktreeConfig, load_worktree_config};
 use crate::worktree::git::{
     LiveWorktree, add_worktree, checkout_worktree_branch, checkout_worktree_detached,
     create_local_branch_from_start_point_strict, current_branch, current_head_oid,
     delete_local_branch_if_tip_matches, ensure_local_branch_exists,
-    ensure_local_branch_exists_from_start_point, is_worktree_dirty, list_live_worktrees,
-    live_worktree_map, remove_worktree, repo_root,
+    ensure_local_branch_exists_from_start_point, force_delete_local_branch, is_worktree_dirty,
+    list_live_worktrees, live_worktree_map, remove_worktree, repo_root,
 };
 use crate::worktree::hooks::{HookEvent, run_global_hooks, run_hooks};
 use crate::worktree::path_resolver::{
@@ -60,6 +60,10 @@ pub struct RemoveResult {
     pub role: String,
     pub branch: String,
     pub path: PathBuf,
+    /// Whether the local branch was also deleted as part of the operation.
+    pub branch_deleted: bool,
+    /// The tip commit of the branch at the time it was deleted (for recovery).
+    pub deleted_branch_tip: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -536,7 +540,13 @@ pub fn list_managed_worktrees(repo: &Repository) -> Result<Vec<WorktreeListRow>>
     Ok(rows)
 }
 
-pub fn remove_target(repo: &Repository, target: &str, force: bool) -> Result<RemoveResult> {
+pub fn remove_target(
+    repo: &Repository,
+    target: &str,
+    force: bool,
+    keep_branch: bool,
+    with_branch: bool,
+) -> Result<RemoveResult> {
     let ctx = load_context(repo)?;
     let resolved = resolve_target(&ctx, target)?;
     let role_label = role_label_for_path(&ctx.config, &resolved.path)?;
@@ -556,29 +566,114 @@ pub fn remove_target(repo: &Repository, target: &str, force: bool) -> Result<Rem
         ));
     }
 
-    let message = if dirty {
+    let is_trunk_branch = resolved.branch == ctx.config.trunk;
+    let worktree_role = role_for_path(&ctx.config, &normalize_path(&resolved.path))?;
+    let is_persistent_role = is_persistent_worktree_role(worktree_role);
+    let auto_delete_allowed =
+        ctx.config.temp.delete_merged && !is_trunk_branch && !is_persistent_role;
+
+    let will_delete_branch = if keep_branch {
+        false
+    } else if with_branch {
+        if is_trunk_branch {
+            return Err(anyhow!(
+                "Refusing to delete the trunk branch '{}'.",
+                resolved.branch
+            ));
+        }
+        true
+    } else if auto_delete_allowed {
+        // Only compute merged set when we actually need it for the default auto-delete path.
+        let merged_branches: HashSet<String> = crate::stack::collect_merged_local_branches(
+            repo,
+            &ctx.config.trunk,
+            &[&ctx.config.trunk],
+        )?
+        .into_iter()
+        .collect();
+        merged_branches.contains(&resolved.branch)
+    } else {
+        false
+    };
+
+    // If we plan to delete the branch, ensure it isn't checked out in another live worktree.
+    // For explicit --with-branch, hard error (user wants the branch gone).
+    // For default auto-delete, skip branch deletion but still remove the worktree (consistent with cleanup).
+    let explicit_branch_delete = with_branch;
+    let mut attempt_branch_delete = will_delete_branch;
+    if will_delete_branch {
+        match resolve_cross_worktree_branch_delete(
+            &ctx.live_worktrees,
+            &resolved.branch,
+            &resolved.path,
+            explicit_branch_delete,
+        ) {
+            CrossWorktreeBranchDeleteAction::Proceed => {}
+            CrossWorktreeBranchDeleteAction::Refuse { other_path } => {
+                return Err(anyhow!(
+                    "Branch '{}' is checked out in another worktree at '{}'. Remove or switch that worktree before deleting the branch.",
+                    resolved.branch,
+                    other_path.display()
+                ));
+            }
+            CrossWorktreeBranchDeleteAction::Skip { other_path } => {
+                println!(
+                    "Skipping branch delete for '{}' (checked out in another worktree at '{}').",
+                    resolved.branch,
+                    other_path.display()
+                );
+                attempt_branch_delete = false;
+            }
+        }
+    }
+
+    let branch_tip = if attempt_branch_delete {
+        capture_branch_tip_for_deletion(repo, &resolved.branch)
+    } else {
+        None
+    };
+
+    // Build confirmation message that includes branch deletion when applicable.
+    let worktree_desc = format!(
+        "{} worktree '{}' at '{}'",
+        role_label,
+        resolved.branch,
+        resolved.path.display()
+    );
+    let message = if branch_tip.is_some() {
+        if dirty {
+            format!(
+                "{} has uncommitted changes. Remove the worktree and delete branch '{}' anyway?",
+                worktree_desc, resolved.branch
+            )
+        } else {
+            format!(
+                "Remove {} and delete branch '{}'?",
+                worktree_desc, resolved.branch
+            )
+        }
+    } else if dirty {
         format!(
-            "Worktree '{}' for {} '{}' has uncommitted changes. Remove it anyway?",
-            resolved.path.display(),
-            role_label,
-            resolved.branch
+            "{} has uncommitted changes. Remove it anyway?",
+            worktree_desc
         )
     } else {
-        format!(
-            "Remove {} worktree '{}' at '{}'?",
-            role_label,
-            resolved.branch,
-            resolved.path.display()
-        )
+        format!("Remove {}?", worktree_desc)
     };
     confirm_or_abort(&message)?;
 
     remove_resolved_target(repo, &ctx.config, &resolved, force)?;
 
+    let (branch_deleted, deleted_branch_tip) = branch_tip
+        .map(|tip| delete_branch_after_removal(repo, &resolved.branch, tip, force))
+        .unwrap_or((false, None));
+
     Ok(RemoveResult {
         role: role_label,
         branch: resolved.branch,
         path: resolved.path,
+        branch_deleted,
+        deleted_branch_tip,
     })
 }
 
@@ -590,7 +685,113 @@ fn role_label_for_path(config: &WorktreeConfig, path: &Path) -> Result<String> {
         .unwrap_or_else(|| "plain".to_string()))
 }
 
-pub fn cleanup_temp_worktrees(repo: &Repository, force: bool) -> Result<CleanupSummary> {
+fn is_persistent_worktree_role(role: Option<WorktreeRole>) -> bool {
+    matches!(role, Some(WorktreeRole::Main | WorktreeRole::Review))
+}
+
+#[derive(Debug)]
+enum CrossWorktreeBranchDeleteAction {
+    Proceed,
+    Skip { other_path: PathBuf },
+    Refuse { other_path: PathBuf },
+}
+
+fn other_worktree_with_branch<'a>(
+    live_worktrees: &'a [LiveWorktree],
+    branch: &str,
+    excluding_path: &Path,
+) -> Option<&'a LiveWorktree> {
+    let excluded = normalize_path(excluding_path);
+    live_worktrees.iter().find(|worktree| {
+        worktree.branch.as_deref() == Some(branch) && worktree.normalized_path() != excluded
+    })
+}
+
+fn resolve_cross_worktree_branch_delete(
+    live_worktrees: &[LiveWorktree],
+    branch: &str,
+    path: &Path,
+    explicit_branch_delete: bool,
+) -> CrossWorktreeBranchDeleteAction {
+    let Some(other) = other_worktree_with_branch(live_worktrees, branch, path) else {
+        return CrossWorktreeBranchDeleteAction::Proceed;
+    };
+    if explicit_branch_delete {
+        CrossWorktreeBranchDeleteAction::Refuse {
+            other_path: other.path.clone(),
+        }
+    } else {
+        CrossWorktreeBranchDeleteAction::Skip {
+            other_path: other.path.clone(),
+        }
+    }
+}
+
+fn count_cross_worktree_branch_conflicts(
+    live_worktrees: &[LiveWorktree],
+    candidates: &[(CleanupCandidate, bool)],
+) -> usize {
+    candidates
+        .iter()
+        .filter(|(candidate, _)| {
+            other_worktree_with_branch(live_worktrees, &candidate.branch, &candidate.path).is_some()
+        })
+        .count()
+}
+
+fn capture_branch_tip_for_deletion(repo: &Repository, branch: &str) -> Option<Oid> {
+    match local_branch_tip(repo, branch) {
+        Ok(tip) => Some(tip),
+        Err(err) => {
+            eprintln!(
+                "Warning: failed to capture tip for branch '{}': {}. Branch will not be deleted.",
+                branch, err
+            );
+            None
+        }
+    }
+}
+
+/// Delete a branch after its worktree has been removed, using a tip captured
+/// beforehand. Warns and returns `(false, None)` on failure so callers can still
+/// report successful worktree removal.
+fn delete_branch_after_removal(
+    repo: &Repository,
+    branch: &str,
+    tip: Oid,
+    force: bool,
+) -> (bool, Option<String>) {
+    match delete_local_branch_if_tip_matches(repo, branch, tip) {
+        Ok(true) => (true, Some(tip.to_string())),
+        Ok(false) => {
+            if force {
+                match force_delete_local_branch(repo, branch) {
+                    Ok(()) => (true, Some(tip.to_string())),
+                    Err(err) => {
+                        eprintln!("Warning: {}", err);
+                        (false, None)
+                    }
+                }
+            } else {
+                eprintln!(
+                    "Note: did not delete branch '{}' (tip no longer matches the captured value; use --force to override).",
+                    branch
+                );
+                (false, None)
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to delete branch '{}': {}", branch, e);
+            (false, None)
+        }
+    }
+}
+
+pub fn cleanup_temp_worktrees(
+    repo: &Repository,
+    force: bool,
+    keep_branch: bool,
+) -> Result<CleanupSummary> {
     let ctx = load_context(repo)?;
     let candidates = find_cleanup_candidates(repo, &ctx.config, &ctx.live_worktrees)?;
     if candidates.is_empty() {
@@ -619,22 +820,42 @@ pub fn cleanup_temp_worktrees(repo: &Repository, force: bool) -> Result<CleanupS
         );
     }
 
-    let confirmation = if dirty_count == 0 {
+    let will_delete_branches = !keep_branch;
+    let cross_worktree_branch_skip_count = if will_delete_branches {
+        count_cross_worktree_branch_conflicts(&ctx.live_worktrees, &candidates_with_dirty)
+    } else {
+        0
+    };
+    let base = if will_delete_branches {
+        if cross_worktree_branch_skip_count > 0 {
+            format!(
+                "Remove {} temp worktree candidate(s) and delete branches where possible ({} checked out elsewhere)",
+                candidates_with_dirty.len(),
+                cross_worktree_branch_skip_count
+            )
+        } else {
+            format!(
+                "Remove {} temp worktree candidate(s) and delete their branches",
+                candidates_with_dirty.len()
+            )
+        }
+    } else {
         format!(
-            "Remove {} temp worktree candidate(s)?",
+            "Remove {} temp worktree candidate(s)",
             candidates_with_dirty.len()
         )
+    };
+    let confirmation = if dirty_count == 0 {
+        format!("{}?", base)
     } else if force {
         format!(
-            "Remove {} temp worktree candidate(s)? {} dirty candidate(s) will be removed.",
-            candidates_with_dirty.len(),
-            dirty_count
+            "{}? {} dirty candidate(s) will be removed.",
+            base, dirty_count
         )
     } else {
         format!(
-            "Remove {} temp worktree candidate(s)? {} dirty candidate(s) will be skipped without --force.",
-            candidates_with_dirty.len(),
-            dirty_count
+            "{}? {} dirty candidate(s) will be skipped without --force.",
+            base, dirty_count
         )
     };
     confirm_or_abort(&confirmation)?;
@@ -657,12 +878,52 @@ pub fn cleanup_temp_worktrees(repo: &Repository, force: bool) -> Result<CleanupS
             skipped += 1;
             continue;
         }
+
+        let mut do_branch_delete = will_delete_branches;
+        if do_branch_delete {
+            match resolve_cross_worktree_branch_delete(
+                &ctx.live_worktrees,
+                &resolved.branch,
+                &resolved.path,
+                false,
+            ) {
+                CrossWorktreeBranchDeleteAction::Proceed => {}
+                CrossWorktreeBranchDeleteAction::Refuse { .. } => {
+                    unreachable!(
+                        "cleanup never requests explicit branch deletion via --with-branch"
+                    )
+                }
+                CrossWorktreeBranchDeleteAction::Skip { other_path } => {
+                    println!(
+                        "Skipping branch delete for '{}' (checked out in another worktree at '{}').",
+                        resolved.branch,
+                        other_path.display()
+                    );
+                    do_branch_delete = false;
+                }
+            }
+        }
+
+        // Capture tip before removing the worktree (all cleanup candidates are merged).
+        let branch_tip = if do_branch_delete {
+            capture_branch_tip_for_deletion(repo, &resolved.branch)
+        } else {
+            None
+        };
+
         remove_resolved_target(repo, &ctx.config, &resolved, force)?;
+
+        let (branch_deleted, deleted_branch_tip) = branch_tip
+            .map(|tip| delete_branch_after_removal(repo, &resolved.branch, tip, force))
+            .unwrap_or((false, None));
+
         removed.push(RemoveResult {
             // Cleanup only ever targets temp worktrees.
             role: WorktreeRole::Temp.to_string(),
             branch: resolved.branch,
             path: resolved.path,
+            branch_deleted,
+            deleted_branch_tip,
         });
     }
 
@@ -1003,5 +1264,150 @@ fn rollback_review_checkout(
             "{hook_err}\nAdditionally failed to restore worktree '{}': {rollback_err}",
             path.display()
         ),
+    }
+}
+
+#[cfg(test)]
+mod branch_delete_tests {
+    use super::*;
+    use git2::BranchType;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn live(path: &str, branch: Option<&str>) -> LiveWorktree {
+        LiveWorktree {
+            path: PathBuf::from(path),
+            branch: branch.map(str::to_string),
+            detached: branch.is_none(),
+        }
+    }
+
+    #[test]
+    fn resolve_cross_worktree_refuses_explicit_delete() {
+        let path1 = PathBuf::from("/a");
+        let path2 = PathBuf::from("/b");
+        let worktrees = vec![live("/a", Some("feat")), live("/b", Some("feat"))];
+        match resolve_cross_worktree_branch_delete(&worktrees, "feat", &path1, true) {
+            CrossWorktreeBranchDeleteAction::Refuse { other_path } => {
+                assert_eq!(other_path, path2);
+            }
+            other => panic!("expected refuse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_cross_worktree_skips_auto_delete() {
+        let path1 = PathBuf::from("/a");
+        let path2 = PathBuf::from("/b");
+        let worktrees = vec![live("/a", Some("feat")), live("/b", Some("feat"))];
+        match resolve_cross_worktree_branch_delete(&worktrees, "feat", &path1, false) {
+            CrossWorktreeBranchDeleteAction::Skip { other_path } => {
+                assert_eq!(other_path, path2);
+            }
+            other => panic!("expected skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn count_cross_worktree_branch_conflicts_detects_blocked_candidates() {
+        let worktrees = vec![
+            live("/temp/feat", Some("feat")),
+            live("/review", Some("feat")),
+        ];
+        let candidates = vec![(
+            CleanupCandidate {
+                branch: "feat".to_string(),
+                path: PathBuf::from("/temp/feat"),
+                live: worktrees[0].clone(),
+            },
+            false,
+        )];
+        assert_eq!(
+            count_cross_worktree_branch_conflicts(&worktrees, &candidates),
+            1
+        );
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn init_repo(dir: &Path) -> git2::Repository {
+        git(dir, &["init", "--initial-branch=main"]);
+        git(dir, &["config", "user.name", "Test"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.join("base.txt"), "base").unwrap();
+        git(dir, &["add", "base.txt"]);
+        git(dir, &["commit", "-m", "base"]);
+        git2::Repository::open(dir).unwrap()
+    }
+
+    #[test]
+    fn capture_branch_tip_for_deletion_returns_none_when_branch_missing() {
+        let dir = TempDir::new().unwrap();
+        let repo = init_repo(dir.path());
+        assert!(capture_branch_tip_for_deletion(&repo, "missing-branch").is_none());
+    }
+
+    #[test]
+    fn delete_branch_after_removal_deletes_when_tip_matches() {
+        let dir = TempDir::new().unwrap();
+        let repo = init_repo(dir.path());
+        git(dir.path(), &["checkout", "-b", "feature-a"]);
+        std::fs::write(dir.path().join("feature.txt"), "feature").unwrap();
+        git(dir.path(), &["add", "feature.txt"]);
+        git(dir.path(), &["commit", "-m", "feature"]);
+        let tip = local_branch_tip(&repo, "feature-a").unwrap();
+
+        let (deleted, stored_tip) = delete_branch_after_removal(&repo, "feature-a", tip, false);
+        assert!(deleted);
+        assert_eq!(stored_tip, Some(tip.to_string()));
+        assert!(repo.find_branch("feature-a", BranchType::Local).is_err());
+    }
+
+    #[test]
+    fn delete_branch_after_removal_skips_mismatch_without_force() {
+        let dir = TempDir::new().unwrap();
+        let repo = init_repo(dir.path());
+        git(dir.path(), &["checkout", "-b", "feature-a"]);
+        std::fs::write(dir.path().join("feature.txt"), "feature").unwrap();
+        git(dir.path(), &["add", "feature.txt"]);
+        git(dir.path(), &["commit", "-m", "feature"]);
+        let stale_tip = local_branch_tip(&repo, "feature-a").unwrap();
+        std::fs::write(dir.path().join("feature-2.txt"), "feature-2").unwrap();
+        git(dir.path(), &["add", "feature-2.txt"]);
+        git(dir.path(), &["commit", "-m", "feature-2"]);
+
+        let (deleted, stored_tip) =
+            delete_branch_after_removal(&repo, "feature-a", stale_tip, false);
+        assert!(!deleted);
+        assert_eq!(stored_tip, None);
+        assert!(repo.find_branch("feature-a", BranchType::Local).is_ok());
+    }
+
+    #[test]
+    fn delete_branch_after_removal_force_deletes_on_tip_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let repo = init_repo(dir.path());
+        git(dir.path(), &["checkout", "-b", "feature-a"]);
+        std::fs::write(dir.path().join("feature.txt"), "feature").unwrap();
+        git(dir.path(), &["add", "feature.txt"]);
+        git(dir.path(), &["commit", "-m", "feature"]);
+        let stale_tip = local_branch_tip(&repo, "feature-a").unwrap();
+        std::fs::write(dir.path().join("feature-2.txt"), "feature-2").unwrap();
+        git(dir.path(), &["add", "feature-2.txt"]);
+        git(dir.path(), &["commit", "-m", "feature-2"]);
+        git(dir.path(), &["checkout", "main"]);
+
+        let (deleted, stored_tip) =
+            delete_branch_after_removal(&repo, "feature-a", stale_tip, true);
+        assert!(deleted);
+        assert_eq!(stored_tip, Some(stale_tip.to_string()));
+        assert!(repo.find_branch("feature-a", BranchType::Local).is_err());
     }
 }
