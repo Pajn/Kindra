@@ -566,9 +566,18 @@ It emits static text and does not require being inside a repository, so it is sa
 
 ```bash
 kin push
+kin push --allow-base-push <branch>
 ```
 
+**Options:**
+
+- `--allow-base-push <BRANCH>`: Allow `<BRANCH>` to push onto the base branch it tracks. Repeatable; each branch must be named explicitly.
+
 This command performs an atomic push of all branches in the stack using `force-with-lease` to ensure safety.
+
+**Pushing onto a base branch is refused.** If a branch's upstream is a base branch — `main`, `master`, `trunk`, `init.defaultBranch`, or the stack's configured base — then its push destination is that base, and pushing would force-update it with the branch's history. This happens by default in git: with `branch.autoSetupMerge=true`, `git switch -c feature origin/main` sets `branch.feature.merge = refs/heads/main`. `kin push` refuses, names the mapping, and offers to repoint the branch at its own remote branch.
+
+To do it deliberately anyway — say you maintain a fork's `main` from a local branch — name the branch: `kin push --allow-base-push mirror`, or set it once with `git config branch.mirror.kinAllowBasePush true`. The override is per-branch by design: it cannot be applied to a whole stack at once, `--yes` does not imply it, and every overridden mapping is labelled in the push output. Git's own `--force-with-lease` still applies.
 
 **When to use it:** Use this when you've updated multiple branches in your stack (e.g., after a `kin commit` or `kin move`) and want to sync them all to the remote in one go.
 

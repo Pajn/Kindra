@@ -1,12 +1,42 @@
-use crate::commands::find_upstream;
+use crate::commands::{find_upstream, foreign_base_target, protected_push_targets};
 use crate::stack::get_stack_branches_for_head;
 use anyhow::{Result, anyhow};
+use clap::Args;
 use git2::{BranchType, ErrorCode, Repository};
 use std::collections::HashSet;
 use std::fmt;
 use std::process::Command;
 
-pub fn push() -> Result<()> {
+/// Per-branch git config opting a branch out of the base-branch push guard.
+const ALLOW_BASE_PUSH_CONFIG: &str = "kinAllowBasePush";
+
+#[derive(Args, Default)]
+pub struct PushArgs {
+    /// Allow this branch to push onto the base branch it tracks, overriding the
+    /// safety refusal. Repeatable; each branch must be named explicitly, so this
+    /// cannot blanket-disable the guard. Equivalent per-branch config:
+    /// `branch.<name>.kinAllowBasePush = true`
+    #[arg(long = "allow-base-push", value_name = "BRANCH")]
+    pub allow_base_push: Vec<String>,
+}
+
+/// Is `branch` exempt from the base-branch push guard?
+///
+/// Exemption is deliberately per-branch and never global: the flag names branches
+/// one at a time (a typo leaves the branch refused rather than opening the guard),
+/// and the config key is scoped to a single branch. Note this is intentionally
+/// *not* implied by the global `--yes`, which would otherwise silently re-enable
+/// the incident in any non-interactive run.
+fn base_push_allowed(repo: &Repository, branch: &str, explicit: &[String]) -> bool {
+    if explicit.iter().any(|name| name == branch) {
+        return true;
+    }
+    repo.config()
+        .and_then(|config| config.get_bool(&format!("branch.{branch}.{ALLOW_BASE_PUSH_CONFIG}")))
+        .unwrap_or(false)
+}
+
+pub fn push(args: &PushArgs) -> Result<()> {
     let repo = crate::open_repo()?;
 
     let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
@@ -27,20 +57,84 @@ pub fn push() -> Result<()> {
         .map(|sb| sb.name)
         .collect::<Vec<_>>();
 
-    push_stack_branches(&repo, &branch_names)
+    push_stack_branches(&repo, &branch_names, &args.allow_base_push)
 }
 
-pub(crate) fn push_stack_branches(repo: &Repository, branches: &[String]) -> Result<()> {
+/// The error for branches whose upstream is a protected base branch, listing each
+/// offending mapping and how to repoint it.
+///
+/// Takes `(branch, remote, target)` triples so the message names the branch's own
+/// remote rather than assuming `origin`.
+fn protected_target_error(mistracked: &[(String, String, String)]) -> anyhow::Error {
+    let mut message = String::from(
+        "Refusing to push: these branches track a base branch, so pushing them would force-update it\n",
+    );
+    for (branch, remote, target) in mistracked {
+        message.push_str(&format!(
+            "  {branch} -> {remote}/{target} (would overwrite {target} with {branch}'s history)\n"
+        ));
+    }
+    message.push_str(
+        "\nThis happens when a branch is created from a base branch's remote ref: git's default\n\
+         branch.autoSetupMerge=true makes 'git switch -c <branch> <remote>/<base>' track <base>.\n\
+         Repoint each branch at its own remote branch:\n",
+    );
+    for (branch, remote, _) in mistracked {
+        message.push_str(&format!(
+            "  git branch --unset-upstream {branch}   # then re-run, or 'git push -u {remote} {branch}'\n"
+        ));
+    }
+    // Callers only build this error for a non-empty set; take the first element
+    // explicitly so an empty slice degrades to a message without the worked
+    // example rather than panicking on an index.
+    if let Some((branch, _, _)) = mistracked.first() {
+        message.push_str(&format!(
+            "\nIf a mapping above is deliberate (e.g. maintaining a fork's base branch), allow that\n\
+             branch explicitly: 'kin push --allow-base-push {branch}', or set\n\
+             'git config branch.{branch}.{ALLOW_BASE_PUSH_CONFIG} true'.\n"
+        ));
+    }
+    message.push_str(
+        "\nSetting 'git config --global branch.autoSetupMerge simple' prevents it recurring.",
+    );
+    anyhow!(message)
+}
+
+pub(crate) fn push_stack_branches(
+    repo: &Repository,
+    branches: &[String],
+    allow_base_push: &[String],
+) -> Result<()> {
     let branch_filter = branches.iter().collect::<HashSet<_>>();
+    let protected = protected_push_targets(repo)?;
     let mut branches_to_push = Vec::new();
     let mut branches_without_upstream = Vec::new();
+    // Branches whose upstream is a protected base branch. Their tracked destination
+    // is unusable (it would rewrite that base), so they are treated as having no
+    // upstream and offered to the set-upstream flow below, which pushes
+    // `branch:branch`. Each entry is a `(branch, remote, target)` triple.
+    let mut branches_tracking_base: Vec<(String, String, String)> = Vec::new();
 
     for name in branches {
         let branch = repo.find_branch(name, BranchType::Local)?;
         match tracked_push_target(repo, &branch, name.clone())? {
-            Some(target) => {
-                branches_to_push.push(target);
-            }
+            Some(target) => match target.protected_target(&protected) {
+                // An explicitly exempted branch keeps its tracked destination and
+                // pushes as configured; `perform_push` labels it in the output so
+                // the override is never silent.
+                Some(_) if base_push_allowed(repo, name, allow_base_push) => {
+                    branches_to_push.push(target);
+                }
+                Some((remote, base)) => {
+                    branches_tracking_base.push((name.clone(), remote.clone(), base.to_string()));
+                    branches_without_upstream.push(BranchStatus::tracking_base(
+                        name.clone(),
+                        base,
+                        remote,
+                    ));
+                }
+                None => branches_to_push.push(target),
+            },
             None => {
                 branches_without_upstream.push(BranchStatus::without_upstream(name.clone()));
             }
@@ -53,7 +147,7 @@ pub(crate) fn push_stack_branches(repo: &Repository, branches: &[String]) -> Res
     }
 
     if branches_without_upstream.is_empty() {
-        perform_push(repo, branches_to_push)?;
+        perform_push(repo, branches_to_push, allow_base_push)?;
     } else {
         let mut all_branches = branches_to_push.clone();
         all_branches.extend(branches_without_upstream.clone());
@@ -66,7 +160,14 @@ pub(crate) fn push_stack_branches(repo: &Repository, branches: &[String]) -> Res
             .collect::<Vec<_>>();
 
         if options.is_empty() {
-            perform_push(repo, branches_to_push)?;
+            // Unreachable while `branch_filter` is built from the same slice these
+            // statuses come from (every mis-tracked branch is therefore an option).
+            // Kept so a future change to that filter cannot silently drop the check
+            // and fall through to a push.
+            if !branches_tracking_base.is_empty() {
+                return Err(protected_target_error(&branches_tracking_base));
+            }
+            perform_push(repo, branches_to_push, allow_base_push)?;
             return Ok(());
         }
 
@@ -77,6 +178,20 @@ pub(crate) fn push_stack_branches(repo: &Repository, branches: &[String]) -> Res
             // branches still push below.
             crate::commands::Fallback::Default(Vec::new()),
         )?;
+
+        // A mis-tracked branch that was not repointed must not be silently skipped:
+        // it is one keystroke away from rewriting a base branch, and non-interactive
+        // runs (CI, `kin pr` from a script) never reach the prompt at all. Erroring
+        // here pushes nothing, matching the --atomic semantics used below: the stack
+        // is mis-configured, so fix it before any of it lands.
+        let unfixed = branches_tracking_base
+            .iter()
+            .filter(|(name, _, _)| !selected.iter().any(|choice| &choice.name == name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unfixed.is_empty() {
+            return Err(protected_target_error(&unfixed));
+        }
 
         if selected.is_empty() && branches_to_push.is_empty() {
             println!("No branches selected to push.");
@@ -110,7 +225,7 @@ pub(crate) fn push_stack_branches(repo: &Repository, branches: &[String]) -> Res
             .collect();
 
         if !existing_upstream.is_empty() {
-            perform_push(repo, existing_upstream)?;
+            perform_push(repo, existing_upstream, allow_base_push)?;
         }
     }
 
@@ -120,7 +235,7 @@ pub(crate) fn push_stack_branches(repo: &Repository, branches: &[String]) -> Res
 fn push_upstream_branch(repo: &Repository, upstream_name: &str) -> Result<()> {
     let branch = repo.find_branch(upstream_name, BranchType::Local)?;
     if let Some(target) = tracked_push_target(repo, &branch, upstream_name.to_string())? {
-        perform_push(repo, vec![target])
+        perform_push(repo, vec![target], &[])
     } else {
         let remote_name = resolve_remote(repo)?;
         perform_push_with_upstream(repo, &[upstream_name.to_string()], remote_name.as_str())
@@ -133,6 +248,10 @@ struct BranchStatus {
     tracked_remote: Option<String>,
     tracked_ref: Option<String>,
     display_upstream: Option<String>,
+    /// Set when the branch's upstream is a protected base branch, naming that base
+    /// and the remote it lives on. Such a branch has no usable tracked destination,
+    /// so `tracked_ref` is left `None`.
+    tracks_base: Option<BaseTracking>,
 }
 
 impl BranchStatus {
@@ -142,6 +261,7 @@ impl BranchStatus {
             tracked_remote: Some(remote.to_string()),
             tracked_ref: Some(remote_ref.to_string()),
             display_upstream: Some(format!("{}/{}", remote, remote_ref)),
+            tracks_base: None,
         }
     }
 
@@ -151,12 +271,53 @@ impl BranchStatus {
             tracked_remote: None,
             tracked_ref: None,
             display_upstream: None,
+            tracks_base: None,
         }
     }
+
+    fn tracking_base(name: String, base: &str, remote: &str) -> Self {
+        Self {
+            name,
+            tracked_remote: None,
+            tracked_ref: None,
+            display_upstream: None,
+            tracks_base: Some(BaseTracking {
+                base: base.to_string(),
+                remote: remote.to_string(),
+            }),
+        }
+    }
+
+    /// The `(remote, base)` this branch would overwrite if pushed to its tracked
+    /// destination, or `None` when that destination is its own remote branch.
+    fn protected_target<'a>(&self, protected: &'a [String]) -> Option<(&String, &'a str)> {
+        let remote = self.tracked_remote.as_ref()?;
+        let remote_ref = self.tracked_ref.as_deref()?;
+        foreign_base_target(&self.name, remote_ref, protected).map(|base| (remote, base))
+    }
+}
+
+/// The base branch a mis-tracked branch points at, and the remote it lives on.
+#[derive(Clone, Debug)]
+struct BaseTracking {
+    base: String,
+    remote: String,
 }
 
 impl fmt::Display for BranchStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(tracking) = &self.tracks_base {
+            // Name the (wrong) upstream in full, but do not name the remote the
+            // repoint will push to: that is chosen by `resolve_remote`, which
+            // prefers `origin`, and may differ from the remote the branch currently
+            // tracks. In a fork clone tracking `upstream/main`, pushing to `origin`
+            // is correct — so the message must not promise `upstream/<branch>`.
+            return write!(
+                f,
+                "{} (tracks base branch '{}/{}' — select to repoint at its own remote branch)",
+                self.name, tracking.remote, tracking.base
+            );
+        }
         match &self.display_upstream {
             Some(u) => write!(f, "{} -> {}", self.name, u),
             None => write!(f, "{} (no upstream)", self.name),
@@ -191,6 +352,9 @@ fn perform_push_with_upstream(repo: &Repository, branches: &[String], remote: &s
         branches.len(),
         remote
     );
+    for branch in branches {
+        println!("  {branch} -> {remote}/{branch}");
+    }
     let mut cmd = Command::new("git");
     cmd.arg("push")
         .arg("--atomic")
@@ -221,7 +385,11 @@ fn perform_push_with_upstream(repo: &Repository, branches: &[String], remote: &s
     Ok(())
 }
 
-fn perform_push(repo: &Repository, branches: Vec<BranchStatus>) -> Result<()> {
+fn perform_push(
+    repo: &Repository,
+    branches: Vec<BranchStatus>,
+    allow_base_push: &[String],
+) -> Result<()> {
     if branches.is_empty() {
         println!("Nothing to push.");
         return Ok(());
@@ -248,8 +416,41 @@ fn perform_push(repo: &Repository, branches: Vec<BranchStatus>) -> Result<()> {
         return Ok(());
     }
 
+    // Last line of defence, covering every caller (`kin push`, `kin pr`, …): never
+    // hand git a refspec that rewrites a base branch from a differently-named
+    // branch. This must not rely on `--force-with-lease --force-if-includes`
+    // catching it — the lease only answers "has the remote moved since I fetched?",
+    // and the incident that motivated this guard got past both flags.
+    let protected = protected_push_targets(repo)?;
+    let mut overridden: HashSet<String> = HashSet::new();
+    let mut offending = Vec::new();
+    for (remote, refs) in &branches_by_remote {
+        for (local_name, remote_ref) in refs {
+            let Some(base) = foreign_base_target(local_name, remote_ref, &protected) else {
+                continue;
+            };
+            if base_push_allowed(repo, local_name, allow_base_push) {
+                overridden.insert(local_name.clone());
+            } else {
+                offending.push((local_name.clone(), remote.clone(), base.to_string()));
+            }
+        }
+    }
+    if !offending.is_empty() {
+        return Err(protected_target_error(&offending));
+    }
+
     for (remote, refs) in branches_by_remote {
         println!("Pushing {} branches to {}...", refs.len(), remote);
+        // Show what maps where: a wrong destination is invisible otherwise, and an
+        // allowed base push must never look like an ordinary one.
+        for (local_name, remote_ref) in &refs {
+            if overridden.contains(local_name) {
+                println!("  {local_name} -> {remote}/{remote_ref}  (override: allow-base-push)");
+            } else {
+                println!("  {local_name} -> {remote}/{remote_ref}");
+            }
+        }
         let mut cmd = Command::new("git");
         cmd.arg("push")
             .arg("--atomic")
@@ -390,5 +591,6 @@ fn tracked_push_target(
         tracked_remote: Some(remote_name),
         tracked_ref: Some(remote_ref),
         display_upstream: display_upstream.or_else(|| Some(upstream_ref.to_string())),
+        tracks_base: None,
     }))
 }
