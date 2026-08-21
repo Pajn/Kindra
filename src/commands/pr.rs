@@ -283,7 +283,10 @@ fn run_pr_create_or_update_preflight(
         .iter()
         .map(|sb| sb.name.clone())
         .collect::<Vec<_>>();
-    crate::commands::push::push_stack_branches(repo, &branch_names)?;
+    // `kin pr` exposes no --allow-base-push: a PR whose head branch was pushed to a
+    // differently-named base ref is incoherent (the head ref never lands under its
+    // own name). A per-branch config opt-in still applies.
+    crate::commands::push::push_stack_branches(repo, &branch_names, &[])?;
     println!();
 
     Ok(flattened)

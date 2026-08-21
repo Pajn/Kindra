@@ -290,6 +290,74 @@ pub(crate) fn base_short_name(repo: &Repository, upstream: &str) -> String {
         .unwrap_or_else(|| upstream.to_string())
 }
 
+/// Branch names that must never be the destination of a push (or the target of a
+/// remote delete) driven from a differently-named local branch.
+///
+/// Deliberately wider than "the trunk [`find_upstream`] resolved to":
+///
+/// - `find_upstream` returns the *first* candidate that exists, so in a repo that
+///   has both `main` and `master` only one would be protected — overwriting the
+///   other is just as destructive.
+/// - The resolved base is included both as-is and reduced through
+///   [`base_short_name`]. A refspec destination is always a bare branch name while
+///   `find_upstream` may return `origin/main`, but `base_short_name` reduces on
+///   "first segment names a configured remote", which mangles a base like
+///   `release/2024` in a repo that also has a remote named `release`. Keeping both
+///   spellings means the comparison cannot miss on that mismatch.
+///
+/// Listing candidates that do not exist in this repo costs nothing: a branch can
+/// only track a ref that exists, so an absent name is never a push destination.
+pub(crate) fn protected_push_targets(repo: &Repository) -> Result<Vec<String>> {
+    let mut protected: Vec<String> = Vec::new();
+    let add = |protected: &mut Vec<String>, name: String| {
+        if !name.is_empty() && !protected.contains(&name) {
+            protected.push(name);
+        }
+    };
+
+    if let Some(upstream) = find_upstream(repo)? {
+        add(&mut protected, base_short_name(repo, &upstream));
+        add(&mut protected, upstream);
+    }
+    if let Ok(default_branch) = repo.config()?.get_string("init.defaultBranch") {
+        add(&mut protected, default_branch.trim().to_string());
+    }
+    for name in ["main", "master", "trunk"] {
+        add(&mut protected, name.to_string());
+    }
+
+    Ok(protected)
+}
+
+/// If acting on `remote_ref` — a push destination or a remote delete target,
+/// derived from `local_name`'s upstream — would hit a protected base branch under
+/// a different name, return that base's name.
+///
+/// Git's default `branch.autoSetupMerge=true` makes `git switch -c feature
+/// origin/main` set `branch.feature.merge = refs/heads/main`, so anything that
+/// reads a branch's upstream to find "its" remote branch gets `main` back. For a
+/// push that means `feature:main`, which force-updates the base; for a delete it
+/// means deleting the base on the remote. Neither is ever intended.
+///
+/// The comparison is on branch names only, ignoring which remote they live on.
+/// That errs toward refusing (a branch tracking `fork/main` is refused even though
+/// it would only touch the user's fork), which is the safe direction: every way
+/// this check can be wrong should be a false refusal, never a missed one. Acting
+/// on a base while standing on it (`local_name == remote_ref`) is legitimate.
+pub(crate) fn foreign_base_target<'a>(
+    local_name: &str,
+    remote_ref: &str,
+    protected: &'a [String],
+) -> Option<&'a str> {
+    if local_name == remote_ref {
+        return None;
+    }
+    protected
+        .iter()
+        .find(|name| name.as_str() == remote_ref)
+        .map(String::as_str)
+}
+
 fn branch_exists(repo: &Repository, name: &str) -> bool {
     repo.find_branch(name, BranchType::Local).is_ok()
         || repo.find_branch(name, BranchType::Remote).is_ok()
@@ -552,7 +620,7 @@ fn global_config_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::slugify_subject;
+    use super::{foreign_base_target, slugify_subject};
 
     #[test]
     fn slugify_basic() {
@@ -598,5 +666,48 @@ mod tests {
         let slug = slugify_subject(&subject).unwrap();
         assert!(!slug.ends_with('-'), "slug ended with '-': {slug}");
         assert!(slug.len() <= 50);
+    }
+
+    #[test]
+    fn foreign_base_target_flags_only_a_differently_named_branch() {
+        let protected = vec!["main".to_string(), "master".to_string()];
+
+        // The incident: a branch tracking the base, so its push destination is
+        // the base.
+        assert_eq!(
+            foreign_base_target("feature", "main", &protected),
+            Some("main")
+        );
+        assert_eq!(
+            foreign_base_target("ci/checks-frontend-runners", "main", &protected),
+            Some("main")
+        );
+
+        // A sibling long-lived branch is protected too, not just the one
+        // `find_upstream` happens to resolve to first.
+        assert_eq!(
+            foreign_base_target("feature", "master", &protected),
+            Some("master")
+        );
+
+        // Standing on the base and pushing it is legitimate.
+        assert_eq!(foreign_base_target("main", "main", &protected), None);
+
+        // An ordinary branch pushing to its own remote branch.
+        assert_eq!(foreign_base_target("feature", "feature", &protected), None);
+
+        // A branch that merely looks base-ish is not a base.
+        assert_eq!(foreign_base_target("feature", "mainline", &protected), None);
+
+        // A base whose name contains a slash is matched whole, so a repo with a
+        // remote named `release` cannot disarm the check.
+        let slashed = vec!["release/2024".to_string()];
+        assert_eq!(
+            foreign_base_target("feature", "release/2024", &slashed),
+            Some("release/2024")
+        );
+
+        // Nothing protected: nothing to flag.
+        assert_eq!(foreign_base_target("feature", "main", &[]), None);
     }
 }

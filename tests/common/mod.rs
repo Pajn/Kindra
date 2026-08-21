@@ -98,6 +98,21 @@ pub fn make_commit(
 pub fn repo_init(path: &Path) -> Repository {
     std::fs::create_dir_all(path).unwrap();
     run_ok("git", &["init", "--initial-branch=main"], path);
+    // Pin hooks to this repo's own hooks directory — git's default — so a
+    // developer's global `core.hooksPath` cannot influence test outcomes. Kindra's
+    // own guards are what these tests assert on, and a personal pre-push hook
+    // protecting `main`/`master` would otherwise mask a missing guard locally while
+    // CI (which has no such hook) fails. Tests that install `.git/hooks/*` still
+    // work, since this is where git would look anyway.
+    run_ok(
+        "git",
+        &[
+            "config",
+            "core.hooksPath",
+            path.join(".git").join("hooks").to_str().unwrap(),
+        ],
+        path,
+    );
     Repository::open(path).unwrap()
 }
 
@@ -219,4 +234,136 @@ pub fn assert_no_rebase_in_progress(repo_path: &Path) {
         "Rebase head exists at {:?}",
         rebase_head
     );
+}
+
+/// Build the shape behind the trunk force-push incident: a bare remote, a local
+/// clone-like repo with `main` pushed, and `branch` created off `origin/main` so
+/// that `branch.<name>.merge` is `refs/heads/main` (git's `autoSetupMerge=true`
+/// default for `git switch -c <name> origin/main`).
+///
+/// Returns the working repo dir and the remote dir.
+#[allow(dead_code)]
+pub fn setup_trunk_tracking_branch(
+    branch: &str,
+) -> (tempfile::TempDir, tempfile::TempDir, Repository) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "main.txt",
+        "initial",
+        "initial commit",
+        &[],
+    );
+
+    let remote_dir = tempfile::tempdir().unwrap();
+    // `--initial-branch` explicitly: a bare repo's HEAD otherwise follows the
+    // ambient `init.defaultBranch`, which is `main` on many dev machines but unset
+    // (so `master`) on CI. That leaves the remote's HEAD dangling at a branch that
+    // is never created, which breaks cloning it below.
+    run_ok(
+        "git",
+        &["init", "--bare", "--initial-branch=main"],
+        remote_dir.path(),
+    );
+    run_ok(
+        "git",
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok("git", &["push", "-u", "origin", "main"], dir.path());
+
+    // The footgun, built exactly as git's own default config builds it: with
+    // `branch.autoSetupMerge=true`, branching off `origin/main` sets
+    // `branch.<name>.merge = refs/heads/main`. Forced on the command line so this
+    // reproduces a default machine even when the developer running the suite has
+    // set `branch.autoSetupMerge=simple` — that setting avoids the footgun
+    // locally, but it must not be what makes Kindra safe.
+    run_ok(
+        "git",
+        &[
+            "-c",
+            "branch.autoSetupMerge=true",
+            "checkout",
+            "-b",
+            branch,
+            "origin/main",
+        ],
+        dir.path(),
+    );
+    let merge_config = std::process::Command::new("git")
+        .args(["config", "--get", &format!("branch.{branch}.merge")])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&merge_config.stdout).trim(),
+        "refs/heads/main",
+        "fixture must produce a trunk-tracking branch, or it is not testing the bug",
+    );
+
+    {
+        let branch_base = repo.head().unwrap().peel_to_commit().unwrap();
+        make_commit(
+            &repo,
+            &format!("refs/heads/{branch}"),
+            "work.txt",
+            "work",
+            "feat: branch work",
+            &[&branch_base],
+        );
+    }
+    repo.set_head(&format!("refs/heads/{branch}")).unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    (dir, remote_dir, repo)
+}
+
+/// Advance `main` on the remote from a second clone, then fetch it into `dir`,
+/// so `origin/main` is fresh (the implicit `--force-with-lease` is satisfied)
+/// while the local stack branch does not contain those commits.
+#[allow(dead_code)]
+pub fn advance_remote_main(dir: &std::path::Path, remote_dir: &std::path::Path, commits: usize) {
+    let other = tempfile::tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            "--branch",
+            "main",
+            remote_dir.to_str().unwrap(),
+            other.path().to_str().unwrap(),
+        ],
+        dir,
+    );
+
+    for i in 0..commits {
+        fs::write(other.path().join(format!("trunk-{i}.txt")), format!("{i}")).unwrap();
+        run_ok("git", &["add", "."], other.path());
+        run_ok(
+            "git",
+            &["commit", "-m", &format!("trunk commit {i}")],
+            other.path(),
+        );
+    }
+    run_ok("git", &["push", "origin", "main"], other.path());
+    run_ok("git", &["fetch", "origin"], dir);
+}
+
+#[allow(dead_code)]
+pub fn remote_tip(remote_dir: &std::path::Path, refname: &str) -> git2::Oid {
+    Repository::open(remote_dir)
+        .unwrap()
+        .find_reference(refname)
+        .unwrap()
+        .target()
+        .unwrap()
 }

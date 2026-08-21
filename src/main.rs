@@ -17,7 +17,7 @@ use crate::commands::commit::commit;
 use crate::commands::continue_cmd::continue_cmd;
 use crate::commands::move_cmd::{MoveArgs, move_cmd};
 use crate::commands::pr::{PrSubcommand, pr};
-use crate::commands::push::push;
+use crate::commands::push::{PushArgs, push};
 use crate::commands::rename::{RenameArgs, rename};
 use crate::commands::reorder::{ReorderArgs, reorder};
 use crate::commands::restack::{RestackArgs, restack};
@@ -58,7 +58,7 @@ enum Commands {
     /// Opens $EDITOR to manage branches in a stack of commits
     Split(SplitArgs),
     /// Pushes all branches with upstreams (atomic, force-with-lease)
-    Push,
+    Push(PushArgs),
     /// Create/update PRs for stack branches, or open existing PRs in the browser
     Pr {
         #[command(subcommand)]
@@ -238,7 +238,7 @@ fn dispatch() -> Result<()> {
 
     match &cli.command {
         Commands::Split(args) => split(args)?,
-        Commands::Push => push()?,
+        Commands::Push(args) => push(args)?,
         Commands::Pr {
             subcommand,
             no_push,

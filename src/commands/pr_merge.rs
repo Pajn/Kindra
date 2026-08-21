@@ -269,7 +269,7 @@ fn merge_and_cascade(
     // path again. Run it *after* sync (which may rewrite/delete the local
     // branch), then surface any sync error so the user can `kin continue`.
     if !args.no_delete {
-        delete_merged_remote_branch(branches_with_upstream, merged_branch_name);
+        delete_merged_remote_branch(repo, branches_with_upstream, merged_branch_name);
     }
 
     sync_result?;
@@ -280,6 +280,7 @@ fn merge_and_cascade(
 /// warned about but does not fail the command, since the merge and local
 /// restack have already succeeded.
 fn delete_merged_remote_branch(
+    repo: &Repository,
     branches_with_upstream: &[(StackBranch, String)],
     merged_branch_name: &str,
 ) {
@@ -296,6 +297,36 @@ fn delete_merged_remote_branch(
         );
         return;
     };
+
+    // The upstream is only a reliable source for "this branch's remote branch" when
+    // it actually names that branch. A branch created off a base branch's remote ref
+    // tracks that base (git's default `branch.autoSetupMerge=true`), and deleting
+    // `remote_branch` would then delete the base branch on the remote. Skip rather
+    // than fail: the merge already succeeded, and the base is not ours to remove.
+    // Same root cause as the push guard in `commands::push`.
+    //
+    // A failure to resolve the protected set must also skip: a safety check that
+    // cannot run has to block the destructive action, not wave it through.
+    let protected = match crate::commands::protected_push_targets(repo) {
+        Ok(protected) => protected,
+        Err(err) => {
+            eprintln!(
+                "Warning: not deleting remote branch '{remote}/{remote_branch}': could not \
+                 determine the repository's base branches ({err})."
+            );
+            return;
+        }
+    };
+    if let Some(base) =
+        crate::commands::foreign_base_target(merged_branch_name, remote_branch, &protected)
+    {
+        eprintln!(
+            "Warning: not deleting remote branch '{remote}/{remote_branch}': branch \
+             '{merged_branch_name}' tracks the base branch '{base}', so this would delete it on \
+             the remote. Repoint it with 'git branch --unset-upstream {merged_branch_name}'."
+        );
+        return;
+    }
 
     match gh::delete_remote_branch(remote, remote_branch) {
         Ok(()) => println!("✓ Deleted remote branch {upstream}"),

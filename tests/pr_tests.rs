@@ -1,7 +1,10 @@
 mod common;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use common::{kin_cmd, make_commit, repo_init, run_ok, write_repo_config};
+use common::{
+    advance_remote_main, kin_cmd, make_commit, remote_tip, repo_init, run_ok,
+    setup_trunk_tracking_branch, write_repo_config,
+};
 use git2::{BranchType, Repository};
 use kindra::commands::pr::resolve_stack_boundary_and_base;
 use std::fs;
@@ -6613,5 +6616,205 @@ fi"#,
     assert!(
         !combined.contains("Merging PR #42"),
         "merge must not proceed while a check is in the EXPECTED state. Got:\n{combined}"
+    );
+}
+
+/// Regression: `kin pr` was the command that force-pushed a stack branch onto
+/// `main`, dropping three merged commits. It shares `push_stack_branches` with
+/// `kin push`, so it must refuse the same way — before any PR is created and
+/// without git ever seeing a `branch:main` refspec.
+#[test]
+fn pr_refuses_stack_branch_tracking_trunk_and_creates_no_pr() {
+    let (dir, remote_dir, _repo) = setup_trunk_tracking_branch("ci/checks-frontend-runners");
+    advance_remote_main(dir.path(), remote_dir.path(), 3);
+
+    let main_before = remote_tip(remote_dir.path(), "refs/heads/main");
+
+    // A gh mock that records every invocation, so we can prove no PR was created.
+    let gh_log = dir.path().join("gh-calls.log");
+    let gh_mock = dir.path().join("gh");
+    fs::write(
+        &gh_mock,
+        format!(
+            r#"#!/bin/bash
+echo "$@" >> "{log}"
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo "no pull requests found for branch" >&2
+    exit 1
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
+    echo "https://github.com/test/repo/pull/1"
+    exit 0
+fi
+exit 0
+"#,
+            log = gh_log.display()
+        ),
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = kin_cmd()
+        .arg("pr")
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "kin pr must refuse a trunk-tracking branch.\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert_eq!(
+        remote_tip(remote_dir.path(), "refs/heads/main"),
+        main_before,
+        "remote main was rewritten by kin pr",
+    );
+    assert!(
+        !stderr.contains("[rejected]"),
+        "must be refused by Kindra, not by git's lease:\n{stderr}",
+    );
+    // Pin the failure to the guard rather than to any non-zero exit (a `gh` mock
+    // miss or a preflight error would otherwise satisfy this test).
+    assert!(
+        stderr.contains("Refusing to push") && stderr.contains("ci/checks-frontend-runners"),
+        "expected the base-branch refusal naming the branch, got:\n{stderr}",
+    );
+
+    let calls = fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        !calls.contains("pr create"),
+        "no PR should be created when the push is refused, got gh calls:\n{calls}",
+    );
+}
+
+/// Regression: `pr_merge` derives the branch's remote branch from its upstream, so
+/// a merged branch that tracks a base branch would have run
+/// `git push origin --delete <base>`, deleting that base on the remote. The merge
+/// must still succeed; only the remote delete is skipped, with a warning.
+///
+/// The tracked base here is `master`, deliberately *not* the remote's HEAD branch:
+/// a remote refuses to delete its own default branch (as GitHub does for `main`),
+/// so a fixture using the default branch would pass with or without the guard. A
+/// non-default base is the case that actually gets destroyed.
+#[test]
+fn pr_merge_does_not_delete_the_base_branch_on_the_remote() {
+    let (dir, _repo) = setup_simple_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    // Pin the remote's HEAD to `main`: a remote refuses to delete its own current
+    // branch, so if HEAD were `master` (what a bare init yields when
+    // `init.defaultBranch` is unset, as on CI) the assertion below would hold with
+    // or without the guard.
+    run_ok(
+        "git",
+        &["init", "--bare", "--initial-branch=main"],
+        &remote_dir,
+    );
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    // `master` is a second long-lived base branch; the remote's HEAD stays `main`.
+    run_ok("git", &["branch", "master"], dir.path());
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "master", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+    // The footgun: the merged branch tracks a base branch rather than its own
+    // remote branch.
+    run_ok(
+        "git",
+        &["branch", "--set-upstream-to=origin/master", "feature"],
+        dir.path(),
+    );
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "42" ]]; then
+        echo '{"state":"MERGED"}'
+        exit 0
+    fi
+    echo '{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = kin_cmd()
+        .args(["pr", "merge"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // The merge itself must still succeed; only the remote delete is skipped. Without
+    // this, a `kin pr merge` that failed after printing the warning would pass.
+    assert!(
+        output.status.success(),
+        "kin pr merge should succeed and skip only the delete.\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+
+    // The substantive assertion: the base branch still exists on the remote.
+    let remote_repo = Repository::open(&remote_dir).unwrap();
+    assert!(
+        remote_repo.find_reference("refs/heads/master").is_ok(),
+        "refs/heads/master was deleted from the remote.\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        stderr.contains("not deleting remote branch") && stderr.contains("master"),
+        "expected the protected-base warning, got:\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout),
     );
 }
