@@ -661,7 +661,13 @@ pub fn unmerged_paths_exist() -> Result<bool> {
         .arg("ls-files")
         .arg("--unmerged")
         .output()?;
-    Ok(output.status.success() && !output.stdout.is_empty())
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Failed to inspect unmerged paths with git ls-files --unmerged: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(!output.stdout.is_empty())
 }
 
 pub fn has_staged_changes() -> Result<bool> {
@@ -928,6 +934,24 @@ pub fn unstage_all() -> Result<()> {
 
 pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> {
     ensure_git_supports_update_refs()?;
+
+    // A commit can leave unstaged edits on the parent. Git's per-rebase
+    // autostash would restore those edits on a child, where they may conflict
+    // even though they apply cleanly on the caller. Own the stash across the
+    // entire restack so completion and abort restore it on the saved branch.
+    if state.operation == Operation::Commit
+        && !state.remaining_branches.is_empty()
+        && state.autostash
+        && state.stash_ref.is_none()
+    {
+        state.stash_ref = take_autostash(repo, true)?;
+        state.stash_apply_index = true;
+        state.autostash = false;
+        if let Err(err) = save_state(repo, &state) {
+            restore_set_aside_changes(state.stash_ref.take());
+            return Err(err);
+        }
+    }
 
     let mut started_any = false;
     while !state.remaining_branches.is_empty() {
