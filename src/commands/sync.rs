@@ -121,7 +121,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
         let autostash =
             crate::commands::resolve_and_check_autostash(&repo, args.autostash, args.no_autostash)?;
 
-        let state = RebaseState {
+        let mut state = RebaseState {
             operation: Operation::Sync,
             original_branch: top_branch.clone(),
             target_branch: rebase_onto_name.clone(),
@@ -153,7 +153,18 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
             cleanup_checkout_fallback: Some(local_upstream.clone()),
         };
 
-        save_state(&repo, &state)?;
+        // Git's autostash runs too late to protect the checkout to the tip.
+        // Keep these changes in Kindra's state until we return to the caller,
+        // including across rebase conflicts and aborts.
+        if state.caller_branch.is_some() {
+            state.stash_ref = crate::rebase_utils::take_autostash(&repo, autostash)?;
+            state.stash_apply_index = true;
+            state.autostash = false;
+        }
+        if let Err(err) = save_state(&repo, &state) {
+            crate::rebase_utils::restore_set_aside_changes(state.stash_ref.take());
+            return Err(err);
+        }
 
         if current_branch_name.as_deref() != Some(top_branch.as_str()) {
             checkout_branch(&top_branch)?;
@@ -164,7 +175,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
             .arg("rebase")
             .arg("--reapply-cherry-picks")
             .arg("--empty=keep")
-            .arg(if autostash {
+            .arg(if state.autostash {
                 "--autostash"
             } else {
                 "--no-autostash"
@@ -414,8 +425,18 @@ fn run_sync_rebase(
     ))
 }
 
-pub(crate) fn finish_sync_after_rebase(repo: &git2::Repository, state: RebaseState) -> Result<()> {
+pub(crate) fn finish_sync_after_rebase(
+    repo: &git2::Repository,
+    mut state: RebaseState,
+) -> Result<()> {
     ensure_sync_rebase_completed(repo, &state)?;
+    // The tip drives --update-refs, but the caller should return to the branch
+    // they synced from. Restore before cleanup so a merged caller uses the
+    // normal checkout fallback, and keep recovery state if checkout fails.
+    if let Some(caller) = &state.caller_branch {
+        checkout_branch(caller)?;
+    }
+    crate::rebase_utils::restore_state_stash(repo, &mut state)?;
     clear_state(repo)?;
 
     let checkout_fallback = state

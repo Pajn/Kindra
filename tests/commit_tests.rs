@@ -5480,3 +5480,132 @@ fn assert_checkpoint_write_failure_restores_tip(amend: bool) {
     }
     retry.assert().success();
 }
+
+#[test]
+fn test_commit_autostash_restores_on_parent_after_dependent_rebase() {
+    check_commit_autostash_on_parent(None);
+}
+
+#[test]
+fn test_commit_autostash_restores_on_parent_after_conflict_continue() {
+    check_commit_autostash_on_parent(Some(false));
+}
+
+#[test]
+fn test_commit_autostash_restores_on_parent_after_conflict_abort() {
+    check_commit_autostash_on_parent(Some(true));
+}
+
+fn check_commit_autostash_on_parent(recovery: Option<bool>) {
+    let (dir, repo) = setup_repo();
+    run_ok("git", &["checkout", "feature"], dir.path());
+    stage(dir.path(), "file.txt", "child refactoring\n");
+    stage(dir.path(), "overlap.txt", "child version\n");
+    run_ok("git", &["commit", "-m", "refactor child"], dir.path());
+    let child_tip = git_stdout(dir.path(), &["rev-parse", "feature"]);
+    run_ok("git", &["checkout", "main"], dir.path());
+    stage(dir.path(), "new.txt", "parent commit\n");
+    if recovery.is_some() {
+        stage(dir.path(), "overlap.txt", "parent version\n");
+    }
+    fs::write(dir.path().join("file.txt"), "unfinished parent edit\n").unwrap();
+    let mut cmd = kin_commit(dir.path());
+    cmd.args(["-m", "parent update", "--autostash"]);
+    if let Some(abort) = recovery {
+        cmd.assert().failure();
+        let state = kindra::rebase_utils::load_state(&repo).unwrap();
+        assert!(
+            state.stash_ref.is_some(),
+            "Kindra must own the caller's stash"
+        );
+        if !abort {
+            stage(dir.path(), "overlap.txt", "resolved version\n");
+        }
+        kin_cmd()
+            .current_dir(dir.path())
+            .env("GIT_EDITOR", "true")
+            .arg(if abort { "abort" } else { "continue" })
+            .assert()
+            .success();
+        if abort {
+            assert_eq!(git_stdout(dir.path(), &["rev-parse", "feature"]), child_tip);
+        }
+    } else {
+        cmd.assert().success();
+    }
+    assert_eq!(current_branch(dir.path()), "main");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "unfinished parent edit\n"
+    );
+    assert_eq!(
+        git_stdout(dir.path(), &["show", "HEAD:new.txt"]),
+        "parent commit\n"
+    );
+    assert_no_staged_changes(dir.path());
+    assert!(!kindra::rebase_utils::git_rebase_in_progress(&repo));
+    assert!(git_stdout(dir.path(), &["ls-files", "-u"]).is_empty());
+    assert!(!repo.path().join("kindra_rebase_state.json").exists());
+    assert!(git_stdout(dir.path(), &["stash", "list"]).trim().is_empty());
+    if recovery != Some(true) {
+        run_ok(
+            "git",
+            &["merge-base", "--is-ancestor", "main", "feature"],
+            dir.path(),
+        );
+        assert_eq!(
+            git_stdout(dir.path(), &["show", "feature:file.txt"]),
+            "child refactoring\n"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_failed_unmerged_inspection_preserves_completed_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, repo) = setup_repo();
+    write_commit_rebase_state_fixture(&repo, "unused");
+    let mut state = kindra::rebase_utils::load_state(&repo).unwrap();
+    state.stash_ref = None;
+    save_state(&repo, &state).unwrap();
+    let state_path = repo.path().join("kindra_rebase_state.json");
+    let saved = fs::read(&state_path).unwrap();
+
+    let bin = tempdir().unwrap();
+    let wrapper = bin.path().join("git");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\nif [ \"$1\" = ls-files ] && [ \"$2\" = --unmerged ]; then\n  echo 'inspection unavailable' >&2\n  exit 1\nfi\nexec \"$KIN_TEST_REAL_GIT\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let output = kin_cmd()
+        .current_dir(dir.path())
+        .arg("status")
+        .env("PATH", path)
+        .env("KIN_TEST_REAL_GIT", which::which("git").unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        state_path.exists(),
+        "failed inspection must not delete saved state"
+    );
+    assert_eq!(fs::read(&state_path).unwrap(), saved);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("inspection unavailable"));
+
+    // With inspection available again, this completed state can be cleared.
+    kin_cmd()
+        .current_dir(dir.path())
+        .arg("status")
+        .assert()
+        .success();
+    assert!(!state_path.exists());
+}

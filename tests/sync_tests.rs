@@ -106,7 +106,7 @@ fn sync_handles_rebased_lower_branch() {
 
     let repo = Repository::open(dir.path()).unwrap();
 
-    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-c"));
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-b"));
 
     let new_feature_a = repo
         .find_branch("feature-a", BranchType::Local)
@@ -212,7 +212,7 @@ fn sync_handles_squashed_lower_branch() {
 
     let repo = Repository::open(dir.path()).unwrap();
 
-    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-b"));
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-a"));
 
     let new_feature_a = repo
         .find_branch("feature-a", BranchType::Local)
@@ -391,7 +391,7 @@ fn sync_handles_merged_lower_branch() {
 
     let repo = Repository::open(dir.path()).unwrap();
 
-    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-b"));
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-a"));
 
     let new_feature_a = repo
         .find_branch("feature-a", BranchType::Local)
@@ -479,7 +479,7 @@ fn sync_skips_squashed_lower_branch_and_deletes_it() {
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
-    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-b"));
+    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
     assert!(repo.find_branch("feature-a", BranchType::Local).is_err());
 
     let new_feature_b = repo
@@ -563,7 +563,7 @@ fn sync_skips_rewritten_lower_branch_on_main() {
         .success();
 
     let repo = Repository::open(dir.path()).unwrap();
-    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-b"));
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-a"));
 
     let new_feature_b = repo
         .find_branch("feature-b", BranchType::Local)
@@ -1018,7 +1018,7 @@ fn sync_reports_rebase_conflict() {
 }
 
 #[test]
-fn sync_no_delete_manual_continue_from_non_tip_branch_clears_passively() {
+fn sync_no_delete_manual_continue_from_non_tip_branch_preserves_checkout_recovery() {
     let dir = tempdir().unwrap();
     let repo = repo_init(dir.path());
 
@@ -1088,12 +1088,16 @@ fn sync_no_delete_manual_continue_from_non_tip_branch_clears_passively() {
         .current_dir(dir.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("No Kindra operation active."));
+        .stdout(predicate::str::contains("Sync"));
 
-    assert!(
-        !state_path.exists(),
-        "completed sync state should be cleared without requiring kin continue"
-    );
+    assert!(state_path.exists(), "checkout restoration is still pending");
+    kin_cmd()
+        .arg("continue")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(!state_path.exists());
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-a"));
     assert!(
         Repository::open(dir.path())
             .unwrap()
@@ -3033,7 +3037,7 @@ fn sync_skips_squashed_lower_branch_after_later_upstream_edits_on_same_path() {
     cmd.arg("sync").current_dir(dir.path()).assert().success();
 
     let repo = Repository::open(dir.path()).unwrap();
-    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-b"));
+    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
     assert!(repo.find_branch("feature-a", BranchType::Local).is_err());
 
     let new_feature_b = repo

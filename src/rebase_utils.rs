@@ -472,6 +472,11 @@ fn sync_rebase_completed(repo: &Repository, state: &RebaseState) -> Result<bool>
 }
 
 fn can_passively_clear_completed_state(repo: &Repository, state: &RebaseState) -> Result<bool> {
+    // A conflicted stash is removed from state to avoid applying it twice,
+    // but recovery must remain available until its index conflicts are resolved.
+    if unmerged_paths_exist()? {
+        return Ok(false);
+    }
     if state.stash_ref.is_some()
         || state.unstage_on_restore
         || !state.cleanup_merged_branches.is_empty()
@@ -479,14 +484,12 @@ fn can_passively_clear_completed_state(repo: &Repository, state: &RebaseState) -
         return Ok(false);
     }
 
-    if state.operation != Operation::Sync {
-        let restore_branch = state
-            .caller_branch
-            .as_deref()
-            .unwrap_or(state.original_branch.as_str());
-        if current_branch_name(repo)? != Some(restore_branch.to_string()) {
-            return Ok(false);
-        }
+    let restore_branch = state
+        .caller_branch
+        .as_deref()
+        .unwrap_or(state.original_branch.as_str());
+    if current_branch_name(repo)? != Some(restore_branch.to_string()) {
+        return Ok(false);
     }
 
     Ok(true)
@@ -658,7 +661,13 @@ pub fn unmerged_paths_exist() -> Result<bool> {
         .arg("ls-files")
         .arg("--unmerged")
         .output()?;
-    Ok(output.status.success() && !output.stdout.is_empty())
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Failed to inspect unmerged paths with git ls-files --unmerged: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(!output.stdout.is_empty())
 }
 
 pub fn has_staged_changes() -> Result<bool> {
@@ -926,6 +935,24 @@ pub fn unstage_all() -> Result<()> {
 pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> {
     ensure_git_supports_update_refs()?;
 
+    // A commit can leave unstaged edits on the parent. Git's per-rebase
+    // autostash would restore those edits on a child, where they may conflict
+    // even though they apply cleanly on the caller. Own the stash across the
+    // entire restack so completion and abort restore it on the saved branch.
+    if state.operation == Operation::Commit
+        && !state.remaining_branches.is_empty()
+        && state.autostash
+        && state.stash_ref.is_none()
+    {
+        state.stash_ref = take_autostash(repo, true)?;
+        state.stash_apply_index = true;
+        state.autostash = false;
+        if let Err(err) = save_state(repo, &state) {
+            restore_set_aside_changes(state.stash_ref.take());
+            return Err(err);
+        }
+    }
+
     let mut started_any = false;
     while !state.remaining_branches.is_empty() {
         let current_name = state.remaining_branches[0].clone();
@@ -1011,32 +1038,7 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         )
     })?;
 
-    if let Some(stash_ref) = state.stash_ref.clone() {
-        println!("Restoring set-aside changes...");
-        match apply_state_stash(&state, &stash_ref)? {
-            StashApplyOutcome::Applied => {
-                state.stash_ref = None;
-                save_state(repo, &state)?;
-                if let Err(err) = drop_stash(&stash_ref) {
-                    eprintln!("Warning: {}", err);
-                }
-            }
-            StashApplyOutcome::ConflictsLeftInTree => {
-                // The changes are in the tree as conflict markers; a later
-                // `kin continue` must not apply the stash a second time, so
-                // drop it from the state but keep the entry as a backup. Keep
-                // the saved state itself: the operation stays resumable
-                // (`kin continue` finishes its bookkeeping) and abortable
-                // (`kin abort` rolls the branches back).
-                state.stash_ref = None;
-                save_state(repo, &state)?;
-                return Err(anyhow!(
-                    "Restoring the set-aside changes hit conflicts; resolve the conflict markers in the working tree, then run 'kin continue' to finish (or 'kin abort' to roll the operation back). The original changes are also preserved in stash entry '{}'.",
-                    stash_ref
-                ));
-            }
-        }
-    }
+    restore_state_stash(repo, &mut state)?;
 
     if state.unstage_on_restore {
         unstage_all()?;
@@ -1122,6 +1124,38 @@ fn parse_git_semver(version_output: &str) -> Option<(u64, u64, u64)> {
     }
 
     Some((numbers[0], numbers[1], numbers[2]))
+}
+
+/// Restore saved changes after returning to the caller, retaining recovery
+/// state on errors and avoiding a second stash apply after conflicts.
+pub fn restore_state_stash(repo: &Repository, state: &mut RebaseState) -> Result<()> {
+    if let Some(stash_ref) = state.stash_ref.clone() {
+        println!("Restoring set-aside changes...");
+        match apply_state_stash(state, &stash_ref)? {
+            StashApplyOutcome::Applied => {
+                state.stash_ref = None;
+                save_state(repo, state)?;
+                if let Err(err) = drop_stash(&stash_ref) {
+                    eprintln!("Warning: {}", err);
+                }
+            }
+            StashApplyOutcome::ConflictsLeftInTree => {
+                // The changes are in the tree as conflict markers; a later
+                // `kin continue` must not apply the stash a second time, so
+                // drop it from the state but keep the entry as a backup. Keep
+                // the saved state itself: the operation stays resumable
+                // (`kin continue` finishes its bookkeeping) and abortable
+                // (`kin abort` rolls the branches back).
+                state.stash_ref = None;
+                save_state(repo, state)?;
+                return Err(anyhow!(
+                    "Restoring the set-aside changes hit conflicts; resolve the conflict markers in the working tree, then run 'kin continue' to finish (or 'kin abort' to roll the operation back). The original changes are also preserved in stash entry '{}'.",
+                    stash_ref
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

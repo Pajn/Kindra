@@ -458,3 +458,315 @@ fn sync_still_prompts_when_tips_diverge() {
         .failure()
         .stderr(predicate::str::contains("Multiple stack tips found"));
 }
+
+#[test]
+fn sync_restores_lower_branch_after_rebasing_stack() {
+    check_sync_checkout(false, false);
+}
+
+#[test]
+fn sync_continue_restores_lower_branch_after_conflict() {
+    check_sync_checkout(true, false);
+}
+
+#[test]
+fn sync_uses_base_when_original_lower_branch_is_deleted() {
+    check_sync_checkout(false, true);
+}
+
+fn check_sync_checkout(conflict: bool, merged: bool) {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "shared.txt",
+        "base\n",
+        "base",
+        &[],
+    );
+    run_ok("git", &["checkout", "-b", "lower"], dir.path());
+    fs::write(dir.path().join("shared.txt"), "lower\n").unwrap();
+    run_ok("git", &["commit", "-am", "lower"], dir.path());
+    run_ok("git", &["checkout", "-b", "upper"], dir.path());
+    fs::write(dir.path().join("upper.txt"), "upper\n").unwrap();
+    run_ok("git", &["add", "upper.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "upper"], dir.path());
+    let old_upper = repo.revparse_single("upper").unwrap().id();
+    run_ok("git", &["checkout", "main"], dir.path());
+    if merged {
+        run_ok("git", &["merge", "--ff-only", "lower"], dir.path());
+    }
+    let path = if conflict { "shared.txt" } else { "main.txt" };
+    fs::write(dir.path().join(path), "upstream\n").unwrap();
+    run_ok("git", &["add", path], dir.path());
+    run_ok("git", &["commit", "-m", "advance main"], dir.path());
+    run_ok("git", &["checkout", "lower"], dir.path());
+
+    let mut cmd = kin_cmd();
+    cmd.arg("sync").current_dir(dir.path());
+    if conflict {
+        cmd.assert()
+            .failure()
+            .stderr(predicate::str::contains("Resolve conflicts"));
+        assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
+        fs::write(dir.path().join("shared.txt"), "resolved\n").unwrap();
+        run_ok("git", &["add", "shared.txt"], dir.path());
+        kin_cmd()
+            .arg("continue")
+            .current_dir(dir.path())
+            .assert()
+            .success();
+    } else {
+        cmd.assert().success();
+    }
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(
+        repo.head().unwrap().shorthand(),
+        Some(if merged { "main" } else { "lower" })
+    );
+    let upper = repo.revparse_single("upper").unwrap().id();
+    let main = repo.revparse_single("main").unwrap().id();
+    assert_ne!(upper, old_upper);
+    assert!(repo.graph_descendant_of(upper, main).unwrap());
+    if merged {
+        assert!(repo.find_branch("lower", BranchType::Local).is_err());
+    } else {
+        let lower = repo.revparse_single("lower").unwrap().id();
+        assert!(repo.graph_descendant_of(lower, main).unwrap());
+        assert!(repo.graph_descendant_of(upper, lower).unwrap());
+    }
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+}
+
+#[test]
+fn sync_manual_continue_preserves_checkout_recovery_after_status() {
+    check_sync_recovery_after_branch_switch(true);
+}
+
+#[test]
+fn sync_autostash_handles_dirty_path_changed_on_tip() {
+    check_sync_recovery_after_branch_switch(false);
+}
+
+fn sync_recovery_repo(manual_continue: bool) -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "shared.txt",
+        "base\n",
+        "base",
+        &[],
+    );
+    run_ok("git", &["checkout", "-b", "lower"], dir.path());
+    fs::write(dir.path().join("shared.txt"), "lower\n").unwrap();
+    run_ok("git", &["commit", "-am", "lower"], dir.path());
+    run_ok("git", &["checkout", "-b", "upper"], dir.path());
+    let upper_path = if manual_continue {
+        "upper.txt"
+    } else {
+        "shared.txt"
+    };
+    fs::write(dir.path().join(upper_path), "upper\n").unwrap();
+    run_ok("git", &["add", upper_path], dir.path());
+    run_ok("git", &["commit", "-m", "upper"], dir.path());
+    run_ok("git", &["checkout", "main"], dir.path());
+    let upstream_path = if manual_continue {
+        "shared.txt"
+    } else {
+        "main.txt"
+    };
+    fs::write(dir.path().join(upstream_path), "upstream\n").unwrap();
+    run_ok("git", &["add", upstream_path], dir.path());
+    run_ok("git", &["commit", "-m", "advance main"], dir.path());
+    run_ok("git", &["checkout", "lower"], dir.path());
+
+    dir
+}
+
+fn check_sync_recovery_after_branch_switch(manual_continue: bool) {
+    let dir = sync_recovery_repo(manual_continue);
+    if manual_continue {
+        kin_cmd()
+            .args(["sync", "--no-delete"])
+            .current_dir(dir.path())
+            .assert()
+            .failure();
+        fs::write(dir.path().join("shared.txt"), "resolved\n").unwrap();
+        run_ok("git", &["add", "shared.txt"], dir.path());
+        run_ok(
+            "git",
+            &["-c", "core.editor=true", "rebase", "--continue"],
+            dir.path(),
+        );
+        kin_cmd()
+            .arg("status")
+            .current_dir(dir.path())
+            .assert()
+            .success();
+        kin_cmd()
+            .arg("continue")
+            .current_dir(dir.path())
+            .assert()
+            .success();
+    } else {
+        fs::write(dir.path().join("shared.txt"), "dirty\n").unwrap();
+        kin_cmd()
+            .args(["sync", "--autostash"])
+            .current_dir(dir.path())
+            .assert()
+            .success();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
+            "dirty\n"
+        );
+    }
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(repo.head().unwrap().shorthand(), Some("lower"));
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+}
+
+#[test]
+fn sync_autostash_restored_on_caller_after_conflict_continue() {
+    check_sync_autostash_conflict_recovery(false);
+}
+
+#[test]
+fn sync_autostash_restored_on_caller_after_conflict_abort() {
+    check_sync_autostash_conflict_recovery(true);
+}
+
+fn check_sync_autostash_conflict_recovery(abort: bool) {
+    let dir = sync_recovery_repo(true);
+    fs::write(dir.path().join("shared.txt"), "dirty\n").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+    kin_cmd()
+        .args(["sync", "--autostash"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Resolve conflicts"));
+    let repo = Repository::open(dir.path()).unwrap();
+    let state = kindra::rebase_utils::load_state(&repo).unwrap();
+    assert!(state.stash_ref.is_some());
+    if !abort {
+        fs::write(dir.path().join("shared.txt"), "lower\n").unwrap();
+        run_ok("git", &["add", "shared.txt"], dir.path());
+    }
+    kin_cmd()
+        .arg(if abort { "abort" } else { "continue" })
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(repo.head().unwrap().shorthand(), Some("lower"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
+        "dirty\n"
+    );
+    assert!(
+        repo.status_file(std::path::Path::new("shared.txt"))
+            .unwrap()
+            .is_index_modified()
+    );
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(repo.find_reference("refs/stash").is_err());
+}
+
+#[test]
+fn sync_autostash_can_abort_after_tip_checkout_is_blocked() {
+    let dir = sync_recovery_repo(true);
+    fs::write(dir.path().join("shared.txt"), "dirty\n").unwrap();
+    // An untracked file blocks checkout even after tracked edits are stashed.
+    fs::write(dir.path().join("upper.txt"), "untracked\n").unwrap();
+    kin_cmd()
+        .args(["sync", "--autostash"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("git checkout failed"));
+    let repo = Repository::open(dir.path()).unwrap();
+    assert!(
+        kindra::rebase_utils::load_state(&repo)
+            .unwrap()
+            .stash_ref
+            .is_some()
+    );
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(repo.head().unwrap().shorthand(), Some("lower"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
+        "dirty\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("upper.txt")).unwrap(),
+        "untracked\n"
+    );
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(repo.find_reference("refs/stash").is_err());
+}
+
+#[test]
+fn sync_no_delete_stash_conflict_preserves_state_until_resolved() {
+    let dir = sync_recovery_repo(true);
+    fs::write(dir.path().join("shared.txt"), "dirty\n").unwrap();
+    kin_cmd()
+        .args(["sync", "--no-delete", "--autostash"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Resolve conflicts"));
+
+    // Resolve the rebase differently from the original lower branch so that
+    // restoring its saved working-tree edits conflicts after the rebase ends.
+    fs::write(dir.path().join("shared.txt"), "rebased\n").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+    kin_cmd()
+        .arg("continue")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Restoring the set-aside changes hit conflicts",
+        ));
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert!(repo.index().unwrap().has_conflicts());
+    assert_eq!(repo.head().unwrap().shorthand(), Some("lower"));
+    let state = kindra::rebase_utils::load_state(&repo).unwrap();
+    assert!(state.stash_ref.is_none(), "stash must not be applied twice");
+    assert!(state.cleanup_merged_branches.is_empty());
+    let state_path = dir.path().join(".git/kindra_rebase_state.json");
+    kin_cmd()
+        .arg("status")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(
+        state_path.exists(),
+        "status must retain recovery state while stash conflicts remain"
+    );
+    assert!(repo.index().unwrap().has_conflicts());
+
+    fs::write(dir.path().join("shared.txt"), "resolved edits\n").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+    kin_cmd()
+        .arg("continue")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(!state_path.exists());
+    let repo = Repository::open(dir.path()).unwrap();
+    assert!(!repo.index().unwrap().has_conflicts());
+    assert_eq!(repo.head().unwrap().shorthand(), Some("lower"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
+        "resolved edits\n"
+    );
+}
