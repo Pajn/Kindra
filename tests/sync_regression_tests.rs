@@ -374,11 +374,9 @@ fn sync_skips_tip_prompt_when_tips_share_a_commit() {
     );
 }
 
-/// When the tips point at *different* commits (a real fork above a shared
-/// branch), the choice matters and sync must still prompt. In a non-interactive
-/// run that prompt surfaces as a hard error rather than silently picking a side.
+/// A real fork is synced in full without requiring an interactive tip choice.
 #[test]
-fn sync_still_prompts_when_tips_diverge() {
+fn sync_rebases_all_divergent_tips() {
     let dir = tempdir().unwrap();
     let repo = repo_init(dir.path());
 
@@ -452,11 +450,15 @@ fn sync_still_prompts_when_tips_diverge() {
     run_ok("git", &["checkout", "-f", "mid"], dir.path());
 
     let mut cmd = kin_cmd();
-    cmd.arg("sync")
-        .current_dir(dir.path())
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Multiple stack tips found"));
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
+    let main = repo.revparse_single("origin/main").unwrap().id();
+    let mid = repo.revparse_single("mid").unwrap().id();
+    assert!(repo.graph_descendant_of(mid, main).unwrap());
+    for name in ["analyze", "perf"] {
+        let tip = repo.revparse_single(name).unwrap().id();
+        assert_eq!(repo.find_commit(tip).unwrap().parent_id(0).unwrap(), mid);
+    }
+    assert_eq!(repo.head().unwrap().shorthand(), Some("mid"));
 }
 
 #[test]
@@ -768,5 +770,242 @@ fn sync_no_delete_stash_conflict_preserves_state_until_resolved() {
     assert_eq!(
         fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
         "resolved edits\n"
+    );
+}
+
+#[test]
+fn sync_tree_continue_after_later_sibling_conflict() {
+    check_tree_recovery(false, false);
+}
+
+#[test]
+fn sync_tree_abort_restores_already_rebased_branches() {
+    check_tree_recovery(true, false);
+}
+
+#[test]
+fn sync_tree_manual_abort_keeps_pending_work() {
+    check_tree_recovery(false, true);
+}
+
+fn check_tree_recovery(abort: bool, manual_abort: bool) {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let base = make_commit(
+        &Repository::open(dir.path()).unwrap(),
+        "refs/heads/main",
+        "shared.txt",
+        "base\n",
+        "base",
+        &[],
+    );
+    let mut tips = std::collections::HashMap::new();
+    for (name, parent, path) in [
+        ("root", "main", "root.txt"),
+        ("a", "root", "a.txt"),
+        ("a-child", "a", "child.txt"),
+        ("z", "root", "shared.txt"),
+        ("z-child", "z", "z-child.txt"),
+    ] {
+        run_ok("git", &["checkout", "-b", name, parent], dir.path());
+        fs::write(dir.path().join(path), "feature\n").unwrap();
+        run_ok("git", &["add", path], dir.path());
+        run_ok("git", &["commit", "-m", name], dir.path());
+        tips.insert(name, repo.revparse_single(name).unwrap().id());
+    }
+    run_ok("git", &["checkout", "main"], dir.path());
+    fs::write(dir.path().join("shared.txt"), "upstream\n").unwrap();
+    run_ok("git", &["commit", "-am", "advance"], dir.path());
+    let main = repo.revparse_single("main").unwrap().id();
+    // Start at a leaf: discovery must include cousins, but exclude independent stacks.
+    run_ok(
+        "git",
+        &["checkout", "-b", "unrelated", &base.to_string()],
+        dir.path(),
+    );
+    fs::write(dir.path().join("other.txt"), "other\n").unwrap();
+    run_ok("git", &["add", "other.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "other"], dir.path());
+    let unrelated = repo.revparse_single("unrelated").unwrap().id();
+    run_ok("git", &["checkout", "-f", "a-child"], dir.path());
+    let result = kin_cmd()
+        .args(["sync", "--no-delete"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Resolve conflicts"));
+    assert_ne!(
+        repo.revparse_single("root").unwrap().id(),
+        tips["root"],
+        "{:?}",
+        result.get_output()
+    );
+    if manual_abort {
+        let rebased_root = repo.revparse_single("root").unwrap().id();
+        run_ok("git", &["rebase", "--abort"], dir.path());
+        assert_eq!(repo.revparse_single("root").unwrap().id(), rebased_root);
+        kin_cmd()
+            .arg("status")
+            .current_dir(dir.path())
+            .assert()
+            .success();
+        assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
+        kin_cmd()
+            .arg("continue")
+            .current_dir(dir.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("Resolve conflicts"));
+    }
+    if !abort {
+        fs::write(dir.path().join("shared.txt"), "resolved\n").unwrap();
+        run_ok("git", &["add", "shared.txt"], dir.path());
+    }
+    kin_cmd()
+        .arg(if abort { "abort" } else { "continue" })
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(repo.head().unwrap().shorthand(), Some("a-child"));
+    assert_eq!(repo.revparse_single("unrelated").unwrap().id(), unrelated);
+    if abort {
+        for (name, tip) in tips {
+            assert_eq!(repo.revparse_single(name).unwrap().id(), tip);
+        }
+    } else {
+        for (name, parent) in [
+            ("root", "main"),
+            ("a", "root"),
+            ("a-child", "a"),
+            ("z", "root"),
+            ("z-child", "z"),
+        ] {
+            let tip = repo.revparse_single(name).unwrap().id();
+            assert!(repo.graph_descendant_of(tip, main).unwrap());
+            assert_eq!(
+                repo.find_commit(tip).unwrap().parent_id(0).unwrap(),
+                repo.revparse_single(parent).unwrap().id(),
+                "branch {name} should be on {parent}"
+            );
+        }
+    }
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+}
+
+#[test]
+fn sync_tree_deletes_squashed_root_and_restores_staged_changes() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    make_commit(&repo, "refs/heads/main", "base.txt", "base\n", "base", &[]);
+    for (name, parent) in [("root", "main"), ("left", "root"), ("right", "root")] {
+        run_ok("git", &["checkout", "-b", name, parent], dir.path());
+        fs::write(dir.path().join(format!("{name}.txt")), name).unwrap();
+        run_ok("git", &["add", "."], dir.path());
+        run_ok("git", &["commit", "-m", name], dir.path());
+    }
+    run_ok("git", &["checkout", "main"], dir.path());
+    run_ok("git", &["merge", "--squash", "root"], dir.path());
+    run_ok("git", &["commit", "-m", "squashed root"], dir.path());
+    run_ok("git", &["checkout", "root"], dir.path());
+    fs::write(dir.path().join("base.txt"), "dirty\n").unwrap();
+    run_ok("git", &["add", "base.txt"], dir.path());
+    kin_cmd()
+        .args(["sync", "--autostash"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(repo.find_branch("root", BranchType::Local).is_err());
+    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("base.txt")).unwrap(),
+        "dirty\n"
+    );
+    assert!(
+        Repository::open(dir.path())
+            .unwrap()
+            .status_file(std::path::Path::new("base.txt"))
+            .unwrap()
+            .is_index_modified()
+    );
+    let main = repo.revparse_single("main").unwrap().id();
+    for name in ["left", "right"] {
+        let tip = repo.revparse_single(name).unwrap().id();
+        assert_eq!(repo.find_commit(tip).unwrap().parent_id(0).unwrap(), main);
+    }
+}
+
+#[test]
+fn sync_tree_cleanup_excludes_branches_retained_by_the_plan() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let base = make_commit(
+        &repo,
+        "refs/heads/main",
+        "shared.txt",
+        "base\n",
+        "base",
+        &[],
+    );
+    run_ok("git", &["checkout", "-b", "a-shared"], dir.path());
+    fs::write(dir.path().join("shared.txt"), "feature\n").unwrap();
+    run_ok("git", &["commit", "-am", "shared"], dir.path());
+    run_ok("git", &["checkout", "-b", "b-combined", "main"], dir.path());
+    fs::write(dir.path().join("shared.txt"), "feature\n").unwrap();
+    fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+    run_ok("git", &["add", "."], dir.path());
+    run_ok("git", &["commit", "-m", "combined"], dir.path());
+    run_ok(
+        "git",
+        &["checkout", "-b", "joined", "b-combined"],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["merge", "--no-ff", "a-shared", "-m", "join"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "main"], dir.path());
+    run_ok(
+        "git",
+        &["cherry-pick", "--no-commit", "a-shared"],
+        dir.path(),
+    );
+    run_ok("git", &["commit", "-m", "integrate shared"], dir.path());
+    fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+    run_ok("git", &["add", "b.txt"], dir.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "integrate b separately"],
+        dir.path(),
+    );
+    fs::write(dir.path().join("shared.txt"), "upstream\n").unwrap();
+    run_ok("git", &["commit", "-am", "evolve shared"], dir.path());
+    let branches = ["a-shared", "b-combined", "joined"]
+        .iter()
+        .map(|name| kindra::stack::StackBranch {
+            name: name.to_string(),
+            id: repo.revparse_single(name).unwrap().id(),
+        })
+        .collect::<Vec<_>>();
+    // The combined patch is retained when examined on its own, but the joined
+    // lineage can classify it as integrated relative to its shared sibling.
+    assert!(
+        kindra::stack::find_sync_boundary(&repo, "b-combined", "main", &branches)
+            .unwrap()
+            .old_base
+            .is_some()
+    );
+    assert!(
+        kindra::stack::find_sync_boundary(&repo, "joined", "main", &branches)
+            .unwrap()
+            .merged_branches
+            .contains(&"b-combined".to_string())
+    );
+    let plan = kindra::stack::plan_tree_sync(&repo, &branches, "main", base).unwrap();
+    assert!(plan.remaining.contains(&"b-combined".to_string()));
+    assert!(
+        plan.remaining
+            .iter()
+            .all(|branch| !plan.merged.contains(branch))
     );
 }

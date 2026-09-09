@@ -1337,7 +1337,7 @@ fn sync_refuses_when_git_rebase_in_progress() {
 }
 
 #[test]
-fn sync_refuses_to_auto_pick_tip_in_non_interactive_mode() {
+fn sync_handles_forks_in_non_interactive_mode() {
     let dir = tempdir().unwrap();
     let repo = repo_init(dir.path());
 
@@ -1378,14 +1378,29 @@ fn sync_refuses_to_auto_pick_tip_in_non_interactive_mode() {
         &[&a],
     );
 
+    let old_tips = ["feature-a", "feature-b", "feature-c"]
+        .map(|name| repo.revparse_single(name).unwrap().id());
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    fs::write(dir.path().join("upstream.txt"), "upstream\n").unwrap();
+    run_ok("git", &["add", "upstream.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "advance main"], dir.path());
+    let main = repo.revparse_single("main").unwrap().id();
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
     let mut cmd = kin_cmd();
-    cmd.arg("sync")
-        .current_dir(dir.path())
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Multiple stack tips found"));
+    cmd.arg("sync").current_dir(dir.path()).assert().success();
+    let parent = repo.revparse_single("feature-a").unwrap().id();
+    assert_ne!(parent, old_tips[0]);
+    assert_eq!(
+        repo.find_commit(parent).unwrap().parent_id(0).unwrap(),
+        main
+    );
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-a"));
+    for (branch, old_tip) in ["feature-b", "feature-c"].into_iter().zip(&old_tips[1..]) {
+        let tip = repo.revparse_single(branch).unwrap().id();
+        assert_ne!(tip, *old_tip);
+        assert_eq!(repo.find_commit(tip).unwrap().parent_id(0).unwrap(), parent);
+    }
 }
 
 #[test]
