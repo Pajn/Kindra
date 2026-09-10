@@ -49,7 +49,9 @@ pub fn continue_cmd() -> Result<()> {
 
     if let Some(state) = rebase_state {
         return match state.operation {
-            Operation::Sync => crate::commands::sync::finish_sync_after_rebase(&repo, state),
+            Operation::Sync if state.parent_name_map.is_empty() => {
+                crate::commands::sync::finish_sync_after_rebase(&repo, state)
+            }
             _ => run_rebase_loop(&repo, state),
         };
     }

@@ -2284,3 +2284,58 @@ pub fn visualize_stack(
 
     Ok(result)
 }
+
+pub struct TreeSyncPlan {
+    pub remaining: Vec<String>,
+    pub bases: HashMap<String, String>,
+    pub parents: HashMap<String, String>,
+    pub merged: Vec<String>,
+}
+
+/// Plan a branching sync before any refs move. Each child cuts at its original
+/// parent tip, unless sync's integration boundary lies beyond that parent.
+pub fn plan_tree_sync(
+    repo: &Repository,
+    branches: &[StackBranch],
+    upstream: &str,
+    merge_base: Oid,
+) -> Result<TreeSyncPlan> {
+    let mut ordered = branches.to_vec();
+    sort_branches_topologically(repo, &mut ordered)?;
+    let mut remaining = Vec::new();
+    let mut bases = HashMap::new();
+    let mut parents = HashMap::new();
+    let mut merged = HashSet::new();
+    for branch in &ordered {
+        let boundary = find_sync_boundary(repo, &branch.name, upstream, branches)?;
+        merged.extend(boundary.merged_branches);
+        let Some(mut base) = boundary.old_base else {
+            continue;
+        };
+        let parent_id = find_parent_in_stack(repo, &branch.name, branches, merge_base)?;
+        let parent = ordered
+            .iter()
+            .find(|p| p.id == parent_id && remaining.contains(&p.name));
+        let onto = if let Some(parent) = parent
+            && (parent.id == base || repo.graph_descendant_of(parent.id, base)?)
+        {
+            base = parent.id;
+            parent.name.clone()
+        } else {
+            upstream.to_string()
+        };
+        bases.insert(branch.name.clone(), base.to_string());
+        parents.insert(branch.name.clone(), onto);
+        remaining.push(branch.name.clone());
+    }
+    // A branch retained by any boundary must survive cleanup after the rebases.
+    merged.retain(|branch| !bases.contains_key(branch));
+    let mut merged: Vec<_> = merged.into_iter().collect();
+    merged.sort();
+    Ok(TreeSyncPlan {
+        remaining,
+        bases,
+        parents,
+        merged,
+    })
+}

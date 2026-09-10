@@ -80,6 +80,36 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
         &rebase_onto_name,
     )?;
 
+    // Include cousins connected through private ancestor branches, even from a leaf.
+    let stack_branches = if let Some(current) = current_branch_name.as_deref()
+        && stack_branches.iter().any(|b| b.name == current)
+    {
+        crate::stack::collect_stack_component(
+            &repo,
+            current,
+            merge_base,
+            upstream_id,
+            &rebase_onto_name,
+        )?
+    } else {
+        stack_branches
+    };
+    let distinct_tips: std::collections::HashSet<_> = get_stack_tips(&repo, &stack_branches)?
+        .iter()
+        .map(|name| repo.revparse_single(name).map(|o| o.id()))
+        .collect::<Result<_, _>>()?;
+    if distinct_tips.len() > 1 {
+        return sync_tree(
+            &repo,
+            args,
+            &stack_branches,
+            merge_base,
+            &rebase_onto_name,
+            &local_upstream,
+            current_branch_name.as_deref(),
+        );
+    }
+
     let mut tips = get_stack_tips(&repo, &stack_branches)?;
     tips.sort();
     let top_branch = match tips.len() {
@@ -92,7 +122,12 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
             }
         }
         1 => tips[0].clone(),
-        _ => resolve_sync_tip(&tips, &stack_branches, current_branch_name.as_deref())?,
+        // Only co-located tips remain here; one rebase carries their refs together.
+        _ => current_branch_name
+            .as_ref()
+            .filter(|current| tips.contains(current))
+            .unwrap_or(&tips[0])
+            .clone(),
     };
 
     let top_branch_tip = repo.revparse_single(&top_branch)?.id();
@@ -202,56 +237,6 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
     // merged-branch deletions (if any) or drops the snapshot when nothing
     // changed. The rebase path above defers settling to the resuming process.
     Ok(())
-}
-
-/// Choose which stack tip drives the sync rebase when more than one tip exists.
-///
-/// Multiple tips are only genuinely ambiguous when they point at *different*
-/// commits (a real fork in the stack). When every tip is the same commit — e.g.
-/// two branches parked on one HEAD — `git rebase --update-refs` rewrites that
-/// commit once and carries all co-located refs along, so the driving branch has
-/// no bearing on the outcome. In that case we auto-select and skip the prompt,
-/// preferring the currently checked-out branch to avoid a needless checkout.
-/// Only when the tips actually diverge do we fall back to prompting.
-fn resolve_sync_tip(
-    tips: &[String],
-    stack_branches: &[crate::stack::StackBranch],
-    current_branch_name: Option<&str>,
-) -> Result<String> {
-    let tip_oid = |name: &str| -> Result<git2::Oid> {
-        stack_branches
-            .iter()
-            .find(|b| b.name == name)
-            .map(|b| b.id)
-            .ok_or_else(|| anyhow!("Stack tip '{}' not found in stack.", name))
-    };
-
-    let first_oid = tip_oid(&tips[0])?;
-    let mut all_same = true;
-    for tip in &tips[1..] {
-        if tip_oid(tip)? != first_oid {
-            all_same = false;
-            break;
-        }
-    }
-
-    if all_same {
-        // Every tip is the same commit; the choice is immaterial. Prefer the
-        // current branch so the checkout below is a no-op, else take the first
-        // (tips are sorted, so this is deterministic).
-        if let Some(current) = current_branch_name
-            && tips.iter().any(|t| t == current)
-        {
-            return Ok(current.to_string());
-        }
-        return Ok(tips[0].clone());
-    }
-
-    crate::commands::prompt_select(
-        "Multiple stack tips found. Select one:",
-        tips.to_vec(),
-        crate::commands::Fallback::Require("Checkout the desired tip branch and rerun 'kin sync'."),
-    )
 }
 
 fn sync_upstream_branch(
@@ -429,7 +414,9 @@ pub(crate) fn finish_sync_after_rebase(
     repo: &git2::Repository,
     mut state: RebaseState,
 ) -> Result<()> {
-    ensure_sync_rebase_completed(repo, &state)?;
+    if state.parent_name_map.is_empty() {
+        ensure_sync_rebase_completed(repo, &state)?;
+    }
     // The tip drives --update-refs, but the caller should return to the branch
     // they synced from. Restore before cleanup so a merged caller uses the
     // normal checkout fallback, and keep recovery state if checkout fails.
@@ -536,4 +523,71 @@ fn fetch_sync_remote(remote_name: Option<&str>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn sync_tree(
+    repo: &git2::Repository,
+    args: &SyncArgs,
+    branches: &[crate::stack::StackBranch],
+    merge_base: git2::Oid,
+    upstream: &str,
+    local_upstream: &str,
+    caller: Option<&str>,
+) -> Result<()> {
+    let crate::stack::TreeSyncPlan {
+        remaining,
+        bases,
+        parents,
+        merged,
+    } = crate::stack::plan_tree_sync(repo, branches, upstream, merge_base)?;
+    let mut check: Vec<_> = branches.iter().map(|b| b.name.clone()).collect();
+    if !args.no_delete {
+        check.extend(merged.iter().cloned());
+    }
+    crate::rebase_utils::check_worktrees(&check, args.force)?;
+    if remaining.is_empty() {
+        return if args.no_delete {
+            Ok(())
+        } else {
+            delete_merged_branches(repo, &merged, local_upstream)
+        };
+    }
+    let original = caller.unwrap_or(&remaining[0]).to_string();
+    let autostash =
+        crate::commands::resolve_and_check_autostash(repo, args.autostash, args.no_autostash)?;
+    let mut state = RebaseState {
+        operation: Operation::Sync,
+        original_branch: original.clone(),
+        target_branch: upstream.to_string(),
+        caller_branch: Some(original.clone()),
+        remaining_branches: remaining,
+        in_progress_branch: None,
+        // A nonempty parent_name_map marks a tree sync for the shared resumable loop.
+        parent_id_map: bases,
+        parent_name_map: parents,
+        new_base_map: HashMap::new(),
+        original_commit_count_map: HashMap::new(),
+        original_tip_map: branches
+            .iter()
+            .map(|b| (b.name.clone(), b.id.to_string()))
+            .collect(),
+        owned_tip_map: HashMap::new(),
+        stash_ref: None,
+        stash_apply_index: false,
+        carry_stash_ref: None,
+        preserve_content_on_abort: false,
+        suppress_editor: false,
+        unstage_on_restore: false,
+        autostash,
+        cleanup_merged_branches: if args.no_delete { Vec::new() } else { merged },
+        cleanup_checkout_fallback: Some(local_upstream.to_string()),
+    };
+    state.stash_ref = crate::rebase_utils::take_autostash(repo, autostash)?;
+    state.stash_apply_index = true;
+    state.autostash = false;
+    if let Err(err) = save_state(repo, &state) {
+        crate::rebase_utils::restore_set_aside_changes(state.stash_ref.take());
+        return Err(err);
+    }
+    crate::rebase_utils::run_rebase_loop(repo, state)
 }

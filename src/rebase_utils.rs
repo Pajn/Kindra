@@ -164,7 +164,8 @@ pub fn reconcile_saved_rebase_state(
     }
 
     let mut changed = false;
-    if state.operation == Operation::Sync {
+    // Legacy linear syncs have no parent map; tree syncs reconcile each branch.
+    if state.operation == Operation::Sync && state.parent_name_map.is_empty() {
         if sync_rebase_completed(repo, &state)? {
             state.remaining_branches.clear();
             state.in_progress_branch = None;
@@ -373,9 +374,10 @@ fn branch_rebase_target(state: &RebaseState, branch_name: &str) -> Result<(Strin
         .ok_or_else(|| anyhow!("Parent ID not found for branch '{}'", branch_name))?
         .clone();
 
+    // In tree sync the caller may be a leaf: it must still land on its planned parent.
     let new_base = if let Some(explicit_base) = state.new_base_map.get(branch_name) {
         explicit_base.clone()
-    } else if branch_name == state.original_branch {
+    } else if branch_name == state.original_branch && state.operation != Operation::Sync {
         state.target_branch.clone()
     } else {
         match state.parent_name_map.get(branch_name) {
@@ -982,8 +984,12 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         }
 
         println!("Rebasing {}...", current_name);
-        let status = Command::new("git")
-            .arg("rebase")
+        let mut rebase = Command::new("git");
+        rebase.arg("rebase");
+        if state.operation == Operation::Sync {
+            rebase.args(["--reapply-cherry-picks", "--empty=keep"]);
+        }
+        let status = rebase
             .arg("--no-ff")
             .arg(if state.autostash {
                 "--autostash"
@@ -1022,6 +1028,9 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         }
     }
 
+    if state.operation == Operation::Sync {
+        return crate::commands::sync::finish_sync_after_rebase(repo, state);
+    }
     let restore_branch = state
         .caller_branch
         .clone()
