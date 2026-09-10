@@ -7060,3 +7060,69 @@ exit 1
         String::from_utf8_lossy(&output.stdout),
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn pr_created_url_is_clickable_only_in_a_terminal() {
+    let dir = setup_pushed_feature();
+    write_script(
+        &dir.path().join("gh"),
+        &gh_mock_with_create(r#"echo "https://github.com/test/repo/pull/1"; exit 0"#),
+    );
+    let runner = write_script(
+        &dir.path().join("run-pr.sh"),
+        "#!/bin/sh\nexec \"$KIN_BIN\" pr --no-interactive --title Feature --body-from-commits\n",
+    );
+    for (terminal, term) in [
+        (false, "xterm-256color"),
+        (true, "xterm-256color"),
+        (true, "dumb"),
+    ] {
+        let mut command = if terminal {
+            let mut command = std::process::Command::new("script");
+            #[cfg(target_os = "macos")]
+            command.args(["-q", "/dev/null"]).arg(&runner);
+            #[cfg(not(target_os = "macos"))]
+            command
+                .args(["-q", "-e", "-c"])
+                .arg(&runner)
+                .arg("/dev/null");
+            command
+        } else {
+            std::process::Command::new(&runner)
+        };
+        let output = command
+            .current_dir(dir.path())
+            .env("KIN_BIN", assert_cmd::cargo::cargo_bin!("kin"))
+            .env("TERM", term)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let url = "https://github.com/test/repo/pull/1";
+        if terminal && term != "dumb" {
+            assert!(
+                stdout.contains(&format!(
+                    "PR created: \x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\"
+                )),
+                "{stdout:?}"
+            );
+        } else {
+            assert!(stdout.contains(&format!("PR created: {url}")), "{stdout}");
+            assert!(!stdout.contains("\x1b]8;"), "{stdout:?}");
+        }
+    }
+}

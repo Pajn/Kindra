@@ -1226,7 +1226,12 @@ fn create_pr_interactive(
     )?;
     let body = body.into_inner();
 
-    println!("  ✓ PR created: {}", url);
+    if std::io::stdout().is_terminal() && std::env::var("TERM").as_deref() != Ok("dumb") {
+        // OSC 8 makes the displayed URL an explicit terminal hyperlink.
+        println!("  ✓ PR created: \x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\");
+    } else {
+        println!("  ✓ PR created: {}", url);
+    }
     Ok(Some(gh::EditablePr {
         number: parse_pr_number_from_url(&url)?,
         title,
