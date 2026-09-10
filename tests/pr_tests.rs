@@ -1157,8 +1157,33 @@ exit 1
 
 #[test]
 fn pr_adds_stack_section_to_multi_pr_descriptions() {
+    check_pr_stack_sections(false);
+}
+
+#[test]
+fn pr_stack_sections_include_cousins_when_run_from_a_leaf() {
+    check_pr_stack_sections(true);
+}
+
+fn check_pr_stack_sections(branching: bool) {
     let (dir, _repo) = setup_two_level_stack();
 
+    let extra_branches = if branching {
+        vec![
+            ("feature-c", "feature-a"),
+            ("feature-d", "feature-c"),
+            ("feature-z", "feature-b"),
+            ("unrelated", "main"),
+        ]
+    } else {
+        Vec::new()
+    };
+    for (branch, parent) in &extra_branches {
+        run_ok("git", &["checkout", "-b", branch, parent], dir.path());
+        fs::write(dir.path().join(format!("{branch}.txt")), branch).unwrap();
+        run_ok("git", &["add", "."], dir.path());
+        run_ok("git", &["commit", "-m", branch], dir.path());
+    }
     let remote_dir = dir.path().join("remote.git");
     std::fs::create_dir_all(&remote_dir).unwrap();
     run_ok("git", &["init", "--bare"], &remote_dir);
@@ -1167,11 +1192,9 @@ fn pr_adds_stack_section_to_multi_pr_descriptions() {
         &["remote", "add", "origin", remote_dir.to_str().unwrap()],
         dir.path(),
     );
-    run_ok(
-        "git",
-        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
-        dir.path(),
-    );
+    let mut push_args = vec!["push", "-u", "origin", "main", "feature-a", "feature-b"];
+    push_args.extend(extra_branches.iter().map(|(branch, _)| *branch));
+    run_ok("git", &push_args, dir.path());
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
@@ -1191,19 +1214,35 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
     head=""
+    base=""
     while [[ $# -gt 0 ]]; do
         if [[ "$1" == "--head" ]]; then
             head="$2"
-            break
+        fi
+        if [[ "$1" == "--base" ]]; then
+            base="$2"
         fi
         shift
     done
+    printf "%s" "$base" > "$MOCK_GH_BODY_DIR/base_$head.txt"
     if [[ "$head" == "feature-a" ]]; then
         echo "https://github.com/test/repo/pull/10"
         exit 0
     fi
     if [[ "$head" == "feature-b" ]]; then
         echo "https://github.com/test/repo/pull/11"
+        exit 0
+    fi
+    if [[ "$head" == "feature-c" ]]; then
+        echo "https://github.com/test/repo/pull/12"
+        exit 0
+    fi
+    if [[ "$head" == "feature-d" ]]; then
+        echo "https://github.com/test/repo/pull/13"
+        exit 0
+    fi
+    if [[ "$head" == "feature-z" ]]; then
+        echo "https://github.com/test/repo/pull/14"
         exit 0
     fi
 fi
@@ -1273,6 +1312,62 @@ exit 1
         "feature-b body should mark the current PR. Got:\n{}",
         feature_b_body
     );
+    if branching {
+        for number in 10..=14 {
+            let body =
+                fs::read_to_string(captured_body_dir.join(format!("pr_{number}.txt"))).unwrap();
+            for branch in ["feature-a", "feature-b", "feature-c", "feature-d"] {
+                assert!(
+                    body.contains(branch),
+                    "PR #{number} missing {branch}: {body}"
+                );
+            }
+            let stack_lines: Vec<_> = body
+                .lines()
+                .filter(|line| line.trim_start().starts_with("- "))
+                .collect();
+            for (line, (depth, branch)) in stack_lines.iter().zip([
+                (0, "feature-a"),
+                (1, "feature-b"),
+                (2, "feature-z"),
+                (1, "feature-c"),
+                (2, "feature-d"),
+            ]) {
+                assert!(
+                    line.starts_with(&format!("{}- ", "  ".repeat(depth))),
+                    "Wrong depth: {line}"
+                );
+                assert!(line.contains(branch), "Expected {branch}: {line}");
+            }
+            assert_eq!(stack_lines.len(), 5);
+            assert!(!body.contains("unrelated"));
+        }
+        for (branch, base) in [
+            ("feature-a", "main"),
+            ("feature-b", "feature-a"),
+            ("feature-c", "feature-a"),
+            ("feature-d", "feature-c"),
+            ("feature-z", "feature-b"),
+        ] {
+            assert_eq!(
+                fs::read_to_string(captured_body_dir.join(format!("base_{branch}.txt"))).unwrap(),
+                base
+            );
+        }
+        assert!(!captured_body_dir.join("base_unrelated.txt").exists());
+    } else {
+        for body in [&feature_a_body, &feature_b_body] {
+            let lines: Vec<_> = body
+                .lines()
+                .filter(|line| line.trim_start().starts_with("- "))
+                .collect();
+            assert_eq!(lines.len(), 2);
+            assert!(
+                lines.iter().all(|line| line.starts_with("- ")),
+                "Linear stack should stay flat: {body}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -2899,7 +2994,7 @@ fn pr_edit_reorders_stack_section_using_live_stack_order() {
     let start = "<!-- kindra-stack:start -->";
     let end = "<!-- kindra-stack:end -->";
     let stale_body = format!(
-        "Body with stale stack\n\n{}\n## Stack\n- ~[sync-main](https://github.com/test/repo/pull/24) #24~ (merged)\n- [pr-merge](https://github.com/test/repo/pull/26) #26\n- → pr-review #27\n{}\n",
+        "Body with stale stack\n\n{}\n## Stack\n- ~[sync-main](https://github.com/test/repo/pull/24) #24~ (merged)\n    - [pr-merge](https://github.com/test/repo/pull/26) #26\n  - → pr-review #27\n{}\n",
         start, end
     );
     let stale_body_for_bash = stale_body.replace('\n', "\\n").replace('"', "\\\"");
@@ -2971,6 +3066,8 @@ exit 1
     assert!(output.status.success(), "kin pr edit failed: {:?}", output);
 
     let body = fs::read_to_string(captured_body_dir.join("pr_27.txt")).unwrap();
+    assert!(body.contains("\n- → pr-review #27\n"), "{body}");
+    assert!(body.contains("\n- [pr-merge]"), "{body}");
     let sync_main_idx = body.find("sync-main").unwrap();
     let pr_review_idx = body.find("→ pr-review #27").unwrap();
     let pr_merge_idx = body

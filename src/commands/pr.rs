@@ -1,7 +1,8 @@
 use crate::commands::pr_merge::pr_merge;
 use crate::gh::{self, CreatePrParams};
 use crate::stack::{
-    StackBranch, compute_base_map, get_stack_branches_for_head, sort_branches_topologically,
+    StackBranch, collect_stack_component, compute_base_map, get_stack_branches_for_head,
+    resolve_merge_base, sort_branches_topologically,
 };
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -245,7 +246,7 @@ fn pr_create_or_update(
 
     // Now that we have all active PRs, update descriptions to include the full stack
     // (including merged ones parsed from existing descriptions).
-    sync_stack_descriptions(&processed_prs)?;
+    sync_stack_descriptions(&processed_prs, &base_map)?;
 
     Ok(())
 }
@@ -427,7 +428,7 @@ fn pr_edit() -> Result<()> {
     gh::check_gh().context("GitHub CLI check failed")?;
 
     let repo = crate::open_repo()?;
-    let (_upstream_name, branches_with_upstream) = discover_stack_branches_with_upstream(&repo)?;
+    let (upstream_name, branches_with_upstream) = discover_stack_branches_with_upstream(&repo)?;
 
     if branches_with_upstream.is_empty() {
         println!("No branches with a remote upstream in stack.");
@@ -441,6 +442,8 @@ fn pr_edit() -> Result<()> {
         println!("No open PRs found in the current stack.");
         return Ok(());
     }
+
+    let base_map = compute_base_map(&repo, &branches_with_upstream, &upstream_name)?;
 
     let selected = select_stack_pr(&all_stack_prs, "Select PR to edit:")?;
     let branch_name = selected.branch_name.clone();
@@ -519,7 +522,7 @@ fn pr_edit() -> Result<()> {
             let body_for_reconciliation = body.as_deref().unwrap_or(&existing.body);
             let old_list = parse_stack_section(body_for_reconciliation);
             let merged_list = merge_stack_lists(&old_list, &all_stack_prs, &branch_name)?;
-            let stack_section = render_stack_section(&merged_list);
+            let stack_section = render_stack_section(&merged_list, &base_map);
             let final_body = update_stack_section(body_for_reconciliation, stack_section);
 
             let body_to_send = if final_body == existing.body && body.is_none() {
@@ -837,6 +840,25 @@ fn discover_stack_branches(repo: &Repository) -> Result<(String, Vec<StackBranch
     // processed before the branches that depend on them.
     let mut stack_branches =
         get_stack_branches_for_head(repo, head_id, upstream_id, &git_boundary_ref)?;
+    // The HEAD lineage omits cousins. Expand through private ancestor branches
+    // so every PR in a branching stack receives the complete stack section.
+    // Keep the lineage entries too, including co-located branch aliases.
+    if !repo.head_detached()?
+        && let Some(current) = repo.head()?.shorthand()
+        && stack_branches.iter().any(|branch| branch.name == current)
+    {
+        let merge_base = resolve_merge_base(repo, upstream_id, head_id)?;
+        for branch in
+            collect_stack_component(repo, current, merge_base, upstream_id, &git_boundary_ref)?
+        {
+            if !stack_branches
+                .iter()
+                .any(|existing| existing.name == branch.name)
+            {
+                stack_branches.push(branch);
+            }
+        }
+    }
     sort_branches_topologically(repo, &mut stack_branches)?;
 
     if stack_branches.is_empty() {
@@ -1215,11 +1237,11 @@ fn create_pr_interactive(
     }))
 }
 
-fn sync_stack_descriptions(prs: &[StackPr]) -> Result<()> {
+fn sync_stack_descriptions(prs: &[StackPr], base_map: &HashMap<String, String>) -> Result<()> {
     for pr in prs {
         let old_list = parse_stack_section(&pr.pr.body);
         let merged_list = merge_stack_lists(&old_list, prs, &pr.branch_name)?;
-        let stack_section = render_stack_section(&merged_list);
+        let stack_section = render_stack_section(&merged_list, base_map);
         let updated_body = update_stack_section(&pr.pr.body, stack_section);
 
         if updated_body == pr.pr.body {
@@ -1375,15 +1397,61 @@ fn merge_stack_lists(
     Ok(items)
 }
 
-fn render_stack_section(items: &[RenderItem]) -> Option<String> {
+fn render_stack_section(
+    items: &[RenderItem],
+    base_map: &HashMap<String, String>,
+) -> Option<String> {
     if items.len() <= 1 {
         return None;
     }
 
     let mut section = String::from(STACK_SECTION_START);
-    section.push_str("\n## Stack\n");
+    section.push_str("\n## Stack\n\n");
 
-    for item in items {
+    // Walk the presentation tree depth first: a topological order alone can
+    // place a sibling between a parent and its child, which misnests Markdown.
+    // Skip omitted PRs while following the already-computed local parent map.
+    let mut children = vec![Vec::new(); items.len()];
+    let mut roots = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        let mut parent = base_map.get(&item.branch_name);
+        let mut seen = HashSet::from([item.branch_name.as_str()]);
+        let mut parent_idx = None;
+        while let Some(name) = parent {
+            if !seen.insert(name.as_str()) {
+                break;
+            }
+            parent_idx = items
+                .iter()
+                .position(|candidate| !candidate.is_merged && candidate.branch_name == *name)
+                .or_else(|| {
+                    items
+                        .iter()
+                        .position(|candidate| candidate.branch_name == *name)
+                });
+            if parent_idx.is_some() {
+                break;
+            }
+            parent = base_map.get(name);
+        }
+        if let Some(parent_idx) = parent_idx {
+            children[parent_idx].push(idx);
+        } else {
+            roots.push(idx);
+        }
+    }
+    // Historical merged entries alone do not turn a linear stack into a fork.
+    let branching = children.iter().any(|children| children.len() > 1)
+        || roots.iter().filter(|&&idx| !items[idx].is_merged).count() > 1;
+    let mut pending: Vec<_> = if branching {
+        roots.into_iter().rev().map(|idx| (idx, 0)).collect()
+    } else {
+        // Preserve the original ordering of historical entries in flat stacks.
+        (0..items.len()).rev().map(|idx| (idx, 0)).collect()
+    };
+    while let Some((idx, depth)) = pending.pop() {
+        let item = &items[idx];
+        section.push_str(&"  ".repeat(depth));
         if item.is_current {
             section.push_str(&format!("- → {} #{}\n", item.branch_name, item.number));
         } else if item.is_merged {
@@ -1396,6 +1464,9 @@ fn render_stack_section(items: &[RenderItem]) -> Option<String> {
                 "- [{}]({}) #{}\n",
                 item.branch_name, item.url, item.number
             ));
+        }
+        if branching {
+            pending.extend(children[idx].iter().rev().map(|&child| (child, depth + 1)));
         }
     }
 
