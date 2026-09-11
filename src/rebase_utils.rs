@@ -582,10 +582,9 @@ pub fn dirty_working_tree_error() -> anyhow::Error {
     )
 }
 
-/// Pre-flight for commands that delegate stashing to `git rebase --autostash`
-/// (sync, move, reorder, restack). Surfaces Kindra's uniform message up front
-/// when the tree is dirty and autostash is off; when autostash is on, git does
-/// the stashing so this is a no-op.
+/// Pre-flight for rebase commands (sync, move, reorder, restack). Surfaces
+/// Kindra's uniform message when the tree is dirty and autostash is off.
+/// When enabled, stashing is deferred until the operation is ready to start.
 pub fn ensure_rebase_working_tree(repo: &Repository, autostash: bool) -> Result<()> {
     if !autostash && working_tree_dirty(repo)? {
         return Err(dirty_working_tree_error());
@@ -594,7 +593,7 @@ pub fn ensure_rebase_working_tree(repo: &Repository, autostash: bool) -> Result<
 }
 
 /// Enforce the clean-or-autostash contract for commands that manage the working
-/// tree themselves rather than via `git rebase` (run, split). Returns:
+/// tree themselves rather than via `git rebase`. Returns:
 /// - `Ok(None)` if the tree is clean (nothing stashed),
 /// - `Err(..)` if the tree is dirty and autostash is off,
 /// - `Ok(Some(stash_ref))` if the tree was dirty and autostash stashed it.
@@ -937,15 +936,11 @@ pub fn unstage_all() -> Result<()> {
 pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> {
     ensure_git_supports_update_refs()?;
 
-    // A commit can leave unstaged edits on the parent. Git's per-rebase
+    // The caller can have uncommitted edits on the parent. Git's per-rebase
     // autostash would restore those edits on a child, where they may conflict
     // even though they apply cleanly on the caller. Own the stash across the
     // entire restack so completion and abort restore it on the saved branch.
-    if state.operation == Operation::Commit
-        && !state.remaining_branches.is_empty()
-        && state.autostash
-        && state.stash_ref.is_none()
-    {
+    if !state.remaining_branches.is_empty() && state.autostash && state.stash_ref.is_none() {
         state.stash_ref = take_autostash(repo, true)?;
         state.stash_apply_index = true;
         state.autostash = false;
