@@ -271,3 +271,43 @@ fn rename_migrates_branch_tracking_config() {
     );
     assert!(git_config("branch.feature-a.merge").is_none());
 }
+
+#[test]
+fn rename_respects_repository_lock_across_worktrees() {
+    let dir = common::setup_repo();
+    let repo = git2::Repository::open(dir.path()).unwrap();
+    let wt = tempfile::tempdir().unwrap();
+    common::run_ok(
+        "git",
+        &["worktree", "add", wt.path().to_str().unwrap(), "feature-a"],
+        dir.path(),
+    );
+    let linked = git2::Repository::open(wt.path()).unwrap();
+    for holder in [&repo, &linked] {
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(holder.commondir().join("kindra.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        for cwd in [dir.path(), wt.path()] {
+            common::kin_cmd()
+                .current_dir(cwd)
+                .args(["rename", "feature-b", "renamed"])
+                .assert()
+                .failure()
+                .stderr(predicates::str::contains("Another 'kin' process"));
+        }
+        // Explicitly release before the next iteration: a concurrent test may
+        // briefly inherit this descriptor between fork and exec.
+        fs2::FileExt::unlock(&lock).unwrap();
+        drop(lock);
+    }
+    common::kin_cmd()
+        .current_dir(wt.path())
+        .args(["rename", "feature-b", "renamed"])
+        .assert()
+        .success();
+}

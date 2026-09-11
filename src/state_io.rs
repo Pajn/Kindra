@@ -112,7 +112,9 @@ fn temp_path_for(path: &Path) -> PathBuf {
 
 /// Path to the repository-wide advisory lock file guarding Kindra operations.
 pub fn lock_path(repo: &Repository) -> PathBuf {
-    repo.path().join("kindra.lock")
+    // Branch refs are shared by all linked worktrees, so their mutations must
+    // share a lock even though rebase state belongs to each worktree.
+    repo.commondir().join("kindra.lock")
 }
 
 /// A held exclusive lock over all Kindra state mutations in a repository.
