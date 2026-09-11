@@ -2946,3 +2946,32 @@ fn restack_blocked_by_stale_run_state() {
     );
     assert!(dir.path().join(".git/kindra_run_state.json").exists());
 }
+
+#[test]
+fn restack_rejects_checked_out_child_before_saving_state() {
+    let dir = common::setup_repo();
+    let wt = tempfile::tempdir().unwrap();
+    run_ok("git", &["checkout", "feature-a"], dir.path());
+    run_ok(
+        "git",
+        &["commit", "--amend", "-m", "amended parent"],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["worktree", "add", wt.path().to_str().unwrap(), "feature-b"],
+        dir.path(),
+    );
+    let repo = Repository::open(dir.path()).unwrap();
+    let original = repo.revparse_single("feature-b").unwrap().id();
+    kin_cmd()
+        .current_dir(dir.path())
+        .arg("restack")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("feature-b is checked out in"));
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert_eq!(repo.revparse_single("feature-b").unwrap().id(), original);
+    assert_eq!(common::current_branch(dir.path()), "feature-a");
+    assert_no_rebase_in_progress(dir.path());
+}
