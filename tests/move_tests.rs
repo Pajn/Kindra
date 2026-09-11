@@ -1819,8 +1819,12 @@ fn test_move_respects_git_rebase_autostash_config() {
         "git config rebase.autostash should allow move to start rebasing"
     );
 
-    // Clean up: abort the rebase so the test leaves a clean state
-    run_ok("git", &["rebase", "--abort"], dir.path());
+    // Kindra owns the stash for the whole operation, including abort.
+    kin_cmd()
+        .current_dir(dir.path())
+        .arg("abort")
+        .assert()
+        .success();
     assert_eq!(
         fs::read_to_string(dir.path().join("file.txt")).unwrap(),
         "base\nfeature\ndirty\n",
@@ -1883,10 +1887,14 @@ fn test_move_repo_config_enables_autostash_and_persists_in_state() {
         "repo config should allow move to start rebasing with autostash"
     );
 
-    let state = fs::read_to_string(dir.path().join(".git/kindra_rebase_state.json")).unwrap();
+    let state = kindra::rebase_utils::load_state(&repo).unwrap();
     assert!(
-        state.contains("\"autostash\": true"),
-        "rebase state should persist autostash preference: {state}"
+        state.stash_ref.is_some(),
+        "operation must own the autostash"
+    );
+    assert!(
+        !state.autostash,
+        "Git must not restore edits on each branch"
     );
 }
 
@@ -2245,4 +2253,113 @@ fn move_refuses_dirty_working_tree_with_no_autostash() {
     assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
+}
+
+fn dirty_parent_with_child() -> tempfile::TempDir {
+    let dir = common::setup_repo();
+    fs::write(dir.path().join("file.txt"), "child version\n").unwrap();
+    run_ok("git", &["add", "file.txt"], dir.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "child changes shared file"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-a"], dir.path());
+    fs::write(dir.path().join("file.txt"), "uncommitted parent edit\n").unwrap();
+    run_ok("git", &["add", "file.txt"], dir.path());
+    dir
+}
+
+fn assert_parent_edits_restored(dir: &Path) {
+    assert_eq!(common::current_branch(dir), "feature-a");
+    assert_eq!(
+        fs::read_to_string(dir.join("file.txt")).unwrap(),
+        "uncommitted parent edit\n"
+    );
+    let status = common::git_command(dir)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert_eq!(String::from_utf8_lossy(&status.stdout), "M  file.txt\n");
+    let stashes = common::git_command(dir)
+        .args(["stash", "list"])
+        .output()
+        .unwrap();
+    assert!(stashes.status.success());
+    assert!(stashes.stdout.is_empty());
+    assert!(!dir.join(".git/kindra_rebase_state.json").exists());
+}
+
+#[test]
+fn move_autostash_restores_edits_only_on_caller() {
+    let dir = dirty_parent_with_child();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["move", "--onto", "main", "--autostash"])
+        .assert()
+        .success();
+    assert_parent_edits_restored(dir.path());
+    let repo = Repository::open(dir.path()).unwrap();
+    let parent = repo.revparse_single("feature-a").unwrap().id();
+    let child = repo
+        .revparse_single("feature-b")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    assert!(repo.graph_descendant_of(child.id(), parent).unwrap());
+    assert_eq!(
+        repo.find_blob(child.tree().unwrap().get_name("file.txt").unwrap().id())
+            .unwrap()
+            .content(),
+        b"child version\n"
+    );
+}
+
+#[test]
+fn move_autostash_abort_restores_staged_caller_edits() {
+    let dir = dirty_parent_with_child();
+    let repo = Repository::open(dir.path()).unwrap();
+    let original_parent = repo.revparse_single("feature-a").unwrap().id();
+    let original_child = repo.revparse_single("feature-b").unwrap().id();
+    // A commit-tree target avoids disturbing the caller's staged edits.
+    let main = repo
+        .revparse_single("main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    let blob = repo.blob(b"conflicting target content\n").unwrap();
+    let mut tree = repo.treebuilder(Some(&main.tree().unwrap())).unwrap();
+    tree.insert("feature.txt", blob, 0o100644).unwrap();
+    let tree_id = tree.write().unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    repo.commit(
+        Some("refs/heads/target"),
+        &sig,
+        &sig,
+        "target",
+        &repo.find_tree(tree_id).unwrap(),
+        &[&main],
+    )
+    .unwrap();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["move", "--onto", "target", "--autostash"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Resolve conflicts"));
+    kin_cmd()
+        .current_dir(dir.path())
+        .arg("abort")
+        .assert()
+        .success();
+    assert_parent_edits_restored(dir.path());
+    assert_eq!(
+        repo.revparse_single("feature-a").unwrap().id(),
+        original_parent
+    );
+    assert_eq!(
+        repo.revparse_single("feature-b").unwrap().id(),
+        original_child
+    );
 }

@@ -182,6 +182,8 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
         cleanup_checkout_fallback: None,
     };
 
+    crate::rebase_utils::check_worktrees(&state.remaining_branches, false)?;
+
     // Snapshot for undo only now that the no-op checks ("No floating children",
     // "No branches selected") have passed and we are about to mutate branches.
     // The guard settles the snapshot on every exit from here on, so no path can
