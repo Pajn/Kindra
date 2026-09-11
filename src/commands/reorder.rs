@@ -63,7 +63,7 @@ pub fn reorder(args: &ReorderArgs) -> Result<()> {
 
     let current_parent_map =
         crate::stack::current_parent_name_map(&repo, &stack_component, merge_base, &upstream_name)?;
-    let edited_parent_map = edit_parent_map(
+    let (edited_parent_map, draft) = edit_parent_map(
         &stack_component,
         &current_parent_map,
         &upstream_name,
@@ -72,66 +72,77 @@ pub fn reorder(args: &ReorderArgs) -> Result<()> {
     )?;
 
     if edited_parent_map == current_parent_map {
+        draft.discard();
         println!("No reorder changes.");
         return Ok(());
     }
 
-    let plan = crate::stack::plan_graph_reorder(
-        &repo,
-        &stack_component,
-        merge_base,
-        &upstream_name,
-        &edited_parent_map,
-    )?;
+    let prepared = (|| -> Result<RebaseState> {
+        let plan = crate::stack::plan_graph_reorder(
+            &repo,
+            &stack_component,
+            merge_base,
+            &upstream_name,
+            &edited_parent_map,
+        )?;
 
-    let autostash =
-        crate::commands::resolve_and_check_autostash(&repo, args.autostash, args.no_autostash)?;
+        let autostash =
+            crate::commands::resolve_and_check_autostash(&repo, args.autostash, args.no_autostash)?;
 
-    crate::rebase_utils::check_worktrees(&plan.remaining_branches, args.force)?;
+        crate::rebase_utils::check_worktrees(&plan.remaining_branches, args.force)?;
 
-    let original_commit_count_map = stack_component
-        .iter()
-        .map(|branch| {
-            let parent_id = plan
-                .parent_id_map
-                .get(&branch.name)
-                .ok_or_else(|| anyhow!("Missing parent id for '{}'.", branch.name))?;
-            let chain = crate::stack::collect_first_parent_chain(
-                &repo,
-                git2::Oid::from_str(parent_id)?,
-                branch.id,
-            )?;
-            Ok((branch.name.clone(), chain.len()))
-        })
-        .collect::<Result<HashMap<_, _>>>()?;
-    let original_tip_map = stack_component
-        .iter()
-        .map(|branch| (branch.name.clone(), branch.id.to_string()))
-        .collect::<HashMap<_, _>>();
+        let original_commit_count_map = stack_component
+            .iter()
+            .map(|branch| {
+                let parent_id = plan
+                    .parent_id_map
+                    .get(&branch.name)
+                    .ok_or_else(|| anyhow!("Missing parent id for '{}'.", branch.name))?;
+                let chain = crate::stack::collect_first_parent_chain(
+                    &repo,
+                    git2::Oid::from_str(parent_id)?,
+                    branch.id,
+                )?;
+                Ok((branch.name.clone(), chain.len()))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let original_tip_map = stack_component
+            .iter()
+            .map(|branch| (branch.name.clone(), branch.id.to_string()))
+            .collect::<HashMap<_, _>>();
 
-    let state = RebaseState {
-        operation: Operation::Reorder,
-        original_branch: current_branch_name,
-        target_branch: upstream_name,
-        caller_branch: None,
-        remaining_branches: plan.remaining_branches,
-        in_progress_branch: None,
-        parent_id_map: plan.parent_id_map,
-        parent_name_map: current_parent_map,
-        new_base_map: plan.new_base_map,
-        original_commit_count_map,
-        original_tip_map,
-        owned_tip_map: HashMap::new(),
-        stash_ref: None,
-        stash_apply_index: false,
-        carry_stash_ref: None,
-        preserve_content_on_abort: false,
-        suppress_editor: false,
-        unstage_on_restore: false,
-        autostash,
-        cleanup_merged_branches: Vec::new(),
-        cleanup_checkout_fallback: None,
-    };
+        let state = RebaseState {
+            operation: Operation::Reorder,
+            original_branch: current_branch_name,
+            target_branch: upstream_name,
+            caller_branch: None,
+            remaining_branches: plan.remaining_branches,
+            in_progress_branch: None,
+            parent_id_map: plan.parent_id_map,
+            parent_name_map: current_parent_map,
+            new_base_map: plan.new_base_map,
+            original_commit_count_map,
+            original_tip_map,
+            owned_tip_map: HashMap::new(),
+            stash_ref: None,
+            stash_apply_index: false,
+            carry_stash_ref: None,
+            preserve_content_on_abort: false,
+            suppress_editor: false,
+            unstage_on_restore: false,
+            autostash,
+            cleanup_merged_branches: Vec::new(),
+            cleanup_checkout_fallback: None,
+        };
+
+        Ok(state)
+    })();
+    let state = prepared.inspect_err(|_| {
+        eprintln!(
+            "  Your reorder edits were saved to {} — fix the issue and re-run `kin reorder`.",
+            draft.path().display()
+        );
+    })?;
 
     // Snapshot for undo only now that all no-op/validation checks have passed and
     // we are about to mutate branches. The guard settles the snapshot on every
@@ -139,6 +150,7 @@ pub fn reorder(args: &ReorderArgs) -> Result<()> {
     // a stale pending snapshot behind.
     let _snapshot = crate::oplog::begin(&repo, "reorder")?;
     save_state(&repo, &state)?;
+    draft.discard();
     run_rebase_loop(&repo, state)
 }
 
@@ -148,7 +160,7 @@ fn edit_parent_map(
     upstream_name: &str,
     current_branch_name: &str,
     git_dir: &std::path::Path,
-) -> Result<HashMap<String, String>> {
+) -> Result<(HashMap<String, String>, crate::editor::Draft)> {
     let buffer = render_parent_map_buffer(
         branches,
         current_parent_map,
@@ -167,10 +179,7 @@ fn edit_parent_map(
     let edited_buffer = draft.edit_or_resume(&buffer)?;
 
     match parse_parent_map(&edited_buffer, branches, upstream_name) {
-        Ok(map) => {
-            draft.discard();
-            Ok(map)
-        }
+        Ok(map) => Ok((map, draft)),
         Err(e) => {
             eprintln!(
                 "  Your reorder edits were saved to {} — fix them and re-run `kin reorder`.",

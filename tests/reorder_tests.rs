@@ -876,3 +876,29 @@ fn reorder_failure_preserves_draft_and_prints_guidance() {
         "preserved draft should hold the user's edits, got:\n{saved}"
     );
 }
+
+#[test]
+fn reorder_graph_validation_preserves_draft() {
+    for edited in [
+        "branch feature-a parent feature-c\nbranch feature-b parent feature-a\nbranch feature-c parent feature-b\n",
+        "branch feature-a parent feature-a\nbranch feature-b parent feature-a\nbranch feature-c parent feature-b\n",
+    ] {
+        let dir = linear_stack_on_feature_a();
+        let editor = write_editor_script(dir.path(), edited);
+        kin_cmd()
+            .current_dir(dir.path())
+            .arg("reorder")
+            .env("GIT_EDITOR", editor)
+            .assert()
+            .failure();
+        let draft = reorder_draft_path(dir.path(), "feature-a");
+        assert_eq!(fs::read_to_string(&draft).unwrap(), edited);
+        // A no-op editor must reopen the rejected graph, not regenerate it.
+        kin_cmd()
+            .current_dir(dir.path())
+            .arg("reorder")
+            .assert()
+            .failure();
+        assert_eq!(fs::read_to_string(draft).unwrap(), edited);
+    }
+}
