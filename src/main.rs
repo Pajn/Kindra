@@ -3,6 +3,7 @@ mod editor;
 mod gh;
 mod interaction;
 mod oplog;
+mod overrides;
 mod rebase_todo;
 mod rebase_utils;
 mod repository;
@@ -133,6 +134,11 @@ enum Commands {
         /// Clear only Kindra's saved operation state; keep Git state and stashes intact
         #[arg(long)]
         clear_state: bool,
+    },
+    /// Apply, remove, or inspect configured local overrides
+    Overrides {
+        #[command(subcommand)]
+        subcommand: crate::commands::overrides::OverridesSubcommand,
     },
     /// Show the status of an in-progress Kindra operation
     Status,
@@ -301,6 +307,7 @@ fn dispatch() -> Result<()> {
         Commands::Commit { args } => commit(args)?,
         Commands::Continue => continue_cmd()?,
         Commands::Abort { clear_state } => abort_cmd(*clear_state)?,
+        Commands::Overrides { subcommand } => crate::commands::overrides::overrides(subcommand)?,
         Commands::Status => status_cmd()?,
         Commands::Undo { force } => oplog::undo(*force)?,
         Commands::Redo { force } => oplog::redo(*force)?,

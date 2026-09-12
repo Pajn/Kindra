@@ -34,3 +34,10 @@
 2.  **Implement**: Apply the minimal surgical change required.
 3.  **Verify**: Run the full test suite (`cargo test`) and check Clippy/Fmt.
 4.  **Document**: Update this file or add comments for particularly complex Git graph operations.
+
+### Local Override Lifecycle
+- `src/overrides.rs` wraps whole operations while their existing `RepoLock` is held. Keep intermediate checkouts and rebases inside the wrapper; applying overlays between rebase steps can corrupt conflict resolutions.
+- Override configuration is shared via the common Git directory, but snapshots and recovery phases belong to the individual worktree. Never restore the index from an override snapshot.
+- New commands that change working-tree contents should use `with_suspended`; recovery commands must preserve suspended overlays until both Git and Kindra operation state are clear.
+- `kin overrides remove` disables automatic application per worktree. Recovery must honor persisted removal intent, and re-enabling must protect edits made to the original files while disabled.
+- `kin overrides diff` compares configured on-disk files with HEAD through a temporary index and object database. Keep the real index, object database, and override state untouched; never run apply hooks for inspection.

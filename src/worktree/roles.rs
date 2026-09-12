@@ -149,22 +149,32 @@ pub fn ensure_review(
             });
         }
 
-        let dirty = is_worktree_dirty(&path)?;
-        let discard_local_changes = force || (dirty && ctx.config.review.clean_before_switch);
-        if dirty && !force && ctx.config.review.clean_before_switch {
-            confirm_or_abort(&format!(
-                "Review worktree '{}' has uncommitted changes. Discard them and switch to '{}'?",
-                path.display(),
-                branch
-            ))?;
-        }
+        let worktree_repo = Repository::open(&path)?;
+        let _lock = crate::state_io::RepoLock::acquire(&worktree_repo)?;
+        let (dirty, discard_local_changes, rollback) = crate::overrides::with_suspended(
+            &worktree_repo,
+            false,
+            || {
+                let dirty = is_worktree_dirty(&path)?;
+                let discard_local_changes =
+                    force || (dirty && ctx.config.review.clean_before_switch);
+                if dirty && !force && ctx.config.review.clean_before_switch {
+                    confirm_or_abort(&format!(
+                        "Review worktree '{}' has uncommitted changes. Discard them and switch to '{}'?",
+                        path.display(),
+                        branch
+                    ))?;
+                }
 
-        let rollback = live
-            .branch
-            .clone()
-            .map(RollbackTarget::Branch)
-            .map_or_else(|| current_head_oid(&path).map(RollbackTarget::Detached), Ok)?;
-        checkout_worktree_branch(&path, &branch, discard_local_changes)?;
+                let rollback = live
+                    .branch
+                    .clone()
+                    .map(RollbackTarget::Branch)
+                    .map_or_else(|| current_head_oid(&path).map(RollbackTarget::Detached), Ok)?;
+                checkout_worktree_branch(&path, &branch, discard_local_changes)?;
+                Ok((dirty, discard_local_changes, rollback))
+            },
+        )?;
         run_checkout_hooks(
             &ctx.config,
             &path,
@@ -1253,10 +1263,17 @@ fn rollback_review_checkout(
     hook_err: anyhow::Error,
 ) -> anyhow::Error {
     let force_rollback = discard_local_changes || !was_dirty;
-    let rollback_result = match rollback {
-        RollbackTarget::Branch(branch) => checkout_worktree_branch(path, branch, force_rollback),
-        RollbackTarget::Detached(oid) => checkout_worktree_detached(path, oid, force_rollback),
-    };
+    // The enclosing review operation still owns RepoLock. Setup hooks run with
+    // overlays applied, so suspend again before restoring the original branch.
+    let rollback_result = (|| -> Result<()> {
+        let repo = Repository::open(path)?;
+        crate::overrides::with_suspended(&repo, false, || match rollback {
+            RollbackTarget::Branch(branch) => {
+                checkout_worktree_branch(path, branch, force_rollback)
+            }
+            RollbackTarget::Detached(oid) => checkout_worktree_detached(path, oid, force_rollback),
+        })
+    })();
 
     match rollback_result {
         Ok(()) => hook_err,

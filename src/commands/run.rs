@@ -63,13 +63,17 @@ pub(crate) struct RunState {
 pub fn run(args: &RunArgs) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    if passively_reconcile_rebase_state(&repo)? || run_state_exists(&repo) {
+    crate::overrides::with_suspended(&repo, false, || run_locked(&repo, args))
+}
+
+fn run_locked(repo: &git2::Repository, args: &RunArgs) -> Result<()> {
+    if passively_reconcile_rebase_state(repo)? || run_state_exists(repo) {
         return Err(anyhow!(
             "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));
     }
 
-    let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
+    let upstream_name = find_upstream(repo)?.ok_or_else(|| {
         anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
     })?;
 
@@ -83,15 +87,10 @@ pub fn run(args: &RunArgs) -> Result<()> {
 
     let upstream_obj = repo.revparse_single(&upstream_name)?;
     let upstream_id = upstream_obj.id();
-    let merge_base = resolve_merge_base(&repo, upstream_id, head_id)?;
+    let merge_base = resolve_merge_base(repo, upstream_id, head_id)?;
 
-    let mut stack_branches = get_stack_branches_from_merge_base(
-        &repo,
-        merge_base,
-        head_id,
-        upstream_id,
-        &upstream_name,
-    )?;
+    let mut stack_branches =
+        get_stack_branches_from_merge_base(repo, merge_base, head_id, upstream_id, &upstream_name)?;
 
     if stack_branches.is_empty() {
         println!("No branches found in the current stack.");
@@ -99,15 +98,15 @@ pub fn run(args: &RunArgs) -> Result<()> {
     }
 
     // Sort from base to tips (topological order)
-    sort_branches_topologically(&repo, &mut stack_branches)?;
+    sort_branches_topologically(repo, &mut stack_branches)?;
 
     // Enforce the uniform clean-or-autostash contract before checking out any
     // branch, so uncommitted changes never travel across the stack.
     let autostash = crate::commands::resolve_rebase_autostash(
-        &repo,
+        repo,
         crate::commands::autostash_override(args.autostash, args.no_autostash),
     )?;
-    let stash_ref = crate::rebase_utils::take_autostash(&repo, autostash)?;
+    let stash_ref = crate::rebase_utils::take_autostash(repo, autostash)?;
 
     let mut run_state = RunState {
         target_branches: stack_branches.into_iter().map(|b| b.name).collect(),
@@ -122,11 +121,11 @@ pub fn run(args: &RunArgs) -> Result<()> {
     };
     // If persisting fails, nothing downstream knows to restore the autostash, so
     // pop it back now rather than stranding the user's uncommitted changes.
-    if let Err(err) = persist_run_state(&repo, &run_state) {
+    if let Err(err) = persist_run_state(repo, &run_state) {
         restore_run_stash(&mut run_state);
         return Err(err);
     }
-    execute_run(&repo, &mut run_state)
+    execute_run(repo, &mut run_state)
 }
 
 pub(crate) fn abort_run(repo: &Repository) -> Result<()> {

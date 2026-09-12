@@ -50,8 +50,11 @@ pub struct AbsorbArgs {
 pub fn absorb(args: &AbsorbArgs) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+    crate::overrides::with_suspended(&repo, false, || absorb_locked(&repo, args))
+}
 
-    if passively_reconcile_rebase_state(&repo)? || crate::commands::run::run_state_exists(&repo) {
+fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
+    if passively_reconcile_rebase_state(repo)? || crate::commands::run::run_state_exists(repo) {
         return Err(anyhow!(
             "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));
@@ -66,13 +69,13 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
     .ok_or_else(|| anyhow!("You must be on a branch to use 'absorb'"))?;
     let head_before = head.peel_to_commit()?.id();
 
-    let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
+    let upstream_name = find_upstream(repo)?.ok_or_else(|| {
         anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
     })?;
     let upstream_id = repo.revparse_single(&upstream_name)?.id();
     let merge_base = repo.merge_base(upstream_id, head_before)?;
     let stack_branches = get_stack_branches_from_merge_base(
-        &repo,
+        repo,
         merge_base,
         head_before,
         upstream_id,
@@ -86,8 +89,8 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
     })?;
 
     let mut sub_stack = Vec::new();
-    collect_descendants(&repo, &current_branch_name, &stack_branches, &mut sub_stack)?;
-    crate::stack::sort_branches_topologically(&repo, &mut sub_stack)?;
+    collect_descendants(repo, &current_branch_name, &stack_branches, &mut sub_stack)?;
+    crate::stack::sort_branches_topologically(repo, &mut sub_stack)?;
     let remaining_branches: Vec<String> = sub_stack
         .iter()
         .filter(|sb| sb.name != current_branch_name)
@@ -102,7 +105,7 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
     // would relocate the branch, and one below the stack parent would rewrite
     // ancestor branches whose siblings this command does not restack.
     let stack_parent_id = crate::stack::find_parent_in_stack(
-        &repo,
+        repo,
         &current_branch_name,
         &stack_branches,
         merge_base,
@@ -147,12 +150,12 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
     // that is refused up front.
     ensure_git_supports_update_refs()?;
     let in_range_tips: Vec<(String, Oid)> =
-        local_branch_tips_in_range(&repo, Some(base_id), head_before)?
+        local_branch_tips_in_range(repo, Some(base_id), head_before)?
             .into_iter()
             .filter(|(name, _)| name != &current_branch_name)
             .collect();
     ensure_no_forks_from_rewritten_range(
-        &repo,
+        repo,
         &current_branch_name,
         &sub_stack,
         &in_range_tips,
@@ -172,7 +175,7 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
     // Snapshot for undo before the absorb engine commits anything, so `kin undo`
     // rolls the whole operation back to the pre-fixup tips. The guard settles the
     // snapshot on every exit; a no-change exit leaves no oplog entry.
-    let _snapshot = crate::oplog::begin(&repo, "absorb")?;
+    let _snapshot = crate::oplog::begin(repo, "absorb")?;
 
     if let Err(err) = run_absorb_engine(args, base_id) {
         // The engine may have created some fixup commits before failing; roll
