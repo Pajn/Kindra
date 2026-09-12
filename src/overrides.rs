@@ -35,6 +35,10 @@ enum Phase {
 struct State {
     config: Config,
     phase: Phase,
+    // Persist the user's intent before removing any overlay files, so recovery
+    // cannot inadvertently reapply overrides after an interrupted removal.
+    #[serde(default)]
+    removing: bool,
     head: String,
     tree: String,
     files: Vec<SavedFile>,
@@ -57,6 +61,14 @@ enum Contents {
 
 pub fn state_path(repo: &Repository) -> PathBuf {
     repo.path().join("kindra_overrides_state.json")
+}
+
+fn disabled_path(repo: &Repository) -> PathBuf {
+    repo.path().join("kindra_overrides_disabled")
+}
+
+pub fn is_disabled(repo: &Repository) -> bool {
+    disabled_path(repo).exists()
 }
 
 fn config(repo: &Repository) -> Result<Option<Config>> {
@@ -271,6 +283,7 @@ fn snapshot(repo: &Repository, config: Config) -> Result<State> {
     Ok(State {
         config,
         phase: Phase::Preparing,
+        removing: false,
         files,
         head: String::from_utf8(git(repo, &["rev-parse", "HEAD"], None)?)?,
         tree: String::from_utf8(git(repo, &["write-tree"], None)?)?,
@@ -305,6 +318,35 @@ fn suspend(repo: &Repository, state: &mut State) -> Result<()> {
     }
     state.phase = Phase::Suspended;
     save(repo, state)
+}
+
+fn prepare(repo: &Repository, mut state: State) -> Result<State> {
+    // Failure here must leave the original files and flags untouched.
+    save(repo, &state)?;
+    if let Err(err) = suspend(repo, &mut state) {
+        // No Git operation has started, even if the Suspended checkpoint failed.
+        return match rollback_preparation(repo, &state) {
+            Ok(()) => Err(err),
+            Err(restore) => Err(anyhow!(
+                "{err:#}\nOverride recovery also failed: {restore:#}"
+            )),
+        };
+    }
+    Ok(state)
+}
+
+// The disabled marker must be durable before discarding the recovery state.
+// Both files may coexist after interruption; recovery completes removal first.
+fn finish_removal(repo: &Repository) -> Result<()> {
+    crate::state_io::write_atomic(
+        &disabled_path(repo),
+        "Run 'kin overrides apply' to re-enable overrides in this worktree.\n",
+    )?;
+    fs::remove_file(state_path(repo))?;
+    eprintln!(
+        "Local overrides removed and disabled in this worktree. Run 'kin overrides apply' to re-enable them."
+    );
+    Ok(())
 }
 
 fn rollback_preparation(repo: &Repository, state: &State) -> Result<()> {
@@ -395,6 +437,9 @@ fn apply(repo: &Repository, state: &mut State) -> Result<()> {
     }
     let tracked = paths(repo, &state.config, &["ls-files", "--cached", "-z"])?;
     flags(repo, &tracked, true)?;
+    // A failed apply keeps both recovery state and the disabled marker. Only a
+    // fully successful apply re-enables automatic override management.
+    remove_file(&disabled_path(repo))?;
     fs::remove_file(state_path(repo))?;
     Ok(())
 }
@@ -420,9 +465,18 @@ pub fn with_suspended<T>(
             rollback_preparation(repo, &state)?;
             return operation();
         }
+        if state.removing {
+            if busy(repo) {
+                bail!(
+                    "Cannot finish removing overrides while a Git or Kindra operation is in progress."
+                );
+            }
+            finish_removal(repo)?;
+            return operation();
+        }
         state
     } else {
-        if recovery {
+        if recovery || is_disabled(repo) {
             return operation();
         }
         let Some(config) = config(repo)? else {
@@ -433,20 +487,7 @@ pub fn with_suspended<T>(
                 "Cannot suspend local overrides while a Git or Kindra operation is in progress. Finish it with continue/abort first."
             );
         }
-        let mut state = snapshot(repo, config)?;
-        // Failure here must leave the original files and flags untouched.
-        save(repo, &state)?;
-        if let Err(err) = suspend(repo, &mut state) {
-            // Even if writing the Suspended checkpoint failed, no Git operation
-            // has run yet, so the original contents can still be recovered.
-            return match rollback_preparation(repo, &state) {
-                Ok(()) => Err(err),
-                Err(restore) => Err(anyhow!(
-                    "{err:#}\nOverride recovery also failed: {restore:#}"
-                )),
-            };
-        }
-        state
+        prepare(repo, snapshot(repo, config)?)?
     };
     let result = operation();
     if busy(repo) {
@@ -473,7 +514,48 @@ pub fn apply_current(repo: &Repository) -> Result<()> {
             );
         }
         with_suspended(repo, true, || Ok(()))
+    } else if is_disabled(repo) {
+        if busy(repo) {
+            bail!(
+                "Cannot re-enable local overrides while a Git or Kindra operation is in progress."
+            );
+        }
+        let config = config(repo)?.context("No [overrides] configuration found")?;
+        let state = snapshot(repo, config)?;
+        // Once removed, these paths are ordinary working files. An explicit
+        // apply must not discard new edits, including untracked original files.
+        if !paths(repo, &state.config, &["diff", "--name-only", "-z"])?.is_empty()
+            || state.files.iter().any(|file| !file.tracked)
+        {
+            bail!(
+                "Override paths have uncommitted changes. Commit, stash, or move those edits before running 'kin overrides apply'. Overrides remain disabled."
+            );
+        }
+        let mut state = prepare(repo, state)?;
+        apply(repo, &mut state)
     } else {
         with_suspended(repo, false, || Ok(()))
     }
+}
+
+/// Restore the index's versions and leave automatic application disabled in
+/// this worktree. Repeating the command never discards edits to the originals.
+pub fn remove_current(repo: &Repository) -> Result<()> {
+    if state_path(repo).exists() {
+        bail!(
+            "Local override recovery is pending. Run 'kin continue' or 'kin abort' before removing overrides."
+        );
+    }
+    if is_disabled(repo) {
+        eprintln!("Local overrides are already disabled in this worktree.");
+        return Ok(());
+    }
+    if busy(repo) {
+        bail!("Cannot remove local overrides while a Git or Kindra operation is in progress.");
+    }
+    let config = config(repo)?.context("No [overrides] configuration found")?;
+    let mut state = snapshot(repo, config)?;
+    state.removing = true;
+    prepare(repo, state)?;
+    finish_removal(repo)
 }

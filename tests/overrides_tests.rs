@@ -621,3 +621,299 @@ fn glob_pathspecs_apply_from_a_subdirectory() {
     );
     assert!(git(dir.path(), &["ls-files", "-v", "apps/web/AGENTS.md"]).starts_with("S "));
 }
+
+#[test]
+fn remove_restores_originals_until_explicitly_reenabled() {
+    let dir = setup();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "remove"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(),
+        "feature\n"
+    );
+    assert!(git(dir.path(), &["ls-files", "-v", "AGENTS.md"]).starts_with("H "));
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["checkout", "down"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(),
+        "base\n"
+    );
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "apply"])
+        .assert()
+        .success();
+    assert_applied(dir.path());
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["checkout", "up"])
+        .assert()
+        .success();
+    assert_applied(dir.path());
+}
+
+#[test]
+fn removed_overrides_allow_editing_and_committing_original_files() {
+    let dir = setup();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "remove"])
+        .assert()
+        .success();
+    fs::write(dir.path().join("AGENTS.md"), "intentional edit\n").unwrap();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "remove"])
+        .assert()
+        .success();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "apply"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("uncommitted"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(),
+        "intentional edit\n"
+    );
+    run_ok("git", &["add", "AGENTS.md"], dir.path());
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "apply"])
+        .assert()
+        .failure();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["commit", "-m", "Edit original instructions"])
+        .assert()
+        .success();
+    assert_eq!(
+        git(dir.path(), &["show", "HEAD:AGENTS.md"]),
+        "intentional edit\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(),
+        "intentional edit\n"
+    );
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "apply"])
+        .assert()
+        .success();
+    assert_applied(dir.path());
+}
+
+#[test]
+fn removal_restores_symlinks_and_deletions_and_removes_untracked_overlay_files() {
+    let dir = setup();
+    commit(dir.path(), "CLAUDE.md", "original Claude instructions");
+    commit(dir.path(), "deleted", "original deleted file");
+    fs::write(dir.path().join(".git/kindra.toml"), "[overrides]\npaths = ['AGENTS.md', 'CLAUDE.md', 'deleted', 'local.json']\napply = ['sh \"$(git rev-parse --git-common-dir)/apply.sh\"']\n").unwrap();
+    fs::write(dir.path().join(".git/apply.sh"), "printf 'local override\\n' > AGENTS.md\nrm -f CLAUDE.md deleted\nln -s AGENTS.md CLAUDE.md\nprintf local > local.json\n").unwrap();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "apply"])
+        .assert()
+        .success();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "remove"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(),
+        "original Claude instructions"
+    );
+    assert!(
+        !fs::symlink_metadata(dir.path().join("CLAUDE.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("deleted")).unwrap(),
+        "original deleted file"
+    );
+    assert!(!dir.path().join("local.json").exists());
+    // A newly created original file must also be preserved when re-enabling.
+    fs::write(dir.path().join("local.json"), "new original config").unwrap();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "apply"])
+        .assert()
+        .failure();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("local.json")).unwrap(),
+        "new original config"
+    );
+}
+
+#[test]
+fn removal_is_worktree_local_and_review_switches_remain_disabled() {
+    let dir = setup();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["wt", "review", "main"])
+        .assert()
+        .success();
+    let review = dir.path().join(".git/kindra-worktrees/review");
+    kin_cmd()
+        .current_dir(&review)
+        .args(["overrides", "remove"])
+        .assert()
+        .success();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["wt", "review", "feature"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(review.join("AGENTS.md")).unwrap(),
+        "feature\n"
+    );
+    assert_applied(dir.path());
+    kin_cmd()
+        .current_dir(&review)
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("disabled"));
+}
+
+#[test]
+fn removal_refuses_conflicts_without_overwriting_resolutions() {
+    let dir = conflict_setup();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["move", "--onto", "target"])
+        .assert()
+        .failure();
+    let conflict = fs::read(dir.path().join("AGENTS.md")).unwrap();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "remove"])
+        .assert()
+        .failure();
+    assert_eq!(fs::read(dir.path().join("AGENTS.md")).unwrap(), conflict);
+    kin_cmd()
+        .current_dir(dir.path())
+        .arg("abort")
+        .assert()
+        .success();
+    assert_applied(dir.path());
+}
+
+#[test]
+fn interrupted_removal_finishes_without_reapplying_overrides() {
+    let dir = setup();
+    let marker = dir.path().join(".git/fail-disable-write");
+    fs::write(
+        &marker,
+        dir.path()
+            .canonicalize()
+            .unwrap()
+            .join(".git/kindra_overrides_disabled")
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    kin_cmd()
+        .current_dir(dir.path())
+        .env("KIN_TEST_FAIL_STATE_WRITE", &marker)
+        .args(["overrides", "remove"])
+        .assert()
+        .failure();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(),
+        "feature\n"
+    );
+    assert!(dir.path().join(".git/kindra_overrides_state.json").exists());
+    fs::write(dir.path().join(".git/apply.sh"), "exit 42\n").unwrap();
+    kin_cmd()
+        .current_dir(dir.path())
+        .arg("continue")
+        .assert()
+        .success();
+    assert!(!dir.path().join(".git/kindra_overrides_state.json").exists());
+    assert!(dir.path().join(".git/kindra_overrides_disabled").exists());
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["checkout", "down"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(),
+        "base\n"
+    );
+}
+
+#[test]
+fn failed_reenable_keeps_disabled_marker_until_recovery_succeeds() {
+    let dir = setup();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "remove"])
+        .assert()
+        .success();
+    fs::write(dir.path().join(".git/apply.sh"), "exit 42\n").unwrap();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "apply"])
+        .assert()
+        .failure();
+    assert!(dir.path().join(".git/kindra_overrides_disabled").exists());
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["checkout", "down"])
+        .assert()
+        .failure();
+    fs::write(
+        dir.path().join(".git/apply.sh"),
+        "printf 'local override\\n' > AGENTS.md\n",
+    )
+    .unwrap();
+    kin_cmd()
+        .current_dir(dir.path())
+        .arg("continue")
+        .assert()
+        .success();
+    assert!(!dir.path().join(".git/kindra_overrides_disabled").exists());
+    assert_applied(dir.path());
+}
+
+#[test]
+fn removal_refuses_staged_managed_changes_and_preserves_other_staged_files() {
+    let dir = setup();
+    fs::write(dir.path().join("staged.txt"), "keep").unwrap();
+    run_ok("git", &["add", "staged.txt"], dir.path());
+    run_ok(
+        "git",
+        &["update-index", "--no-skip-worktree", "AGENTS.md"],
+        dir.path(),
+    );
+    fs::write(dir.path().join("AGENTS.md"), "staged original").unwrap();
+    run_ok("git", &["add", "AGENTS.md"], dir.path());
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "remove"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("staged"));
+    assert_eq!(git(dir.path(), &["show", ":AGENTS.md"]), "staged original");
+    run_ok("git", &["restore", "--staged", "AGENTS.md"], dir.path());
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "remove"])
+        .assert()
+        .success();
+    assert_eq!(
+        git(dir.path(), &["diff", "--cached", "--name-only"]).trim(),
+        "staged.txt"
+    );
+}

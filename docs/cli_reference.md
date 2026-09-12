@@ -729,6 +729,34 @@ script. Remove its `git update-index` commands and remove the apply script from
 kin overrides apply
 ```
 
+To work on the original repository files, remove the overrides in that worktree:
+
+```sh
+kin overrides remove
+# Edit the originals, then stage and commit your changes as usual.
+kin overrides apply
+```
+
+`remove` restores tracked files from the index, clears their `skip-worktree`
+flags, and removes matching untracked/ignored overlay files. It leaves overrides
+**disabled in the current worktree** through subsequent Kindra commands, including
+checkout, commit, rebase, and review switching. Other worktrees keep their own
+settings. Repeating `remove` while disabled does nothing and preserves your edits.
+`kin status` reports that overrides are disabled.
+
+`apply` explicitly re-enables automatic management after its hook succeeds.
+While disabled, it refuses to overwrite staged or unstaged changes in managed
+paths, including new untracked files. Commit, stash, or move those edits first.
+Unrelated staged files and ignored files outside the configured paths are left
+alone. Removal refuses staged managed changes and pending Git/Kindra operations
+or override recovery; resolve those before removing overrides.
+
+The disabled setting lives in `kindra_overrides_disabled` in the worktree's
+private Git directory. Interrupted removal retains its intention in recovery
+state: `kin continue` or `kin abort` completes removal without applying overlays
+(or restores the original snapshot if preparation was incomplete). A failed
+re-enable keeps the disabled marker and recovery state until a retry succeeds.
+
 Kindra saves the managed contents, clears their `skip-worktree` flags, and
 restores tracked files **from the index** before an operation. Matching untracked
 and ignored overlay files are also saved and removed so they cannot obstruct a

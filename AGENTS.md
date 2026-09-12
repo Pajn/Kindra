@@ -39,3 +39,4 @@
 - `src/overrides.rs` wraps whole operations while their existing `RepoLock` is held. Keep intermediate checkouts and rebases inside the wrapper; applying overlays between rebase steps can corrupt conflict resolutions.
 - Override configuration is shared via the common Git directory, but snapshots and recovery phases belong to the individual worktree. Never restore the index from an override snapshot.
 - New commands that change working-tree contents should use `with_suspended`; recovery commands must preserve suspended overlays until both Git and Kindra operation state are clear.
+- `kin overrides remove` disables automatic application per worktree. Recovery must honor persisted removal intent, and re-enabling must protect edits made to the original files while disabled.
