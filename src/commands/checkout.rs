@@ -153,13 +153,17 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
 }
 
 fn perform_git_checkout(name: &str) -> Result<()> {
-    let status = Command::new("git").arg("checkout").arg(name).status()?;
+    let repo = crate::open_repo()?;
+    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+    crate::overrides::with_suspended(&repo, false, || {
+        let status = Command::new("git").arg("checkout").arg(name).status()?;
 
-    if !status.success() {
-        return Err(anyhow!("git checkout failed"));
-    }
+        if !status.success() {
+            return Err(anyhow!("git checkout failed"));
+        }
 
-    Ok(())
+        Ok(())
+    })
 }
 
 fn find_first_parent_branches_via_git_log(

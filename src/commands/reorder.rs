@@ -22,12 +22,16 @@ pub struct ReorderArgs {
 pub fn reorder(args: &ReorderArgs) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    if passively_reconcile_rebase_state(&repo)? || crate::commands::run::run_state_exists(&repo) {
+    crate::overrides::with_suspended(&repo, false, || reorder_locked(&repo, args))
+}
+
+fn reorder_locked(repo: &git2::Repository, args: &ReorderArgs) -> Result<()> {
+    if passively_reconcile_rebase_state(repo)? || crate::commands::run::run_state_exists(repo) {
         return Err(anyhow!(
             "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));
     }
-    crate::commands::sync::ensure_no_native_git_operation(&repo)?;
+    crate::commands::sync::ensure_no_native_git_operation(repo)?;
 
     let head = repo.head()?;
     let current_branch_name = head
@@ -35,7 +39,7 @@ pub fn reorder(args: &ReorderArgs) -> Result<()> {
         .ok_or_else(|| anyhow!("You must be on a branch to use 'reorder'"))?
         .to_string();
 
-    let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
+    let upstream_name = find_upstream(repo)?.ok_or_else(|| {
         anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
     })?;
     if current_branch_name == upstream_name {
@@ -50,7 +54,7 @@ pub fn reorder(args: &ReorderArgs) -> Result<()> {
     let merge_base = repo.merge_base(upstream_id, head_id)?;
 
     let stack_component = crate::stack::collect_stack_component(
-        &repo,
+        repo,
         &current_branch_name,
         merge_base,
         upstream_id,
@@ -62,7 +66,7 @@ pub fn reorder(args: &ReorderArgs) -> Result<()> {
     }
 
     let current_parent_map =
-        crate::stack::current_parent_name_map(&repo, &stack_component, merge_base, &upstream_name)?;
+        crate::stack::current_parent_name_map(repo, &stack_component, merge_base, &upstream_name)?;
     let (edited_parent_map, draft) = edit_parent_map(
         &stack_component,
         &current_parent_map,
@@ -79,7 +83,7 @@ pub fn reorder(args: &ReorderArgs) -> Result<()> {
 
     let prepared = (|| -> Result<RebaseState> {
         let plan = crate::stack::plan_graph_reorder(
-            &repo,
+            repo,
             &stack_component,
             merge_base,
             &upstream_name,
@@ -87,7 +91,7 @@ pub fn reorder(args: &ReorderArgs) -> Result<()> {
         )?;
 
         let autostash =
-            crate::commands::resolve_and_check_autostash(&repo, args.autostash, args.no_autostash)?;
+            crate::commands::resolve_and_check_autostash(repo, args.autostash, args.no_autostash)?;
 
         crate::rebase_utils::check_worktrees(&plan.remaining_branches, args.force)?;
 
@@ -99,7 +103,7 @@ pub fn reorder(args: &ReorderArgs) -> Result<()> {
                     .get(&branch.name)
                     .ok_or_else(|| anyhow!("Missing parent id for '{}'.", branch.name))?;
                 let chain = crate::stack::collect_first_parent_chain(
-                    &repo,
+                    repo,
                     git2::Oid::from_str(parent_id)?,
                     branch.id,
                 )?;
@@ -148,10 +152,10 @@ pub fn reorder(args: &ReorderArgs) -> Result<()> {
     // we are about to mutate branches. The guard settles the snapshot on every
     // exit from here on (including a failing `save_state`), so no path can leave
     // a stale pending snapshot behind.
-    let _snapshot = crate::oplog::begin(&repo, "reorder")?;
-    save_state(&repo, &state)?;
+    let _snapshot = crate::oplog::begin(repo, "reorder")?;
+    save_state(repo, &state)?;
     draft.discard();
-    run_rebase_loop(&repo, state)
+    run_rebase_loop(repo, state)
 }
 
 fn edit_parent_map(

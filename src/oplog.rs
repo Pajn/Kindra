@@ -301,19 +301,23 @@ pub fn discard(repo: &Repository) -> Result<()> {
 pub fn undo(force: bool) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    ensure_no_operation_in_progress(&repo)?;
-    finalize_inner(&repo)?;
+    crate::overrides::with_suspended(&repo, false, || undo_locked(&repo, force))
+}
 
-    let mut log = load_log(&repo)?;
+fn undo_locked(repo: &git2::Repository, force: bool) -> Result<()> {
+    ensure_no_operation_in_progress(repo)?;
+    finalize_inner(repo)?;
+
+    let mut log = load_log(repo)?;
     if log.cursor == 0 {
         println!("Nothing to undo.");
         return Ok(());
     }
 
     let entry = log.entries[log.cursor - 1].clone();
-    restore(&repo, &entry, Direction::Undo, force)?;
+    restore(repo, &entry, Direction::Undo, force)?;
     log.cursor -= 1;
-    save_log(&repo, &log)?;
+    save_log(repo, &log)?;
 
     println!("Undid {}: {}", entry.op, entry.summary);
     println!("Run 'kin redo' to reapply it.");
@@ -324,19 +328,23 @@ pub fn undo(force: bool) -> Result<()> {
 pub fn redo(force: bool) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    ensure_no_operation_in_progress(&repo)?;
-    finalize_inner(&repo)?;
+    crate::overrides::with_suspended(&repo, false, || redo_locked(&repo, force))
+}
 
-    let mut log = load_log(&repo)?;
+fn redo_locked(repo: &git2::Repository, force: bool) -> Result<()> {
+    ensure_no_operation_in_progress(repo)?;
+    finalize_inner(repo)?;
+
+    let mut log = load_log(repo)?;
     if log.cursor >= log.entries.len() {
         println!("Nothing to redo.");
         return Ok(());
     }
 
     let entry = log.entries[log.cursor].clone();
-    restore(&repo, &entry, Direction::Redo, force)?;
+    restore(repo, &entry, Direction::Redo, force)?;
     log.cursor += 1;
-    save_log(&repo, &log)?;
+    save_log(repo, &log)?;
 
     println!("Redid {}: {}", entry.op, entry.summary);
     Ok(())

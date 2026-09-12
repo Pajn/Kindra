@@ -3,6 +3,11 @@ use anyhow::Result;
 
 pub fn status_cmd() -> Result<()> {
     let repo = crate::open_repo()?;
+    if crate::overrides::state_path(&repo).exists() {
+        println!(
+            "Local overrides are suspended or awaiting recovery. Run 'kin continue' or 'kin abort' after resolving the operation or apply-hook failure."
+        );
+    }
     if crate::commands::run::run_state_exists(&repo) {
         let run_state = crate::commands::run::load_run_state(&repo)?;
         let processed = run_state.current_index.min(run_state.target_branches.len());

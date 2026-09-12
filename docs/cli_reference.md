@@ -691,6 +691,99 @@ kin pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--reviewe
 
 ---
 
+### Local overrides
+
+Configure local file replacements in the repository's `.git/kindra.toml`. Linked
+worktrees share this configuration through their common Git directory.
+
+```toml
+[overrides]
+paths = [
+  ".agents",
+  ".claude",
+  ".cursor",
+  ".mcp.json",
+  "AGENTS.md",
+  "CLAUDE.md",
+  "opencode.jsonc",
+  ":(glob)**/AGENTS.md",
+  ":(glob)**/CLAUDE.md",
+]
+apply = ["sh ../overrides/apply.sh"]
+
+[worktrees.hooks]
+on_create = ["pnpm install"]
+on_checkout = ["pnpm install"]
+```
+
+`paths` uses Git pathspecs, resolved from each worktree root. Directories select
+all their files; `:(glob)` enables explicit glob patterns. Only list paths that
+your apply hook owns: local contents at those paths are replaced by the hook
+after each operation. Other files with `skip-worktree` remain untouched.
+
+Keep copying, deleting, symlink creation, and ignored `.env` setup in your apply
+script. Remove its `git update-index` commands and remove the apply script from
+`worktrees.hooks`; Kindra now owns the flags and apply timing. Apply it initially:
+
+```sh
+kin overrides apply
+```
+
+Kindra saves the managed contents, clears their `skip-worktree` flags, and
+restores tracked files **from the index** before an operation. Matching untracked
+and ignored overlay files are also saved and removed so they cannot obstruct a
+branch that tracks them. It never resets the index. Staged changes in a managed
+path cause a refusal before any files are changed; staged changes elsewhere are
+left for the command to handle normally.
+
+On completion, Kindra runs `apply` and sets `skip-worktree` on matching files
+tracked by the destination branch. The apply script must recreate the desired
+overlay, including intentional deletions and symlinks, and be safe to run again.
+Files that are untracked on that branch cannot receive `skip-worktree`; use Git
+ignore rules if they should stay out of status. Ignored files outside `paths`,
+such as `.env` files, are left on disk during suspension.
+
+The lifecycle covers `checkout`, `commit`, `absorb`, `move`, `reorder`, `sync`,
+`restack`, `split`, `run`, `undo`, and `redo`, plus review worktree switching.
+Overrides remain suspended throughout all intermediate checkouts, including
+commands executed by `kin run`. New worktrees apply overrides before their
+`on_create` hooks; review switches apply before `on_checkout`. Ordinary
+`kin checkout` reapplies overrides but does not run worktree setup hooks.
+Read-only commands do not apply overrides. Direct `git` commands bypass this
+lifecycle. Sparse checkout is not supported with local overrides.
+
+Apply commands run through `sh -c` (`cmd /C` on Windows), in the target worktree
+root, with `KINDRA_WORKTREE_PATH` and `KINDRA_WORKTREE_BRANCH` set. Relative source
+paths such as `../overrides` must exist relative to **every** worktree; use an
+absolute source path if worktrees live at different directory depths.
+
+**Conflicts and recovery:**
+
+- During a rebase conflict, overrides stay suspended so conflict markers and
+  staged resolutions remain visible. Resolve and stage the actual repository
+  content, then run `kin continue`; `kin abort` restores the operation and
+  reapplies overrides once Git and Kindra have finished.
+- A failed operation with no pending Git/Kindra state still reapplies overrides.
+  A failed apply leaves recovery state; fix the apply script and run
+  `kin continue` or `kin overrides apply` in the affected worktree. Recovery uses
+  the saved configuration, so edit the script itself to fix a failed command.
+  Failed worktree creation keeps the existing rollback behavior: if rollback
+  succeeds, the newly created worktree and its recovery state are removed.
+- `kin status` reports pending override recovery. Other operations refuse to
+  start while it is pending. Interrupted preparation restores saved files,
+  symlinks, permissions, deletions, and flags when continued, provided HEAD and
+  the index have not changed in the meantime.
+- Recovery state is stored in `kindra_overrides_state.json` in the affected
+  worktree's private Git directory, with Unix `0600` permissions or a protected owner-only Windows DACL applied
+  at temporary-file creation. It
+  includes backups of local file contents and survives process interruption.
+  Do not delete it while recovery is needed.
+- `kin abort --clear-state` leaves override recovery and working files intact,
+  including any conflict resolution. After finishing a native Git operation,
+  `kin continue` can finish reapplying the overrides.
+
+---
+
 ### `split`
 
 **Description:** Opens your `$EDITOR` to visually manage branch assignments for a series of commits.

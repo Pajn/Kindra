@@ -26,8 +26,11 @@ pub struct RestackArgs {
 pub fn restack(args: &RestackArgs) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+    crate::overrides::with_suspended(&repo, false, || restack_locked(&repo, args))
+}
 
-    if passively_reconcile_rebase_state(&repo)? || crate::commands::run::run_state_exists(&repo) {
+fn restack_locked(repo: &git2::Repository, args: &RestackArgs) -> Result<()> {
+    if passively_reconcile_rebase_state(repo)? || crate::commands::run::run_state_exists(repo) {
         return Err(anyhow!(
             "A Kindra-managed operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));
@@ -45,9 +48,8 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
         current_branch_name
     );
 
-    let history_limit = resolve_restack_history_limit(&repo, args.history_limit)?;
-    let children =
-        find_floating_children(&repo, &head_commit, &current_branch_name, history_limit)?;
+    let history_limit = resolve_restack_history_limit(repo, args.history_limit)?;
+    let children = find_floating_children(repo, &head_commit, &current_branch_name, history_limit)?;
 
     if children.is_empty() {
         println!("No floating children found.");
@@ -60,7 +62,7 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
     // (Kept after the no-op check above so a restack with nothing to do still
     // succeeds on a dirty tree, matching its previous behavior.)
     let autostash =
-        crate::commands::resolve_and_check_autostash(&repo, args.autostash, args.no_autostash)?;
+        crate::commands::resolve_and_check_autostash(repo, args.autostash, args.no_autostash)?;
 
     let children = if args.pick {
         // prompt_multi_select resolves the selection per mode: interactive shows
@@ -188,9 +190,9 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
     // "No branches selected") have passed and we are about to mutate branches.
     // The guard settles the snapshot on every exit from here on, so no path can
     // leave a stale pending snapshot behind.
-    let _snapshot = crate::oplog::begin(&repo, "restack")?;
-    crate::rebase_utils::save_state(&repo, &state)?;
-    run_rebase_loop(&repo, state)?;
+    let _snapshot = crate::oplog::begin(repo, "restack")?;
+    crate::rebase_utils::save_state(repo, &state)?;
+    run_rebase_loop(repo, state)?;
 
     Ok(())
 }
