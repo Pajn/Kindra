@@ -135,7 +135,7 @@ enum Commands {
         #[arg(long)]
         clear_state: bool,
     },
-    /// Apply or remove configured local overrides
+    /// Apply, remove, or inspect configured local overrides
     Overrides {
         #[command(subcommand)]
         subcommand: crate::commands::overrides::OverridesSubcommand,

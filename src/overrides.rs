@@ -98,8 +98,13 @@ fn root(repo: &Repository) -> Result<&Path> {
 }
 
 fn git(repo: &Repository, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
-    let mut child = Command::new("git")
-        .current_dir(root(repo)?)
+    let mut command = Command::new("git");
+    command.current_dir(root(repo)?);
+    run_git(command, args, input)
+}
+
+fn run_git(mut command: Command, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
+    let mut child = command
         .args(args)
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -558,4 +563,137 @@ pub fn remove_current(repo: &Repository) -> Result<()> {
     state.removing = true;
     prepare(repo, state)?;
     finish_removal(repo)
+}
+
+/// Diff the actual overlay against HEAD using a disposable index and object
+/// database. Clearing flags on the real index would expose overrides to other
+/// Git processes; staging them in the real object database could retain secrets.
+pub fn diff_current(repo: &Repository) -> Result<()> {
+    let config = config(repo)?.context("No [overrides] configuration found")?;
+    // Pin the baseline: native Git commands do not honor Kindra's lock.
+    let head = repo.head()?.peel_to_commit()?.id().to_string();
+    let temp = tempfile::tempdir()?;
+    let index = temp.path().join("index");
+    let objects = temp.path().join("objects");
+    fs::create_dir(&objects)?;
+    let original_objects = String::from_utf8(git(
+        repo,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ],
+        None,
+    )?)?;
+    let original_objects = original_objects
+        .strip_suffix('\n')
+        .unwrap_or(&original_objects);
+    // Git accepts C-quoted entries in GIT_ALTERNATE_OBJECT_DIRECTORIES. Quote
+    // separators, quotes, and control bytes so even unusual repo paths work.
+    let mut quoted = String::from("\"");
+    for byte in original_objects.bytes() {
+        match byte {
+            b'"' => quoted.push_str("\\\""),
+            b'\\' => quoted.push_str("\\\\"),
+            0x20..=0x7e => quoted.push(char::from(byte)),
+            _ => {
+                use std::fmt::Write;
+                write!(quoted, "\\{byte:03o}")?;
+            }
+        }
+    }
+    quoted.push('"');
+    let mut alternates = std::ffi::OsString::from(quoted);
+    if let Some(existing) = std::env::var_os("GIT_ALTERNATE_OBJECT_DIRECTORIES") {
+        alternates.push(if cfg!(windows) { ";" } else { ":" });
+        alternates.push(existing);
+    }
+    let command = || -> Result<Command> {
+        let mut command = Command::new("git");
+        command
+            .current_dir(root(repo)?)
+            .arg("--no-pager")
+            .env("GIT_INDEX_FILE", &index)
+            .env("GIT_OBJECT_DIRECTORY", &objects)
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &alternates)
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        Ok(command)
+    };
+    run_git(command()?, &["read-tree", &head], None)?;
+    let mut selected = BTreeSet::new();
+    for options in [
+        vec!["ls-files", "--cached", "-z"],
+        vec!["ls-files", "--others", "--exclude-standard", "-z"],
+        vec![
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ],
+    ] {
+        let mut args = options;
+        args.push("--");
+        args.extend(config.paths.iter().map(String::as_str));
+        for name in run_git(command()?, &args, None)?
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+        {
+            selected.insert(
+                String::from_utf8(name.to_vec()).context("Override paths must be valid UTF-8")?,
+            );
+        }
+    }
+    let mut stage = Vec::new();
+    let mut replaced_directories = Vec::new();
+    for name in selected {
+        // Adding a symlink replacing a tracked directory already records its
+        // children as deleted. Do not traverse the symlink to stage those paths.
+        if replaced_directories
+            .iter()
+            .any(|parent: &PathBuf| Path::new(&name).starts_with(parent))
+        {
+            continue;
+        }
+        let path = safe_path(repo, &name)?;
+        if fs::symlink_metadata(&path).is_ok_and(|meta| !meta.is_dir()) {
+            replaced_directories.push(PathBuf::from(&name));
+        }
+        stage.push(name);
+    }
+    if !stage.is_empty() {
+        run_git(
+            command()?,
+            &[
+                "--literal-pathspecs",
+                "add",
+                "--all",
+                "--force",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ],
+            Some(&input(&stage)),
+        )?;
+    }
+    let status = command()?
+        .args([
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--no-relative",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--exit-code",
+            &head,
+            "--",
+        ])
+        .status()?;
+    // With --exit-code, 1 means a successful diff containing differences.
+    if !status.success() && status.code() != Some(1) {
+        bail!("git diff failed ({status})");
+    }
+    Ok(())
 }

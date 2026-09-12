@@ -15,7 +15,7 @@ fn git(path: &Path, args: &[&str]) -> String {
 }
 fn commit(path: &Path, name: &str, content: &str) {
     fs::write(path.join(name), content).unwrap();
-    run_ok("git", &["add", "--", name], path);
+    run_ok("git", &["--literal-pathspecs", "add", "--", name], path);
     run_ok("git", &["commit", "-m", content], path);
 }
 fn setup() -> TempDir {
@@ -916,4 +916,273 @@ fn removal_refuses_staged_managed_changes_and_preserves_other_staged_files() {
         git(dir.path(), &["diff", "--cached", "--name-only"]).trim(),
         "staged.txt"
     );
+}
+
+#[test]
+fn diff_shows_hidden_overrides_without_changing_index_files_or_objects() {
+    let dir = setup();
+    fs::write(dir.path().join("unrelated.txt"), "staged unrelated").unwrap();
+    run_ok("git", &["add", "unrelated.txt"], dir.path());
+    let index = fs::read(dir.path().join(".git/index")).unwrap();
+    let objects = git(dir.path(), &["count-objects", "-v"]);
+    fs::write(dir.path().join(".git/apply.sh"), "exit 42\n").unwrap();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "diff"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("-feature\n+local override\n"));
+    assert_eq!(fs::read(dir.path().join(".git/index")).unwrap(), index);
+    assert_eq!(git(dir.path(), &["count-objects", "-v"]), objects);
+    assert_applied(dir.path());
+}
+
+#[test]
+fn diff_compares_with_head_not_staged_content_when_overrides_are_disabled() {
+    let dir = setup();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "remove"])
+        .assert()
+        .success();
+    fs::write(dir.path().join("AGENTS.md"), "staged version\n").unwrap();
+    run_ok("git", &["add", "AGENTS.md"], dir.path());
+    fs::write(dir.path().join("AGENTS.md"), "working version\n").unwrap();
+    let index = fs::read(dir.path().join(".git/index")).unwrap();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "diff"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("-feature\n+working version\n"));
+    assert_eq!(fs::read(dir.path().join(".git/index")).unwrap(), index);
+    assert!(dir.path().join(".git/kindra_overrides_disabled").exists());
+}
+
+#[test]
+fn diff_shows_added_ignored_deleted_and_symlink_override_files() {
+    let dir = setup();
+    commit(dir.path(), "deleted", "original deleted\n");
+    commit(dir.path(), "CLAUDE.md", "original Claude\n");
+    fs::write(dir.path().join(".git/kindra.toml"), "[overrides]\npaths = ['AGENTS.md', 'deleted', 'CLAUDE.md', 'local.json', 'never-existed']\napply = ['true']\n").unwrap();
+    fs::remove_file(dir.path().join("deleted")).unwrap();
+    fs::remove_file(dir.path().join("CLAUDE.md")).unwrap();
+    std::os::unix::fs::symlink("AGENTS.md", dir.path().join("CLAUDE.md")).unwrap();
+    fs::write(dir.path().join(".git/info/exclude"), "local.json\n").unwrap();
+    fs::write(dir.path().join("local.json"), "local addition\n").unwrap();
+    let output = kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "diff"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("deleted file mode"), "{output}");
+    assert!(output.contains("new file mode 120000"), "{output}");
+    assert!(output.contains("+local addition"), "{output}");
+    assert!(!output.contains("never-existed"), "{output}");
+    assert_eq!(
+        fs::read_link(dir.path().join("CLAUDE.md")).unwrap(),
+        Path::new("AGENTS.md")
+    );
+}
+
+#[test]
+fn diff_is_empty_when_originals_match_head() {
+    let dir = setup();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "remove"])
+        .assert()
+        .success();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "diff"])
+        .assert()
+        .success()
+        .stdout("");
+}
+
+#[test]
+fn diff_handles_globs_and_subdirectories_without_including_unmanaged_changes() {
+    let dir = setup();
+    fs::create_dir_all(dir.path().join("apps/web")).unwrap();
+    commit(dir.path(), "apps/web/AGENTS.md", "nested original\n");
+    fs::write(
+        dir.path().join(".git/kindra.toml"),
+        "[overrides]\npaths = [':(glob)apps/**/AGENTS.md']\napply = ['true']\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("apps/web/AGENTS.md"), "nested override\n").unwrap();
+    let output = kin_cmd()
+        .current_dir(dir.path().join("apps/web"))
+        .args(["overrides", "diff"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    assert!(
+        output.contains("-nested original\n+nested override"),
+        "{output}"
+    );
+    assert!(!output.contains("+local override"), "{output}");
+}
+
+#[test]
+fn diff_in_linked_worktree_uses_its_head_and_files() {
+    let dir = setup();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["wt", "review", "main"])
+        .assert()
+        .success();
+    let review = dir.path().join(".git/kindra-worktrees/review");
+    let repo = git2::Repository::open(&review).unwrap();
+    let index = fs::read(repo.path().join("index")).unwrap();
+    kin_cmd()
+        .current_dir(&review)
+        .args(["overrides", "diff"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("-base\n+local override\n"));
+    assert_eq!(fs::read(repo.path().join("index")).unwrap(), index);
+    assert_applied(&review);
+    assert_applied(dir.path());
+}
+
+#[test]
+fn diff_during_conflict_preserves_index_and_recovery_state() {
+    let dir = conflict_setup();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["move", "--onto", "target"])
+        .assert()
+        .failure();
+    let index = fs::read(dir.path().join(".git/index")).unwrap();
+    let state = fs::read(dir.path().join(".git/kindra_overrides_state.json")).unwrap();
+    let file = fs::read(dir.path().join("AGENTS.md")).unwrap();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "diff"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("+<<<<<<<"));
+    assert_eq!(fs::read(dir.path().join(".git/index")).unwrap(), index);
+    assert_eq!(
+        fs::read(dir.path().join(".git/kindra_overrides_state.json")).unwrap(),
+        state
+    );
+    assert_eq!(fs::read(dir.path().join("AGENTS.md")).unwrap(), file);
+}
+
+#[test]
+fn diff_handles_literal_filenames_and_binary_files() {
+    let dir = setup();
+    for name in ["line\nbreak", ":(glob)literal", "-option", "binary.dat"] {
+        commit(dir.path(), name, "original\n");
+        fs::write(dir.path().join(name), b"local\n").unwrap();
+        run_ok(
+            "git",
+            &["update-index", "--skip-worktree", "--", name],
+            dir.path(),
+        );
+    }
+    fs::write(dir.path().join("binary.dat"), b"local\0binary").unwrap();
+    fs::write(dir.path().join(".git/kindra.toml"), "[overrides]\npaths = [\"line\\nbreak\", ':(literal):(glob)literal', '-option', 'binary.dat']\napply = ['true']\n").unwrap();
+    let output = kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "diff"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    assert_eq!(output.matches("+local\n").count(), 3, "{output}");
+    assert!(output.contains("Binary files"), "{output}");
+}
+
+#[test]
+fn diff_handles_directory_replaced_by_symlink_without_reading_its_target() {
+    let dir = setup();
+    fs::create_dir(dir.path().join("agents")).unwrap();
+    commit(dir.path(), "agents/rule", "tracked rule\n");
+    let external = tempdir().unwrap();
+    fs::write(external.path().join("rule"), "external contents").unwrap();
+    fs::remove_file(dir.path().join("agents/rule")).unwrap();
+    fs::remove_dir(dir.path().join("agents")).unwrap();
+    std::os::unix::fs::symlink(external.path(), dir.path().join("agents")).unwrap();
+    fs::write(
+        dir.path().join(".git/kindra.toml"),
+        "[overrides]\npaths = ['agents']\napply = ['true']\n",
+    )
+    .unwrap();
+    let output = kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "diff"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("new file mode 120000"), "{output}");
+    assert!(output.contains("-tracked rule"), "{output}");
+    assert!(!output.contains("external contents"), "{output}");
+}
+
+#[test]
+fn diff_handles_repository_paths_with_alternate_directory_separators_and_quotes() {
+    let dir = setup();
+    let parent = tempdir().unwrap();
+    let renamed = parent.path().join("repo: \"å\\name\n");
+    fs::rename(dir.path(), &renamed).unwrap();
+    kin_cmd()
+        .current_dir(&renamed)
+        .args(["overrides", "diff"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("-feature\n+local override\n"));
+    assert_applied(&renamed);
+}
+
+#[test]
+fn diff_uses_one_head_snapshot_if_the_branch_moves_during_inspection() {
+    let dir = setup();
+    run_ok("git", &["checkout", "-b", "other"], dir.path());
+    commit(dir.path(), "unrelated.txt", "unrelated branch change\n");
+    let other = git(dir.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+    run_ok("git", &["checkout", "feature"], dir.path());
+    // Move the ref while the disposable index stages local contents. This
+    // models a concurrent native Git command, which does not take Kindra's lock.
+    fs::write(
+        dir.path().join(".git/info/attributes"),
+        "AGENTS.md filter=move-head\n",
+    )
+    .unwrap();
+    run_ok(
+        "git",
+        &[
+            "config",
+            "filter.move-head.clean",
+            &format!("git update-ref HEAD {other}; cat"),
+        ],
+        dir.path(),
+    );
+    let output = kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "diff"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]).trim(), other);
+    assert!(output.contains("-feature\n+local override\n"), "{output}");
+    assert!(!output.contains("unrelated.txt"), "{output}");
 }

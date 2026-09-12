@@ -7,6 +7,8 @@ pub enum OverridesSubcommand {
     Apply,
     /// Restore repository files and disable overrides in this worktree until apply
     Remove,
+    /// Show configured local files compared with HEAD, including hidden overrides
+    Diff,
 }
 
 pub fn overrides(command: &OverridesSubcommand) -> Result<()> {
@@ -15,5 +17,6 @@ pub fn overrides(command: &OverridesSubcommand) -> Result<()> {
     match command {
         OverridesSubcommand::Apply => crate::overrides::apply_current(&repo),
         OverridesSubcommand::Remove => crate::overrides::remove_current(&repo),
+        OverridesSubcommand::Diff => crate::overrides::diff_current(&repo),
     }
 }

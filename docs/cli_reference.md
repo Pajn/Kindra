@@ -729,6 +729,28 @@ script. Remove its `git update-index` commands and remove the apply script from
 kin overrides apply
 ```
 
+Inspect how the local files differ from the current branch:
+
+```sh
+kin overrides diff
+```
+
+This prints a Git patch comparing configured paths **on disk with `HEAD`**, even
+when their changes are hidden by `skip-worktree`. It includes added and ignored
+files, deletions, symlink changes, and Git's binary-file difference summaries.
+Only matching override paths are shown. It compares the on-disk contents rather
+than the staged version, works from subdirectories and linked worktrees, and
+returns success whether or not differences exist. An empty diff prints nothing.
+
+The command does not run apply hooks or change files, staging, index flags, or
+override recovery/disabled state. Its temporary index and object database are
+discarded afterward, so inspecting overrides does not store their contents in
+the repository's object database. It also works while overrides are disabled
+or an operation is paused; in those cases it shows the originals or conflict
+contents currently on disk, rather than reconstructing overrides from the apply
+script. During a rebase, the comparison uses the current, potentially detached,
+`HEAD`, captured when inspection starts.
+
 To work on the original repository files, remove the overrides in that worktree:
 
 ```sh
