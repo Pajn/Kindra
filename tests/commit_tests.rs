@@ -1,6 +1,7 @@
 mod common;
 use common::{
-    assert_no_rebase_in_progress, current_branch, kin_cmd, make_commit, repo_init, run_ok,
+    assert_no_rebase_in_progress, current_branch, git_command, kin_cmd, make_commit, repo_init,
+    run_ok,
 };
 use git2::Repository;
 use kindra::rebase_utils::{Operation, RebaseState, save_state};
@@ -44,11 +45,7 @@ fn setup_repo() -> (tempfile::TempDir, Repository) {
 }
 
 fn git_stdout(dir: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap();
+    let out = git_command(dir).args(args).output().unwrap();
     assert!(
         out.status.success(),
         "git {:?} failed: {}",
@@ -5608,4 +5605,88 @@ fn test_failed_unmerged_inspection_preserves_completed_state() {
         .assert()
         .success();
     assert!(!state_path.exists());
+}
+
+#[test]
+fn test_fixup_shared_ancestor_restacks_sibling_tree() {
+    check_fixup_sibling_tree(None);
+}
+
+#[test]
+fn test_fixup_sibling_tree_conflict_continue() {
+    check_fixup_sibling_tree(Some("continue"));
+}
+
+#[test]
+fn test_fixup_sibling_tree_conflict_abort() {
+    check_fixup_sibling_tree(Some("abort"));
+}
+
+fn check_fixup_sibling_tree(recovery: Option<&str>) {
+    let (dir, repo) = setup_repo();
+    let base = repo.revparse_single("feature").unwrap().id();
+    for (name, parent) in [
+        ("left", "feature"),
+        ("right", "feature"),
+        ("right-child", "right"),
+    ] {
+        git_stdout(dir.path(), &["checkout", "-f", "-b", name, parent]);
+        fs::write(dir.path().join(format!("{name}.txt")), name).unwrap();
+        if recovery.is_some() && name == "right" {
+            fs::write(dir.path().join("feature.txt"), "sibling edit").unwrap();
+        }
+        git_stdout(dir.path(), &["add", "."]);
+        git_stdout(dir.path(), &["commit", "-m", name]);
+    }
+    git_stdout(dir.path(), &["checkout", "-f", "left"]);
+    fs::write(dir.path().join("feature.txt"), "fixed").unwrap();
+    git_stdout(dir.path(), &["add", "feature.txt"]);
+    let output = kin_cmd()
+        .current_dir(dir.path())
+        .args(["commit", "--fixup", &base.to_string()])
+        .output()
+        .unwrap();
+    if let Some(action) = recovery {
+        assert!(!output.status.success());
+        if action == "continue" {
+            fs::write(dir.path().join("feature.txt"), "fixed").unwrap();
+            git_stdout(dir.path(), &["add", "feature.txt"]);
+        }
+        let resumed = kin_cmd()
+            .current_dir(dir.path())
+            .env("GIT_EDITOR", "true")
+            .arg(action)
+            .output()
+            .unwrap();
+        assert!(
+            resumed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        if action == "abort" {
+            assert_eq!(repo.revparse_single("feature").unwrap().id(), base);
+            assert_eq!(
+                git_stdout(dir.path(), &["show", "right:feature.txt"]),
+                "sibling edit"
+            );
+            assert_eq!(current_branch(dir.path()), "left");
+            assert_no_rebase_in_progress(dir.path());
+            return;
+        }
+    } else {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    for branch in ["left", "right", "right-child"] {
+        assert_eq!(
+            git_stdout(dir.path(), &["show", &format!("{branch}:feature.txt")]),
+            "fixed",
+            "{branch} was not restacked"
+        );
+    }
+    assert_eq!(current_branch(dir.path()), "left");
+    assert_no_rebase_in_progress(dir.path());
 }

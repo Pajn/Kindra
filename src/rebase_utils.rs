@@ -137,7 +137,26 @@ pub fn git_rebase_in_progress(repo: &Repository) -> bool {
     repo.path().join("rebase-merge").exists() || repo.path().join("rebase-apply").exists()
 }
 
+// Each absorb owns a unique namespace recorded in its worktree's saved state.
+// Shared refs are used because libgit2 does not resolve refs/worktree consistently
+// in linked worktrees. Cleanup removes only anchors listed in this operation.
+pub const ABSORB_FORK_REF_PREFIX: &str = "refs/kindra/absorb/";
+
 pub fn clear_state(repo: &Repository) -> Result<()> {
+    if let Ok(state) = load_state(repo) {
+        let references: HashSet<_> = state
+            .new_base_map
+            .values()
+            .filter(|name| name.starts_with(ABSORB_FORK_REF_PREFIX))
+            .collect();
+        for name in references {
+            match repo.find_reference(name) {
+                Ok(mut reference) => reference.delete()?,
+                Err(err) if err.code() == git2::ErrorCode::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
     let path = state_path(repo);
     if path.exists() {
         fs::remove_file(path)?;

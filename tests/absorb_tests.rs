@@ -503,14 +503,43 @@ fn test_absorb_abort_restores_tips_and_absorbed_changes() {
 }
 
 #[test]
-fn test_absorb_refuses_branch_forking_from_inside_the_range() {
+fn test_absorb_restacks_branch_forking_from_inside_the_range() {
+    check_absorb_fork(None);
+}
+
+#[test]
+fn test_absorb_fork_conflict_continue() {
+    check_absorb_fork(Some("continue"));
+}
+
+#[test]
+fn test_absorb_fork_conflict_abort() {
+    check_absorb_fork(Some("abort"));
+}
+
+#[test]
+fn test_absorb_fork_dry_run() {
+    check_absorb_fork(Some("dry-run"));
+}
+
+#[test]
+fn test_absorb_multiple_fork_points_with_abbreviated_todo() {
+    check_absorb_fork(Some("multiple"));
+}
+
+#[test]
+fn test_absorb_fork_undo() {
+    check_absorb_fork(Some("undo"));
+}
+
+fn check_absorb_fork(mode: Option<&str>) {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
     let repo = setup_stack(repo_path);
 
     // A branch forked from review's first commit (which no branch points at)
     // with its own work on top. The fold would rewrite the fork point, and
-    // nothing would move this branch, so absorb must refuse up front.
+    // absorb must carry the branch onto the rewritten fork point.
     let review_tip = tip(&repo, "review");
     let code_commit = first_parent(&repo, review_tip);
     run_ok(
@@ -518,41 +547,149 @@ fn test_absorb_refuses_branch_forking_from_inside_the_range() {
         &["checkout", "-b", "loose", &code_commit.to_string()],
         repo_path,
     );
-    make_commit(
-        &repo,
-        "HEAD",
-        "loose.txt",
-        "L",
-        "loose: work",
-        &[&repo.find_commit(code_commit).unwrap()],
-    );
+    std::fs::write(repo_path.join("loose.txt"), "L").unwrap();
+    run_ok("git", &["add", "loose.txt"], repo_path);
+    run_ok("git", &["commit", "-m", "loose: work"], repo_path);
+    if matches!(mode, Some("continue" | "abort")) {
+        std::fs::write(repo_path.join("code.txt"), "line1 SIDE\nline2\nline3\n").unwrap();
+        run_ok("git", &["add", "code.txt"], repo_path);
+        run_ok("git", &["commit", "-m", "side edit"], repo_path);
+    }
+    run_ok("git", &["checkout", "-b", "loose-child"], repo_path);
+    std::fs::write(repo_path.join("child.txt"), "child").unwrap();
+    run_ok("git", &["add", "child.txt"], repo_path);
+    run_ok("git", &["commit", "-m", "child"], repo_path);
     run_ok("git", &["checkout", "review"], repo_path);
 
+    if mode == Some("multiple") {
+        // perf now forks at review's second commit, while loose forks at its
+        // first: neither fork point has a branch ref on the rewritten path.
+        std::fs::write(repo_path.join("tail.txt"), "tail").unwrap();
+        run_ok("git", &["add", "tail.txt"], repo_path);
+        run_ok("git", &["commit", "-m", "review tail"], repo_path);
+        std::fs::write(repo_path.join("extra.txt"), "extra fixed").unwrap();
+        run_ok("git", &["add", "extra.txt"], repo_path);
+        run_ok(
+            "git",
+            &["config", "rebase.abbreviateCommands", "true"],
+            repo_path,
+        );
+    }
     std::fs::write(repo_path.join("code.txt"), "line1 FIXED\nline2\nline3\n").unwrap();
     run_ok("git", &["add", "code.txt"], repo_path);
 
-    let tips_before = (tip(&repo, "review"), tip(&repo, "loose"));
-    let mut cmd = kin_cmd();
-    let output = cmd.current_dir(repo_path).arg("absorb").output().unwrap();
-    assert!(
-        !output.status.success(),
-        "fork inside the range must refuse"
+    let names = ["review", "perf", "docs", "loose", "loose-child"];
+    let before: Vec<_> = names.iter().map(|name| tip(&repo, name)).collect();
+    let mut command = kin_cmd();
+    command.current_dir(repo_path).arg("absorb");
+    if mode == Some("multiple") {
+        command.arg("--force-author");
+    }
+    if mode == Some("dry-run") {
+        command.arg("--dry-run");
+    }
+    let output = command.output().unwrap();
+    if matches!(mode, Some("continue" | "abort")) {
+        assert!(!output.status.success());
+        assert!(repo_path.join(".git/rebase-merge").exists());
+        if mode == Some("continue") {
+            std::fs::write(repo_path.join("code.txt"), "line1 FIXED\nline2\nline3\n").unwrap();
+            run_ok("git", &["add", "code.txt"], repo_path);
+        }
+        let output = kin_cmd()
+            .current_dir(repo_path)
+            .env("GIT_EDITOR", "true")
+            .arg(mode.unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    } else {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if matches!(mode, Some("abort" | "dry-run")) {
+        assert_eq!(
+            before,
+            names
+                .iter()
+                .map(|name| tip(&repo, name))
+                .collect::<Vec<_>>()
+        );
+        let staged = std::process::Command::new("git")
+            .current_dir(repo_path)
+            .args(["diff", "--cached", "--name-only"])
+            .output()
+            .unwrap();
+        assert!(staged.status.success());
+        assert_eq!(String::from_utf8_lossy(&staged.stdout).trim(), "code.txt");
+    } else {
+        let rewritten_fork = if mode == Some("multiple") {
+            let second = first_parent(&repo, tip(&repo, "review"));
+            assert_eq!(first_parent(&repo, tip(&repo, "perf")), second);
+            assert_eq!(
+                file_in_commit(&repo, tip(&repo, "perf"), "extra.txt"),
+                "extra fixed"
+            );
+            first_parent(&repo, second)
+        } else {
+            first_parent(&repo, tip(&repo, "review"))
+        };
+        assert_ne!(rewritten_fork, code_commit);
+        assert!(
+            repo.graph_descendant_of(tip(&repo, "loose"), rewritten_fork)
+                .unwrap()
+        );
+        assert!(
+            !repo
+                .graph_descendant_of(tip(&repo, "loose"), tip(&repo, "review"))
+                .unwrap()
+        );
+        assert_eq!(
+            first_parent(&repo, tip(&repo, "loose-child")),
+            tip(&repo, "loose")
+        );
+        for name in names {
+            assert_eq!(
+                file_in_commit(&repo, tip(&repo, name), "code.txt"),
+                "line1 FIXED\nline2\nline3\n"
+            );
+        }
+    }
+    if mode == Some("undo") {
+        let output = kin_cmd()
+            .current_dir(repo_path)
+            .arg("undo")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            before,
+            names
+                .iter()
+                .map(|name| tip(&repo, name))
+                .collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(common::current_branch(repo_path), "review");
+    assert_no_rebase_in_progress(repo_path);
+    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    assert_eq!(
+        repo.references_glob("refs/kindra/absorb/*")
+            .unwrap()
+            .count(),
+        0
     );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("forks from commit"),
-        "stderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    // Refusal happens before the engine runs: nothing moved, staging intact.
-    let tips_after = (tip(&repo, "review"), tip(&repo, "loose"));
-    assert_eq!(tips_before, tips_after);
-    let staged = std::process::Command::new("git")
-        .args(["diff", "--cached", "--name-only"])
-        .current_dir(repo_path)
-        .output()
-        .unwrap();
-    assert_eq!(String::from_utf8_lossy(&staged.stdout).trim(), "code.txt");
 }
 
 #[test]
@@ -732,4 +869,105 @@ fn test_absorb_undo_restores_pre_absorb_tips() {
         tips_before, tips_after,
         "undo must restore every pre-absorb branch tip"
     );
+}
+
+#[test]
+fn test_absorb_fork_in_another_worktree_is_rejected_before_changes() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = setup_stack(repo_path);
+    let fork = first_parent(&repo, tip(&repo, "review"));
+    run_ok(
+        "git",
+        &["checkout", "-b", "side", &fork.to_string()],
+        repo_path,
+    );
+    std::fs::write(repo_path.join("side.txt"), "side").unwrap();
+    run_ok("git", &["add", "side.txt"], repo_path);
+    run_ok("git", &["commit", "-m", "side"], repo_path);
+    run_ok("git", &["checkout", "review"], repo_path);
+    let other = TempDir::new().unwrap();
+    run_ok(
+        "git",
+        &["worktree", "add", other.path().to_str().unwrap(), "side"],
+        repo_path,
+    );
+    std::fs::write(repo_path.join("code.txt"), "line1 FIXED\nline2\nline3\n").unwrap();
+    run_ok("git", &["add", "code.txt"], repo_path);
+    let before = tip(&repo, "review");
+    let output = kin_cmd()
+        .current_dir(repo_path)
+        .arg("absorb")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("checked out"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(tip(&repo, "review"), before);
+    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    assert_eq!(
+        repo.references_glob("refs/kindra/absorb/*")
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn test_absorb_fork_from_linked_worktree() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = setup_stack(repo_path);
+    let fork = first_parent(&repo, tip(&repo, "review"));
+    run_ok(
+        "git",
+        &["checkout", "-b", "side", &fork.to_string()],
+        repo_path,
+    );
+    std::fs::write(repo_path.join("side.txt"), "side").unwrap();
+    run_ok("git", &["add", "side.txt"], repo_path);
+    run_ok("git", &["commit", "-m", "side"], repo_path);
+    run_ok("git", &["checkout", "main"], repo_path);
+    let other = TempDir::new().unwrap();
+    run_ok(
+        "git",
+        &["worktree", "add", other.path().to_str().unwrap(), "review"],
+        repo_path,
+    );
+    // An anchor owned by another operation must be left intact.
+    let anchor = format!("refs/kindra/absorb/other-operation/{fork}");
+    run_ok(
+        "git",
+        &["update-ref", &anchor, &fork.to_string()],
+        repo_path,
+    );
+    std::fs::write(other.path().join("code.txt"), "line1 FIXED\nline2\nline3\n").unwrap();
+    run_ok("git", &["add", "code.txt"], other.path());
+    let output = kin_cmd()
+        .current_dir(other.path())
+        .arg("absorb")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        first_parent(&repo, tip(&repo, "side")),
+        first_parent(&repo, tip(&repo, "review"))
+    );
+    let linked = Repository::open(other.path()).unwrap();
+    assert_eq!(
+        linked
+            .references_glob("refs/kindra/absorb/*")
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(repo.find_reference(&anchor).unwrap().target(), Some(fork));
+    assert!(!linked.path().join("kindra_rebase_state.json").exists());
 }

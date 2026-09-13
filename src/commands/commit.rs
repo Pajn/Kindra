@@ -1,14 +1,14 @@
 use crate::commands::{find_upstream, resolve_rebase_autostash};
 use crate::rebase_utils::{
     RebaseState, StashApplyOutcome, apply_stash, apply_stash_with_outcome, check_worktrees,
-    checkout_branch, clear_state, drop_stash, git_rebase_in_progress,
+    checkout_branch, clear_state, drop_stash, git_rebase_in_progress, local_branch_tips_in_range,
     passively_reconcile_rebase_state, record_branch_tips_in_range, restore_set_aside_changes,
     restore_stashed_changes, run_rebase_loop, save_state, stash_push_changes,
 };
 use crate::stack::{
     StackBranch, StackCommit, build_parent_maps, collect_descendants, collect_descendants_of_id,
-    enumerate_fixup_commits, enumerate_stack_commits, get_stack_branches_from_merge_base,
-    sort_branches_topologically,
+    collect_sub_stack_from_id, enumerate_fixup_commits, enumerate_stack_commits,
+    get_stack_branches_from_merge_base, is_on_history_of, sort_branches_topologically,
 };
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Oid, Repository};
@@ -195,14 +195,25 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
             .iter()
             .any(|b| b.name == target_branch);
 
-    let target_stack = build_stack_context(repo, target_old_head_id, upstream_id, &upstream_name)?;
-    let target_sub_stack = collect_target_sub_stack(
-        repo,
-        &target_branch,
-        target_old_head_id,
-        &upstream_name,
-        &target_stack.stack_branches,
-    )?;
+    // An inline fold rewrites ancestors of HEAD too. Discover from the folded
+    // commit so side branches of those ancestors participate in the restack.
+    let discovery_id = if inline_fixup && target_branch != upstream_name {
+        Oid::from_str(&fixup_commit_id)?
+    } else {
+        target_old_head_id
+    };
+    let target_stack = build_stack_context(repo, discovery_id, upstream_id, &upstream_name)?;
+    let target_sub_stack = if inline_fixup {
+        collect_sub_stack_from_id(repo, discovery_id, &target_stack.stack_branches)?
+    } else {
+        collect_target_sub_stack(
+            repo,
+            &target_branch,
+            target_old_head_id,
+            &upstream_name,
+            &target_stack.stack_branches,
+        )?
+    };
     let target_has_dependents =
         has_dependents_to_rebase(&target_branch, &upstream_name, &target_sub_stack);
 
@@ -222,11 +233,16 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
     let mut sub_stack = target_sub_stack;
     crate::stack::sort_branches_topologically(repo, &mut sub_stack)?;
 
-    let remaining_branches: Vec<String> = sub_stack
-        .iter()
-        .filter(|sb| sb.name != target_branch)
-        .map(|sb| sb.name.clone())
-        .collect();
+    let mut remaining_branches = Vec::new();
+    for branch in &sub_stack {
+        // Ancestor refs move during autosquash; only off-path branches need replay.
+        if branch.name == target_branch
+            || (inline_fixup && is_on_history_of(repo, branch.id, head_id)?)
+        {
+            continue;
+        }
+        remaining_branches.push(branch.name.clone());
+    }
 
     let will_rebase = should_rebase && target_has_dependents && !remaining_branches.is_empty();
     let needs_autosquash = is_fixup;
@@ -239,7 +255,23 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
     // The check_worktrees call must run before the code path that performs the commit and
     // mutates target_branch so failures don't leave state unpersisted.
     if will_rebase || needs_autosquash {
-        check_worktrees(&remaining_branches, parsed.force)?;
+        let mut guarded_branches = remaining_branches.clone();
+        // An inline fold rewrites the fixup target's parent..HEAD with
+        // `--update-refs`, moving every branch tip inside that range — not just
+        // the off-path dependents replayed afterwards. Those tips must pass the
+        // worktree check too, or one checked out elsewhere would be skipped by
+        // `--update-refs` and silently left on pre-fold history.
+        if inline_fixup {
+            let fixup_commit = repo.find_commit(Oid::from_str(&fixup_commit_id)?)?;
+            for (name, _) in
+                local_branch_tips_in_range(repo, autosquash_base(&fixup_commit)?, head_id)?
+            {
+                if name != current_branch_name && !guarded_branches.contains(&name) {
+                    guarded_branches.push(name);
+                }
+            }
+        }
+        check_worktrees(&guarded_branches, parsed.force)?;
     }
     // The move rebase rewrites the branches between the target and HEAD as well,
     // which the dependent list above does not cover.
