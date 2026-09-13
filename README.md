@@ -62,7 +62,7 @@ cargo release 0.3.0 --execute
 1. **Start a stack**: Create several branches, each building on the previous one — with plain `git checkout -b`, or `kin commit -b <name>` to fork a branch and commit onto it in one step (add `--insert` to splice it into the middle of an existing stack).
 2. **Make a change**: Checkout a branch in the middle of the stack and run `kin commit`.
 3. **Watch the magic**: Kindra will automatically rebase all branches that depend on your change.
-4. **Move the stack**: Ready to target a different feature? `kin move --onto main` to relocate the entire stack.
+4. **Move the stack**: Ready to target a different feature? `kin move --onto main` relocates the current branch and its descendants, preserving branch relationships. Moving onto a descendant rotates that target and its single-child chain ahead of the current branch, stopping at a fork; side branches retain their parents. Conflicts support `kin continue` and `kin abort`. Descendant rotations do not support merge commits.
 5. **Sync after merges**: If lower PRs landed, run `kin sync` to rebase the remaining stack onto latest `main`. Branching stacks are synced parent first, preserving every fork in the connected tree, even when you start from a leaf. Conflicts pause the operation for `kin continue`; `kin abort` restores the original branch tips.
 6. **Reorder the stack**: Need to reshuffle or fork branches? Run `kin reorder` and edit the parent map in your editor.
 7. **Repair broken stacks**: Amended a commit and left dependent branches "floating"? Run `kin restack` to fix them.

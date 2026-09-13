@@ -1019,7 +1019,7 @@ fn test_move_onto_descendant_reorders_target_descendants_too() {
 }
 
 #[test]
-fn test_move_onto_descendant_rejects_forked_subtree() {
+fn test_move_onto_descendant_preserves_forked_subtree() {
     let dir = tempdir().unwrap();
     let repo = repo_init(dir.path());
 
@@ -1080,8 +1080,23 @@ fn test_move_onto_descendant_rejects_forked_subtree() {
         .env("GIT_COMMITTER_NAME", "Test")
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
         .assert()
-        .failure()
-        .stderr(predicates::str::contains("affected subtree is forked"));
+        .success();
+    for (branch, parent) in [
+        ("feature-b", "main"),
+        ("feature-a", "feature-b"),
+        ("feature-c", "feature-b"),
+        ("feature-d", "feature-b"),
+    ] {
+        let commit = repo
+            .revparse_single(branch)
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            commit.parent_id(0).unwrap(),
+            repo.revparse_single(parent).unwrap().id()
+        );
+    }
 }
 
 #[test]
@@ -1161,6 +1176,15 @@ fn test_move_onto_descendant_rejects_fork_then_merge_subtree() {
 
 #[test]
 fn test_move_onto_descendant_conflict_and_continue() {
+    descendant_tree_conflict(false);
+}
+
+#[test]
+fn test_move_onto_descendant_tree_conflict_and_abort() {
+    descendant_tree_conflict(true);
+}
+
+fn descendant_tree_conflict(abort: bool) {
     let dir = tempdir().unwrap();
     let repo = repo_init(dir.path());
 
@@ -1204,6 +1228,8 @@ fn test_move_onto_descendant_conflict_and_continue() {
     );
     let _fc = repo.find_commit(fc_id).unwrap();
 
+    let side_id = make_commit(&repo, "refs/heads/side", "side.txt", "side", "side", &[&fb]);
+
     run_ok("git", &["checkout", "-f", "main"], dir.path());
     fs::write(dir.path().join("file.txt"), "1\nmain\n3\n").unwrap();
     run_ok("git", &["add", "file.txt"], dir.path());
@@ -1228,6 +1254,25 @@ fn test_move_onto_descendant_conflict_and_continue() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("Resolve conflicts"));
+
+    if abort {
+        kin_cmd()
+            .arg("abort")
+            .current_dir(dir.path())
+            .assert()
+            .success();
+        for (branch, original) in [
+            ("feature-a", fa_id),
+            ("feature-b", fb_id),
+            ("feature-c", fc_id),
+            ("side", side_id),
+        ] {
+            assert_eq!(repo.revparse_single(branch).unwrap().id(), original);
+        }
+        assert!(!repo.path().join("kindra_rebase_state.json").exists());
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+        return;
+    }
 
     fs::write(dir.path().join("file.txt"), "1\nresolved\n3\n").unwrap();
     run_ok("git", &["add", "file.txt"], dir.path());
@@ -1267,6 +1312,13 @@ fn test_move_onto_descendant_conflict_and_continue() {
         feature_b_commit.parent_id(0).unwrap(),
         feature_a.get().target().unwrap()
     );
+    let side = repo
+        .revparse_single("side")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    assert_eq!(side.parent_id(0).unwrap(), feature_b_commit.id());
+    assert!(!repo.path().join("kindra_rebase_state.json").exists());
 }
 
 #[test]
@@ -1315,6 +1367,8 @@ fn test_move_onto_descendant_prestart_failure_retries_first_reordered_branch() {
         "d commit",
         &[&fc],
     );
+
+    make_commit(&repo, "refs/heads/side", "side.txt", "side", "side", &[&fb]);
 
     repo.set_head("refs/heads/feature-a").unwrap();
     repo.checkout_tree(
@@ -1434,6 +1488,15 @@ exec "{}" "$@"
     assert_eq!(
         feature_b_commit.parent_id(0).unwrap(),
         feature_a.get().target().unwrap()
+    );
+    let side = repo
+        .revparse_single("side")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    assert_eq!(
+        side.parent_id(0).unwrap(),
+        repo.revparse_single("feature-b").unwrap().id()
     );
 }
 
@@ -2362,4 +2425,67 @@ fn move_autostash_abort_restores_staged_caller_edits() {
         repo.revparse_single("feature-b").unwrap().id(),
         original_child
     );
+}
+
+#[test]
+fn move_onto_descendant_allows_merge_before_subtree() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let base_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "base", &[]);
+    let base = repo.find_commit(base_id).unwrap();
+    let left_id = make_commit(
+        &repo,
+        "refs/heads/parent",
+        "left.txt",
+        "left",
+        "left",
+        &[&base],
+    );
+    let right_id = make_commit(
+        &repo,
+        "refs/heads/merged-side",
+        "right.txt",
+        "right",
+        "right",
+        &[&base],
+    );
+    let left = repo.find_commit(left_id).unwrap();
+    let right = repo.find_commit(right_id).unwrap();
+    let parent_id = make_commit(
+        &repo,
+        "refs/heads/parent",
+        "right.txt",
+        "right",
+        "ancestor merge",
+        &[&left, &right],
+    );
+    let parent = repo.find_commit(parent_id).unwrap();
+    let a_id = make_commit(&repo, "refs/heads/feature-a", "a.txt", "a", "a", &[&parent]);
+    let a = repo.find_commit(a_id).unwrap();
+    make_commit(&repo, "refs/heads/feature-b", "b.txt", "b", "b", &[&a]);
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+
+    kin_cmd()
+        .args(["move", "--onto", "feature-b"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let b = repo
+        .revparse_single("feature-b")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    let a = repo
+        .revparse_single("feature-a")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    assert_eq!(b.parent_id(0).unwrap(), parent_id);
+    assert_eq!(a.parent_id(0).unwrap(), b.id());
+    assert_eq!(repo.revparse_single("parent").unwrap().id(), parent_id);
+    assert_eq!(repo.revparse_single("merged-side").unwrap().id(), right_id);
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-a"));
+    assert_eq!(repo.state(), git2::RepositoryState::Clean);
+    assert!(!repo.path().join("kindra_rebase_state.json").exists());
 }
