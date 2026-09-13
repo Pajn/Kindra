@@ -195,14 +195,37 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
             .iter()
             .any(|b| b.name == target_branch);
 
-    let target_stack = build_stack_context(repo, target_old_head_id, upstream_id, &upstream_name)?;
-    let target_sub_stack = collect_target_sub_stack(
-        repo,
-        &target_branch,
-        target_old_head_id,
-        &upstream_name,
-        &target_stack.stack_branches,
-    )?;
+    // An inline fold rewrites ancestors of HEAD too. Discover from the folded
+    // commit so side branches of those ancestors participate in the restack.
+    let discovery_id = if inline_fixup && target_branch != upstream_name {
+        Oid::from_str(&fixup_commit_id)?
+    } else {
+        target_old_head_id
+    };
+    let target_stack = build_stack_context(repo, discovery_id, upstream_id, &upstream_name)?;
+    let target_sub_stack = if inline_fixup {
+        let mut branches: Vec<_> = target_stack
+            .stack_branches
+            .iter()
+            .filter(|b| b.id == discovery_id)
+            .cloned()
+            .collect();
+        collect_descendants_of_id(
+            repo,
+            discovery_id,
+            &target_stack.stack_branches,
+            &mut branches,
+        )?;
+        branches
+    } else {
+        collect_target_sub_stack(
+            repo,
+            &target_branch,
+            target_old_head_id,
+            &upstream_name,
+            &target_stack.stack_branches,
+        )?
+    };
     let target_has_dependents =
         has_dependents_to_rebase(&target_branch, &upstream_name, &target_sub_stack);
 
@@ -222,11 +245,17 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
     let mut sub_stack = target_sub_stack;
     crate::stack::sort_branches_topologically(repo, &mut sub_stack)?;
 
-    let remaining_branches: Vec<String> = sub_stack
-        .iter()
-        .filter(|sb| sb.name != target_branch)
-        .map(|sb| sb.name.clone())
-        .collect();
+    let mut remaining_branches = Vec::new();
+    for branch in &sub_stack {
+        // Ancestor refs move during autosquash; only off-path branches need replay.
+        if branch.name == target_branch
+            || (inline_fixup
+                && (branch.id == head_id || repo.graph_descendant_of(head_id, branch.id)?))
+        {
+            continue;
+        }
+        remaining_branches.push(branch.name.clone());
+    }
 
     let will_rebase = should_rebase && target_has_dependents && !remaining_branches.is_empty();
     let needs_autosquash = is_fixup;
