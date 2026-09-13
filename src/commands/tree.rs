@@ -1,6 +1,6 @@
 use crate::commands::find_upstream;
 use crate::gh;
-use crate::stack::{StackBranch, find_parent_in_stack, get_stack_branches_for_head};
+use crate::stack::{StackBranch, find_parent_in_stack, get_full_stack_branches_for_head};
 use anyhow::{Context, Result};
 use clap::Args;
 use crossterm::style::{Color, Stylize};
@@ -158,14 +158,14 @@ pub fn tree(args: &TreeArgs) -> Result<()> {
     let upstream_obj = repo.revparse_single(&upstream_name)?;
     let upstream_id = upstream_obj.id();
 
-    // Get HEAD commit ID
-    // Get stack branches
+    // Discover the full stack independently of HEAD's position within it.
     let head_id = repo
         .head()
         .context("Failed to get HEAD")?
         .peel_to_commit()?
         .id();
-    let stack_branches = get_stack_branches_for_head(&repo, head_id, upstream_id, &upstream_name)?;
+    let stack_branches =
+        get_full_stack_branches_for_head(&repo, head_id, upstream_id, &upstream_name)?;
 
     if stack_branches.is_empty() {
         println!("{} (empty stack)", upstream_name);
