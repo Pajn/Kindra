@@ -20,28 +20,31 @@ pub struct SplitArgs {
 pub fn split(args: &SplitArgs) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+    crate::overrides::with_suspended(&repo, false, || split_locked(&repo, args))
+}
 
-    if crate::rebase_utils::passively_reconcile_rebase_state(&repo)?
-        || crate::commands::run::run_state_exists(&repo)
+fn split_locked(repo: &git2::Repository, args: &SplitArgs) -> Result<()> {
+    if crate::rebase_utils::passively_reconcile_rebase_state(repo)?
+        || crate::commands::run::run_state_exists(repo)
     {
         return Err(anyhow!(
             "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));
     }
-    crate::commands::sync::ensure_no_native_git_operation(&repo)?;
+    crate::commands::sync::ensure_no_native_git_operation(repo)?;
 
     // Enforce the uniform clean-or-autostash contract up front (before any
     // oplog entry or ref mutation); the actual stash is taken later, right
     // before the mutations in `apply_split`.
     let autostash =
-        crate::commands::resolve_and_check_autostash(&repo, args.autostash, args.no_autostash)?;
+        crate::commands::resolve_and_check_autostash(repo, args.autostash, args.no_autostash)?;
 
     // Snapshot for undo. The guard settles it on every exit — the "no commits"
     // no-op, an editor/parse failure, a successful apply, or a rolled-back
     // failure — so `split` can never leave a stale pending snapshot behind.
-    let _snapshot = crate::oplog::begin(&repo, "split")?;
+    let _snapshot = crate::oplog::begin(repo, "split")?;
 
-    let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
+    let upstream_name = find_upstream(repo)?.ok_or_else(|| {
         anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
     })?;
     let upstream_obj = repo.revparse_single(&upstream_name)?;
@@ -52,13 +55,13 @@ pub fn split(args: &SplitArgs) -> Result<()> {
     let merge_base = repo.merge_base(upstream_id, head_id)?;
 
     let stack_branches = crate::stack::get_stack_branches_from_merge_base(
-        &repo,
+        repo,
         merge_base,
         head_id,
         upstream_id,
         &upstream_name,
     )?;
-    let mut tips = get_stack_tips(&repo, &stack_branches)?;
+    let mut tips = get_stack_tips(repo, &stack_branches)?;
     tips.sort();
 
     // If there are multiple tips, the user must choose one.
@@ -80,7 +83,7 @@ pub fn split(args: &SplitArgs) -> Result<()> {
     };
 
     // Now we only care about branches that are on the linear path to the target tip.
-    let path_branches = collect_path_branches(&repo, target_tip_id, merge_base, &stack_branches)?;
+    let path_branches = collect_path_branches(repo, target_tip_id, merge_base, &stack_branches)?;
 
     let mut revwalk = repo.revwalk()?;
     revwalk.push(target_tip_id)?;
@@ -149,7 +152,7 @@ pub fn split(args: &SplitArgs) -> Result<()> {
     let edited_buffer = draft.edit_or_resume(&buffer)?;
 
     match split_from_buffer(
-        &repo,
+        repo,
         &edited_buffer,
         &commits,
         &path_branches,

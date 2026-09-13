@@ -36,12 +36,16 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
     let repo = crate::open_repo()?;
 
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    if passively_reconcile_rebase_state(&repo)? || crate::commands::run::run_state_exists(&repo) {
+    crate::overrides::with_suspended(&repo, false, || sync_locked(&repo, args))
+}
+
+fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
+    if passively_reconcile_rebase_state(repo)? || crate::commands::run::run_state_exists(repo) {
         return Err(anyhow!(
             "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));
     }
-    ensure_no_native_git_operation(&repo)?;
+    ensure_no_native_git_operation(repo)?;
 
     let head = repo.head()?;
     let head_id = head.peel_to_commit()?.id();
@@ -51,11 +55,11 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
         None
     };
 
-    let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
+    let upstream_name = find_upstream(repo)?.ok_or_else(|| {
         anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
     })?;
     let local_upstream = upstream_name.clone();
-    let (rebase_onto_name, fetch_remote) = resolve_sync_onto(&repo, &upstream_name)?;
+    let (rebase_onto_name, fetch_remote) = resolve_sync_onto(repo, &upstream_name)?;
     fetch_sync_remote(fetch_remote.as_deref())?;
 
     // Snapshot for undo only after the preflight (upstream discovery, remote
@@ -63,17 +67,17 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
     // snapshot. The guard settles it on every exit below — the rebase path, the
     // delete-only path, the up-to-date no-op, and `sync_upstream_branch` — unless
     // a rebase is left in progress for `kin continue` / `kin abort` to settle.
-    let _snapshot = crate::oplog::begin(&repo, "sync")?;
+    let _snapshot = crate::oplog::begin(repo, "sync")?;
 
     if current_branch_name.as_deref() == Some(&upstream_name) {
-        return sync_upstream_branch(&repo, args, &upstream_name, &rebase_onto_name);
+        return sync_upstream_branch(repo, args, &upstream_name, &rebase_onto_name);
     }
 
     let upstream_obj = repo.revparse_single(&rebase_onto_name)?;
     let upstream_id = upstream_obj.id();
-    let merge_base = resolve_merge_base(&repo, upstream_id, head_id)?;
+    let merge_base = resolve_merge_base(repo, upstream_id, head_id)?;
     let stack_branches = get_stack_branches_from_merge_base(
-        &repo,
+        repo,
         merge_base,
         head_id,
         upstream_id,
@@ -85,7 +89,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
         && stack_branches.iter().any(|b| b.name == current)
     {
         crate::stack::collect_stack_component(
-            &repo,
+            repo,
             current,
             merge_base,
             upstream_id,
@@ -94,13 +98,13 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
     } else {
         stack_branches
     };
-    let distinct_tips: std::collections::HashSet<_> = get_stack_tips(&repo, &stack_branches)?
+    let distinct_tips: std::collections::HashSet<_> = get_stack_tips(repo, &stack_branches)?
         .iter()
         .map(|name| repo.revparse_single(name).map(|o| o.id()))
         .collect::<Result<_, _>>()?;
     if distinct_tips.len() > 1 {
         return sync_tree(
-            &repo,
+            repo,
             args,
             &stack_branches,
             merge_base,
@@ -110,7 +114,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
         );
     }
 
-    let mut tips = get_stack_tips(&repo, &stack_branches)?;
+    let mut tips = get_stack_tips(repo, &stack_branches)?;
     tips.sort();
     let top_branch = match tips.len() {
         0 => {
@@ -132,7 +136,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
 
     let top_branch_tip = repo.revparse_single(&top_branch)?.id();
 
-    let boundary = find_sync_boundary(&repo, &top_branch, &rebase_onto_name, &stack_branches)?;
+    let boundary = find_sync_boundary(repo, &top_branch, &rebase_onto_name, &stack_branches)?;
 
     let mut branches_to_check = stack_branches
         .iter()
@@ -154,7 +158,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
     if let Some(old_base) = boundary.old_base {
         crate::rebase_utils::ensure_git_supports_update_refs()?;
         let autostash =
-            crate::commands::resolve_and_check_autostash(&repo, args.autostash, args.no_autostash)?;
+            crate::commands::resolve_and_check_autostash(repo, args.autostash, args.no_autostash)?;
 
         let mut state = RebaseState {
             operation: Operation::Sync,
@@ -192,11 +196,11 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
         // Keep these changes in Kindra's state until we return to the caller,
         // including across rebase conflicts and aborts.
         if state.caller_branch.is_some() {
-            state.stash_ref = crate::rebase_utils::take_autostash(&repo, autostash)?;
+            state.stash_ref = crate::rebase_utils::take_autostash(repo, autostash)?;
             state.stash_apply_index = true;
             state.autostash = false;
         }
-        if let Err(err) = save_state(&repo, &state) {
+        if let Err(err) = save_state(repo, &state) {
             crate::rebase_utils::restore_set_aside_changes(state.stash_ref.take());
             return Err(err);
         }
@@ -221,7 +225,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
             .arg(old_base.to_string())
             .arg(&top_branch);
 
-        return run_sync_rebase(&repo, state, rebase);
+        return run_sync_rebase(repo, state, rebase);
     } else {
         println!(
             "All commits in this stack appear to be integrated into {}.",
@@ -230,7 +234,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
     }
 
     if !args.no_delete {
-        delete_merged_branches(&repo, &boundary.merged_branches, &local_upstream)?;
+        delete_merged_branches(repo, &boundary.merged_branches, &local_upstream)?;
     }
 
     // The undo guard settles the pending snapshot on return: it records the

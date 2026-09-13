@@ -18,8 +18,11 @@ use std::process::Command;
 pub fn commit(args: &[String]) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+    crate::overrides::with_suspended(&repo, false, || commit_locked(&repo, args))
+}
 
-    if passively_reconcile_rebase_state(&repo)? || crate::commands::run::run_state_exists(&repo) {
+fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
+    if passively_reconcile_rebase_state(repo)? || crate::commands::run::run_state_exists(repo) {
         return Err(anyhow!(
             "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));
@@ -33,14 +36,14 @@ pub fn commit(args: &[String]) -> Result<()> {
     }
     .ok_or_else(|| anyhow!("You must be on a branch to use 'commit'"))?;
 
-    let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
+    let upstream_name = find_upstream(repo)?.ok_or_else(|| {
         anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
     })?;
     let upstream_obj = repo.revparse_single(&upstream_name)?;
     let upstream_id = upstream_obj.id();
     let head_id = head.peel_to_commit()?.id();
     let mut parsed = parse_commit_args(args)?;
-    let autostash = resolve_rebase_autostash(&repo, parsed.autostash)?;
+    let autostash = resolve_rebase_autostash(repo, parsed.autostash)?;
     let on_flag = parsed.on_target.is_some();
 
     // `-b`/`--new-branch` commits onto a freshly created branch rather than an
@@ -49,7 +52,7 @@ pub fn commit(args: &[String]) -> Result<()> {
     // below.
     if parsed.new_branch.is_some() {
         return commit_on_new_branch(
-            &repo,
+            repo,
             &current_branch_name,
             &upstream_name,
             upstream_id,
@@ -59,7 +62,7 @@ pub fn commit(args: &[String]) -> Result<()> {
         );
     }
 
-    let current_stack = build_stack_context(&repo, head_id, upstream_id, &upstream_name)
+    let current_stack = build_stack_context(repo, head_id, upstream_id, &upstream_name)
         .with_context(|| {
             format!(
                 "Failed to discover stack context for current branch '{}'.",
@@ -68,18 +71,17 @@ pub fn commit(args: &[String]) -> Result<()> {
         })?;
 
     let interactive_selection = if parsed.interactive {
-        let commits =
-            enumerate_stack_commits(&repo, &current_stack.stack_branches, &upstream_name)?;
+        let commits = enumerate_stack_commits(repo, &current_stack.stack_branches, &upstream_name)?;
         Some(select_commit_interactive(&commits)?)
     } else if let Some(fixup_target) = &parsed.fixup_target {
         let commits = enumerate_fixup_commits(
-            &repo,
+            repo,
             &current_stack.stack_branches,
             &upstream_name,
             &current_branch_name,
             head_id,
         )?;
-        Some(resolve_fixup_commit(&repo, &commits, fixup_target)?)
+        Some(resolve_fixup_commit(repo, &commits, fixup_target)?)
     } else {
         None
     };
@@ -128,7 +130,7 @@ pub fn commit(args: &[String]) -> Result<()> {
     // index is required unless `-a`/`-p`/a pathspec supplies the content instead.
     if interactive_selection.is_some()
         && requires_staged_changes(&parsed.git_commit_args)
-        && !has_staged_changes(&repo)?
+        && !has_staged_changes(repo)?
     {
         return Err(anyhow!("nothing to commit, working tree clean"));
     }
@@ -142,7 +144,7 @@ pub fn commit(args: &[String]) -> Result<()> {
             None => current_branch_name.clone(),
             Some(Some(ref branch_name)) => branch_name.clone(),
             Some(None) => select_target_branch(
-                &repo,
+                repo,
                 &current_branch_name,
                 head_id,
                 &current_stack.stack_branches,
@@ -160,7 +162,7 @@ pub fn commit(args: &[String]) -> Result<()> {
     // technique as an inline fixup, and for the same reason — carrying staged
     // changes across a diverged tree is what `git checkout` refuses to do.
     let ancestor_on_target = ancestor_move_target(
-        &repo,
+        repo,
         &parsed,
         interactive_selection.is_some(),
         &requested_target,
@@ -193,9 +195,9 @@ pub fn commit(args: &[String]) -> Result<()> {
             .iter()
             .any(|b| b.name == target_branch);
 
-    let target_stack = build_stack_context(&repo, target_old_head_id, upstream_id, &upstream_name)?;
+    let target_stack = build_stack_context(repo, target_old_head_id, upstream_id, &upstream_name)?;
     let target_sub_stack = collect_target_sub_stack(
-        &repo,
+        repo,
         &target_branch,
         target_old_head_id,
         &upstream_name,
@@ -218,7 +220,7 @@ pub fn commit(args: &[String]) -> Result<()> {
 
     let switching_branches = target_branch != current_branch_name;
     let mut sub_stack = target_sub_stack;
-    crate::stack::sort_branches_topologically(&repo, &mut sub_stack)?;
+    crate::stack::sort_branches_topologically(repo, &mut sub_stack)?;
 
     let remaining_branches: Vec<String> = sub_stack
         .iter()
@@ -243,7 +245,7 @@ pub fn commit(args: &[String]) -> Result<()> {
     // which the dependent list above does not cover.
     if let Some(ancestor_target) = &ancestor_on_target {
         let in_range: Vec<String> = crate::rebase_utils::local_branch_tips_in_range(
-            &repo,
+            repo,
             Some(requested_target_old_head_id),
             head_id,
         )?
@@ -267,7 +269,7 @@ pub fn commit(args: &[String]) -> Result<()> {
     if pre_commit_state_required || needs_autosquash || moving_onto_ancestor {
         let (parent_id_map, parent_name_map) = if will_rebase {
             crate::stack::build_parent_maps(
-                &repo,
+                repo,
                 &sub_stack,
                 &target_stack.stack_branches,
                 target_stack.merge_base,
@@ -295,7 +297,7 @@ pub fn commit(args: &[String]) -> Result<()> {
         // stranded at the folded commit.
         if inline_fixup {
             record_below_head_rewritten_tips(
-                &repo,
+                repo,
                 &fixup_commit_id,
                 target_old_head_id,
                 &mut original_tip_map,
@@ -350,7 +352,7 @@ pub fn commit(args: &[String]) -> Result<()> {
         // The move path has nothing to recover until its commit exists, so it
         // saves its state after committing (below) rather than here — a `git
         // commit` that fails must not leave a state file behind.
-        if pre_commit_state_required && let Err(err) = save_state(&repo, &state) {
+        if pre_commit_state_required && let Err(err) = save_state(repo, &state) {
             // Persisting failed, so no later `kin continue`/`abort` knows about
             // the stash; pop it back rather than stranding the user's changes.
             restore_stashed_changes(state.stash_ref.take());
@@ -363,7 +365,7 @@ pub fn commit(args: &[String]) -> Result<()> {
             // differs on the target branch. Set the staged content aside too, so
             // the switch happens on a clean tree, and merge it back on the other
             // side — a three-way apply, which only fails on a real conflict.
-            carry_staged_changes_onto(&repo, &mut state, &target_branch)?;
+            carry_staged_changes_onto(repo, &mut state, &target_branch)?;
         }
 
         // Run the actual git commit
@@ -389,7 +391,7 @@ pub fn commit(args: &[String]) -> Result<()> {
             state
                 .original_tip_map
                 .insert(target_branch.clone(), committed_tip.to_string());
-            if let Err(err) = save_state(&repo, &state) {
+            if let Err(err) = save_state(repo, &state) {
                 // Move only the ref, retaining the committed index and unstaged
                 // work. Unlike HEAD^, the captured tip also restores an amend.
                 // Compare the current tip before replacing it, so unexpected
@@ -446,12 +448,12 @@ pub fn commit(args: &[String]) -> Result<()> {
                 .entry(ancestor_target.clone())
                 .or_insert_with(|| requested_target_old_head_id.to_string());
             record_branch_tips_in_range(
-                &repo,
+                repo,
                 Some(requested_target_old_head_id),
                 moved_commit_id,
                 &mut state.original_tip_map,
             )?;
-            if let Err(err) = save_state(&repo, &state) {
+            if let Err(err) = save_state(repo, &state) {
                 restore_stashed_changes(state.stash_ref.take());
                 return Err(err.context(
                     "The commit was created on this branch but the move could not be started; it is still at HEAD.",
@@ -484,11 +486,11 @@ pub fn commit(args: &[String]) -> Result<()> {
             cmd.arg(ancestor_target);
 
             if !cmd.status()?.success() {
-                if git_rebase_in_progress(&repo) {
+                if git_rebase_in_progress(repo) {
                     // Record which branch is mid-rebase so `kin continue` matches
                     // the saved state, exactly as the autosquash path does.
                     state.in_progress_branch = Some(current_branch_name.clone());
-                    save_state(&repo, &state)?;
+                    save_state(repo, &state)?;
                     return Err(anyhow!(
                         "Moving the commit onto '{}' hit conflicts. Resolve them and run 'kin continue', or run 'kin abort' to undo the commit and get the changes back staged.",
                         ancestor_target
@@ -502,8 +504,8 @@ pub fn commit(args: &[String]) -> Result<()> {
             }
 
             if move_state_required {
-                restore_autostash(&repo, &mut state)?;
-                clear_state(&repo)?;
+                restore_autostash(repo, &mut state)?;
+                clear_state(repo)?;
                 return Ok(());
             }
         }
@@ -536,7 +538,7 @@ pub fn commit(args: &[String]) -> Result<()> {
                         }
                     }
                 };
-                if let Err(err) = save_state(&repo, &state) {
+                if let Err(err) = save_state(repo, &state) {
                     // Persisting failed; pop the stash back rather than leaving
                     // the user's unstaged changes stranded.
                     restore_stashed_changes(state.stash_ref.take());
@@ -572,19 +574,19 @@ pub fn commit(args: &[String]) -> Result<()> {
             let status = cmd.status()?;
 
             if !status.success() {
-                if git_rebase_in_progress(&repo) {
+                if git_rebase_in_progress(repo) {
                     // The autosquash rebase paused on a conflict. Record which
                     // branch is mid-rebase so `kin continue` matches the saved
                     // state — required whether or not the target has dependents
                     // (a missing in_progress_branch makes `kin continue` refuse).
                     state.in_progress_branch = Some(target_branch.clone());
-                    save_state(&repo, &state)?;
+                    save_state(repo, &state)?;
                 } else if autosquash_state_required {
                     // autosquash_state_required implies no dependents/switch, so
                     // this only runs on the single-branch path. The rebase failed
                     // without a resumable state, so put the user's autostash back
                     // before surfacing the error.
-                    restore_autostash(&repo, &mut state)?;
+                    restore_autostash(repo, &mut state)?;
                 }
                 return Err(anyhow!(
                     "git rebase --autosquash failed. Resolve conflicts and run 'kin continue', or run 'kin abort'."
@@ -592,8 +594,8 @@ pub fn commit(args: &[String]) -> Result<()> {
             }
 
             if autosquash_state_required {
-                restore_autostash(&repo, &mut state)?;
-                clear_state(&repo)?;
+                restore_autostash(repo, &mut state)?;
+                clear_state(repo)?;
             }
         }
 

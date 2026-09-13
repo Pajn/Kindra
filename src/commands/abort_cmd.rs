@@ -10,9 +10,16 @@ use std::process::Command;
 pub fn abort_cmd(clear_state_only: bool) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    let path = state_path(&repo);
+    if clear_state_only {
+        return abort_locked(&repo, clear_state_only);
+    }
+    crate::overrides::with_suspended(&repo, true, || abort_locked(&repo, false))
+}
+
+fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
+    let path = state_path(repo);
     let has_rebase_state = path.exists();
-    let has_run_state = crate::commands::run::run_state_exists(&repo);
+    let has_run_state = crate::commands::run::run_state_exists(repo);
     // Settle the pending oplog snapshot on *every* exit from here on, including
     // the early `?` returns below. Default is `Leave`: only once we have actually
     // finished handling the saved state do we switch to `Discard` (pre-operation
@@ -22,7 +29,7 @@ pub fn abort_cmd(clear_state_only: bool) -> Result<()> {
     // next operation's `begin` can still flush it into an undo entry rather than
     // this abort silently dropping it.
     let mut settle = AbortOplogSettle {
-        repo: &repo,
+        repo,
         action: SettleAction::Leave,
     };
 
@@ -30,18 +37,18 @@ pub fn abort_cmd(clear_state_only: bool) -> Result<()> {
         // This escape hatch deliberately does not deserialize state: it must
         // also work for malformed files or overlapping interrupted operations.
         // Keep Git's rebase, refs, index, worktree and stash entries untouched.
-        for state_file in [&path, &crate::commands::run::run_state_path(&repo)] {
+        for state_file in [&path, &crate::commands::run::run_state_path(repo)] {
             match std::fs::remove_file(state_file) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err.into()),
             }
         }
-        if !git_rebase_in_progress(&repo) {
+        if !git_rebase_in_progress(repo) {
             settle.action = SettleAction::Finalize;
         }
         println!("Kindra operation state cleared. Git state and saved stashes were left intact.");
-        if git_rebase_in_progress(&repo) {
+        if git_rebase_in_progress(repo) {
             println!(
                 "The Git rebase is still in progress; manage it with git rebase --continue or --abort."
             );
@@ -56,9 +63,9 @@ pub fn abort_cmd(clear_state_only: bool) -> Result<()> {
     }
 
     if has_rebase_state {
-        let mut parsed_state = load_state(&repo)?;
-        let git_rebase_active = git_rebase_in_progress(&repo);
-        let kindra_owns_current_state = owned_tip_state_matches(&repo, &parsed_state)?;
+        let mut parsed_state = load_state(repo)?;
+        let git_rebase_active = git_rebase_in_progress(repo);
+        let kindra_owns_current_state = owned_tip_state_matches(repo, &parsed_state)?;
 
         if git_rebase_active && kindra_owns_current_state {
             println!("Aborting active git rebase...");
@@ -83,7 +90,7 @@ pub fn abort_cmd(clear_state_only: bool) -> Result<()> {
                 // below then moves the ref out from underneath, so the
                 // discarded content reappears as staged changes.
                 checkout_branch(&parsed_state.original_branch)?;
-                apply_abort_stash(&repo, &mut parsed_state)?;
+                apply_abort_stash(repo, &mut parsed_state)?;
                 restore_original_branch_tips(&parsed_state.original_tip_map)?;
                 if restore_branch != parsed_state.original_branch {
                     checkout_branch(&restore_branch)?;
@@ -91,7 +98,7 @@ pub fn abort_cmd(clear_state_only: bool) -> Result<()> {
             } else {
                 restore_original_branch_tips(&parsed_state.original_tip_map)?;
                 checkout_branch(&restore_branch)?;
-                apply_abort_stash(&repo, &mut parsed_state)?;
+                apply_abort_stash(repo, &mut parsed_state)?;
             }
 
             if parsed_state.unstage_on_restore {
@@ -138,8 +145,8 @@ pub fn abort_cmd(clear_state_only: bool) -> Result<()> {
             }
         }
     } else if has_run_state {
-        crate::commands::run::abort_run(&repo)?;
-    } else if git_rebase_in_progress(&repo) {
+        crate::commands::run::abort_run(repo)?;
+    } else if git_rebase_in_progress(repo) {
         println!("A native git rebase is in progress. Use 'git rebase --abort'.");
     } else {
         println!("No operation in progress.");

@@ -10,6 +10,7 @@ Kindra is a CLI tool for managing **stacked git branches**. Its `kin` command au
 - **Fork-Aware Reordering**: Edit branch parent relationships in your `$EDITOR`, including creating or preserving forks.
 - **Smart Sync**: Rebase the current stack onto `main`/`master` in one pass using `--update-refs`, while skipping already-landed lower PRs.
 - **Auto-Restack**: Automatically identify and repair "floating" branches that were based on an old version of the current branch (e.g., after an `amend` or `rebase`).
+- **Local Overrides**: Temporarily restore managed files for checkouts and stack operations, then reapply local config and agent instructions. [Configure overrides](docs/cli_reference.md#local-overrides).
 - **Interactive Navigation**: Quickly hop between branches in your stack with `up`, `down`, and `top` commands.
 
 - **Visual Branch Splitting**: Assign branches to specific commits in a linear history using your favorite `$EDITOR`.

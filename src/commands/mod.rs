@@ -4,6 +4,7 @@ pub mod checkout;
 pub mod commit;
 pub mod continue_cmd;
 pub mod move_cmd;
+pub mod overrides;
 pub mod pr;
 pub(crate) mod pr_merge;
 pub mod push;

@@ -14,6 +14,10 @@
 //!    other's state file. [`RepoLock`] takes a whole-repository advisory lock so the
 //!    second process fails fast with a clear message instead.
 
+#[cfg(windows)]
+#[path = "state_io/windows.rs"]
+pub(crate) mod windows;
+
 use anyhow::{Context, Result, anyhow};
 use fs2::FileExt;
 use git2::Repository;
@@ -28,6 +32,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// disk, and renames it over the destination. A crash can leave a stale
 /// `*.tmp.*` file behind but never a partially written destination file.
 pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    write_atomic_impl(path, contents, false)
+}
+
+/// Persist local overlay contents without making backups world-readable.
+pub fn write_atomic_private(path: &Path, contents: &str) -> Result<()> {
+    write_atomic_impl(path, contents, true)
+}
+
+fn write_atomic_impl(path: &Path, contents: &str, private: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -65,11 +78,29 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
         }
     }
 
-    let mut temp = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temp_path)
-        .with_context(|| format!("Failed to create temp file '{}'", temp_path.display()))?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(any(unix, windows)))]
+    if private {
+        return Err(anyhow!(
+            "Private state files are unsupported on this platform"
+        ));
+    }
+    #[cfg(windows)]
+    let opened = if private {
+        windows::create_private_file(&temp_path)
+    } else {
+        options.open(&temp_path)
+    };
+    #[cfg(not(windows))]
+    let opened = options.open(&temp_path);
+    let mut temp =
+        opened.with_context(|| format!("Failed to create temp file '{}'", temp_path.display()))?;
     temp.write_all(contents.as_bytes())?;
     temp.sync_all()?;
     drop(temp);

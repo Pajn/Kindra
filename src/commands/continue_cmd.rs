@@ -9,9 +9,13 @@ use std::process::Command;
 pub fn continue_cmd() -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    let rebase_state = reconcile_saved_rebase_state(&repo, ReconcileMode::Continue)?;
+    crate::overrides::with_suspended(&repo, true, || continue_cmd_locked(&repo))
+}
+
+fn continue_cmd_locked(repo: &git2::Repository) -> Result<()> {
+    let rebase_state = reconcile_saved_rebase_state(repo, ReconcileMode::Continue)?;
     let has_rebase_state = rebase_state.is_some();
-    let has_run_state = crate::commands::run::run_state_exists(&repo);
+    let has_run_state = crate::commands::run::run_state_exists(repo);
 
     if has_rebase_state && has_run_state {
         return Err(anyhow!(
@@ -19,14 +23,14 @@ pub fn continue_cmd() -> Result<()> {
         ));
     }
 
-    if git_rebase_in_progress(&repo) {
+    if git_rebase_in_progress(repo) {
         if !has_rebase_state {
             return Err(anyhow!(
                 "A native git rebase is in progress. Use 'git rebase --continue'."
             ));
         }
 
-        let repaired = repair_stalled_pick_commit(&repo)?;
+        let repaired = repair_stalled_pick_commit(repo)?;
 
         println!("Continuing git rebase...");
         let status = git_rebase_step(rebase_state.as_ref(), "--continue")?;
@@ -35,7 +39,7 @@ pub fn continue_cmd() -> Result<()> {
             // committed; that replay usually comes up empty and stops. Nothing
             // is staged and nothing conflicts in that case, so finishing it
             // with --skip is the completion of the recovery, not a decision.
-            if repaired && rebase_stopped_on_empty_pick(&repo)? {
+            if repaired && rebase_stopped_on_empty_pick(repo)? {
                 println!("The recovered commit made the replayed pick empty; skipping it...");
                 let status = git_rebase_step(rebase_state.as_ref(), "--skip")?;
                 if !status.success() {
@@ -50,9 +54,9 @@ pub fn continue_cmd() -> Result<()> {
     if let Some(state) = rebase_state {
         return match state.operation {
             Operation::Sync if state.parent_name_map.is_empty() => {
-                crate::commands::sync::finish_sync_after_rebase(&repo, state)
+                crate::commands::sync::finish_sync_after_rebase(repo, state)
             }
-            _ => run_rebase_loop(&repo, state),
+            _ => run_rebase_loop(repo, state),
         };
     }
 

@@ -11,6 +11,7 @@ pub mod editor;
 pub mod gh;
 pub mod interaction;
 pub mod oplog;
+pub mod overrides;
 pub mod rebase_todo;
 pub mod rebase_utils;
 pub mod repository;

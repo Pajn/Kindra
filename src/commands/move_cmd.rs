@@ -37,6 +37,10 @@ pub fn move_cmd(args: &MoveArgs) -> Result<()> {
 
 fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
     let _lock = crate::state_io::RepoLock::acquire(repo)?;
+    crate::overrides::with_suspended(repo, false, || start_move_locked(repo, args))
+}
+
+fn start_move_locked(repo: &Repository, args: &MoveArgs) -> Result<()> {
     if passively_reconcile_rebase_state(repo)? || crate::commands::run::run_state_exists(repo) {
         return Err(anyhow!(
             "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."

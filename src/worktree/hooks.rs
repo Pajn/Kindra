@@ -80,6 +80,13 @@ fn run_hook_list(
     worktree_path: &Path,
     branch: &str,
 ) -> Result<()> {
+    if event == HookEvent::Create {
+        // Hook unit tests also use directories that are not repositories.
+        if let Ok(repo) = git2::Repository::open(worktree_path) {
+            let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+            crate::overrides::apply_current(&repo)?;
+        }
+    }
     for hook in hooks {
         eprintln!("Running {} hook: {}...", event.as_str(), hook);
         let status = shell_command(&hook)
