@@ -1,7 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use git2::{Oid, Repository, Signature, build::CheckoutBuilder};
 use kindra::commands::DEFAULT_RESTACK_HISTORY_LIMIT;
-use kindra::stack::{build_floating_target_context, find_floating_base};
+use kindra::stack::{build_floating_target_context, find_floating_bases};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -218,7 +218,7 @@ fn discover_floating_children(repo_path: &Path, current_branch: &str) -> usize {
         .branches(Some(git2::BranchType::Local))
         .expect("failed to enumerate local branches");
 
-    let mut found = 0;
+    let mut tips = Vec::new();
     for branch_res in branches {
         let (branch, _) = branch_res.expect("failed to read branch");
         let name = match branch.name() {
@@ -232,22 +232,20 @@ fn discover_floating_children(repo_path: &Path, current_branch: &str) -> usize {
         let Some(tip) = branch.get().target() else {
             continue;
         };
-
-        if find_floating_base(
-            &repo,
-            tip,
-            &target,
-            DEFAULT_RESTACK_HISTORY_LIMIT,
-            &mut patch_id_cache,
-        )
-        .expect("failed to search floating base")
-        .is_some()
-        {
-            found += 1;
-        }
+        tips.push(tip);
     }
 
-    found
+    find_floating_bases(
+        &repo,
+        &tips,
+        &target,
+        DEFAULT_RESTACK_HISTORY_LIMIT,
+        &mut patch_id_cache,
+    )
+    .expect("failed to search floating bases")
+    .iter()
+    .filter(|found| found.is_some())
+    .count()
 }
 
 fn setup_repo(scenario: Scenario) -> BenchRepo {

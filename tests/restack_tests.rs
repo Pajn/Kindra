@@ -1,7 +1,18 @@
 use git2::Repository;
-use kindra::stack::{build_floating_target_context, find_floating_base};
+use kindra::stack::{FloatingTargetContext, build_floating_target_context, find_floating_bases};
 use std::collections::HashMap;
 use tempfile::TempDir;
+
+/// Single-tip convenience over the batched detection the restack command uses.
+fn find_floating_base(
+    repo: &Repository,
+    branch_tip: git2::Oid,
+    target: &FloatingTargetContext,
+    history_limit: usize,
+    patch_id_cache: &mut HashMap<git2::Oid, Option<String>>,
+) -> anyhow::Result<Option<git2::Oid>> {
+    Ok(find_floating_bases(repo, &[branch_tip], target, history_limit, patch_id_cache)?.remove(0))
+}
 
 mod common;
 use common::{assert_no_rebase_in_progress, kin_cmd, make_commit, repo_init, run_ok};

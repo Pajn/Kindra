@@ -212,9 +212,9 @@ fn find_floating_children(
         history_limit,
         &mut patch_id_cache,
     )?;
-    let branches = repo.branches(Some(BranchType::Local))?;
-
-    for branch_res in branches {
+    let mut names = Vec::new();
+    let mut tips = Vec::new();
+    for branch_res in repo.branches(Some(BranchType::Local))? {
         let (branch, _) = branch_res?;
         let name = match branch.name() {
             Ok(Some(n)) => n.to_string(),
@@ -229,21 +229,27 @@ fn find_floating_children(
             Some(t) => t,
             None => continue,
         };
+        names.push(name);
+        tips.push(tip);
+    }
 
-        if let Some(old_base) = crate::stack::find_floating_base(
-            repo,
-            tip,
-            &target,
-            history_limit,
-            &mut patch_id_cache,
-        )? {
-            // If another branch still points at the detected old base, this branch is
-            // part of an intact alternate stack rather than floating off the current one.
-            if has_other_local_branch_at_tip(repo, &name, old_base)? {
-                continue;
-            }
-            results.push((name, old_base));
+    let old_bases = crate::stack::find_floating_bases(
+        repo,
+        &tips,
+        &target,
+        history_limit,
+        &mut patch_id_cache,
+    )?;
+    for (name, old_base) in names.into_iter().zip(old_bases) {
+        let Some(old_base) = old_base else {
+            continue;
+        };
+        // If another branch still points at the detected old base, this branch is
+        // part of an intact alternate stack rather than floating off the current one.
+        if has_other_local_branch_at_tip(repo, &name, old_base)? {
+            continue;
         }
+        results.push((name, old_base));
     }
     Ok(results)
 }
