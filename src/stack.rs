@@ -717,7 +717,14 @@ pub struct FloatingTargetContext {
     candidate_ids: HashSet<Oid>,
     candidate_positions: HashMap<Oid, usize>,
     patch_ids: HashSet<String>,
+    /// Paths touched by each commit behind `patch_ids`, as sets. A branch
+    /// commit can only share a patch id with a target commit that touches the
+    /// same paths, so this prunes the patch-id fallback to the few candidates
+    /// that could match. `None` when a merge commit is in the private lineage;
+    /// its combined diff has no single path set to compare against.
+    patch_path_sets: Option<HashSet<Vec<String>>>,
     reflog_ids: HashSet<Oid>,
+    historical_tip_ids: HashSet<Oid>,
 }
 
 #[derive(Clone)]
@@ -832,6 +839,26 @@ pub fn build_floating_target_context(
         .iter()
         .filter_map(|oid| patch_id_cache.get(oid).and_then(|v| v.as_ref()).cloned())
         .collect();
+    let patch_path_sets = if patch_commit_ids.is_empty() {
+        Some(HashSet::new())
+    } else if patch_commit_ids
+        .iter()
+        .map(|oid| {
+            repo.find_commit(*oid)
+                .map(|commit| commit.parent_count() > 1)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|is_merge| is_merge)
+    {
+        None
+    } else {
+        Some(
+            touched_path_sets(repo, &patch_commit_ids)?
+                .into_values()
+                .collect(),
+        )
+    };
     let candidates: Vec<FloatingTargetCandidate> =
         all_candidates.into_iter().take(private_len).collect();
     let candidate_ids = candidates.iter().map(|candidate| candidate.id).collect();
@@ -842,44 +869,247 @@ pub fn build_floating_target_context(
         .collect();
     let reflog_ids = read_branch_reflog_ids(repo, target_branch);
 
+    // Exact shared ancestors need evidence that they belonged to this branch,
+    // and a private boundary so shared upstream history cannot adopt siblings.
+    let mut historical_tip_ids = HashSet::new();
+    if patch_id_boundary.is_some() {
+        historical_tip_ids.extend(reflog_ids.iter().copied());
+        if let Ok(branch) = repo.find_branch(target_branch, git2::BranchType::Local)
+            && let Ok(upstream) = branch.upstream()
+            && upstream.get().is_remote()
+            && let Some(tip) = upstream.get().target()
+        {
+            historical_tip_ids.insert(tip);
+        }
+    }
+
     Ok(FloatingTargetContext {
         candidates,
         candidate_ids,
         candidate_positions,
         patch_ids,
+        patch_path_sets,
         reflog_ids,
+        historical_tip_ids,
     })
 }
 
-pub fn find_floating_base(
+/// For each branch tip, the commit on its history that the target branch was
+/// rewritten from (its floating base), or `None` when the branch is not a
+/// floating child of the target.
+///
+/// The tips are resolved together because the patch-id fallback needs a
+/// `git show | git patch-id` round trip per batch of commits; sharing it lets
+/// every branch's candidates go out in one batch instead of one pair of
+/// processes per branch.
+pub fn find_floating_bases(
     repo: &Repository,
-    branch_tip: Oid,
+    branch_tips: &[Oid],
     target: &FloatingTargetContext,
     history_limit: usize,
     patch_id_cache: &mut HashMap<Oid, Option<String>>,
-) -> Result<Option<Oid>> {
-    find_floating_match(repo, branch_tip, target, history_limit, patch_id_cache)
-        .map(|found| found.map(|matching| matching.branch_id))
+) -> Result<Vec<Option<Oid>>> {
+    let mut walks = Vec::with_capacity(branch_tips.len());
+    let mut pending = Vec::new();
+    for &branch_tip in branch_tips {
+        let walk =
+            walk_floating_candidates(repo, branch_tip, target, history_limit, patch_id_cache)?;
+        if let FloatingWalk::PatchCandidates(candidates) = &walk {
+            pending.extend(candidates.iter().copied());
+        }
+        walks.push(walk);
+    }
+    let pending = filter_patch_candidates(repo, target, &pending)?;
+    ensure_patch_ids(repo, &pending, patch_id_cache)?;
+    let mut results = Vec::with_capacity(branch_tips.len());
+    for (walk, &branch_tip) in walks.into_iter().zip(branch_tips) {
+        let found = match walk {
+            FloatingWalk::Resolved(found) => found,
+            FloatingWalk::PatchCandidates(candidates) => {
+                match_floating_patch_ids(repo, branch_tip, target, &candidates, patch_id_cache)?
+            }
+        };
+        results.push(found.map(|matching| matching.branch_id));
+    }
+    Ok(results)
 }
 
-fn find_floating_match(
+/// Outcome of walking a branch's first-parent history against the target.
+enum FloatingWalk {
+    /// The walk settled the answer on its own, by an exact, tree, or metadata match.
+    Resolved(Option<FloatingBaseMatch>),
+    /// The walk found nothing conclusive; these private commits remain to be
+    /// compared by patch id (see [`match_floating_patch_ids`]).
+    PatchCandidates(Vec<Oid>),
+}
+
+/// The merge bases of a branch tip and the target, or none when the histories
+/// are unrelated. Every reachability question the walk asks reduces to these:
+/// the target is an ancestor of the tip exactly when it is one of the bases,
+/// and a commit on the tip's history is reachable from the target exactly when
+/// some base reaches it. Resolving them once per branch keeps each question a
+/// short walk near the fork point rather than a paint-down from the target
+/// over everything the branch has fallen behind.
+fn floating_merge_bases(repo: &Repository, branch_tip: Oid, target_id: Oid) -> Result<Vec<Oid>> {
+    match repo.merge_bases(branch_tip, target_id) {
+        Ok(bases) => Ok(bases.iter().copied().collect()),
+        Err(err) if err.code() == git2::ErrorCode::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Keep only the patch candidates that could share a patch id with a target
+/// commit: those touching exactly the paths some target commit touches. Merge
+/// commits are kept as they are; they have no single path set to compare.
+/// Candidates are deduplicated, preserving first occurrence.
+fn filter_patch_candidates(
+    repo: &Repository,
+    target: &FloatingTargetContext,
+    candidates: &[Oid],
+) -> Result<Vec<Oid>> {
+    let mut seen = HashSet::new();
+    let candidates: Vec<Oid> = candidates
+        .iter()
+        .copied()
+        .filter(|oid| seen.insert(*oid))
+        .collect();
+    let Some(target_path_sets) = &target.patch_path_sets else {
+        return Ok(candidates);
+    };
+    let mut kept = Vec::new();
+    let mut comparable = Vec::new();
+    for oid in candidates {
+        if repo.find_commit(oid)?.parent_count() > 1 {
+            kept.push(oid);
+        } else {
+            comparable.push(oid);
+        }
+    }
+    let path_sets = touched_path_sets(repo, &comparable)?;
+    for oid in comparable {
+        let paths = path_sets.get(&oid).cloned().unwrap_or_default();
+        if target_path_sets.contains(&paths) {
+            kept.push(oid);
+        }
+    }
+    Ok(kept)
+}
+
+/// The sorted set of paths each commit changes against its first parent (or
+/// against the empty tree for a root commit), in one `git diff-tree` run.
+///
+/// The output is read as NUL-delimited `--name-status` records: a bare commit
+/// id opens a commit's block, and every change follows as a status record and
+/// then its path record. A path is always consumed as the record after a
+/// status, so a file whose name happens to spell a commit id cannot be taken
+/// for a header.
+fn touched_path_sets(repo: &Repository, commit_ids: &[Oid]) -> Result<HashMap<Oid, Vec<String>>> {
+    let mut sets: HashMap<Oid, Vec<String>> = HashMap::new();
+    if commit_ids.is_empty() {
+        return Ok(sets);
+    }
+    let mut child = Command::new("git")
+        .arg("diff-tree")
+        .arg("-r")
+        .arg("--root")
+        .arg("--name-status")
+        .arg("-z")
+        .arg("--no-ext-diff")
+        .arg("--stdin")
+        .current_dir(repo_root(repo)?)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("Failed to open git diff-tree stdin for path listing."))?;
+    let input: String = commit_ids.iter().map(|oid| format!("{oid}\n")).collect();
+    // Feed the ids from another thread: with enough commits the output fills
+    // the pipe before the input is fully written, and both ends would block.
+    let output = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            use std::io::Write;
+            stdin.write_all(input.as_bytes())
+        });
+        let output = child.wait_with_output();
+        let written = writer
+            .join()
+            .map_err(|_| anyhow!("git diff-tree input writer panicked"))?;
+        // A closed pipe means diff-tree exited early; its status carries the error.
+        if let Err(err) = written
+            && err.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(err.into());
+        }
+        output.map_err(anyhow::Error::from)
+    })?;
+    if !output.status.success() {
+        return Err(anyhow!("git diff-tree failed while listing touched paths."));
+    }
+    let requested: HashSet<Oid> = commit_ids.iter().copied().collect();
+    let mut current: Option<Oid> = None;
+    let mut records = output.stdout.split(|byte| *byte == 0);
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let record = String::from_utf8_lossy(record);
+        if let Ok(oid) = Oid::from_str(&record)
+            && requested.contains(&oid)
+        {
+            sets.entry(oid).or_default();
+            current = Some(oid);
+            continue;
+        }
+        // Any other record is a change status; the path is the record after it.
+        let Some(path) = records.next() else {
+            break;
+        };
+        if let Some(oid) = current {
+            sets.entry(oid)
+                .or_default()
+                .push(String::from_utf8_lossy(path).into_owned());
+        }
+    }
+    for paths in sets.values_mut() {
+        paths.sort();
+        paths.dedup();
+    }
+    Ok(sets)
+}
+
+fn reachable_from_merge_bases(repo: &Repository, bases: &[Oid], oid: Oid) -> Result<bool> {
+    if bases.contains(&oid) {
+        return Ok(true);
+    }
+    for &base in bases {
+        if repo.graph_descendant_of(base, oid)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn walk_floating_candidates(
     repo: &Repository,
     branch_tip: Oid,
     target: &FloatingTargetContext,
     history_limit: usize,
     patch_id_cache: &mut HashMap<Oid, Option<String>>,
-) -> Result<Option<FloatingBaseMatch>> {
+) -> Result<FloatingWalk> {
     let Some(target_id) = target.candidates.first().map(|candidate| candidate.id) else {
-        return Ok(None);
+        return Ok(FloatingWalk::Resolved(None));
     };
 
     // If the branch is already on top of, already part of, or already integrated
     // into the target branch, it is not a floating child that needs restacking.
-    if repo.graph_descendant_of(branch_tip, target_id)? || branch_tip == target_id {
-        return Ok(None);
+    if branch_tip == target_id {
+        return Ok(FloatingWalk::Resolved(None));
     }
-    if repo.graph_descendant_of(target_id, branch_tip)? {
-        return Ok(None);
+    let merge_bases = floating_merge_bases(repo, branch_tip, target_id)?;
+    if merge_bases.contains(&target_id) || merge_bases.contains(&branch_tip) {
+        return Ok(FloatingWalk::Resolved(None));
     }
 
     let mut patch_candidates = Vec::new();
@@ -891,9 +1121,22 @@ fn find_floating_match(
             break;
         }
 
+        // An unchanged commit in the target's private lineage is an exact fork
+        // point when the parent gained commits. Check before stopping at shared
+        // history; upstream commits are excluded from candidate_positions.
+        if oid != branch_tip
+            && target.historical_tip_ids.contains(&oid)
+            && let Some(&target_index) = target.candidate_positions.get(&oid)
+        {
+            return Ok(FloatingWalk::Resolved(Some(FloatingBaseMatch {
+                branch_id: oid,
+                target_index,
+            })));
+        }
+
         // Optimization: If we hit a commit that is reachable from the target, we stop.
         // Because any match found *after* this point would be a common ancestor, not a floating base.
-        if repo.graph_descendant_of(target_id, oid)? {
+        if reachable_from_merge_bases(repo, &merge_bases, oid)? {
             break;
         }
 
@@ -911,7 +1154,7 @@ fn find_floating_match(
                     target_index,
                 };
                 if validate_floating_match(repo, branch_tip, matching, target, patch_id_cache)? {
-                    return Ok(Some(matching));
+                    return Ok(FloatingWalk::Resolved(Some(matching)));
                 }
             }
             continue;
@@ -937,7 +1180,7 @@ fn find_floating_match(
                     target_index,
                 };
                 if validate_floating_match(repo, branch_tip, matching, target, patch_id_cache)? {
-                    return Ok(Some(matching));
+                    return Ok(FloatingWalk::Resolved(Some(matching)));
                 }
             }
         }
@@ -951,7 +1194,7 @@ fn find_floating_match(
                 target_index,
             };
             if validate_floating_match(repo, branch_tip, matching, target, patch_id_cache)? {
-                return Ok(Some(matching));
+                return Ok(FloatingWalk::Resolved(Some(matching)));
             }
             continue;
         }
@@ -1019,7 +1262,7 @@ fn find_floating_match(
                     };
                     if validate_floating_match(repo, branch_tip, matching, target, patch_id_cache)?
                     {
-                        return Ok(Some(matching));
+                        return Ok(FloatingWalk::Resolved(Some(matching)));
                     }
                 }
             }
@@ -1028,8 +1271,27 @@ fn find_floating_match(
         patch_candidates.push(oid);
     }
 
-    ensure_patch_ids(repo, &patch_candidates, patch_id_cache)?;
-    for oid in patch_candidates {
+    // No private target commit means no patch id can match; skip the round trip.
+    if target.patch_ids.is_empty() {
+        return Ok(FloatingWalk::Resolved(None));
+    }
+    Ok(FloatingWalk::PatchCandidates(patch_candidates))
+}
+
+/// Patch-id fallback of the floating walk: match the branch's private commits
+/// against rewritten target commits by content. Callers must have populated
+/// `patch_id_cache` for `patch_candidates` (see [`ensure_patch_ids`]).
+fn match_floating_patch_ids(
+    repo: &Repository,
+    branch_tip: Oid,
+    target: &FloatingTargetContext,
+    patch_candidates: &[Oid],
+    patch_id_cache: &mut HashMap<Oid, Option<String>>,
+) -> Result<Option<FloatingBaseMatch>> {
+    let Some(target_id) = target.candidates.first().map(|candidate| candidate.id) else {
+        return Ok(None);
+    };
+    for &oid in patch_candidates {
         if oid == branch_tip {
             continue;
         }
