@@ -114,6 +114,69 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+pub fn absorb_sequence_editor_command() -> Result<String> {
+    let exe =
+        std::env::current_exe().context("Could not locate kin for the absorb sequence editor")?;
+    Ok(format!(
+        "{} absorb-todo",
+        shell_quote(&exe.to_string_lossy())
+    ))
+}
+
+/// Capture each fork point after its complete autosquash group. Git persists
+/// update-ref instructions across conflicts and applies them when the fold ends.
+/// No temporary branch is exposed to stack discovery or other worktrees.
+pub fn rewrite_absorb_todo_file(todo: impl AsRef<Path>) -> Result<()> {
+    let repo = crate::open_repo()?;
+    let state = crate::rebase_utils::load_state(&repo)?;
+    let prefix = crate::rebase_utils::ABSORB_FORK_REF_PREFIX;
+    let mut anchors = std::collections::BTreeMap::new();
+    for reference in state.new_base_map.values() {
+        if let Some(suffix) = reference.strip_prefix(prefix) {
+            let oid = suffix
+                .rsplit('/')
+                .next()
+                .ok_or_else(|| anyhow!("Invalid absorb anchor"))?;
+            anchors.insert(git2::Oid::from_str(oid)?, reference.clone());
+        }
+    }
+    let input = std::fs::read_to_string(todo.as_ref())?;
+    let mut output = String::new();
+    let mut pending = Vec::new();
+    for line in input.lines() {
+        let mut words = line.split_whitespace();
+        let command = words.next().unwrap_or_default();
+        let is_fold = matches!(command, "fixup" | "f" | "squash" | "s");
+        let is_commit = is_fold || matches!(command, "pick" | "p" | "reword" | "r" | "edit" | "e");
+        if is_commit && !is_fold {
+            for reference in pending.drain(..) {
+                output.push_str(&format!("update-ref {reference}\n"));
+            }
+        }
+        output.push_str(line);
+        output.push('\n');
+        if is_commit {
+            let oid = words
+                .find(|word| !word.starts_with('-'))
+                .ok_or_else(|| anyhow!("Missing commit in rebase todo"))?;
+            let oid = repo.revparse_single(oid)?.peel_to_commit()?.id();
+            if let Some(reference) = anchors.remove(&oid) {
+                pending.push(reference);
+            }
+        }
+    }
+    for reference in pending {
+        output.push_str(&format!("update-ref {reference}\n"));
+    }
+    if !anchors.is_empty() {
+        return Err(anyhow!(
+            "The absorb rebase todo omitted a required fork point"
+        ));
+    }
+    std::fs::write(todo, output)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

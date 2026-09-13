@@ -173,6 +173,12 @@ enum Commands {
     },
     /// Print shell integration (e.g. the `kin wt cd` wrapper) to eval in your shell config
     ShellInit(ShellInitArgs),
+    /// Internal: retain fork points while folding absorbed changes.
+    #[command(hide = true)]
+    AbsorbTodo {
+        /// Todo list to rewrite, appended by git
+        todo: std::path::PathBuf,
+    },
     /// Internal: rewrite the rebase todo list git passes to its sequence editor.
     ///
     /// Kindra hands itself to git as `GIT_SEQUENCE_EDITOR` when it moves a commit
@@ -328,6 +334,7 @@ fn dispatch() -> Result<()> {
             ),
         },
         Commands::ShellInit(args) => shell_init(args)?,
+        Commands::AbsorbTodo { todo } => rebase_todo::rewrite_absorb_todo_file(todo)?,
         Commands::RebaseTodo {
             commit,
             claim_ref,

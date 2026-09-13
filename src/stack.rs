@@ -2062,6 +2062,37 @@ pub fn collect_descendants(
     collect_descendants_of_id(repo, root.id, all_branches, result)
 }
 
+/// The branches at `root_id` together with every branch descending from it.
+/// This is the sub-stack an operation that rewrites `root_id` must carry along.
+pub fn collect_sub_stack_from_id(
+    repo: &Repository,
+    root_id: Oid,
+    all_branches: &[StackBranch],
+) -> Result<Vec<StackBranch>> {
+    let mut branches: Vec<_> = all_branches
+        .iter()
+        .filter(|b| b.id == root_id)
+        .cloned()
+        .collect();
+    collect_descendants_of_id(repo, root_id, all_branches, &mut branches)?;
+    Ok(branches)
+}
+
+/// Whether `tip` lies on `head`'s own history (at or below it). A rewrite of
+/// that history with `--update-refs` moves such a tip by itself; only branches
+/// off the path need an explicit replay.
+pub fn is_on_history_of(repo: &Repository, tip: Oid, head: Oid) -> Result<bool> {
+    Ok(tip == head || repo.graph_descendant_of(head, tip)?)
+}
+
+/// Whether a branch forking from `fork_point` is the root of its side path:
+/// its stack parent is the fork point itself, or lies outside the fork point's
+/// descendants. A parent strictly above the fork point is restacked in its
+/// own right and the branch simply follows it.
+pub fn is_side_path_root(repo: &Repository, parent: Oid, fork_point: Oid) -> Result<bool> {
+    Ok(parent == fork_point || !repo.graph_descendant_of(parent, fork_point)?)
+}
+
 pub fn collect_descendants_of_id(
     repo: &Repository,
     root_id: Oid,
@@ -2338,4 +2369,41 @@ pub fn plan_tree_sync(
         parents,
         merged,
     })
+}
+
+/// Local side branches whose merge base with HEAD lies strictly inside the
+/// rewritten range. Descendants of HEAD and branches on HEAD's history are
+/// handled by the ordinary restack and update-refs paths respectively.
+pub fn branches_forking_from_range(
+    repo: &Repository,
+    base: Oid,
+    head: Oid,
+) -> Result<Vec<(StackBranch, Oid)>> {
+    let mut branches = Vec::new();
+    for entry in repo.branches(Some(git2::BranchType::Local))? {
+        let (branch, _) = entry?;
+        let Some(name) = branch.name()? else {
+            continue;
+        };
+        let tip = branch.get().peel_to_commit()?.id();
+        if tip == head
+            || tip == base
+            || repo.graph_descendant_of(head, tip)?
+            || repo.graph_descendant_of(tip, head)?
+            || !repo.graph_descendant_of(tip, base)?
+        {
+            continue;
+        }
+        let fork = repo.merge_base(tip, head)?;
+        if fork != base {
+            branches.push((
+                StackBranch {
+                    name: name.to_string(),
+                    id: tip,
+                },
+                fork,
+            ));
+        }
+    }
+    Ok(branches)
 }

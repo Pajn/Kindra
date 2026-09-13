@@ -7,9 +7,9 @@ use crate::rebase_utils::{
 use crate::stack::{collect_descendants, get_stack_branches_from_merge_base};
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
-use git2::{BranchType, Oid, Repository};
+use git2::{Oid, Repository};
 use slog::Drain;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::process::Command;
 
 #[derive(Args)]
@@ -90,12 +90,6 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
 
     let mut sub_stack = Vec::new();
     collect_descendants(repo, &current_branch_name, &stack_branches, &mut sub_stack)?;
-    crate::stack::sort_branches_topologically(repo, &mut sub_stack)?;
-    let remaining_branches: Vec<String> = sub_stack
-        .iter()
-        .filter(|sb| sb.name != current_branch_name)
-        .map(|sb| sb.name.clone())
-        .collect();
 
     // Scope the absorb to the current branch's own commits: everything below the
     // stack parent (or the merge base for a stack root) is out of range, so a
@@ -146,22 +140,60 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
     // dependents restacked afterwards. Both sets must pass the worktree safety
     // check, or a branch checked out elsewhere would be skipped by
     // `--update-refs` and silently left on pre-fold history. A branch that
-    // *forks* from inside the range would be moved by neither mechanism, so
-    // that is refused up front.
+    // forks inside the range needs an explicit anchor for its rewritten base.
     ensure_git_supports_update_refs()?;
     let in_range_tips: Vec<(String, Oid)> =
         local_branch_tips_in_range(repo, Some(base_id), head_before)?
             .into_iter()
             .filter(|(name, _)| name != &current_branch_name)
             .collect();
-    ensure_no_forks_from_rewritten_range(
+    let forks = crate::stack::branches_forking_from_range(repo, base_id, head_before)?;
+    for (branch, _) in &forks {
+        sub_stack.push(branch.clone());
+    }
+    crate::stack::sort_branches_topologically(repo, &mut sub_stack)?;
+    let remaining_branches: Vec<String> = sub_stack
+        .iter()
+        .filter(|branch| branch.name != current_branch_name)
+        .map(|branch| branch.name.clone())
+        .collect();
+    let mut all_branches = stack_branches.clone();
+    all_branches.extend(forks.iter().map(|(branch, _)| branch.clone()));
+    let (mut parent_id_map, mut parent_name_map) = crate::stack::build_parent_maps(
         repo,
-        &current_branch_name,
         &sub_stack,
-        &in_range_tips,
-        base_id,
+        &all_branches,
+        merge_base,
         head_before,
+        &current_branch_name,
     )?;
+    let mut new_base_map = HashMap::new();
+    let anchor_namespace = format!(
+        "{}{}-{}/",
+        crate::rebase_utils::ABSORB_FORK_REF_PREFIX,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    );
+    for (branch, fork_point) in &forks {
+        let parent = Oid::from_str(&parent_id_map[&branch.name])?;
+        // A named parent on the side path follows its own restack. Only roots
+        // of side paths need an anchor at the unnamed, rewritten fork point.
+        if crate::stack::is_side_path_root(repo, parent, *fork_point)? {
+            parent_id_map.insert(branch.name.clone(), fork_point.to_string());
+            parent_name_map.remove(&branch.name);
+            new_base_map.insert(
+                branch.name.clone(),
+                format!("{anchor_namespace}{fork_point}"),
+            );
+        }
+    }
+    let sequence_editor = if new_base_map.is_empty() {
+        "true".to_string()
+    } else {
+        crate::rebase_todo::absorb_sequence_editor_command()?
+    };
     let mut guarded_branches = remaining_branches.clone();
     for (name, _) in &in_range_tips {
         if !guarded_branches.contains(name) {
@@ -213,19 +245,6 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         if fixup_count == 1 { "" } else { "s" }
     );
 
-    let (parent_id_map, parent_name_map) = if remaining_branches.is_empty() {
-        (HashMap::new(), HashMap::new())
-    } else {
-        crate::stack::build_parent_maps(
-            &repo,
-            &sub_stack,
-            &stack_branches,
-            merge_base,
-            head_before,
-            &current_branch_name,
-        )?
-    };
-
     // Record the pre-fold tip of every branch this operation may move — the
     // current branch, its dependents, and the in-range tips moved by the
     // fold's `--update-refs` (e.g. a sibling branch sharing HEAD's commit) —
@@ -252,7 +271,7 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         in_progress_branch: None,
         parent_id_map,
         parent_name_map,
-        new_base_map: HashMap::new(),
+        new_base_map,
         original_commit_count_map: HashMap::new(),
         original_tip_map,
         owned_tip_map: HashMap::new(),
@@ -307,15 +326,18 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
     // editor per squash (the combined message is accepted as-is); the
     // suppress_editor flag in the saved state makes `kin continue` do the same
     // when resuming after a conflict.
+    // The sequence editor rewrites a pick-based todo, so neutralize the ambient
+    // `rebase.rebaseMerges` config that would turn it into labels and merges.
     // A spawn error means no rebase started at all, so it takes the same
     // rollback path as a pre-start rejection below rather than `?`-returning
     // past the cleanup with the fixups and saved state left behind.
     let status = Command::new("git")
-        .env("GIT_SEQUENCE_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", sequence_editor)
         .env("GIT_EDITOR", "true")
         .arg("rebase")
         .arg("-i")
         .arg("--autosquash")
+        .arg("--no-rebase-merges")
         .arg("--update-refs")
         .arg(base_id.to_string())
         .status();
@@ -378,59 +400,6 @@ fn rollback_fixups(
         ));
     }
     err
-}
-
-/// Refuse the absorb when any local branch forks from a commit strictly inside
-/// the rewritten range (base..HEAD). Such a branch would be moved by neither
-/// the fold's `--update-refs` (its tip is outside the range) nor the dependent
-/// restack (it does not descend from the current branch's tip), silently
-/// stranding it on pre-fold history.
-///
-/// No branch can *point at* the fork point: any branch tip that is an ancestor
-/// of HEAD is in `stack_branches`, so the closest one becomes the stack parent
-/// and the base never lands below it — which is also why branches forking at
-/// the base boundary carry nothing that the fold rewrites.
-fn ensure_no_forks_from_rewritten_range(
-    repo: &Repository,
-    current_branch_name: &str,
-    sub_stack: &[crate::stack::StackBranch],
-    in_range_tips: &[(String, Oid)],
-    base_id: Oid,
-    head_before: Oid,
-) -> Result<()> {
-    let covered: HashSet<&str> = sub_stack
-        .iter()
-        .map(|branch| branch.name.as_str())
-        .chain(in_range_tips.iter().map(|(name, _)| name.as_str()))
-        .chain(std::iter::once(current_branch_name))
-        .collect();
-
-    for (branch, _) in repo.branches(Some(BranchType::Local))?.flatten() {
-        let Ok(Some(name)) = branch.name() else {
-            continue;
-        };
-        if covered.contains(name) {
-            continue;
-        }
-        let Some(tip) = branch.get().target() else {
-            continue;
-        };
-        if tip == base_id || !repo.graph_descendant_of(tip, base_id)? {
-            continue;
-        }
-        let fork_point = repo.merge_base(tip, head_before)?;
-        if fork_point == base_id {
-            // Forks at the range boundary: nothing it carries is rewritten.
-            continue;
-        }
-        return Err(anyhow!(
-            "Branch '{}' forks from commit {} inside the absorbed range, so its commits cannot follow the fold. Rebase '{}' onto a branch first, or pass --base to keep the fork point out of the absorb range.",
-            name,
-            fork_point,
-            name
-        ));
-    }
-    Ok(())
 }
 
 /// Run the git-absorb engine with `and_rebase` disabled: it only creates

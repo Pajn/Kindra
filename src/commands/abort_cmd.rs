@@ -106,7 +106,7 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
             }
         }
 
-        std::fs::remove_file(path)?;
+        crate::rebase_utils::clear_state(repo)?;
         // State handled successfully: now it is safe to settle the snapshot.
         settle.action = if kindra_owns_current_state {
             SettleAction::Discard

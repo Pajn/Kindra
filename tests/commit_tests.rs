@@ -1,6 +1,7 @@
 mod common;
 use common::{
-    assert_no_rebase_in_progress, current_branch, kin_cmd, make_commit, repo_init, run_ok,
+    assert_no_rebase_in_progress, current_branch, git_command, kin_cmd, make_commit, repo_init,
+    run_ok,
 };
 use git2::Repository;
 use kindra::rebase_utils::{Operation, RebaseState, save_state};
@@ -44,11 +45,7 @@ fn setup_repo() -> (tempfile::TempDir, Repository) {
 }
 
 fn git_stdout(dir: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap();
+    let out = git_command(dir).args(args).output().unwrap();
     assert!(
         out.status.success(),
         "git {:?} failed: {}",
