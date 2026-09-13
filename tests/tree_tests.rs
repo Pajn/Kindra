@@ -172,6 +172,81 @@ fn test_tree_simple_stack() {
     );
 }
 
+/// A fork's siblings remain visible from either tip, even without a named parent.
+#[test]
+fn test_tree_shows_full_stack_from_every_branch() {
+    let (dir, repo) = setup_fork_stack();
+    let main = repo
+        .revparse_single("main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/unrelated",
+        "other.txt",
+        "other",
+        "other stack",
+        &[&main],
+    );
+    let middle = repo
+        .revparse_single("feature-b")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature-d",
+        "d.txt",
+        "d",
+        "add feature d",
+        &[&middle],
+    );
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "main-new.txt",
+        "new",
+        "advance upstream",
+        &[&main],
+    );
+
+    // Removing the shared branch must not hide siblings at an unnamed fork.
+    for named_fork in [true, false] {
+        if !named_fork {
+            repo.find_branch("feature-a", git2::BranchType::Local)
+                .unwrap()
+                .delete()
+                .unwrap();
+        }
+        for current in [
+            "feature-a",
+            "feature-b",
+            "feature-c",
+            "feature-d",
+            "detached",
+        ] {
+            if current == "feature-a" && !named_fork {
+                continue;
+            }
+            if current == "detached" {
+                repo.set_head_detached(middle.id()).unwrap();
+            } else {
+                repo.set_head(&format!("refs/heads/{current}")).unwrap();
+            }
+            let output = run_tree_command(dir.path(), &["--commits", "--upstream", "main"]);
+            for branch in ["feature-b", "feature-c", "feature-d"] {
+                assert!(
+                    output.contains(branch),
+                    "Missing {branch} from {current}:\n{output}"
+                );
+            }
+            assert_eq!(output.contains("feature-a"), named_fork, "{output}");
+            assert!(!output.contains("unrelated"), "{output}");
+        }
+    }
+}
+
 /// Test tree output shows proper hierarchical structure with box-drawing characters
 #[test]
 fn test_tree_shows_proper_structure() {

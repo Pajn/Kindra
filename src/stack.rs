@@ -2084,11 +2084,77 @@ pub fn enumerate_current_fixup_commits(repo: &Repository) -> Result<Vec<StackCom
     )
 }
 
+/// Discover the complete connected stack, including siblings at unnamed forks.
+/// Only shared commits outside upstream connect branches; sharing main alone
+/// must not pull unrelated stacks into the tree. Keep lineage-only discovery
+/// separate for commands that operate on ancestors and descendants of HEAD.
+pub fn get_full_stack_branches_for_head(
+    repo: &Repository,
+    head_id: Oid,
+    upstream_id: Oid,
+    upstream_name: &str,
+) -> Result<Vec<StackBranch>> {
+    let private_history = |tip| -> Result<HashSet<Oid>> {
+        let mut walk = repo.revwalk()?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
+        walk.push(tip)?;
+        walk.hide(upstream_id)?;
+        Ok(walk.collect::<std::result::Result<HashSet<_>, _>>()?)
+    };
+    let mut connected = private_history(head_id)?;
+    if connected.is_empty() {
+        // On upstream there is no private component to select. Preserve the
+        // existing overview of stacks descending from the current base.
+        return get_stack_branches_for_head(repo, head_id, upstream_id, upstream_name);
+    }
+
+    let mut candidates = Vec::new();
+    for entry in repo.branches(Some(git2::BranchType::Local))? {
+        let (branch, _) = entry?;
+        let Some(name) = branch.name()? else { continue };
+        if name == upstream_name {
+            continue;
+        }
+        let Some(id) = branch.get().target() else {
+            continue;
+        };
+        let history = private_history(id)?;
+        if !history.is_empty() {
+            candidates.push((
+                StackBranch {
+                    name: name.to_string(),
+                    id,
+                },
+                history,
+            ));
+        }
+    }
+
+    let mut branches = Vec::new();
+    loop {
+        let before = branches.len();
+        candidates.retain(|(branch, history)| {
+            if connected.is_disjoint(history) {
+                true
+            } else {
+                connected.extend(history);
+                branches.push(branch.clone());
+                false
+            }
+        });
+        if branches.len() == before {
+            break;
+        }
+    }
+    sort_branches_topologically(repo, &mut branches)?;
+    Ok(branches)
+}
+
 /// Discover the stack for `head_id` relative to `upstream_id`, computing the
 /// merge base internally before delegating to [`get_stack_branches_from_merge_base`].
 ///
 /// This is the shared entry point for callers that only have HEAD and the
-/// upstream (e.g. `push`, `pr`, `tree`) and would otherwise each repeat the
+/// upstream (e.g. `push`, `pr`) and would otherwise each repeat the
 /// `repo.merge_base(...)` + `get_stack_branches_from_merge_base(...)` boilerplate.
 pub fn get_stack_branches_for_head(
     repo: &Repository,

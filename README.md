@@ -59,6 +59,8 @@ cargo release 0.3.0 --execute
 
 ## Quick Start
 
+Run `kin tree` from any branch in a stack to see that entire connected stack, including sibling forks, without unrelated stacks. Run it from the base branch (such as `main`) to see all stacks branching from that base. Add `--commits` to include commit details.
+
 1. **Start a stack**: Create several branches, each building on the previous one — with plain `git checkout -b`, or `kin commit -b <name>` to fork a branch and commit onto it in one step (add `--insert` to splice it into the middle of an existing stack).
 2. **Make a change**: Checkout a branch in the middle of the stack and run `kin commit`.
 3. **Watch the magic**: Kindra will automatically rebase all branches that depend on your change.
