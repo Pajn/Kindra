@@ -7,6 +7,83 @@ mod common;
 use common::{assert_no_rebase_in_progress, kin_cmd, make_commit, repo_init, run_ok};
 
 #[test]
+fn test_restack_parent_gains_commit_preserves_children_and_siblings() {
+    check_parent_gains_commit(false);
+}
+
+#[test]
+fn test_restack_parent_gains_commit_with_remote_tip_and_expired_reflog() {
+    check_parent_gains_commit(true);
+}
+
+fn check_parent_gains_commit(remote_only: bool) {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path();
+    repo_init(path);
+    let commit = |name: &str| {
+        std::fs::write(path.join(name), name).unwrap();
+        run_ok("git", &["add", name], path);
+        run_ok("git", &["commit", "-m", name], path);
+        Repository::open(path)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+    };
+    commit("root");
+    run_ok("git", &["checkout", "-b", "topic"], path);
+    let base = commit("topic");
+    if remote_only {
+        run_ok("git", &["remote", "add", "origin", "."], path);
+        run_ok(
+            "git",
+            &["update-ref", "refs/remotes/origin/topic", &base.to_string()],
+            path,
+        );
+        run_ok(
+            "git",
+            &["branch", "--set-upstream-to=origin/topic", "topic"],
+            path,
+        );
+    }
+    run_ok("git", &["checkout", "-b", "child"], path);
+    commit("child");
+    run_ok("git", &["checkout", "-b", "grandchild"], path);
+    commit("grandchild");
+    run_ok("git", &["checkout", "-b", "sibling", "main"], path);
+    let sibling = commit("sibling");
+    run_ok("git", &["checkout", "topic"], path);
+    let tip = commit("new");
+    if remote_only {
+        run_ok("git", &["reflog", "expire", "--expire=all", "--all"], path);
+    }
+    kin_cmd()
+        .current_dir(path)
+        .arg("restack")
+        .assert()
+        .success();
+    let repo = Repository::open(path).unwrap();
+    let new_child = repo.revparse_single("child").unwrap().id();
+    assert_eq!(
+        repo.find_commit(new_child).unwrap().parent_id(0).unwrap(),
+        tip
+    );
+    assert_eq!(
+        repo.revparse_single("grandchild")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .parent_id(0)
+            .unwrap(),
+        new_child
+    );
+    assert_eq!(repo.revparse_single("sibling").unwrap().id(), sibling);
+    assert_eq!(repo.head().unwrap().shorthand(), Some("topic"));
+    assert_no_rebase_in_progress(path);
+}
+
+#[test]
 fn test_restack_basic() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();

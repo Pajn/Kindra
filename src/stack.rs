@@ -718,6 +718,7 @@ pub struct FloatingTargetContext {
     candidate_positions: HashMap<Oid, usize>,
     patch_ids: HashSet<String>,
     reflog_ids: HashSet<Oid>,
+    historical_tip_ids: HashSet<Oid>,
 }
 
 #[derive(Clone)]
@@ -842,12 +843,27 @@ pub fn build_floating_target_context(
         .collect();
     let reflog_ids = read_branch_reflog_ids(repo, target_branch);
 
+    // Exact shared ancestors need evidence that they belonged to this branch,
+    // and a private boundary so shared upstream history cannot adopt siblings.
+    let mut historical_tip_ids = HashSet::new();
+    if patch_id_boundary.is_some() {
+        historical_tip_ids.extend(reflog_ids.iter().copied());
+        if let Ok(branch) = repo.find_branch(target_branch, git2::BranchType::Local)
+            && let Ok(upstream) = branch.upstream()
+            && upstream.get().is_remote()
+            && let Some(tip) = upstream.get().target()
+        {
+            historical_tip_ids.insert(tip);
+        }
+    }
+
     Ok(FloatingTargetContext {
         candidates,
         candidate_ids,
         candidate_positions,
         patch_ids,
         reflog_ids,
+        historical_tip_ids,
     })
 }
 
@@ -889,6 +905,19 @@ fn find_floating_match(
     while let Some(oid) = current {
         if history_limit != 0 && remaining == 0 {
             break;
+        }
+
+        // An unchanged commit in the target's private lineage is an exact fork
+        // point when the parent gained commits. Check before stopping at shared
+        // history; upstream commits are excluded from candidate_positions.
+        if oid != branch_tip
+            && target.historical_tip_ids.contains(&oid)
+            && let Some(&target_index) = target.candidate_positions.get(&oid)
+        {
+            return Ok(Some(FloatingBaseMatch {
+                branch_id: oid,
+                target_index,
+            }));
         }
 
         // Optimization: If we hit a commit that is reachable from the target, we stop.
