@@ -284,42 +284,21 @@ pub fn plan_descendant_reorder(
         return Ok(None);
     }
 
-    let tips = get_stack_tips(repo, &sub_stack)?;
-    if tips.len() > 1 {
-        return Err(anyhow!(
-            "Cannot reorder '{}' onto '{}' because the affected subtree is forked. Same-stack reordering only supports a single linear path.",
-            current_branch_name,
-            target_branch_name
-        ));
-    }
-
-    if !branches_are_linearly_ordered(repo, &sub_stack)? {
-        return Err(anyhow!(
-            "Cannot reorder '{}' onto '{}' because the affected subtree is forked. Same-stack reordering only supports a single linear path.",
-            current_branch_name,
-            target_branch_name
-        ));
-    }
-
     sort_branches_topologically(repo, &mut sub_stack)?;
-    let target_index = sub_stack
-        .iter()
-        .position(|branch| branch.name == target_branch_name)
-        .ok_or_else(|| {
-            anyhow!(
-                "Target branch '{}' not found in subtree.",
-                target_branch_name
-            )
-        })?;
-
-    let reordered = sub_stack[target_index..]
-        .iter()
-        .chain(sub_stack[..target_index].iter())
-        .cloned()
-        .collect::<Vec<_>>();
-
     let current_parent_id =
         find_parent_in_stack(repo, current_branch_name, all_branches_in_stack, merge_base)?;
+    // A tree rotation cannot preserve merge edges using branch-by-branch rebases.
+    // The parent and its ancestors are unchanged, so exclude them from validation.
+    for branch in &sub_stack {
+        for id in collect_first_parent_chain(repo, current_parent_id, branch.id)? {
+            if repo.find_commit(id)?.parent_count() > 1 {
+                return Err(anyhow!(
+                    "Cannot reorder because the affected subtree is forked and merged. Tree reordering requires single-parent commits."
+                ));
+            }
+        }
+    }
+
     let current_parent = if current_parent_id == merge_base {
         upstream_name.to_string()
     } else {
@@ -330,17 +309,39 @@ pub fn plan_descendant_reorder(
         )
     };
 
-    let mut remaining_branches = Vec::with_capacity(reordered.len());
     let mut new_base_map = HashMap::new();
-    for (idx, branch) in reordered.iter().enumerate() {
-        remaining_branches.push(branch.name.clone());
-        let new_base = if idx == 0 {
-            current_parent.clone()
-        } else {
-            reordered[idx - 1].name.clone()
-        };
-        new_base_map.insert(branch.name.clone(), new_base);
+    for branch in &sub_stack {
+        let parent_id =
+            find_parent_in_stack(repo, &branch.name, all_branches_in_stack, merge_base)?;
+        new_base_map.insert(
+            branch.name.clone(),
+            parent_base_spec(parent_id, &branch.name, all_branches_in_stack),
+        );
     }
+
+    // Preserve the existing linear rotation, stopping at a fork instead of
+    // choosing an arbitrary leaf. Only these two edges change; side paths keep
+    // their original parents on both sides of the rotation.
+    let mut attachment = target_branch_name.to_string();
+    loop {
+        let children = sub_stack
+            .iter()
+            .filter(|branch| new_base_map.get(&branch.name) == Some(&attachment))
+            .collect::<Vec<_>>();
+        if children.len() != 1 {
+            break;
+        }
+        attachment = children[0].name.clone();
+    }
+    new_base_map.insert(target_branch_name.to_string(), current_parent.clone());
+    new_base_map.insert(current_branch_name.to_string(), attachment);
+    let order_hint = sub_stack
+        .iter()
+        .enumerate()
+        .map(|(idx, branch)| (branch.name.clone(), idx))
+        .collect();
+    let remaining_branches =
+        topologically_sort_edited_graph(&new_base_map, &current_parent, &order_hint)?;
 
     Ok(Some(ReorderPlan {
         ordered_sub_stack: sub_stack,
@@ -349,20 +350,6 @@ pub fn plan_descendant_reorder(
     }))
 }
 
-fn branches_are_linearly_ordered(repo: &Repository, branches: &[StackBranch]) -> Result<bool> {
-    for (idx, branch) in branches.iter().enumerate() {
-        for other in branches.iter().skip(idx + 1) {
-            let comparable = repo.graph_descendant_of(branch.id, other.id)?
-                || repo.graph_descendant_of(other.id, branch.id)?
-                || branch.id == other.id;
-            if !comparable {
-                return Ok(false);
-            }
-        }
-    }
-
-    Ok(true)
-}
 pub fn collect_stack_component(
     repo: &Repository,
     current_branch_name: &str,
