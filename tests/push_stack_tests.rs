@@ -1231,3 +1231,213 @@ fn yes_flag_does_not_imply_allow_base_push() {
         main_before,
     );
 }
+
+/// A teammate's commits that were fetched into the remote-tracking ref but never
+/// integrated into the local branch. This re-arms `--force-with-lease` (the lease
+/// compares against the tracking ref, which now matches the remote) while leaving
+/// `--force-if-includes` armed: it requires the remote-tracking tip to appear in
+/// the local branch's reflog, and a fetch writes nothing there. Returns the repo,
+/// the bare remote, and the local tip that a forced push should install on the
+/// remote.
+fn setup_fetched_but_unintegrated_remote() -> (tempfile::TempDir, tempfile::TempDir, git2::Oid) {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let main_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "main.txt",
+        "initial",
+        "initial commit",
+        &[],
+    );
+    let main_commit = repo.find_commit(main_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature",
+        "f.txt",
+        "f",
+        "feat: f",
+        &[&main_commit],
+    );
+
+    let remote_dir = tempdir().unwrap();
+    run_ok("git", &["init", "--bare"], remote_dir.path());
+    run_ok(
+        "git",
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok("git", &["push", "-u", "origin", "main"], dir.path());
+    run_ok("git", &["push", "-u", "origin", "feature"], dir.path());
+
+    // A teammate advances origin/feature from a separate clone.
+    let other_dir = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote_dir.path().to_str().unwrap(),
+            other_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], other_dir.path());
+    std::fs::write(other_dir.path().join("teammate.txt"), "teammate").unwrap();
+    run_ok("git", &["add", "teammate.txt"], other_dir.path());
+    run_ok(
+        "git",
+        &["commit", "-m", "teammate change"],
+        other_dir.path(),
+    );
+    run_ok("git", &["push", "origin", "feature"], other_dir.path());
+
+    // Local work on top of the *old* tip, then a fetch — the order a background
+    // fetch from an editor produces. origin/feature now matches the remote, so the
+    // lease is satisfied, but the teammate's commit is not in feature's history.
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+    let f_tip = repo.head().unwrap().peel_to_commit().unwrap();
+    let local_tip = make_commit(
+        &repo,
+        "refs/heads/feature",
+        "local2.txt",
+        "local2",
+        "local change",
+        &[&f_tip],
+    );
+    run_ok("git", &["fetch", "origin"], dir.path());
+
+    (dir, remote_dir, local_tip)
+}
+
+/// Without `--force`, `--force-if-includes` rejects the push even though the lease
+/// itself is satisfied: this is the check the flag exists to relax.
+#[test]
+fn push_refuses_fetched_but_unintegrated_remote_commits() {
+    let (dir, remote_dir, _local_tip) = setup_fetched_but_unintegrated_remote();
+    let remote_before = remote_tip(remote_dir.path(), "refs/heads/feature");
+
+    let output = kin_cmd()
+        .arg("push")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "push should be rejected while --force-if-includes is armed: {output:?}",
+    );
+    assert_eq!(
+        remote_tip(remote_dir.path(), "refs/heads/feature"),
+        remote_before,
+        "the teammate's commit must survive a rejected push",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("kin push --force"),
+        "the rejection should point at the flag that relaxes this check, got:\n{stderr}",
+    );
+}
+
+/// `--force` drops `--force-if-includes`, so the same push lands.
+#[test]
+fn force_flag_pushes_over_fetched_but_unintegrated_remote_commits() {
+    let (dir, remote_dir, local_tip) = setup_fetched_but_unintegrated_remote();
+
+    let output = kin_cmd()
+        .args(["push", "--force"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "--force should drop --force-if-includes and let the push land.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        remote_tip(remote_dir.path(), "refs/heads/feature"),
+        local_tip,
+        "remote feature should now be the local tip",
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("--force"),
+        "a relaxed push must be labelled in the output, got:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+}
+
+/// `--force` relaxes only `--force-if-includes`. When the remote moved behind a
+/// stale remote-tracking ref, `--force-with-lease` still refuses.
+#[test]
+fn force_flag_does_not_disarm_force_with_lease() {
+    let (dir, remote_dir, _local_tip) = setup_fetched_but_unintegrated_remote();
+    let remote_before = remote_tip(remote_dir.path(), "refs/heads/feature");
+
+    // Rewind the remote-tracking ref to its parent so it no longer matches the
+    // remote: exactly the state the lease is there to catch.
+    run_ok(
+        "git",
+        &[
+            "update-ref",
+            "refs/remotes/origin/feature",
+            "refs/remotes/origin/feature^",
+        ],
+        dir.path(),
+    );
+
+    let output = kin_cmd()
+        .args(["push", "--force"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "--force must not disarm --force-with-lease.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        remote_tip(remote_dir.path(), "refs/heads/feature"),
+        remote_before,
+        "the lease must have kept the remote tip intact",
+    );
+}
+
+/// `--force` is about git's lease checks, not about Kindra's own refusal to
+/// rewrite a base branch. That guard stays armed.
+#[test]
+fn force_flag_does_not_bypass_the_base_branch_guard() {
+    let (dir, remote_dir, _repo) = setup_trunk_tracking_branch("ci/checks");
+    let main_before = remote_tip(remote_dir.path(), "refs/heads/main");
+
+    let output = kin_cmd()
+        .args(["push", "--force"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        !output.status.success(),
+        "--force must not open the base-branch guard.\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        stderr.contains("Refusing to push") && stderr.contains("ci/checks"),
+        "expected the base-branch refusal naming the branch, got:\n{stderr}",
+    );
+    assert_eq!(
+        remote_tip(remote_dir.path(), "refs/heads/main"),
+        main_before,
+    );
+}

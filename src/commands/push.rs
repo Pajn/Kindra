@@ -18,6 +18,14 @@ pub struct PushArgs {
     /// `branch.<name>.kinAllowBasePush = true`
     #[arg(long = "allow-base-push", value_name = "BRANCH")]
     pub allow_base_push: Vec<String>,
+
+    /// Relax the push to `--force-with-lease` alone, dropping
+    /// `--force-if-includes`. Use when a background fetch (an IDE, another git
+    /// tool) has already pulled the remote commits into your remote-tracking
+    /// refs and you have decided your local history supersedes them. `--atomic`
+    /// and `--force-with-lease` still apply, as does the base-branch guard.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Is `branch` exempt from the base-branch push guard?
@@ -44,7 +52,7 @@ pub fn push(args: &PushArgs) -> Result<()> {
     })?;
     let current_branch_name = repo.head()?.shorthand().map(|name| name.to_string());
     if current_branch_name.as_deref() == Some(&upstream_name) {
-        return push_upstream_branch(&repo, &upstream_name);
+        return push_upstream_branch(&repo, &upstream_name, args.force);
     }
 
     let upstream_obj = repo.revparse_single(&upstream_name)?;
@@ -57,7 +65,7 @@ pub fn push(args: &PushArgs) -> Result<()> {
         .map(|sb| sb.name)
         .collect::<Vec<_>>();
 
-    push_stack_branches(&repo, &branch_names, &args.allow_base_push)
+    push_stack_branches(&repo, &branch_names, &args.allow_base_push, args.force)
 }
 
 /// The error for branches whose upstream is a protected base branch, listing each
@@ -104,6 +112,7 @@ pub(crate) fn push_stack_branches(
     repo: &Repository,
     branches: &[String],
     allow_base_push: &[String],
+    force: bool,
 ) -> Result<()> {
     let branch_filter = branches.iter().collect::<HashSet<_>>();
     let protected = protected_push_targets(repo)?;
@@ -147,7 +156,7 @@ pub(crate) fn push_stack_branches(
     }
 
     if branches_without_upstream.is_empty() {
-        perform_push(repo, branches_to_push, allow_base_push)?;
+        perform_push(repo, branches_to_push, allow_base_push, force)?;
     } else {
         let mut all_branches = branches_to_push.clone();
         all_branches.extend(branches_without_upstream.clone());
@@ -167,7 +176,7 @@ pub(crate) fn push_stack_branches(
             if !branches_tracking_base.is_empty() {
                 return Err(protected_target_error(&branches_tracking_base));
             }
-            perform_push(repo, branches_to_push, allow_base_push)?;
+            perform_push(repo, branches_to_push, allow_base_push, force)?;
             return Ok(());
         }
 
@@ -215,7 +224,7 @@ pub(crate) fn push_stack_branches(
 
         branches_to_push.extend(branches_to_push_with_upstream);
 
-        perform_push_with_upstream(repo, &branches_with_upstream, &remote_name)?;
+        perform_push_with_upstream(repo, &branches_with_upstream, &remote_name, force)?;
 
         let pushed_names: Vec<&String> = branches_with_upstream.iter().collect();
         let existing_upstream: Vec<BranchStatus> = branches_to_push
@@ -225,20 +234,25 @@ pub(crate) fn push_stack_branches(
             .collect();
 
         if !existing_upstream.is_empty() {
-            perform_push(repo, existing_upstream, allow_base_push)?;
+            perform_push(repo, existing_upstream, allow_base_push, force)?;
         }
     }
 
     Ok(())
 }
 
-fn push_upstream_branch(repo: &Repository, upstream_name: &str) -> Result<()> {
+fn push_upstream_branch(repo: &Repository, upstream_name: &str, force: bool) -> Result<()> {
     let branch = repo.find_branch(upstream_name, BranchType::Local)?;
     if let Some(target) = tracked_push_target(repo, &branch, upstream_name.to_string())? {
-        perform_push(repo, vec![target], &[])
+        perform_push(repo, vec![target], &[], force)
     } else {
         let remote_name = resolve_remote(repo)?;
-        perform_push_with_upstream(repo, &[upstream_name.to_string()], remote_name.as_str())
+        perform_push_with_upstream(
+            repo,
+            &[upstream_name.to_string()],
+            remote_name.as_str(),
+            force,
+        )
     }
 }
 
@@ -342,7 +356,39 @@ fn resolve_remote(repo: &Repository) -> Result<String> {
     }
 }
 
-fn perform_push_with_upstream(repo: &Repository, branches: &[String], remote: &str) -> Result<()> {
+/// Say so when the stricter check is off, so a relaxed push never looks ordinary
+/// in the log the user scrolls back through.
+fn announce_force(force: bool) {
+    if force {
+        println!("  (--force: --force-if-includes off; --atomic --force-with-lease still apply)");
+    }
+}
+
+/// `git push` with the flags every Kindra push shares.
+///
+/// `--atomic` and `--force-with-lease` are never dropped: the stack lands as one
+/// unit, and the lease still refuses to overwrite a remote tip that moved since
+/// the remote-tracking ref was last updated. `force` only turns off
+/// `--force-if-includes`, the extra check that the remote's commits were actually
+/// integrated locally — the one that rejects a push when a background fetch has
+/// re-pointed the remote-tracking ref at commits the branch never incorporated.
+fn push_command(force: bool) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("push").arg("--atomic").arg("--force-with-lease");
+    cmd.arg(if force {
+        "--no-force-if-includes"
+    } else {
+        "--force-if-includes"
+    });
+    cmd
+}
+
+fn perform_push_with_upstream(
+    repo: &Repository,
+    branches: &[String],
+    remote: &str,
+    force: bool,
+) -> Result<()> {
     if branches.is_empty() {
         return Ok(());
     }
@@ -355,13 +401,9 @@ fn perform_push_with_upstream(repo: &Repository, branches: &[String], remote: &s
     for branch in branches {
         println!("  {branch} -> {remote}/{branch}");
     }
-    let mut cmd = Command::new("git");
-    cmd.arg("push")
-        .arg("--atomic")
-        .arg("--force-with-lease")
-        .arg("--force-if-includes")
-        .arg("-u")
-        .arg(remote);
+    announce_force(force);
+    let mut cmd = push_command(force);
+    cmd.arg("-u").arg(remote);
 
     for branch in branches {
         cmd.arg(format!("{}:{}", branch, branch));
@@ -377,7 +419,7 @@ fn perform_push_with_upstream(repo: &Repository, branches: &[String], remote: &s
                 .iter()
                 .map(|name| (name.clone(), name.clone()))
                 .collect();
-            report_push_divergence(repo, remote, &refs);
+            report_push_divergence(repo, remote, &refs, force);
         }
         return Err(anyhow!("Push failed for remote '{}'", remote));
     }
@@ -389,6 +431,7 @@ fn perform_push(
     repo: &Repository,
     branches: Vec<BranchStatus>,
     allow_base_push: &[String],
+    force: bool,
 ) -> Result<()> {
     if branches.is_empty() {
         println!("Nothing to push.");
@@ -451,12 +494,9 @@ fn perform_push(
                 println!("  {local_name} -> {remote}/{remote_ref}");
             }
         }
-        let mut cmd = Command::new("git");
-        cmd.arg("push")
-            .arg("--atomic")
-            .arg("--force-with-lease")
-            .arg("--force-if-includes")
-            .arg(&remote);
+        announce_force(force);
+        let mut cmd = push_command(force);
+        cmd.arg(&remote);
 
         for (local_name, remote_ref) in &refs {
             cmd.arg(format!("{}:{}", local_name, remote_ref));
@@ -467,7 +507,7 @@ fn perform_push(
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
         if !output.status.success() {
             if push_rejected_by_lease(&String::from_utf8_lossy(&output.stderr)) {
-                report_push_divergence(repo, &remote, &refs);
+                report_push_divergence(repo, &remote, &refs, force);
             }
             return Err(anyhow!("Push failed for remote '{}'", remote));
         }
@@ -495,17 +535,20 @@ fn push_rejected_by_lease(stderr: &str) -> bool {
 
 /// Print a per-branch divergence summary and recovery guidance after a rejected push.
 ///
-/// Kindra pushes with `--force-with-lease --force-if-includes`, so a rejection
-/// means the remote holds commits that are not in the local history. The
-/// ahead/behind counts are measured against the last-fetched remote-tracking
-/// refs, so a branch can still show `↓0` if those refs are stale — hence the
-/// advice to fetch before re-inspecting.
-fn report_push_divergence(repo: &Repository, remote: &str, refs: &[(String, String)]) {
+/// Kindra pushes with `--force-with-lease` (plus `--force-if-includes` unless
+/// `--force` was passed), so a rejection means the remote holds commits the
+/// local branch never integrated. The ahead/behind counts are measured against the
+/// last-fetched remote-tracking refs, so a branch can still show `↓0` if those
+/// refs are stale — hence the advice to fetch before re-inspecting.
+fn report_push_divergence(repo: &Repository, remote: &str, refs: &[(String, String)], force: bool) {
+    let flags = if force {
+        "--force-with-lease --no-force-if-includes"
+    } else {
+        "--force-with-lease --force-if-includes"
+    };
     eprintln!();
-    eprintln!(
-        "Push to '{remote}' was rejected. Kindra uses --force-with-lease --force-if-includes, which"
-    );
-    eprintln!("refuses to overwrite remote commits that are not in your local history.");
+    eprintln!("Push to '{remote}' was rejected. Kindra uses {flags}, which");
+    eprintln!("refuses to overwrite remote commits you have never integrated locally.");
     eprintln!("Per-branch status (local vs last-fetched {remote}/…):");
     for (local_name, remote_ref) in refs {
         match branch_ahead_behind(repo, local_name, remote, remote_ref) {
@@ -529,6 +572,14 @@ fn report_push_divergence(repo: &Repository, remote: &str, refs: &[(String, Stri
     eprintln!(
         "Run 'git fetch {remote}', rebase your stack onto the updated base (e.g. 'kin sync'), then push again."
     );
+    if !force {
+        // Only worth offering when the stricter check is still armed: with --force
+        // the rejection came from the lease itself, which --force does not relax.
+        eprintln!(
+            "If you have already reviewed those commits and mean to replace them, 'kin push --force'"
+        );
+        eprintln!("drops --force-if-includes while keeping --force-with-lease.");
+    }
 }
 
 /// Ahead/behind of a local branch vs its last-fetched remote-tracking ref.

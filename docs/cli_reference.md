@@ -573,14 +573,18 @@ It emits static text and does not require being inside a repository, so it is sa
 
 ```bash
 kin push
+kin push --force
 kin push --allow-base-push <branch>
 ```
 
 **Options:**
 
 - `--allow-base-push <BRANCH>`: Allow `<BRANCH>` to push onto the base branch it tracks. Repeatable; each branch must be named explicitly.
+- `--force`: Replace `--force-if-includes` with `--no-force-if-includes`, keeping `--atomic` and `--force-with-lease`.
 
 This command performs an atomic push of all branches in the stack using `force-with-lease` to ensure safety.
+
+**What `--force` does and does not relax.** Normal pushes use `--atomic --force-with-lease --force-if-includes`. The lease refuses to overwrite a remote branch whose tip has moved since your remote-tracking ref was last updated; `--force-if-includes` adds a stricter requirement: the remote-tracking tip must have been integrated into your local branch at some point, which Git checks by looking for it in the branch's reflog. A fetch alone does not satisfy it; a rebase onto or merge of the fetched commits does, even if you later rewrote them away. `kin push --force` replaces `--force-if-includes` with `--no-force-if-includes` to turn off that stricter check for the run, so a push rejected only on those grounds lands. `--atomic` (the stack lands as one unit or not at all) and `--force-with-lease` still apply, as does the base-branch refusal below; `--force` is not `git push --force`. Relaxed pushes are labelled in the output.
 
 **Pushing onto a base branch is refused.** If a branch's upstream is a base branch — `main`, `master`, `trunk`, `init.defaultBranch`, or the stack's configured base — then its push destination is that base, and pushing would force-update it with the branch's history. This happens by default in git: with `branch.autoSetupMerge=true`, `git switch -c feature origin/main` sets `branch.feature.merge = refs/heads/main`. `kin push` refuses, names the mapping, and offers to repoint the branch at its own remote branch.
 
