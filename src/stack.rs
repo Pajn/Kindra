@@ -1599,7 +1599,9 @@ fn ensure_patch_ids(
 }
 
 fn compute_patch_ids(repo: &Repository, commit_ids: &[Oid]) -> Result<HashMap<Oid, String>> {
-    compute_patch_ids_for_commits(repo_root(repo)?, commit_ids, None)
+    // Compared only against other commit patch ids, so any context width works
+    // as long as it is the same on both sides.
+    compute_patch_ids_for_commits(repo_root(repo)?, commit_ids, None, DiffContext::Default)
 }
 
 fn compute_commit_patch_ids_for_paths(
@@ -1607,13 +1609,39 @@ fn compute_commit_patch_ids_for_paths(
     commit_ids: &[Oid],
     touched_paths: &[String],
 ) -> Result<HashMap<Oid, String>> {
-    compute_patch_ids_for_commits(repo_root, commit_ids, Some(touched_paths))
+    // These are compared against a range patch id from `compute_range_patch_id`,
+    // which diffs with zero context. `git patch-id` hashes context lines too, so
+    // both sides have to ask for the same width or no pair can ever match.
+    compute_patch_ids_for_commits(
+        repo_root,
+        commit_ids,
+        Some(touched_paths),
+        DiffContext::Zero,
+    )
+}
+
+/// How much context a diff carries before it is hashed into a patch id. Patch
+/// ids are only comparable between diffs generated with the same width.
+#[derive(Clone, Copy)]
+enum DiffContext {
+    Default,
+    Zero,
+}
+
+impl DiffContext {
+    fn arg(self) -> Option<&'static str> {
+        match self {
+            DiffContext::Default => None,
+            DiffContext::Zero => Some("-U0"),
+        }
+    }
 }
 
 fn compute_patch_ids_for_commits(
     repo_root: &Path,
     commit_ids: &[Oid],
     touched_paths: Option<&[String]>,
+    context: DiffContext,
 ) -> Result<HashMap<Oid, String>> {
     if commit_ids.is_empty() {
         return Ok(HashMap::new());
@@ -1625,6 +1653,9 @@ fn compute_patch_ids_for_commits(
     for chunk in commit_ids.chunks(PATCH_ID_BATCH_SIZE) {
         let mut show = Command::new("git");
         show.arg("show").arg("--no-ext-diff").arg("--no-color");
+        if let Some(context_arg) = context.arg() {
+            show.arg(context_arg);
+        }
         for oid in chunk {
             show.arg(oid.to_string());
         }
@@ -1796,7 +1827,9 @@ fn compute_range_patch_id(
 ) -> Result<Option<String>> {
     let mut diff_child = Command::new("git")
         .arg("diff")
-        .arg("-U0")
+        // Must match the width used for the commit patch ids this is compared
+        // against, in `compute_commit_patch_ids_for_paths`.
+        .arg(DiffContext::Zero.arg().unwrap_or("-U0"))
         .arg("--no-ext-diff")
         .arg(range_spec)
         .arg("--")

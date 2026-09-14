@@ -3108,3 +3108,53 @@ fn test_sync_blocked_by_stale_run_state() {
 
     assert!(dir.path().join(".git/kindra_run_state.json").exists());
 }
+
+/// A squash merge lands a branch's commits as one upstream commit, so no
+/// individual commit's patch id matches anything upstream — only the branch's
+/// combined range does. Detection has to recognise that, or sync replays
+/// changes upstream already has and conflicts against them.
+#[test]
+fn squash_merged_branch_is_detected_as_merged() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let root = dir.path();
+    run_ok("git", &["config", "user.name", "Test User"], root);
+    run_ok("git", &["config", "user.email", "test@example.com"], root);
+
+    // Enough surrounding lines that a diff carries real context. With a
+    // one-line file, zero-context and default-context diffs are identical and
+    // the mismatch this guards against cannot show up.
+    let base_lines: Vec<String> = (1..=12).map(|n| format!("line {n}")).collect();
+    fs::write(root.join("a.txt"), base_lines.join("\n") + "\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "base"], root);
+
+    run_ok("git", &["checkout", "-b", "feature"], root);
+    let mut edited = base_lines.clone();
+    edited[6] = "line 7 changed on feature".to_string();
+    fs::write(root.join("a.txt"), edited.join("\n") + "\n").unwrap();
+    run_ok("git", &["commit", "-am", "feature: edit a"], root);
+    fs::write(root.join("b.txt"), "added by feature\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "feature: add b"], root);
+
+    // Land the branch the way a squash merge does: one commit carrying the
+    // whole range, with none of the original commits reachable.
+    run_ok("git", &["checkout", "main"], root);
+    run_ok("git", &["merge", "--squash", "feature"], root);
+    run_ok("git", &["commit", "-m", "squash: feature (#1)"], root);
+
+    // Upstream moves on and touches one of the same files, so the branch tip and
+    // upstream no longer agree tree-wise and the patch-id path has to decide.
+    let mut after = edited.clone();
+    after[0] = "line 1 changed upstream".to_string();
+    fs::write(root.join("a.txt"), after.join("\n") + "\n").unwrap();
+    run_ok("git", &["commit", "-am", "upstream: later edit"], root);
+
+    let repo = Repository::open(repo.path()).unwrap();
+    let merged = kindra::stack::collect_merged_local_branches(&repo, "main", &["main"]).unwrap();
+    assert!(
+        merged.iter().any(|b| b == "feature"),
+        "squash-merged branch should be detected as merged, got {merged:?}"
+    );
+}
