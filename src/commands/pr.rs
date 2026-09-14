@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Args, Subcommand};
 use git2::{BranchType, Repository};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -700,16 +700,37 @@ fn pr_status() -> Result<()> {
         return Ok(());
     }
 
-    let mut prs: Vec<(String, gh::EditablePr)> = Vec::new();
-    for (sb, _remote_upstream) in &branches_with_upstream {
-        if let Some(pr) = gh::find_open_pr_for_edit(&sb.name)? {
-            prs.push((sb.name.clone(), pr));
-        }
-    }
+    // One `gh pr list` snapshot for the whole stack, instead of a `gh pr view`
+    // subprocess per branch.
+    let open_prs = gh::list_open_prs()?;
+    let prs: Vec<(String, gh::EditablePr)> = branches_with_upstream
+        .iter()
+        .filter_map(|(sb, _remote_upstream)| {
+            open_prs
+                .get(&sb.name)
+                .map(|pr| (sb.name.clone(), pr.to_editable()))
+        })
+        .collect();
 
     if prs.is_empty() {
         println!("No open PRs found in the current stack.");
         return Ok(());
+    }
+
+    // Every PR in a stack lives in the same repository, but group by owner/repo
+    // anyway so batching can never mix two of them into one query.
+    let mut numbers_by_repo: BTreeMap<(String, String), Vec<u64>> = BTreeMap::new();
+    for (_branch, pr) in &prs {
+        let owner_repo = parse_github_owner_repo_from_pr_url(&pr.url)
+            .ok_or_else(|| anyhow::anyhow!("Could not parse owner/repo from PR URL: {}", pr.url))?;
+        numbers_by_repo
+            .entry(owner_repo)
+            .or_default()
+            .push(pr.number);
+    }
+    let mut statuses: HashMap<u64, gh::PrStatusSummary> = HashMap::new();
+    for ((owner, repo_name), numbers) in numbers_by_repo {
+        statuses.extend(gh::get_pr_statuses(&owner, &repo_name, &numbers)?);
     }
 
     for (idx, (branch, pr)) in prs.iter().enumerate() {
@@ -717,9 +738,9 @@ fn pr_status() -> Result<()> {
             println!();
         }
 
-        let (owner, repo_name) = parse_github_owner_repo_from_pr_url(&pr.url)
-            .ok_or_else(|| anyhow::anyhow!("Could not parse owner/repo from PR URL: {}", pr.url))?;
-        let status = gh::get_pr_status(&owner, &repo_name, pr.number)?;
+        let status = statuses
+            .get(&pr.number)
+            .ok_or_else(|| anyhow::anyhow!("Missing status for PR #{}", pr.number))?;
 
         println!("── {} (#{}): {} ──", branch, pr.number, pr.title);
         println!("URL: {}", pr.url);
@@ -764,17 +785,17 @@ pub(crate) fn parse_github_owner_repo_from_pr_url(url: &str) -> Option<(String, 
 pub(crate) fn collect_open_stack_prs(
     branches_with_upstream: &[(StackBranch, String)],
 ) -> Result<Vec<StackPr>> {
-    let mut stack_prs = Vec::new();
-    for (sb, _remote_upstream) in branches_with_upstream {
-        if let Some(pr) = gh::find_open_pr_for_edit(&sb.name)? {
-            stack_prs.push(StackPr {
+    // One `gh pr list` snapshot rather than a `gh pr view` subprocess per branch.
+    let open_prs = gh::list_open_prs()?;
+    Ok(branches_with_upstream
+        .iter()
+        .filter_map(|(sb, _remote_upstream)| {
+            open_prs.get(&sb.name).map(|pr| StackPr {
                 branch_name: sb.name.clone(),
-                pr,
-            });
-        }
-    }
-
-    Ok(stack_prs)
+                pr: pr.to_editable(),
+            })
+        })
+        .collect())
 }
 
 pub(crate) fn select_stack_pr<'a>(prs: &'a [StackPr], prompt: &str) -> Result<&'a StackPr> {

@@ -233,7 +233,7 @@ fn single_commit_branch_title_prefill() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -325,7 +325,7 @@ fn single_commit_body_prefill_in_editor() {
         &gh_mock,
         format!(
             r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -551,7 +551,7 @@ fn test_pr_label_flag() {
         &gh_mock,
         format!(
             r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -631,7 +631,7 @@ fn test_pr_draft_reviewer_body_from_commits_flags() {
         &gh_mock,
         format!(
             r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then exit 0; fi
+if [[ "$1" == "auth" ]]; then exit 0; fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then echo '[]'; exit 0; fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     echo "no pull requests found for branch" >&2; exit 1
@@ -719,7 +719,7 @@ fn test_pr_pushes_by_default() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -818,7 +818,7 @@ fn test_pr_no_push_skips_preflight_push() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -1002,7 +1002,7 @@ fn pr_uses_origin_main_as_base_when_local_main_is_behind_after_sync() {
         &gh_mock,
         format!(
             r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -1097,7 +1097,7 @@ fn pr_template_detected() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -1201,7 +1201,7 @@ fn check_pr_stack_sections(branching: bool) {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -1393,7 +1393,7 @@ fn pr_stack_sync_continues_when_one_edit_fails() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -1511,7 +1511,7 @@ fn pr_stack_sync_skips_inaccessible_historical_pr_entries() {
         &gh_mock,
         format!(
             r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -1640,7 +1640,7 @@ fn pr_default_skips_stack_prs_authored_by_other_users() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "user" ]]; then
@@ -1751,7 +1751,7 @@ fn pr_all_includes_stack_prs_authored_by_other_users() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "user" ]]; then
@@ -1895,7 +1895,7 @@ fn multi_commit_branch_title_empty() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -2000,8 +2000,8 @@ fn stacked_branch_shows_correct_commits() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-# Handle gh auth status - pretend we're authenticated
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+# Handle gh auth - pretend we're authenticated
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 # Handle all gh commands that may be called during the test
@@ -2130,7 +2130,7 @@ fn slash_base_branch_uses_git_base_for_local_history() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -2210,7 +2210,7 @@ fn pr_open_opens_single_pr_without_prompt() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -2280,7 +2280,7 @@ fn pr_open_with_multiple_prs_uses_selection() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -2365,7 +2365,11 @@ fn pr_edit_preserves_stack_block() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature-a","number":10,"title":"PR A","body":"Body A","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]},{"headRefName":"feature-b","number":11,"title":"PR B","body":"Body B","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -2463,12 +2467,16 @@ fn pr_edit_cleans_duplicate_stack_blocks() {
         &gh_mock,
         format!(
             r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{{"headRefName":"feature-a","number":10,"title":"PR A","body":"{0}","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}},{{"headRefName":"feature-b","number":11,"title":"PR B","body":"Body B","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     if [[ "$3" == "feature-a" ]]; then
-        echo '{{"number":10,"title":"PR A","body":"{}","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}}'
+        echo '{{"number":10,"title":"PR A","body":"{0}","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}}'
     elif [[ "$3" == "feature-b" ]]; then
         echo '{{"number":11,"title":"PR B","body":"Body B","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}}'
     fi
@@ -2565,12 +2573,16 @@ fn pr_edit_migrates_legacy_stack_markers_without_duplicates() {
         &gh_mock,
         format!(
             r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{{"headRefName":"feature-a","number":10,"title":"PR A","body":"{0}","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}},{{"headRefName":"feature-b","number":11,"title":"PR B","body":"Body B","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     if [[ "$3" == "feature-a" ]]; then
-        echo '{{"number":10,"title":"PR A","body":"{}","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}}'
+        echo '{{"number":10,"title":"PR A","body":"{0}","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}}'
     elif [[ "$3" == "feature-b" ]]; then
         echo '{{"number":11,"title":"PR B","body":"Body B","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}}'
     fi
@@ -2665,7 +2677,11 @@ fn pr_edit_single_open_pr_saves_with_prefilled_title() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Current title","body":"Current body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[{"name":"bug"}],"reviewRequests":[{"requestedReviewer":{"login":"alice"}}]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -2744,7 +2760,11 @@ fn pr_edit_menu_can_edit_title_then_save() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Current title","body":"Current body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -2813,7 +2833,11 @@ fn pr_edit_multiple_open_prs_uses_selection() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature-a","number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]},{"headRefName":"feature-b","number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -2893,7 +2917,11 @@ fn pr_edit_reapplies_stack_section_for_multi_pr_stack() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature-a","number":10,"title":"A title","body":"A body without stack","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]},{"headRefName":"feature-b","number":11,"title":"B title","body":"B body without stack","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -3003,7 +3031,11 @@ fn pr_edit_reorders_stack_section_using_live_stack_order() {
         &gh_mock,
         format!(
             r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{{"headRefName":"pr-review","number":27,"title":"PR review","body":"{0}","url":"https://github.com/test/repo/pull/27","state":"OPEN","labels":[],"reviewRequests":[]}},{{"headRefName":"pr-merge","number":26,"title":"PR merge","body":"PR merge body","url":"https://github.com/test/repo/pull/26","state":"OPEN","labels":[],"reviewRequests":[]}}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -3012,7 +3044,7 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
         exit 0
     fi
     if [[ "$3" == "pr-review" ]]; then
-        echo '{{"number":27,"title":"PR review","body":"{}","url":"https://github.com/test/repo/pull/27","state":"OPEN","labels":[],"reviewRequests":[]}}'
+        echo '{{"number":27,"title":"PR review","body":"{0}","url":"https://github.com/test/repo/pull/27","state":"OPEN","labels":[],"reviewRequests":[]}}'
         exit 0
     fi
     if [[ "$3" == "pr-merge" ]]; then
@@ -3104,7 +3136,11 @@ fn pr_status_shows_reviewers_comments_and_checks() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -3112,7 +3148,7 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     exit 0
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false},{"isResolved":true},{"isResolved":false}]},"reviewRequests":{"nodes":[{"requestedReviewer":{"login":"bob"}}]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}},{"state":"COMMENTED","author":{"login":"carol"}}]},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"ci/test","status":"COMPLETED","conclusion":"FAILURE"},{"__typename":"CheckRun","name":"ci/lint","status":"IN_PROGRESS","conclusion":null},{"__typename":"StatusContext","context":"build","state":"PENDING"}]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[{"isResolved":false},{"isResolved":true},{"isResolved":false}]},"reviewRequests":{"nodes":[{"requestedReviewer":{"login":"bob"}}]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}},{"state":"COMMENTED","author":{"login":"carol"}}]},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"ci/test","status":"COMPLETED","conclusion":"FAILURE"},{"__typename":"CheckRun","name":"ci/lint","status":"IN_PROGRESS","conclusion":null},{"__typename":"StatusContext","context":"build","state":"PENDING"}]}}}}]}}}}}'
     exit 0
 fi
 echo "mock gh: unexpected command: $@" >&2
@@ -3153,6 +3189,103 @@ exit 1
 }
 
 #[test]
+fn pr_status_batches_gh_calls_across_the_stack() {
+    let (dir, _repo) = setup_two_level_stack();
+
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let calls_path = dir.path().join("gh_calls.txt");
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+echo "$1 $2" >> "$GH_CALLS"
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature-a","number":10,"title":"PR A","body":"Body A","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]},{"headRefName":"feature-b","number":11,"title":"PR B","body":"Body B","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}]'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[]},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}},"pr1":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[]},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = kin_cmd()
+        .args(["pr", "status"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("GH_CALLS", &calls_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "kin pr status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let calls = std::fs::read_to_string(&calls_path).unwrap();
+    let count = |needle: &str| calls.lines().filter(|l| *l == needle).count();
+
+    // Every PR is read from one listing and one status query, so the number of
+    // GitHub round trips stays flat as the stack grows.
+    assert_eq!(count("pr list"), 1, "expected one `gh pr list`:\n{calls}");
+    assert_eq!(
+        count("api graphql"),
+        1,
+        "expected one batched status query:\n{calls}"
+    );
+    assert_eq!(
+        count("pr view"),
+        0,
+        "per-branch `gh pr view` should be gone:\n{calls}"
+    );
+
+    // The preflight must not cost a network round trip.
+    assert_eq!(
+        count("auth status"),
+        0,
+        "auth preflight should not call `gh auth status`:\n{calls}"
+    );
+    assert_eq!(
+        count("auth token"),
+        1,
+        "expected one local auth check:\n{calls}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("#10"), "Got:\n{stdout}");
+    assert!(stdout.contains("#11"), "Got:\n{stdout}");
+}
+
+#[test]
 fn pr_status_lists_multiple_stack_prs() {
     let (dir, _repo) = setup_two_level_stack();
 
@@ -3175,7 +3308,11 @@ fn pr_status_lists_multiple_stack_prs() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature-a","number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]},{"headRefName":"feature-b","number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -3189,24 +3326,8 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     fi
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
-    number=""
-    while [[ $# -gt 0 ]]; do
-        if [[ "$1" == "-F" ]]; then
-            shift
-            if [[ "$1" == number=* ]]; then
-                number="${1#number=}"
-            fi
-        fi
-        shift
-    done
-    if [[ "$number" == "10" ]]; then
-        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
-        exit 0
-    fi
-    if [[ "$number" == "11" ]]; then
-        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false}]},"reviewRequests":{"nodes":[{"requestedReviewer":{"login":"bob"}}]},"latestReviews":{"nodes":[]},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"ci/test","status":"COMPLETED","conclusion":"FAILURE"}]}}}}]}}}}}'
-        exit 0
-    fi
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}},"pr1":{"reviewThreads":{"nodes":[{"isResolved":false}]},"reviewRequests":{"nodes":[{"requestedReviewer":{"login":"bob"}}]},"latestReviews":{"nodes":[]},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"ci/test","status":"COMPLETED","conclusion":"FAILURE"}]}}}}]}}}}}'
+    exit 0
 fi
 echo "mock gh: unexpected command: $@" >&2
 exit 1
@@ -3265,7 +3386,11 @@ fn pr_review_renders_markdown_threads_and_replies() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -3338,7 +3463,11 @@ fn pr_review_fetches_paginated_threads_and_comments() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -3414,7 +3543,11 @@ fn pr_review_multiple_prs_uses_selection() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature-a","number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]},{"headRefName":"feature-b","number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -3429,15 +3562,26 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
     number=""
-    while [[ $# -gt 0 ]]; do
-        if [[ "$1" == "-F" ]]; then
-            shift
-            if [[ "$1" == number=* ]]; then
-                number="${1#number=}"
+    for arg in "$@"; do
+        if [[ "$arg" == *"pullRequest(number: "* ]]; then
+            candidate="${arg#*pullRequest(number: }"
+            candidate="${candidate%%)*}"
+            if [[ "$candidate" != '$number' ]]; then
+                number="$candidate"
+                break
             fi
         fi
-        shift
     done
+    if [[ -z "$number" ]]; then
+        prev=""
+        for arg in "$@"; do
+            if [[ "$prev" == "-F" && "$arg" == number=* ]]; then
+                number="${arg#number=}"
+                break
+            fi
+            prev="$arg"
+        done
+    fi
     if [[ "$number" == "10" ]]; then
         echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false,"comments":{"nodes":[{"body":"Review for A.","path":"a.txt","line":5,"startLine":5,"originalLine":5,"originalStartLine":5,"outdated":false,"createdAt":"2024-01-01T00:00:00Z","author":{"__typename":"User","login":"alice"}}]}}]}}}}}'
         exit 0
@@ -3504,7 +3648,11 @@ fn pr_review_applies_reviewer_bot_outdated_and_resolved_filters() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -3581,7 +3729,11 @@ fn pr_review_writes_output_and_skips_osc52_copy_when_not_tty() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -3669,7 +3821,11 @@ fn pr_review_strips_html_comments_from_output() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -3738,7 +3894,11 @@ fn pr_merge_merges_ready_single_pr() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -3750,7 +3910,7 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     exit 0
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
@@ -3819,7 +3979,11 @@ fn pr_merge_multiple_prs_uses_selection() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature-a","number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]},{"headRefName":"feature-b","number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -3838,21 +4002,32 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
     number=""
-    while [[ $# -gt 0 ]]; do
-        if [[ "$1" == "-F" ]]; then
-            shift
-            if [[ "$1" == number=* ]]; then
-                number="${1#number=}"
+    for arg in "$@"; do
+        if [[ "$arg" == *"pullRequest(number: "* ]]; then
+            candidate="${arg#*pullRequest(number: }"
+            candidate="${candidate%%)*}"
+            if [[ "$candidate" != '$number' ]]; then
+                number="$candidate"
+                break
             fi
         fi
-        shift
     done
+    if [[ -z "$number" ]]; then
+        prev=""
+        for arg in "$@"; do
+            if [[ "$prev" == "-F" && "$arg" == number=* ]]; then
+                number="${arg#number=}"
+                break
+            fi
+            prev="$arg"
+        done
+    fi
     if [[ "$number" == "10" ]]; then
-        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+        echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
         exit 0
     fi
     if [[ "$number" == "11" ]]; then
-        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"bob"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+        echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"bob"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
         exit 0
     fi
 fi
@@ -3923,7 +4098,11 @@ fn pr_merge_approved_plus_commented_allows_merge() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -3935,7 +4114,7 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     exit 0
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}},{"state":"COMMENTED","author":{"login":"carol"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}},{"state":"COMMENTED","author":{"login":"carol"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
@@ -3997,7 +4176,11 @@ fn pr_merge_retargets_child_pr_before_merging_parent() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature-a","number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]},{"headRefName":"feature-b","number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -4016,17 +4199,28 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
     number=""
-    while [[ $# -gt 0 ]]; do
-        if [[ "$1" == "-F" ]]; then
-            shift
-            if [[ "$1" == number=* ]]; then
-                number="${1#number=}"
+    for arg in "$@"; do
+        if [[ "$arg" == *"pullRequest(number: "* ]]; then
+            candidate="${arg#*pullRequest(number: }"
+            candidate="${candidate%%)*}"
+            if [[ "$candidate" != '$number' ]]; then
+                number="$candidate"
+                break
             fi
         fi
-        shift
     done
+    if [[ -z "$number" ]]; then
+        prev=""
+        for arg in "$@"; do
+            if [[ "$prev" == "-F" && "$arg" == number=* ]]; then
+                number="${arg#number=}"
+                break
+            fi
+            prev="$arg"
+        done
+    fi
     if [[ "$number" == "10" ]]; then
-        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+        echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
         exit 0
     fi
 fi
@@ -4101,7 +4295,11 @@ fn pr_merge_does_not_retarget_on_merge_failure() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature-a","number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]},{"headRefName":"feature-b","number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -4116,17 +4314,28 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
     number=""
-    while [[ $# -gt 0 ]]; do
-        if [[ "$1" == "-F" ]]; then
-            shift
-            if [[ "$1" == number=* ]]; then
-                number="${1#number=}"
+    for arg in "$@"; do
+        if [[ "$arg" == *"pullRequest(number: "* ]]; then
+            candidate="${arg#*pullRequest(number: }"
+            candidate="${candidate%%)*}"
+            if [[ "$candidate" != '$number' ]]; then
+                number="$candidate"
+                break
             fi
         fi
-        shift
     done
+    if [[ -z "$number" ]]; then
+        prev=""
+        for arg in "$@"; do
+            if [[ "$prev" == "-F" && "$arg" == number=* ]]; then
+                number="${arg#number=}"
+                break
+            fi
+            prev="$arg"
+        done
+    fi
     if [[ "$number" == "10" ]]; then
-        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+        echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
         exit 0
     fi
 fi
@@ -4201,7 +4410,11 @@ fn pr_merge_does_not_retarget_when_merge_is_queued() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature-a","number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]},{"headRefName":"feature-b","number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -4220,17 +4433,28 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
     number=""
-    while [[ $# -gt 0 ]]; do
-        if [[ "$1" == "-F" ]]; then
-            shift
-            if [[ "$1" == number=* ]]; then
-                number="${1#number=}"
+    for arg in "$@"; do
+        if [[ "$arg" == *"pullRequest(number: "* ]]; then
+            candidate="${arg#*pullRequest(number: }"
+            candidate="${candidate%%)*}"
+            if [[ "$candidate" != '$number' ]]; then
+                number="$candidate"
+                break
             fi
         fi
-        shift
     done
+    if [[ -z "$number" ]]; then
+        prev=""
+        for arg in "$@"; do
+            if [[ "$prev" == "-F" && "$arg" == number=* ]]; then
+                number="${arg#number=}"
+                break
+            fi
+            prev="$arg"
+        done
+    fi
     if [[ "$number" == "10" ]]; then
-        echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"queuedsha10","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+        echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"queuedsha10","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
         exit 0
     fi
 fi
@@ -4305,7 +4529,11 @@ fn pr_merge_prompts_and_errors_when_issues_remain_but_merge_is_allowed() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -4313,7 +4541,7 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     exit 0
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false}]},"reviewRequests":{"nodes":[{"requestedReviewer":{"login":"bob"}}]},"latestReviews":{"nodes":[{"state":"COMMENTED","author":{"login":"carol"}}]},"reviewDecision":"REVIEW_REQUIRED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"ci/test","status":"COMPLETED","conclusion":"FAILURE"}]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[{"isResolved":false}]},"reviewRequests":{"nodes":[{"requestedReviewer":{"login":"bob"}}]},"latestReviews":{"nodes":[{"state":"COMMENTED","author":{"login":"carol"}}]},"reviewDecision":"REVIEW_REQUIRED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"ci/test","status":"COMPLETED","conclusion":"FAILURE"}]}}}}]}}}}}'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
@@ -4388,7 +4616,11 @@ fn pr_merge_surfaces_gh_failure_details() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -4396,7 +4628,7 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     exit 0
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
@@ -4463,7 +4695,11 @@ fn pr_merge_errors_when_repo_rules_block_merging() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -4471,7 +4707,7 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     exit 0
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":false}]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[]},"reviewDecision":"REVIEW_REQUIRED","mergeStateStatus":"BLOCKED","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[{"isResolved":false}]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[]},"reviewDecision":"REVIEW_REQUIRED","mergeStateStatus":"BLOCKED","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
@@ -4541,7 +4777,7 @@ fn pr_flatten_retargets_all_open_stack_prs_to_resolved_upstream_base() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -4662,7 +4898,7 @@ fn pr_flatten_uses_resolved_upstream_not_hardcoded_main() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -4738,7 +4974,7 @@ fn pr_flatten_continues_on_partial_failures_and_exits_nonzero() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -4844,7 +5080,7 @@ fn pr_flatten_does_not_mutate_local_git_or_pr_body_metadata() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -4945,7 +5181,7 @@ fn pr_default_preflight_flattens_pushes_and_then_runs_normal_pr_logic() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -5040,7 +5276,7 @@ fn pr_default_preflight_skips_flatten_when_pr_bases_match() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -5122,7 +5358,7 @@ fn pr_no_push_skips_preflight_flatten() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -5207,7 +5443,7 @@ fn pr_preflight_flatten_failure_stops_before_push_and_pr_processing() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -5505,7 +5741,7 @@ fn pr_command_excludes_upstream_branch() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -5616,7 +5852,7 @@ fn pr_uses_single_gh_pr_list_for_the_stack() {
         &gh_mock,
         r#"#!/bin/bash
 echo "$1 $2" >> "$GH_CALLS"
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -5703,7 +5939,7 @@ fn pr_refreshes_metadata_before_syncing_descriptions() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "user" ]]; then
@@ -5835,7 +6071,7 @@ const GH_CREATE_CAPTURE: &str = r#"    while [[ $# -gt 0 ]]; do
 fn gh_mock_with_create(create_handler: &str) -> String {
     format!(
         r#"#!/bin/bash
-if [[ "$1" == "auth" && "$2" == "status" ]]; then exit 0; fi
+if [[ "$1" == "auth" ]]; then exit 0; fi
 if [[ "$1" == "pr" && "$2" == "list" ]]; then echo '[]'; exit 0; fi
 if [[ "$1" == "pr" && "$2" == "view" ]]; then echo "no pull requests found" >&2; exit 1; fi
 if [[ "$1" == "pr" && "$2" == "create" ]]; then
@@ -6148,7 +6384,11 @@ fn pr_edit_rerun_save_directly_recovers_stale_draft() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" && "$2" == "status" ]]; then exit 0; fi
+if [[ "$1" == "auth" ]]; then exit 0; fi
+if [[ "$1" == "pr" && "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Current title","body":"Current body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
+    exit 0
+fi
 if [[ "$1" == "pr" && "$2" == "view" ]]; then
     echo '{"number":42,"title":"Current title","body":"Current body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
     exit 0
@@ -6224,7 +6464,7 @@ fn init_origin_and_push(dir: &std::path::Path, refs: &[&str]) {
 fn write_gh_mock(dir: &std::path::Path, handlers: &str) {
     let script = format!(
         "#!/bin/bash\n\
-         if [[ \"$1\" == \"auth\" && \"$2\" == \"status\" ]]; then exit 0; fi\n\
+         if [[ \"$1\" == \"auth\" ]]; then exit 0; fi\n\
          {handlers}\n\
          echo \"mock gh: unexpected command: $@\" >&2\n\
          exit 1\n"
@@ -6254,13 +6494,17 @@ fn pr_merge_no_cascade_skips_restack_and_delete() {
 
     write_gh_mock(
         dir.path(),
-        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     if [[ "$3" == "42" ]]; then echo '{"state":"MERGED"}'; exit 0; fi
     echo '{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
     exit 0
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then exit 0; fi"#,
@@ -6308,7 +6552,11 @@ fn pr_merge_cascade_restacks_children_and_deletes_merged_branch() {
 
     write_gh_mock(
         dir.path(),
-        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature-a","number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]},{"headRefName":"feature-b","number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}]'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     if [[ "$3" == "10" ]]; then echo '{"state":"MERGED"}'; exit 0; fi
     if [[ "$3" == "feature-a" ]]; then
         echo '{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}'
@@ -6320,7 +6568,7 @@ fn pr_merge_cascade_restacks_children_and_deletes_merged_branch() {
     fi
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then exit 0; fi
@@ -6408,7 +6656,11 @@ fn pr_merge_cascade_surfaces_restack_failure_and_still_deletes_remote() {
 
     write_gh_mock(
         dir.path(),
-        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature-a","number":10,"title":"A","body":"A","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]},{"headRefName":"feature-b","number":11,"title":"B","body":"B","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}]'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     if [[ "$3" == "10" ]]; then echo '{"state":"MERGED"}'; exit 0; fi
     if [[ "$3" == "feature-a" ]]; then
         echo '{"number":10,"title":"A","body":"A","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}'
@@ -6420,7 +6672,7 @@ fn pr_merge_cascade_surfaces_restack_failure_and_still_deletes_remote() {
     fi
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then exit 0; fi
@@ -6478,13 +6730,17 @@ fn pr_merge_passes_method_flag_to_gh() {
     write_gh_mock(
         dir.path(),
         &format!(
-            r#"if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+            r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{{"headRefName":"feature","number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}}]'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     if [[ "$3" == "42" ]]; then echo '{{"state":"MERGED"}}'; exit 0; fi
     echo '{{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}}'
     exit 0
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
-    echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}},"reviewRequests":{{"nodes":[]}},"latestReviews":{{"nodes":[{{"state":"APPROVED","author":{{"login":"alice"}}}}]}},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{{"contexts":{{"nodes":[]}}}}}}}}]}}}}}}}}}}'
+    echo '{{"data":{{"repository":{{"pr0":{{"reviewThreads":{{"nodes":[]}},"reviewRequests":{{"nodes":[]}},"latestReviews":{{"nodes":[{{"state":"APPROVED","author":{{"login":"alice"}}}}]}},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{{"contexts":{{"nodes":[]}}}}}}}}]}}}}}}}}}}'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then printf '%s\n' "$@" > "{}"; exit 0; fi"#,
@@ -6516,13 +6772,17 @@ fn pr_merge_pending_state_skips_cascade_and_delete() {
     // queue), so the command must short-circuit without cascading or deleting.
     write_gh_mock(
         dir.path(),
-        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     if [[ "$3" == "42" ]]; then echo '{"state":"OPEN"}'; exit 0; fi
     echo '{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
     exit 0
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then exit 0; fi"#,
@@ -6555,13 +6815,17 @@ fn pr_merge_surfaces_merge_when_state_read_fails() {
     // Mock: merge succeeds, but the post-merge `pr view 42` state read fails.
     write_gh_mock(
         dir.path(),
-        r#"if [[ "$1" == "pr" && "$2" == "view" ]]; then
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then
     if [[ "$3" == "42" ]]; then echo "network blip" >&2; exit 1; fi
     echo '{"number":42,"title":"Feature title","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
     exit 0
 fi
 if [[ "$1" == "api" && "$2" == "graphql" ]]; then
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
     exit 0
 fi
 if [[ "$1" == "pr" && "$2" == "merge" ]]; then exit 0; fi"#,
@@ -6599,7 +6863,11 @@ fn pr_merge_get_pr_status_paginates_review_threads_beyond_one_page() {
 
     write_gh_mock(
         dir.path(),
-        r#"if [[ "$1" == "pr" && "$2" == "view" ]]; then
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then
     echo '{"number":42,"title":"Feature title","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
     exit 0
 fi
@@ -6610,7 +6878,7 @@ if [[ "$1" == "api" && "$2" == "graphql" ]]; then
         exit 0
     fi
     # Page 1: one unresolved thread, hasNextPage -> forces a follow-up.
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":true,"endCursor":"thread-cursor-1"},"nodes":[{"isResolved":false}]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"pageInfo":{"hasNextPage":true,"endCursor":"thread-cursor-1"},"nodes":[{"isResolved":false}]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
     exit 0
 fi"#,
     );
@@ -6640,7 +6908,11 @@ fn pr_merge_get_pr_status_paginates_review_requests_beyond_one_page() {
 
     write_gh_mock(
         dir.path(),
-        r#"if [[ "$1" == "pr" && "$2" == "view" ]]; then
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"F","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then
     echo '{"number":42,"title":"F","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
     exit 0
 fi
@@ -6649,7 +6921,7 @@ if [[ "$1" == "api" && "$2" == "graphql" ]]; then
         echo '{"data":{"repository":{"pullRequest":{"reviewRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"requestedReviewer":{"login":"bob"}}]}}}}}'
         exit 0
     fi
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"pageInfo":{"hasNextPage":true,"endCursor":"req-cursor-1"},"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"pageInfo":{"hasNextPage":true,"endCursor":"req-cursor-1"},"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
     exit 0
 fi"#,
     );
@@ -6675,7 +6947,11 @@ fn pr_merge_get_pr_status_paginates_latest_reviews_beyond_one_page() {
 
     write_gh_mock(
         dir.path(),
-        r#"if [[ "$1" == "pr" && "$2" == "view" ]]; then
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"F","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then
     echo '{"number":42,"title":"F","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
     exit 0
 fi
@@ -6684,7 +6960,7 @@ if [[ "$1" == "api" && "$2" == "graphql" ]]; then
         echo '{"data":{"repository":{"pullRequest":{"latestReviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"state":"CHANGES_REQUESTED","author":{"login":"carol"}}]}}}}}'
         exit 0
     fi
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"pageInfo":{"hasNextPage":true,"endCursor":"rev-cursor-1"},"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"pageInfo":{"hasNextPage":true,"endCursor":"rev-cursor-1"},"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
     exit 0
 fi"#,
     );
@@ -6710,13 +6986,17 @@ fn pr_merge_treats_neutral_checkrun_as_passing() {
 
     write_gh_mock(
         dir.path(),
-        r#"if [[ "$1" == "pr" && "$2" == "view" ]]; then
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"F","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then
     if [[ "$3" == "42" ]]; then echo '{"state":"MERGED"}'; exit 0; fi
     echo '{"number":42,"title":"F","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
     exit 0
 fi
 if [[ "$1" == "api" && "$2" == "graphql" ]]; then
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"NEUTRAL"}]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"NEUTRAL"}]}}}}]}}}}}'
     exit 0
 fi
 if [[ "$1" == "pr" && "$2" == "merge" ]]; then exit 0; fi"#,
@@ -6744,12 +7024,16 @@ fn pr_merge_treats_unknown_checkrun_conclusion_as_failed() {
 
     write_gh_mock(
         dir.path(),
-        r#"if [[ "$1" == "pr" && "$2" == "view" ]]; then
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"F","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then
     echo '{"number":42,"title":"F","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
     exit 0
 fi
 if [[ "$1" == "api" && "$2" == "graphql" ]]; then
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"UNSTABLE","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"flaky","status":"COMPLETED","conclusion":"MYSTERY"}]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"UNSTABLE","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"flaky","status":"COMPLETED","conclusion":"MYSTERY"}]}}}}]}}}}}'
     exit 0
 fi"#,
     );
@@ -6782,7 +7066,11 @@ fn pr_merge_get_pr_status_paginates_status_checks_beyond_one_page() {
 
     write_gh_mock(
         dir.path(),
-        r#"if [[ "$1" == "pr" && "$2" == "view" ]]; then
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then
     echo '{"number":42,"title":"Feature title","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
     exit 0
 fi
@@ -6793,7 +7081,7 @@ if [[ "$1" == "api" && "$2" == "graphql" ]]; then
         exit 0
     fi
     # Base page: a passing check plus hasNextPage -> forces a checks follow-up.
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"oid":"commit-oid-1","statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":true,"endCursor":"check-cursor-1"},"nodes":[{"__typename":"StatusContext","context":"ci/page1","state":"SUCCESS"}]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"oid":"commit-oid-1","statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":true,"endCursor":"check-cursor-1"},"nodes":[{"__typename":"StatusContext","context":"ci/page1","state":"SUCCESS"}]}}}}]}}}}}'
     exit 0
 fi"#,
     );
@@ -6830,12 +7118,16 @@ fn pr_merge_treats_unknown_check_state_as_not_ready() {
 
     write_gh_mock(
         dir.path(),
-        r#"if [[ "$1" == "pr" && "$2" == "view" ]]; then
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then
     echo '{"number":42,"title":"Feature title","body":"b","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}'
     exit 0
 fi
 if [[ "$1" == "api" && "$2" == "graphql" ]]; then
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"UNSTABLE","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"oid":"commit-oid-1","statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"__typename":"StatusContext","context":"ci/expected","state":"EXPECTED"}]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"UNSTABLE","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"oid":"commit-oid-1","statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"__typename":"StatusContext","context":"ci/expected","state":"EXPECTED"}]}}}}]}}}}}'
     exit 0
 fi"#,
     );
@@ -6880,7 +7172,7 @@ fn pr_refuses_stack_branch_tracking_trunk_and_creates_no_pr() {
         format!(
             r#"#!/bin/bash
 echo "$@" >> "{log}"
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -6995,7 +7287,11 @@ fn pr_merge_does_not_delete_the_base_branch_on_the_remote() {
     std::fs::write(
         &gh_mock,
         r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]}]'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
@@ -7007,7 +7303,7 @@ if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     exit 0
 fi
 if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
-    echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then

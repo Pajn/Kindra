@@ -92,7 +92,7 @@ fn pr_after_branch_merged_into_main() {
         &gh_mock,
         format!(
             r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
@@ -222,7 +222,7 @@ fn pr_unmerged_branches_work() {
         &gh_mock,
         format!(
             r#"#!/bin/bash
-if [[ "$1" == "auth" ]] && [[ "$2" == "status" ]]; then
+if [[ "$1" == "auth" ]]; then
     exit 0
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
