@@ -2094,20 +2094,17 @@ pub fn get_full_stack_branches_for_head(
     upstream_id: Oid,
     upstream_name: &str,
 ) -> Result<Vec<StackBranch>> {
-    let private_history = |tip| -> Result<HashSet<Oid>> {
-        let mut walk = repo.revwalk()?;
-        walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
-        walk.push(tip)?;
-        walk.hide(upstream_id)?;
-        Ok(walk.collect::<std::result::Result<HashSet<_>, _>>()?)
-    };
-    let mut connected = private_history(head_id)?;
-    if connected.is_empty() {
-        // On upstream there is no private component to select. Preserve the
-        // existing overview of stacks descending from the current base.
+    // Upstream already contains HEAD, so HEAD has no private history and there
+    // is no component to select. Preserve the existing overview of stacks
+    // descending from the current base.
+    if head_id == upstream_id || repo.graph_descendant_of(upstream_id, head_id)? {
         return get_stack_branches_for_head(repo, head_id, upstream_id, upstream_name);
     }
 
+    // The sources are HEAD followed by every local branch. Walking all of them
+    // together, bounded by upstream, costs one traversal of the private history
+    // rather than one per branch.
+    let mut sources = vec![head_id];
     let mut candidates = Vec::new();
     for entry in repo.branches(Some(git2::BranchType::Local))? {
         let (branch, _) = entry?;
@@ -2118,32 +2115,63 @@ pub fn get_full_stack_branches_for_head(
         let Some(id) = branch.get().target() else {
             continue;
         };
-        let history = private_history(id)?;
-        if !history.is_empty() {
-            candidates.push((
-                StackBranch {
-                    name: name.to_string(),
-                    id,
-                },
-                history,
-            ));
+        candidates.push(StackBranch {
+            name: name.to_string(),
+            id,
+        });
+        sources.push(id);
+    }
+
+    let mut walk = repo.revwalk()?;
+    walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
+    for &id in &sources {
+        walk.push(id)?;
+    }
+    walk.hide(upstream_id)?;
+    let order = walk.collect::<std::result::Result<Vec<_>, _>>()?;
+    let private: HashSet<Oid> = order.iter().copied().collect();
+
+    // Two sources belong to the same stack when their private histories share a
+    // commit. Handing each commit's group down to its parents discovers exactly
+    // those overlaps, and the disjoint set closes them transitively.
+    let mut seeds: HashMap<Oid, Vec<usize>> = HashMap::new();
+    for (index, id) in sources.iter().enumerate() {
+        if private.contains(id) {
+            seeds.entry(*id).or_default().push(index);
+        }
+    }
+    let mut groups = DisjointSet::new(sources.len());
+    let mut group_of: HashMap<Oid, usize> = HashMap::new();
+    for oid in order {
+        let mut group = group_of.remove(&oid);
+        for &seed in seeds.get(&oid).map(Vec::as_slice).unwrap_or_default() {
+            group = Some(match group {
+                Some(group) => groups.union(group, seed),
+                None => seed,
+            });
+        }
+        let Some(group) = group else { continue };
+        let group = groups.find(group);
+        for parent in repo.find_commit(oid)?.parent_ids() {
+            // Commits already in upstream are shared by unrelated stacks, so
+            // they must not be allowed to connect them.
+            if !private.contains(&parent) {
+                continue;
+            }
+            let merged = match group_of.get(&parent) {
+                Some(&existing) => groups.union(existing, group),
+                None => group,
+            };
+            group_of.insert(parent, merged);
         }
     }
 
+    let head_group = groups.find(0);
     let mut branches = Vec::new();
-    loop {
-        let before = branches.len();
-        candidates.retain(|(branch, history)| {
-            if connected.is_disjoint(history) {
-                true
-            } else {
-                connected.extend(history);
-                branches.push(branch.clone());
-                false
-            }
-        });
-        if branches.len() == before {
-            break;
+    for (index, branch) in candidates.into_iter().enumerate() {
+        // `sources` carries HEAD at index 0, so branch `index` sits at `index + 1`.
+        if private.contains(&branch.id) && groups.find(index + 1) == head_group {
+            branches.push(branch);
         }
     }
     sort_branches_topologically(repo, &mut branches)?;
@@ -2425,6 +2453,166 @@ pub fn collect_descendants_of_id(
     Ok(())
 }
 
+/// Strict ancestry between a fixed set of branch tips, precomputed so callers
+/// can ask "is A a descendant of B?" without walking the graph per question.
+///
+/// Resolving a stack's shape needs that answer for every pair of tips, and
+/// `graph_descendant_of` walks history on each call. One walk over the commits
+/// the tips actually span answers them all.
+pub(crate) struct TipAncestry {
+    /// Slot for every distinct tip, plus the boundary commit.
+    slots: HashMap<Oid, usize>,
+    /// `descendants[i]` holds the slots of tips that are strict descendants of
+    /// the tip in slot `i`.
+    descendants: Vec<HashSet<usize>>,
+}
+
+impl TipAncestry {
+    /// Record ancestry between `tips`, or `None` when they share no common
+    /// ancestor to bound the walk and the caller must query the graph directly.
+    ///
+    /// The bound is `merge_base_octopus`, the commit every tip descends from.
+    /// Commits at or below it are shared by all tips and so cannot distinguish
+    /// them, which is what keeps the walk proportional to the stack instead of
+    /// to all of history. Note that `merge_base_many` is not usable here: it
+    /// bases the later commits against a hypothetical merge of them, so it can
+    /// return a commit some tip does not descend from, and bounding the walk
+    /// there would hide that tip's ancestry and drop edges.
+    pub(crate) fn new(repo: &Repository, tips: &[Oid]) -> Result<Option<Self>> {
+        let Ok(boundary) = repo.merge_base_octopus(tips) else {
+            return Ok(None);
+        };
+        let mut slots: HashMap<Oid, usize> = HashMap::new();
+        for &tip in tips {
+            let next = slots.len();
+            slots.entry(tip).or_insert(next);
+        }
+
+        let mut walk = repo.revwalk()?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
+        for &oid in slots.keys() {
+            walk.push(oid)?;
+        }
+        // Hiding the boundary's parents rather than the boundary itself keeps
+        // the boundary in the walk, so tips can still be related to it.
+        for parent in repo.find_commit(boundary)?.parent_ids() {
+            walk.hide(parent)?;
+        }
+
+        // `reach[c]` accumulates the tips that can reach commit `c`. Topological
+        // order visits a commit only after every child that feeds into it, so
+        // the entry is complete by the time it is read.
+        let mut reach: HashMap<Oid, HashSet<usize>> = HashMap::new();
+        let mut descendants = vec![HashSet::new(); slots.len()];
+        for oid in walk {
+            let oid = oid?;
+            let mut here = reach.remove(&oid).unwrap_or_default();
+            if let Some(&slot) = slots.get(&oid) {
+                descendants[slot] = here.clone();
+                here.insert(slot);
+            }
+            if here.is_empty() {
+                continue;
+            }
+            for parent in repo.find_commit(oid)?.parent_ids() {
+                reach
+                    .entry(parent)
+                    .or_default()
+                    .extend(here.iter().copied());
+            }
+        }
+
+        Ok(Some(Self { slots, descendants }))
+    }
+
+    /// Ancestry for every branch in `branches`, with `merge_base` included so
+    /// it can be compared against too.
+    pub(crate) fn for_branches(
+        repo: &Repository,
+        branches: &[StackBranch],
+        merge_base: Oid,
+    ) -> Result<Option<Self>> {
+        let mut tips = branches.iter().map(|b| b.id).collect::<Vec<_>>();
+        tips.push(merge_base);
+        Self::new(repo, &tips)
+    }
+
+    /// Whether `descendant` is a strict descendant of `ancestor`, matching
+    /// `Repository::graph_descendant_of` (a commit is not its own descendant).
+    ///
+    /// Returns `false` for commits this was not built for.
+    pub(crate) fn is_descendant(&self, descendant: Oid, ancestor: Oid) -> bool {
+        match (self.slots.get(&descendant), self.slots.get(&ancestor)) {
+            (Some(&d), Some(&a)) => self.descendants[a].contains(&d),
+            _ => false,
+        }
+    }
+}
+
+/// Disjoint-set over source indices, used to group branches whose private
+/// histories overlap.
+struct DisjointSet {
+    parent: Vec<usize>,
+}
+
+impl DisjointSet {
+    fn new(len: usize) -> Self {
+        Self {
+            parent: (0..len).collect(),
+        }
+    }
+
+    fn find(&mut self, mut index: usize) -> usize {
+        while self.parent[index] != index {
+            self.parent[index] = self.parent[self.parent[index]];
+            index = self.parent[index];
+        }
+        index
+    }
+
+    /// Merge the sets holding `a` and `b`, returning the surviving root.
+    fn union(&mut self, a: usize, b: usize) -> usize {
+        let (a, b) = (self.find(a), self.find(b));
+        if a != b {
+            self.parent[b] = a;
+        }
+        a
+    }
+}
+
+/// Whether `a` is a strict descendant of `b`, answered from `ancestry` when it
+/// could be built and from the commit graph otherwise.
+fn descends(repo: &Repository, ancestry: Option<&TipAncestry>, a: Oid, b: Oid) -> Result<bool> {
+    match ancestry {
+        Some(ancestry) => Ok(ancestry.is_descendant(a, b)),
+        None => is_descendant(repo, a, b),
+    }
+}
+
+/// The deepest branch in `all_branches` that `branch` descends from, or
+/// `merge_base` when it descends from none of them.
+fn nearest_parent_in_stack(
+    repo: &Repository,
+    ancestry: Option<&TipAncestry>,
+    branch: &StackBranch,
+    all_branches: &[StackBranch],
+    merge_base: Oid,
+) -> Result<Oid> {
+    let mut best_parent = merge_base;
+    for b in all_branches {
+        if b.name == branch.name || b.id == branch.id {
+            continue;
+        }
+        if !descends(repo, ancestry, branch.id, b.id)? {
+            continue;
+        }
+        if best_parent == merge_base || descends(repo, ancestry, b.id, best_parent)? {
+            best_parent = b.id;
+        }
+    }
+    Ok(best_parent)
+}
+
 pub fn find_parent_in_stack(
     repo: &Repository,
     branch_name: &str,
@@ -2436,20 +2624,25 @@ pub fn find_parent_in_stack(
         .find(|b| b.name == branch_name)
         .ok_or_else(|| anyhow!("Branch '{}' not found in stack.", branch_name))?;
 
-    let mut best_parent = merge_base;
-    for b in all_branches {
-        if b.name != branch_name
-            && (repo.graph_descendant_of(branch.id, b.id)? || branch.id == b.id)
-        {
-            if b.id == branch.id {
-                continue;
-            }
-            if best_parent == merge_base || repo.graph_descendant_of(b.id, best_parent)? {
-                best_parent = b.id;
-            }
-        }
+    let ancestry = TipAncestry::for_branches(repo, all_branches, merge_base)?;
+    nearest_parent_in_stack(repo, ancestry.as_ref(), branch, all_branches, merge_base)
+}
+
+/// [`find_parent_in_stack`] for every branch at once, sharing a single ancestry
+/// walk instead of repeating one per branch.
+pub fn find_parents_in_stack(
+    repo: &Repository,
+    all_branches: &[StackBranch],
+    merge_base: Oid,
+) -> Result<HashMap<String, Oid>> {
+    let ancestry = TipAncestry::for_branches(repo, all_branches, merge_base)?;
+    let mut parents = HashMap::new();
+    for branch in all_branches {
+        let parent =
+            nearest_parent_in_stack(repo, ancestry.as_ref(), branch, all_branches, merge_base)?;
+        parents.insert(branch.name.clone(), parent);
     }
-    Ok(best_parent)
+    Ok(parents)
 }
 
 fn parent_base_spec(parent_id: Oid, branch_name: &str, all_branches: &[StackBranch]) -> String {
@@ -2469,13 +2662,23 @@ pub fn sort_branches_topologically(repo: &Repository, branches: &mut [StackBranc
     let mut outgoing = vec![Vec::new(); original.len()];
     let mut indegree = vec![0usize; original.len()];
 
+    // Ordering needs the ancestry of every pair, so precompute it in one walk.
+    // That walk has to be bounded by a commit every tip descends from, which is
+    // what merge_base_octopus returns. merge_base_many is not interchangeable
+    // here: it bases the later commits against a hypothetical merge of them, so
+    // its result can be a commit some tip does not descend from, which would
+    // prune that tip out of the walk. No common ancestor exists for unrelated
+    // tips, in which case fall back to asking the graph pair by pair.
+    let tips = original.iter().map(|b| b.id).collect::<Vec<_>>();
+    let ancestry = TipAncestry::new(repo, &tips)?;
+
     for (idx, branch) in original.iter().enumerate() {
         for (other_idx, other) in original.iter().enumerate() {
             if idx == other_idx || branch.id == other.id {
                 continue;
             }
 
-            if is_descendant(repo, branch.id, other.id)? {
+            if descends(repo, ancestry.as_ref(), branch.id, other.id)? {
                 outgoing[other_idx].push(idx);
                 indegree[idx] += 1;
             }

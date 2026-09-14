@@ -1,6 +1,6 @@
 use crate::commands::find_upstream;
 use crate::gh;
-use crate::stack::{StackBranch, find_parent_in_stack, get_full_stack_branches_for_head};
+use crate::stack::{StackBranch, find_parents_in_stack, get_full_stack_branches_for_head};
 use anyhow::{Context, Result};
 use clap::Args;
 use crossterm::style::{Color, Stylize};
@@ -215,8 +215,13 @@ fn build_tree_structure(
     let mut children_map: HashMap<Option<String>, Vec<String>> = HashMap::new();
 
     // First, find parent for each branch
+    let parent_ids = find_parents_in_stack(repo, stack_branches, upstream_id)?;
     for sb in stack_branches {
-        let parent_id = find_branch_parent(repo, sb, stack_branches, upstream_id)?;
+        let parent_id = match parent_ids.get(&sb.name) {
+            // A branch rooted at upstream has no parent inside the tree.
+            Some(&id) if id != upstream_id => id,
+            _ => git2::Oid::zero(),
+        };
         let parent_name = if parent_id == git2::Oid::zero() {
             None
         } else {
@@ -288,21 +293,6 @@ fn build_tree_structure(
     }
 
     Ok(tree)
-}
-
-/// Find the parent of a branch within the stack
-fn find_branch_parent(
-    repo: &git2::Repository,
-    branch: &StackBranch,
-    all_branches: &[StackBranch],
-    upstream_id: git2::Oid,
-) -> Result<git2::Oid> {
-    let parent_id = find_parent_in_stack(repo, &branch.name, all_branches, upstream_id)?;
-    if parent_id == upstream_id {
-        Ok(git2::Oid::zero())
-    } else {
-        Ok(parent_id)
-    }
 }
 
 /// Populate branch details (commits, remote, PR)

@@ -18,7 +18,7 @@
 mod common;
 use common::repo_init;
 use git2::{Repository, Signature};
-use kindra::stack::get_stack_branches_from_merge_base;
+use kindra::stack::{get_full_stack_branches_for_head, get_stack_branches_from_merge_base};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
@@ -216,5 +216,98 @@ fn stack_discovery_is_proportional_to_stack_size_not_history() {
     eprintln!(
         "✓ Stack discovery: {avg:?} avg over {RUNS} runs \
          (2-branch stack, 1000-commit main, 20 noise branches above merge-base)"
+    );
+}
+
+/// `kin tree` discovers the whole stack around HEAD rather than just HEAD's own
+/// ancestry, so it has to consider every local branch. Doing that one branch at
+/// a time costs a revwalk per branch, each of which re-marks upstream's history
+/// as uninteresting — on a repo with a few hundred branches that dominates the
+/// command. Discovery must instead stay proportional to the private history the
+/// branches actually span.
+///
+///   main (3100 commits)
+///     │
+///     └ at commit 3000: feature-a (3 commits)
+///                         └ feature-b (3 commits)  ← HEAD
+///     │
+///     └ 400 unrelated branches diverged from points across main
+#[test]
+fn full_stack_discovery_is_proportional_to_stack_size_not_branch_count() {
+    const NOISE_BRANCHES: usize = 400;
+    const MAIN_COMMITS: u32 = 3000;
+
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let _pre_stack_tip = append_commits(&repo, "refs/heads/main", MAIN_COMMITS);
+    let merge_base_oid = repo.refname_to_id("refs/heads/main").unwrap();
+
+    let fa_tip = branch_with_commits(&repo, "feature-a", merge_base_oid, 3);
+    let head_id = branch_with_commits(&repo, "feature-b", fa_tip, 3);
+
+    let upstream_tip = append_commits(&repo, "refs/heads/main", 100);
+
+    // Spread the noise branches across main so they fork from many different
+    // points rather than sharing one cheap boundary. Skip the stack's own fork
+    // point: a noise branch there would build commits identical to feature-a's
+    // (same parent, tree and message) and so land on the same OIDs.
+    let main_commits: Vec<git2::Oid> = {
+        let mut walk = repo.revwalk().unwrap();
+        walk.push(upstream_tip).unwrap();
+        walk.collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .filter(|&oid| oid != merge_base_oid)
+            .collect()
+    };
+    let step = (main_commits.len() / (NOISE_BRANCHES + 1)).max(1);
+    for (i, &base_oid) in main_commits
+        .iter()
+        .step_by(step)
+        .take(NOISE_BRANCHES)
+        .enumerate()
+    {
+        branch_with_commits(&repo, &format!("noise-{i}"), base_oid, 2);
+    }
+
+    pack_objects(dir.path());
+
+    let upstream_id = upstream_tip;
+
+    // Warm-up run (load lazy state: packfile indexes, ODB caches, etc.).
+    let _ = get_full_stack_branches_for_head(&repo, head_id, upstream_id, "main").unwrap();
+
+    const RUNS: u32 = 5;
+    let mut total = Duration::ZERO;
+    for _ in 0..RUNS {
+        let t = Instant::now();
+        let _ = get_full_stack_branches_for_head(&repo, head_id, upstream_id, "main").unwrap();
+        total += t.elapsed();
+    }
+    let avg = total / RUNS;
+
+    let stack = get_full_stack_branches_for_head(&repo, head_id, upstream_id, "main").unwrap();
+    let mut names: Vec<&str> = stack.iter().map(|b| b.name.as_str()).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["feature-a", "feature-b"],
+        "Only the two stack branches should be discovered; noise branches must be excluded"
+    );
+
+    // A single bounded walk finishes in a few milliseconds here. One walk per
+    // branch takes well over a second, which this catches with room to spare for
+    // slower machines.
+    assert!(
+        avg < Duration::from_millis(300),
+        "Full stack discovery averaged {avg:?} over {RUNS} runs — expected <300ms.\n\
+         This suggests a regression to one history walk per local branch.\n\
+         Scenario: 2-branch stack on a {MAIN_COMMITS}-commit main with {NOISE_BRANCHES} unrelated branches."
+    );
+
+    eprintln!(
+        "✓ Full stack discovery: {avg:?} avg over {RUNS} runs \
+         (2-branch stack, {MAIN_COMMITS}-commit main, {NOISE_BRANCHES} unrelated branches)"
     );
 }

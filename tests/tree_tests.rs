@@ -247,6 +247,61 @@ fn test_tree_shows_full_stack_from_every_branch() {
     }
 }
 
+/// A merge ties two stacks that forked from upstream separately into one, so
+/// the tree must show both from either side.
+#[test]
+fn test_tree_merge_joins_separate_stacks() {
+    let (dir, repo) = setup_simple_stack();
+    let main = repo
+        .revparse_single("main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/unrelated",
+        "other.txt",
+        "other",
+        "other stack",
+        &[&main],
+    );
+
+    // Before the merge the two stacks are independent.
+    repo.set_head("refs/heads/feature-a").unwrap();
+    let output = run_tree_command(dir.path(), &["--upstream", "main"]);
+    assert!(!output.contains("unrelated"), "{output}");
+
+    let feature_b = repo
+        .revparse_single("feature-b")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    let unrelated = repo
+        .revparse_single("unrelated")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/joined",
+        "joined.txt",
+        "joined",
+        "join both stacks",
+        &[&feature_b, &unrelated],
+    );
+
+    for current in ["feature-a", "feature-b", "unrelated", "joined"] {
+        repo.set_head(&format!("refs/heads/{current}")).unwrap();
+        let output = run_tree_command(dir.path(), &["--upstream", "main"]);
+        for branch in ["feature-a", "feature-b", "unrelated", "joined"] {
+            assert!(
+                output.contains(branch),
+                "Missing {branch} from {current}:\n{output}"
+            );
+        }
+    }
+}
+
 /// Test tree output shows proper hierarchical structure with box-drawing characters
 #[test]
 fn test_tree_shows_proper_structure() {
