@@ -18,7 +18,10 @@
 mod common;
 use common::repo_init;
 use git2::{Repository, Signature};
-use kindra::stack::{get_full_stack_branches_for_head, get_stack_branches_from_merge_base};
+use kindra::stack::{
+    StackBranch, get_full_stack_branches_for_head, get_stack_branches_from_merge_base,
+    plan_tree_sync, resolve_merge_base,
+};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
@@ -99,6 +102,44 @@ fn branch_with_commits(
                 &sig,
                 &sig,
                 &format!("branch c{}", i + 1),
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+    }
+    tip
+}
+
+/// Create `name` at `base_oid` with `count` commits that each change a file, so
+/// the branch has a real diff. The shared `branch_with_commits` reuses its
+/// parent's tree, which makes a branch look like it carries no changes at all.
+fn branch_with_content_commits(
+    repo: &Repository,
+    name: &str,
+    base_oid: git2::Oid,
+    count: u32,
+) -> git2::Oid {
+    let refname = format!("refs/heads/{name}");
+    let sig = Signature::now("perf", "perf@test.com").unwrap();
+    let mut tip = base_oid;
+
+    for i in 0..count {
+        let parent = repo.find_commit(tip).unwrap();
+        let mut builder = repo.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+        let blob = repo
+            .blob(format!("{name} commit {i}\ncontent line\n").as_bytes())
+            .unwrap();
+        builder
+            .insert(format!("{name}-{i}.txt"), blob, 0o100644)
+            .unwrap();
+        let tree_id = builder.write().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        tip = repo
+            .commit(
+                Some(&refname),
+                &sig,
+                &sig,
+                &format!("{name}: commit {i}"),
                 &tree,
                 &[&parent],
             )
@@ -309,5 +350,93 @@ fn full_stack_discovery_is_proportional_to_stack_size_not_branch_count() {
     eprintln!(
         "✓ Full stack discovery: {avg:?} avg over {RUNS} runs \
          (2-branch stack, {MAIN_COMMITS}-commit main, {NOISE_BRANCHES} unrelated branches)"
+    );
+}
+
+/// Planning a tree sync asks the same questions about the same local branches
+/// once per branch in the stack. Answering them per branch makes the plan cost
+/// stack size × local branches graph walks, which on a repo with a few hundred
+/// branches dominates `kin sync` before a single rebase starts.
+///
+///   main (1000 commits)
+///     └ a stack of 20 branches
+///   plus 400 unrelated local branches
+#[test]
+fn tree_sync_planning_is_proportional_to_stack_not_local_branch_count() {
+    const STACK_BRANCHES: u32 = 20;
+    const NOISE_BRANCHES: usize = 400;
+
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let _pre = append_commits(&repo, "refs/heads/main", 1000);
+    let fork_point = repo.refname_to_id("refs/heads/main").unwrap();
+
+    // A linear stack, each branch two commits above the one below it.
+    let mut tip = fork_point;
+    let mut stack = Vec::new();
+    for i in 0..STACK_BRANCHES {
+        let name = format!("stack-{i}");
+        tip = branch_with_content_commits(&repo, &name, tip, 2);
+        stack.push(StackBranch { name, id: tip });
+    }
+
+    let upstream_tip = append_commits(&repo, "refs/heads/main", 50);
+
+    // Unrelated branches, spread across main so they do not share one boundary.
+    let main_commits: Vec<git2::Oid> = {
+        let mut walk = repo.revwalk().unwrap();
+        walk.push(upstream_tip).unwrap();
+        walk.collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .filter(|&oid| oid != fork_point)
+            .collect()
+    };
+    let step = (main_commits.len() / (NOISE_BRANCHES + 1)).max(1);
+    for (i, &base) in main_commits
+        .iter()
+        .step_by(step)
+        .take(NOISE_BRANCHES)
+        .enumerate()
+    {
+        branch_with_commits(&repo, &format!("noise-{i}"), base, 1);
+    }
+
+    pack_objects(dir.path());
+
+    let merge_base = resolve_merge_base(&repo, upstream_tip, tip).unwrap();
+    let _ = plan_tree_sync(&repo, &stack, "main", merge_base).unwrap();
+
+    const RUNS: u32 = 3;
+    let mut total = Duration::ZERO;
+    for _ in 0..RUNS {
+        let start = Instant::now();
+        let _ = plan_tree_sync(&repo, &stack, "main", merge_base).unwrap();
+        total += start.elapsed();
+    }
+    let avg = total / RUNS;
+
+    let plan = plan_tree_sync(&repo, &stack, "main", merge_base).unwrap();
+    assert_eq!(
+        plan.remaining.len(),
+        STACK_BRANCHES as usize,
+        "every stack branch should be planned for a rebase, got {:?}",
+        plan.remaining
+    );
+
+    // Answering the branch-independent questions once leaves this well under a
+    // second. Re-asking them per branch takes tens of seconds on a stack and a
+    // branch list this size.
+    assert!(
+        avg < Duration::from_secs(4),
+        "Tree sync planning averaged {avg:?} over {RUNS} runs — expected <4s.\n\
+         This suggests the per-branch scan over every local branch is back.\n\
+         Scenario: {STACK_BRANCHES}-branch stack, 1050-commit main, {NOISE_BRANCHES} unrelated branches."
+    );
+
+    eprintln!(
+        "✓ Tree sync planning: {avg:?} avg over {RUNS} runs \
+         ({STACK_BRANCHES}-branch stack, {NOISE_BRANCHES} unrelated branches)"
     );
 }
