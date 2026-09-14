@@ -2468,14 +2468,22 @@ pub(crate) struct TipAncestry {
 }
 
 impl TipAncestry {
-    /// Record ancestry between `tips`, walking no further back than `boundary`.
+    /// Record ancestry between `tips`, or `None` when they share no common
+    /// ancestor to bound the walk and the caller must query the graph directly.
     ///
-    /// `boundary` must be an ancestor of every tip. Commits at or below it are
-    /// shared by all tips and so cannot distinguish them, which is what keeps
-    /// the walk proportional to the stack instead of to all of history.
-    pub(crate) fn new(repo: &Repository, tips: &[Oid], boundary: Oid) -> Result<Self> {
+    /// The bound is `merge_base_octopus`, the commit every tip descends from.
+    /// Commits at or below it are shared by all tips and so cannot distinguish
+    /// them, which is what keeps the walk proportional to the stack instead of
+    /// to all of history. Note that `merge_base_many` is not usable here: it
+    /// bases the later commits against a hypothetical merge of them, so it can
+    /// return a commit some tip does not descend from, and bounding the walk
+    /// there would hide that tip's ancestry and drop edges.
+    pub(crate) fn new(repo: &Repository, tips: &[Oid]) -> Result<Option<Self>> {
+        let Ok(boundary) = repo.merge_base_octopus(tips) else {
+            return Ok(None);
+        };
         let mut slots: HashMap<Oid, usize> = HashMap::new();
-        for &tip in tips.iter().chain(std::iter::once(&boundary)) {
+        for &tip in tips {
             let next = slots.len();
             slots.entry(tip).or_insert(next);
         }
@@ -2514,17 +2522,19 @@ impl TipAncestry {
             }
         }
 
-        Ok(Self { slots, descendants })
+        Ok(Some(Self { slots, descendants }))
     }
 
-    /// Ancestry for every branch in `branches`, bounded by `boundary`.
+    /// Ancestry for every branch in `branches`, with `merge_base` included so
+    /// it can be compared against too.
     pub(crate) fn for_branches(
         repo: &Repository,
         branches: &[StackBranch],
-        boundary: Oid,
-    ) -> Result<Self> {
-        let tips = branches.iter().map(|b| b.id).collect::<Vec<_>>();
-        Self::new(repo, &tips, boundary)
+        merge_base: Oid,
+    ) -> Result<Option<Self>> {
+        let mut tips = branches.iter().map(|b| b.id).collect::<Vec<_>>();
+        tips.push(merge_base);
+        Self::new(repo, &tips)
     }
 
     /// Whether `descendant` is a strict descendant of `ancestor`, matching
@@ -2570,27 +2580,37 @@ impl DisjointSet {
     }
 }
 
+/// Whether `a` is a strict descendant of `b`, answered from `ancestry` when it
+/// could be built and from the commit graph otherwise.
+fn descends(repo: &Repository, ancestry: Option<&TipAncestry>, a: Oid, b: Oid) -> Result<bool> {
+    match ancestry {
+        Some(ancestry) => Ok(ancestry.is_descendant(a, b)),
+        None => is_descendant(repo, a, b),
+    }
+}
+
 /// The deepest branch in `all_branches` that `branch` descends from, or
 /// `merge_base` when it descends from none of them.
 fn nearest_parent_in_stack(
-    ancestry: &TipAncestry,
+    repo: &Repository,
+    ancestry: Option<&TipAncestry>,
     branch: &StackBranch,
     all_branches: &[StackBranch],
     merge_base: Oid,
-) -> Oid {
+) -> Result<Oid> {
     let mut best_parent = merge_base;
     for b in all_branches {
         if b.name == branch.name || b.id == branch.id {
             continue;
         }
-        if !ancestry.is_descendant(branch.id, b.id) {
+        if !descends(repo, ancestry, branch.id, b.id)? {
             continue;
         }
-        if best_parent == merge_base || ancestry.is_descendant(b.id, best_parent) {
+        if best_parent == merge_base || descends(repo, ancestry, b.id, best_parent)? {
             best_parent = b.id;
         }
     }
-    best_parent
+    Ok(best_parent)
 }
 
 pub fn find_parent_in_stack(
@@ -2605,12 +2625,7 @@ pub fn find_parent_in_stack(
         .ok_or_else(|| anyhow!("Branch '{}' not found in stack.", branch_name))?;
 
     let ancestry = TipAncestry::for_branches(repo, all_branches, merge_base)?;
-    Ok(nearest_parent_in_stack(
-        &ancestry,
-        branch,
-        all_branches,
-        merge_base,
-    ))
+    nearest_parent_in_stack(repo, ancestry.as_ref(), branch, all_branches, merge_base)
 }
 
 /// [`find_parent_in_stack`] for every branch at once, sharing a single ancestry
@@ -2621,15 +2636,13 @@ pub fn find_parents_in_stack(
     merge_base: Oid,
 ) -> Result<HashMap<String, Oid>> {
     let ancestry = TipAncestry::for_branches(repo, all_branches, merge_base)?;
-    Ok(all_branches
-        .iter()
-        .map(|branch| {
-            (
-                branch.name.clone(),
-                nearest_parent_in_stack(&ancestry, branch, all_branches, merge_base),
-            )
-        })
-        .collect())
+    let mut parents = HashMap::new();
+    for branch in all_branches {
+        let parent =
+            nearest_parent_in_stack(repo, ancestry.as_ref(), branch, all_branches, merge_base)?;
+        parents.insert(branch.name.clone(), parent);
+    }
+    Ok(parents)
 }
 
 fn parent_base_spec(parent_id: Oid, branch_name: &str, all_branches: &[StackBranch]) -> String {
@@ -2650,14 +2663,14 @@ pub fn sort_branches_topologically(repo: &Repository, branches: &mut [StackBranc
     let mut indegree = vec![0usize; original.len()];
 
     // Ordering needs the ancestry of every pair, so precompute it in one walk.
-    // The octopus merge base bounds that walk and is an ancestor of every tip,
-    // as required. It is undefined for branches with no common ancestor, in
-    // which case fall back to asking the graph pair by pair.
+    // That walk has to be bounded by a commit every tip descends from, which is
+    // what merge_base_octopus returns. merge_base_many is not interchangeable
+    // here: it bases the later commits against a hypothetical merge of them, so
+    // its result can be a commit some tip does not descend from, which would
+    // prune that tip out of the walk. No common ancestor exists for unrelated
+    // tips, in which case fall back to asking the graph pair by pair.
     let tips = original.iter().map(|b| b.id).collect::<Vec<_>>();
-    let ancestry = match repo.merge_base_many(&tips) {
-        Ok(boundary) => Some(TipAncestry::new(repo, &tips, boundary)?),
-        Err(_) => None,
-    };
+    let ancestry = TipAncestry::new(repo, &tips)?;
 
     for (idx, branch) in original.iter().enumerate() {
         for (other_idx, other) in original.iter().enumerate() {
@@ -2665,11 +2678,7 @@ pub fn sort_branches_topologically(repo: &Repository, branches: &mut [StackBranc
                 continue;
             }
 
-            let descends = match &ancestry {
-                Some(ancestry) => ancestry.is_descendant(branch.id, other.id),
-                None => is_descendant(repo, branch.id, other.id)?,
-            };
-            if descends {
+            if descends(repo, ancestry.as_ref(), branch.id, other.id)? {
                 outgoing[other_idx].push(idx);
                 indegree[idx] += 1;
             }
