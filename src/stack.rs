@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::process::Command;
 use std::process::Stdio;
+use std::rc::Rc;
 
 #[derive(Clone, Debug)]
 pub struct StackBranch {
@@ -119,11 +120,144 @@ impl TargetPathHistory {
     }
 }
 
+/// Reachability answers that [`find_sync_boundary`] needs for every local branch
+/// in the repository.
+///
+/// None of them depend on which branch's boundary is being computed, only on
+/// the stack's merge base and its upstream. Computing them once per sync rather
+/// than once per branch is what stops a tree sync from costing
+/// branches × local branches graph walks.
+#[derive(Default)]
+pub struct SyncScanCache {
+    /// The `(merge_base, upstream_id)` the entries below were built for.
+    key: Option<(Oid, Oid)>,
+    /// Local branches that sit above the merge base, so could be in a lineage.
+    candidates: Vec<(String, Oid)>,
+    /// Whether upstream already contains a branch tip.
+    in_upstream: HashMap<Oid, bool>,
+    /// Paths a commit range touches, by `(base, tip)`. The lineages of a tree
+    /// stack overlap heavily, so the same ranges are asked for repeatedly.
+    touched_paths: HashMap<(Oid, Oid), Rc<Vec<String>>>,
+    /// Target history indexed by the exact path set it was loaded for.
+    histories: HashMap<Vec<String>, Rc<TargetPathHistory>>,
+}
+
+impl SyncScanCache {
+    /// Local branches that could belong to a stack lineage, with everything
+    /// that does not depend on the lineage's tip already filtered out.
+    fn candidates(
+        &mut self,
+        repo: &Repository,
+        merge_base: Oid,
+        upstream_id: Oid,
+        upstream_name: &str,
+    ) -> Result<&[(String, Oid)]> {
+        if self.key == Some((merge_base, upstream_id)) {
+            return Ok(&self.candidates);
+        }
+
+        let upstream_ref_name = repo
+            .resolve_reference_from_short_name(upstream_name)
+            .ok()
+            .and_then(|r| r.name().map(|s| s.to_string()));
+
+        let mut candidates = Vec::new();
+        for res in repo.branches(Some(git2::BranchType::Local))? {
+            let (branch, _) = res?;
+            let Some(name) = branch.name()? else { continue };
+            let name = name.to_string();
+            if name == upstream_name {
+                continue;
+            }
+            let Some(id) = branch.get().target() else {
+                continue;
+            };
+
+            if let Some(ref ref_name) = upstream_ref_name {
+                if branch.get().name() == Some(ref_name) {
+                    continue;
+                }
+                if let Ok(upstream) = branch.upstream()
+                    && upstream.get().name() == Some(ref_name)
+                {
+                    continue;
+                }
+            }
+
+            // A lineage runs from the merge base up, so a branch below it can
+            // never be in one, whichever tip is being asked about.
+            if !(repo.graph_descendant_of(id, merge_base)? || id == merge_base) {
+                continue;
+            }
+            candidates.push((name, id));
+        }
+
+        self.candidates = candidates;
+        self.in_upstream.clear();
+        self.key = Some((merge_base, upstream_id));
+        Ok(&self.candidates)
+    }
+
+    fn in_upstream(&mut self, repo: &Repository, upstream_id: Oid, id: Oid) -> Result<bool> {
+        if let Some(known) = self.in_upstream.get(&id) {
+            return Ok(*known);
+        }
+        let contained = upstream_id == id || repo.graph_descendant_of(upstream_id, id)?;
+        self.in_upstream.insert(id, contained);
+        Ok(contained)
+    }
+
+    fn touched_paths(
+        &mut self,
+        repo: &Repository,
+        base_id: Oid,
+        tip: Oid,
+    ) -> Result<Rc<Vec<String>>> {
+        if let Some(known) = self.touched_paths.get(&(base_id, tip)) {
+            return Ok(Rc::clone(known));
+        }
+        let paths = Rc::new(range_touched_paths(repo, base_id, tip)?);
+        self.touched_paths.insert((base_id, tip), Rc::clone(&paths));
+        Ok(paths)
+    }
+
+    fn history(
+        &mut self,
+        repo: &Repository,
+        target_tip: Oid,
+        paths: &[String],
+    ) -> Result<Rc<TargetPathHistory>> {
+        if let Some(known) = self.histories.get(paths) {
+            return Ok(Rc::clone(known));
+        }
+        let history = Rc::new(TargetPathHistory::load(repo, target_tip, paths)?);
+        self.histories.insert(paths.to_vec(), Rc::clone(&history));
+        Ok(history)
+    }
+}
+
 pub fn find_sync_boundary(
     repo: &Repository,
     top_branch: &str,
     upstream_name: &str,
     stack_branches: &[StackBranch],
+) -> Result<SyncBoundary> {
+    find_sync_boundary_cached(
+        repo,
+        top_branch,
+        upstream_name,
+        stack_branches,
+        &mut SyncScanCache::default(),
+    )
+}
+
+/// [`find_sync_boundary`] reusing `cache` across the branches of one stack.
+pub fn find_sync_boundary_cached(
+    repo: &Repository,
+    top_branch: &str,
+    upstream_name: &str,
+    stack_branches: &[StackBranch],
+    cache: &mut SyncScanCache,
 ) -> Result<SyncBoundary> {
     let top_id = repo.revparse_single(top_branch)?.id();
     let upstream_id = repo.revparse_single(upstream_name)?.id();
@@ -133,7 +267,7 @@ pub fn find_sync_boundary(
     let mut merged_branches = HashSet::new();
     let mut branch_cutoff = merge_base;
     for branch in lineage.iter().take(lineage.len().saturating_sub(1)) {
-        if !branch_segment_integrated(repo, branch_cutoff, branch.id, upstream_id)? {
+        if !branch_segment_integrated(repo, branch_cutoff, branch.id, upstream_id, cache)? {
             break;
         }
 
@@ -144,7 +278,7 @@ pub fn find_sync_boundary(
     let first_parent_chain = collect_first_parent_chain(repo, branch_cutoff, top_id)?;
     let prefix_touched_paths = first_parent_chain
         .iter()
-        .map(|&commit_id| range_touched_paths(repo, branch_cutoff, commit_id))
+        .map(|&commit_id| cache.touched_paths(repo, branch_cutoff, commit_id))
         .collect::<Result<Vec<_>>>()?;
     let mut union_paths = prefix_touched_paths
         .iter()
@@ -153,7 +287,7 @@ pub fn find_sync_boundary(
         .into_iter()
         .collect::<Vec<_>>();
     union_paths.sort();
-    let target_history = TargetPathHistory::load(repo, upstream_id, &union_paths)?;
+    let target_history = cache.history(repo, upstream_id, &union_paths)?;
     let mut prefix_end: isize = -1;
 
     for (idx, (&commit_id, touched_paths)) in first_parent_chain
@@ -180,51 +314,22 @@ pub fn find_sync_boundary(
         }
     }
 
-    let local_branches = repo.branches(Some(git2::BranchType::Local))?;
-
-    let upstream_ref_name = repo
-        .resolve_reference_from_short_name(upstream_name)
-        .ok()
-        .and_then(|r| r.name().map(|s| s.to_string()));
-
-    for res in local_branches {
-        let (branch, _) = res?;
-        let name = match branch.name()? {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-        if name == upstream_name {
-            continue;
-        }
-        let id = match branch.get().target() {
-            Some(id) => id,
-            None => continue,
-        };
-
-        if let Some(ref ref_name) = upstream_ref_name {
-            if branch.get().name() == Some(ref_name) {
-                continue;
-            }
-            if let Ok(upstream) = branch.upstream()
-                && upstream.get().name() == Some(ref_name)
-            {
-                continue;
-            }
-        }
-
-        // Is this branch part of the stack?
-        // We define it as an ancestor of top_branch and descendant of merge_base.
-        let is_in_stack_lineage = (repo.graph_descendant_of(top_id, id)? || top_id == id)
-            && (repo.graph_descendant_of(id, merge_base)? || id == merge_base);
-
-        if !is_in_stack_lineage {
+    // Candidates are the local branches above the merge base; the rest can
+    // never be in this lineage. Only the question that depends on `top_id` is
+    // left to ask per branch.
+    let candidates = cache
+        .candidates(repo, merge_base, upstream_id, upstream_name)?
+        .to_vec();
+    for (name, id) in candidates {
+        // Is this branch part of the stack? An ancestor of top_branch, and (via
+        // the cache) a descendant of merge_base.
+        if !(repo.graph_descendant_of(top_id, id)? || top_id == id) {
             continue;
         }
 
-        let merged_by_content = merged_branches.contains(&name);
-        let merged_by_graph = repo.graph_descendant_of(upstream_id, id)? || upstream_id == id;
-
-        if merged_by_graph || merged_by_content {
+        // A branch already recorded as merged by content stays recorded, so only
+        // graph containment can add to the set here.
+        if cache.in_upstream(repo, upstream_id, id)? {
             merged_branches.insert(name);
         }
     }
@@ -679,13 +784,16 @@ pub fn collect_merged_local_branches(
     }
 
     let mut merged_branches = Vec::new();
+    // Branches here share ranges and path sets, so the memoised lookups pay off
+    // across the loop even though the per-stack answers are not reused.
+    let mut cache = SyncScanCache::default();
     for (name, branch_id) in branches {
         let merged_by_graph =
             target_id == branch_id || repo.graph_descendant_of(target_id, branch_id)?;
         let merged_by_content = if merged_by_graph {
             false
         } else if let Ok(merge_base) = repo.merge_base(branch_id, target_id) {
-            range_changes_present_in_target(repo, merge_base, branch_id, target_id)?
+            range_changes_present_in_target(repo, merge_base, branch_id, target_id, &mut cache)?
         } else {
             false
         };
@@ -1706,14 +1814,15 @@ fn range_changes_present_in_target(
     base_id: Oid,
     branch_tip: Oid,
     target_tip: Oid,
+    cache: &mut SyncScanCache,
 ) -> Result<bool> {
-    let touched_paths = range_touched_paths(repo, base_id, branch_tip)?;
+    let touched_paths = cache.touched_paths(repo, base_id, branch_tip)?;
 
     if touched_paths.is_empty() {
         return Ok(true);
     }
 
-    let target_history = TargetPathHistory::load(repo, target_tip, &touched_paths)?;
+    let target_history = cache.history(repo, target_tip, &touched_paths)?;
     range_changes_present_in_target_with_history(
         repo,
         base_id,
@@ -1891,12 +2000,13 @@ fn branch_segment_integrated(
     old_base: Oid,
     branch_tip: Oid,
     upstream_id: Oid,
+    cache: &mut SyncScanCache,
 ) -> Result<bool> {
     if repo.graph_descendant_of(upstream_id, branch_tip)? {
         return Ok(true);
     }
 
-    range_changes_present_in_target(repo, old_base, branch_tip, upstream_id)
+    range_changes_present_in_target(repo, old_base, branch_tip, upstream_id, cache)
 }
 
 fn repo_root(repo: &Repository) -> Result<&Path> {
@@ -2888,8 +2998,13 @@ pub fn plan_tree_sync(
     let mut bases = HashMap::new();
     let mut parents = HashMap::new();
     let mut merged = HashSet::new();
+    // One cache for the whole stack: every branch asks the same questions about
+    // the same local branches, and they only depend on the merge base and
+    // upstream.
+    let mut scan_cache = SyncScanCache::default();
     for branch in &ordered {
-        let boundary = find_sync_boundary(repo, &branch.name, upstream, branches)?;
+        let boundary =
+            find_sync_boundary_cached(repo, &branch.name, upstream, branches, &mut scan_cache)?;
         merged.extend(boundary.merged_branches);
         let Some(mut base) = boundary.old_base else {
             continue;
