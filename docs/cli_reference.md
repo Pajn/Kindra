@@ -603,12 +603,14 @@ To do it deliberately anyway — say you maintain a fork's `main` from a local b
 ```bash
 kin run -c <command>
 kin run --command <command>
+kin run --tree --command <command>
 kin run --continue-on-failure --command <command>
 ```
 
 **Arguments:**
 - `-c, --command <command>`: The shell command to run on each branch. Required.
 - `--continue-on-failure`: If the command fails on a branch, continue to the next branch instead of stopping. By default, the command stops on the first failure.
+- `--tree`: Run on every branch in the stack component, including branches that fork off below HEAD, instead of only those on HEAD's own line of descent.
 
 **What it does:**
 - Discovers stack branches from the current HEAD using the same logic as other Kindra commands.
@@ -616,10 +618,25 @@ kin run --continue-on-failure --command <command>
 - For each branch:
   - Prints a header `=== Running on <branch> ===`
   - Checks out the branch
-  - Executes the command via `sh -c`
+  - Executes the command via `sh -c`, with the environment below set
   - Prints stdout and stderr
 - Returns to the original branch when done.
 - Prints a summary showing success/failure counts and any failed branches.
+
+**Scope.** By default `kin run` visits only the branches on HEAD's line of descent, so a branch that forks off below HEAD is skipped. `--tree` widens the run to the whole connected component — the same set `kin tree` draws and `kin sync` rebases — anchored on the component HEAD belongs to, which also works from a detached HEAD. Ordering holds in either scope: a branch is always visited after everything it is stacked on.
+
+**Environment.** Each command runs with:
+
+| Variable | Value |
+| --- | --- |
+| `KINDRA_BRANCH` | The branch checked out for this iteration. |
+| `KINDRA_PARENT` | The branch it is stacked on, or `KINDRA_BASE` for a branch sitting directly on the base. |
+| `KINDRA_BASE` | The stack's base branch, as Kindra resolved it. |
+| `KINDRA_INDEX`, `KINDRA_TOTAL` | Position in the run, counting from 1, and the number of branches. |
+
+Parentage is resolved once, before the first checkout, and describes the stack as it was when the run started — a command that creates commits moves branch tips as it goes, and does not change the parent reported for later branches. `KINDRA_BASE` is the base branch exactly as Kindra resolved it, which is a remote-qualified ref (`origin/main`) in a repo whose base branch exists only on a remote; strip the remote with `${KINDRA_BASE#origin/}` if the command needs a local branch name.
+
+The command's stdin is closed and its output is printed after it exits, so `kin run` drives non-interactive commands. A command that would prompt should be given the answer as a flag.
 
 **When to use it:** Use this to run tests, linters, builds, or any other commands across all branches in your stack. For example, running `cargo test` on each branch to verify tests pass before creating PRs.
 
@@ -634,6 +651,11 @@ kin run --continue-on-failure -c "cargo clippy"
 
 # Run a custom command
 kin run -c "echo 'Hello from $(git branch --show-current)'"
+
+# Register the whole stack, forks included, with an external stacking tool that
+# needs each branch's parent. Base-to-tip order means a parent is always
+# registered before the branches stacked on it.
+kin run --tree -c 'gt track --parent "$KINDRA_PARENT"'
 ```
 
 ---

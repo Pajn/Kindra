@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::Args;
 use git2::Repository;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -21,6 +22,12 @@ pub struct RunArgs {
     /// Continue on failure instead of stopping at the first error
     #[arg(long)]
     pub continue_on_failure: bool,
+
+    /// Run on every branch in the stack component, including branches that fork
+    /// off below HEAD, instead of only those on HEAD's own line of descent
+    #[arg(long)]
+    #[serde(default, skip)]
+    pub tree: bool,
 
     /// Stash uncommitted changes for the duration of the run and restore them
     /// when it finishes (defaults to the rebase.autostash config)
@@ -45,6 +52,18 @@ pub(crate) enum RunStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RunState {
     pub target_branches: Vec<String>,
+    /// Each target branch's parent, as the stack looked when the run started.
+    /// Exported to the command as `KINDRA_PARENT`. Fixed up front on purpose: a
+    /// command that commits moves branch tips as the run proceeds, and the
+    /// parentage the user asked about is the one they could see when they typed
+    /// the command.
+    #[serde(default)]
+    pub parent_branches: HashMap<String, String>,
+    /// The stack's base branch, exported as `KINDRA_BASE`. Exactly as Kindra
+    /// resolved it, so it can be a remote-qualified ref (`origin/main`) in a repo
+    /// whose base exists only on a remote.
+    #[serde(default)]
+    pub base_branch: String,
     pub current_index: usize,
     pub args: RunArgs,
     pub original_branch: Option<String>,
@@ -97,8 +116,33 @@ fn run_locked(repo: &git2::Repository, args: &RunArgs) -> Result<()> {
         return Ok(());
     }
 
+    if args.tree {
+        // Widen from HEAD's line of descent to the whole component, the scope
+        // `kin tree` draws and `kin sync` rebases. Any member anchors the same
+        // component, so a detached HEAD — which has no branch of its own — is
+        // served by anchoring on a branch of the line of descent instead of
+        // quietly falling back to the narrower scope the flag asked to leave.
+        let anchor = current_branch_name
+            .as_deref()
+            .filter(|name| stack_branches.iter().any(|b| &b.name == name))
+            .unwrap_or(stack_branches[0].name.as_str());
+        stack_branches = crate::stack::collect_stack_component(
+            repo,
+            anchor,
+            merge_base,
+            upstream_id,
+            &upstream_name,
+        )?;
+    }
+
     // Sort from base to tips (topological order)
     sort_branches_topologically(repo, &mut stack_branches)?;
+
+    // Resolve parentage once, against the same branch set the run will walk, so
+    // the command can act on the stack's shape (`KINDRA_PARENT`) without
+    // re-deriving it in shell.
+    let parent_branches =
+        crate::stack::current_parent_name_map(repo, &stack_branches, merge_base, &upstream_name)?;
 
     // Enforce the uniform clean-or-autostash contract before checking out any
     // branch, so uncommitted changes never travel across the stack.
@@ -110,6 +154,8 @@ fn run_locked(repo: &git2::Repository, args: &RunArgs) -> Result<()> {
 
     let mut run_state = RunState {
         target_branches: stack_branches.into_iter().map(|b| b.name).collect(),
+        parent_branches,
+        base_branch: upstream_name.clone(),
         current_index: 0,
         args: args.clone(),
         original_branch: current_branch_name,
@@ -215,6 +261,27 @@ fn mark_aborted(
     persist_run_state(repo, run_state)
 }
 
+/// Describe the branch being visited to the command being run.
+///
+/// The stack's shape is the part a shell cannot recover on its own: `git` can
+/// answer "which branch am I on", but "what is this branch stacked on" is
+/// Kindra's answer to give. Exporting it is what lets an external stacking tool
+/// be driven over a Kindra stack without Kindra knowing about that tool.
+///
+/// `KINDRA_PARENT` is left unset rather than guessed if the branch is somehow
+/// absent from the map, so a command that depends on it fails instead of acting
+/// on the wrong parent.
+fn export_branch_env(command: &mut Command, run_state: &RunState, branch: &str) {
+    command
+        .env("KINDRA_BRANCH", branch)
+        .env("KINDRA_BASE", &run_state.base_branch)
+        .env("KINDRA_INDEX", (run_state.current_index + 1).to_string())
+        .env("KINDRA_TOTAL", run_state.target_branches.len().to_string());
+    if let Some(parent) = run_state.parent_branches.get(branch) {
+        command.env("KINDRA_PARENT", parent);
+    }
+}
+
 fn execute_run(repo: &Repository, run_state: &mut RunState) -> Result<()> {
     let mut success_count = 0usize;
     let mut failure_count = 0usize;
@@ -238,10 +305,10 @@ fn execute_run(repo: &Repository, run_state: &mut RunState) -> Result<()> {
             continue;
         }
 
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(&run_state.args.command)
-            .output();
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(&run_state.args.command);
+        export_branch_env(&mut command, run_state, &branch);
+        let output = command.output();
 
         match output {
             Ok(output) => {

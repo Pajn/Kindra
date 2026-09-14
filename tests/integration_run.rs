@@ -315,3 +315,190 @@ fn run_autostash_restored_after_continue_on_failure_run() {
         "a completed continue-on-failure run must leave no blocking state"
     );
 }
+
+/// `setup_run_repo`'s stack plus a branch forking off `feature-a`, so HEAD's line
+/// of descent (`feature-a`, `feature-b`) is a strict subset of the component.
+/// HEAD is left on `feature-b`, from which `feature-c` is invisible by default.
+fn setup_forked_run_repo() -> TempDir {
+    let dir = setup_run_repo();
+
+    run_ok("git", &["checkout", "feature-a"], dir.path());
+    run_ok("git", &["checkout", "-b", "feature-c"], dir.path());
+    fs::write(dir.path().join("c.txt"), "c").unwrap();
+    run_ok("git", &["add", "c.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "feature-c"], dir.path());
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    dir
+}
+
+/// The command is told which branch it is on, what that branch is stacked on, and
+/// where it sits in the run. The parent is the piece a shell cannot derive on its
+/// own, and is what lets an external stacking tool be driven over a Kindra stack.
+#[test]
+fn run_exports_branch_parent_and_base_to_the_command() {
+    let dir = setup_run_repo();
+    let log_path = dir.path().join("run.log");
+
+    let mut cmd = kin_cmd();
+    cmd.arg("run")
+        .arg("--command")
+        .arg(
+            "echo \"$KINDRA_INDEX/$KINDRA_TOTAL $KINDRA_BRANCH parent=$KINDRA_PARENT base=$KINDRA_BASE\" >> run.log",
+        )
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    assert_eq!(
+        read_lines(&log_path),
+        vec![
+            // The branch at the bottom of the stack reports the base as its parent.
+            "1/2 feature-a parent=main base=main",
+            "2/2 feature-b parent=feature-a base=main",
+        ],
+    );
+}
+
+/// The exported branch is the one actually checked out, not merely the name
+/// Kindra planned to visit.
+#[test]
+fn exported_branch_matches_the_checked_out_branch() {
+    let dir = setup_run_repo();
+    let log_path = dir.path().join("run.log");
+
+    let mut cmd = kin_cmd();
+    cmd.arg("run")
+        .arg("--command")
+        .arg("echo \"$KINDRA_BRANCH:$(git branch --show-current)\" >> run.log")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    assert_eq!(
+        read_lines(&log_path),
+        vec!["feature-a:feature-a", "feature-b:feature-b"],
+    );
+}
+
+/// Without `--tree`, the run stays on HEAD's line of descent.
+#[test]
+fn run_without_tree_skips_branches_forking_below_head() {
+    let dir = setup_forked_run_repo();
+    let log_path = dir.path().join("run.log");
+
+    let mut cmd = kin_cmd();
+    cmd.arg("run")
+        .arg("--command")
+        .arg("echo \"$KINDRA_BRANCH\" >> run.log")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    assert_eq!(read_lines(&log_path), vec!["feature-a", "feature-b"]);
+}
+
+/// `--tree` widens to the whole component — the scope `kin tree` draws — and
+/// reports each branch's parent within it.
+#[test]
+fn run_tree_covers_branches_forking_below_head() {
+    let dir = setup_forked_run_repo();
+    let log_path = dir.path().join("run.log");
+
+    let mut cmd = kin_cmd();
+    cmd.arg("run")
+        .arg("--tree")
+        .arg("--command")
+        .arg("echo \"$KINDRA_BRANCH parent=$KINDRA_PARENT\" >> run.log")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let lines = read_lines(&log_path);
+    assert!(
+        lines.contains(&"feature-c parent=feature-a".to_string()),
+        "the branch forking below HEAD should be visited, got:\n{lines:?}",
+    );
+    assert_eq!(
+        lines.len(),
+        3,
+        "expected the whole component, got:\n{lines:?}"
+    );
+    assert_eq!(
+        lines[0], "feature-a parent=main",
+        "the run must still start at the base of the stack, got:\n{lines:?}",
+    );
+    assert_eq!(current_branch(dir.path()), "feature-b");
+}
+
+/// Order is the contract that makes `--tree` usable for tools that require a
+/// branch's parent to be registered before the branch itself: every parent is
+/// visited before its children, even across a fork.
+#[test]
+fn run_tree_visits_every_parent_before_its_children() {
+    let dir = setup_forked_run_repo();
+    // A second branch above the fork, so the ordering claim covers a deeper
+    // subtree than the fork point itself.
+    run_ok("git", &["checkout", "feature-c"], dir.path());
+    run_ok("git", &["checkout", "-b", "feature-d"], dir.path());
+    fs::write(dir.path().join("d.txt"), "d").unwrap();
+    run_ok("git", &["add", "d.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "feature-d"], dir.path());
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let log_path = dir.path().join("run.log");
+    let mut cmd = kin_cmd();
+    cmd.arg("run")
+        .arg("--tree")
+        .arg("--command")
+        .arg("echo \"$KINDRA_BRANCH $KINDRA_PARENT\" >> run.log")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let mut seen: Vec<String> = vec!["main".to_string()];
+    for line in read_lines(&log_path) {
+        let (branch, parent) = line
+            .split_once(' ')
+            .expect("branch and parent on each line");
+        assert!(
+            seen.contains(&parent.to_string()),
+            "'{branch}' was visited before its parent '{parent}'; order was:\n{seen:?}",
+        );
+        seen.push(branch.to_string());
+    }
+    assert_eq!(
+        seen.len(),
+        5,
+        "expected the whole component, got:\n{seen:?}"
+    );
+}
+
+/// A detached HEAD has no branch to anchor the component on. `--tree` must still
+/// mean the component, rather than silently collapsing to the narrower scope the
+/// flag was passed to leave.
+#[test]
+fn run_tree_from_detached_head_still_covers_the_component() {
+    let dir = setup_forked_run_repo();
+    run_ok("git", &["checkout", "--detach", "feature-b"], dir.path());
+    let detached_head = git_stdout(dir.path(), &["rev-parse", "HEAD"]);
+
+    let log_path = dir.path().join("run.log");
+    let mut cmd = kin_cmd();
+    cmd.arg("run")
+        .arg("--tree")
+        .arg("--command")
+        .arg("echo \"$KINDRA_BRANCH\" >> run.log")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    assert_eq!(
+        read_lines(&log_path),
+        vec!["feature-a", "feature-b", "feature-c"],
+    );
+    assert_eq!(
+        git_stdout(dir.path(), &["rev-parse", "HEAD"]),
+        detached_head
+    );
+}
