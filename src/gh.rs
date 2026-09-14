@@ -96,6 +96,8 @@ pub struct PrReviewThread {
 pub struct OpenPr {
     pub number: u64,
     pub base_branch: String,
+    /// Whether the PR's head branch lives in a fork rather than this repository.
+    pub is_cross_repository: bool,
     pub is_draft: bool,
     pub author_login: Option<String>,
     pub title: String,
@@ -147,6 +149,8 @@ pub fn list_open_prs() -> Result<HashMap<String, OpenPr>> {
         number: u64,
         #[serde(rename = "headRefName", default)]
         head_ref_name: String,
+        #[serde(rename = "isCrossRepository", default)]
+        is_cross_repository: bool,
         #[serde(rename = "baseRefName", default)]
         base_ref_name: String,
         #[serde(rename = "isDraft", default)]
@@ -174,7 +178,7 @@ pub fn list_open_prs() -> Result<HashMap<String, OpenPr>> {
             "--limit",
             "500",
             "--json",
-            "number,headRefName,baseRefName,isDraft,author,title,body,url,labels,reviewRequests",
+            "number,headRefName,isCrossRepository,baseRefName,isDraft,author,title,body,url,labels,reviewRequests",
         ])
         .output()
         .context("Failed to run `gh pr list`")?;
@@ -187,7 +191,7 @@ pub fn list_open_prs() -> Result<HashMap<String, OpenPr>> {
     let items: Vec<PrListItem> =
         serde_json::from_slice(&output.stdout).context("Failed to parse `gh pr list` output")?;
 
-    let mut map = HashMap::with_capacity(items.len());
+    let mut map: HashMap<String, OpenPr> = HashMap::with_capacity(items.len());
     for item in items {
         if item.head_ref_name.is_empty() {
             continue;
@@ -198,20 +202,34 @@ pub fn list_open_prs() -> Result<HashMap<String, OpenPr>> {
             .into_iter()
             .filter_map(|r| r.requested_reviewer.and_then(|reviewer| reviewer.login))
             .collect();
-        map.insert(
-            item.head_ref_name.clone(),
-            OpenPr {
-                number: item.number,
-                base_branch: item.base_ref_name,
-                is_draft: item.is_draft,
-                author_login: item.author.map(|author| author.login),
-                title: item.title,
-                body: item.body,
-                url: item.url,
-                labels,
-                reviewers,
-            },
-        );
+        let pr = OpenPr {
+            number: item.number,
+            base_branch: item.base_ref_name,
+            is_cross_repository: item.is_cross_repository,
+            is_draft: item.is_draft,
+            author_login: item.author.map(|author| author.login),
+            title: item.title,
+            body: item.body,
+            url: item.url,
+            labels,
+            reviewers,
+        };
+        // Two open PRs can share a head branch name when one of them comes from
+        // a fork, and callers look branches up by name alone. A stack branch
+        // pushes to this repository, so prefer the PR whose head is here; let a
+        // fork's PR claim the name only when nothing in this repository does.
+        // Without this the last one parsed would win, and `pr edit` or
+        // `pr merge` could act on a contributor's PR.
+        match map.entry(item.head_ref_name.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut existing) => {
+                if existing.get().is_cross_repository && !pr.is_cross_repository {
+                    existing.insert(pr);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(pr);
+            }
+        }
     }
 
     Ok(map)

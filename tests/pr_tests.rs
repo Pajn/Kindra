@@ -3188,6 +3188,65 @@ exit 1
     assert!(stdout.contains("Failed checks: ci/test"));
 }
 
+/// A fork PR can share a head branch name with a local branch. Acting on the
+/// fork's PR would edit or merge someone else's work, so the PR whose head is
+/// in this repository has to win the name.
+#[test]
+fn pr_status_prefers_local_pr_over_fork_pr_with_same_branch_name() {
+    let dir = setup_pushed_feature();
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","isCrossRepository":false,"number":42,"title":"Local PR","body":"local","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[]},{"headRefName":"feature","isCrossRepository":true,"number":99,"title":"Fork PR","body":"fork","url":"https://github.com/test/repo/pull/99","state":"OPEN","labels":[],"reviewRequests":[]}]'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[]},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+
+    let output = kin_cmd()
+        .args(["pr", "status"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "kin pr status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("#42") && stdout.contains("Local PR"),
+        "Expected the PR in this repository. Got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("#99"),
+        "The fork's PR must not claim the branch name. Got:\n{stdout}"
+    );
+}
+
 #[test]
 fn pr_status_batches_gh_calls_across_the_stack() {
     let (dir, _repo) = setup_two_level_stack();
