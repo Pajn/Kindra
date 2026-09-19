@@ -726,6 +726,7 @@ fn summarize(op: &str, changes: &BTreeMap<String, Change>) -> String {
 fn operation_in_progress(repo: &Repository) -> bool {
     crate::rebase_utils::state_path(repo).exists()
         || crate::commands::run::run_state_exists(repo)
+        || crate::commands::checkout::hydration_in_progress(repo)
         || crate::rebase_utils::git_rebase_in_progress(repo)
 }
 

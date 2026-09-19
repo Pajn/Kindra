@@ -13,6 +13,12 @@ pub fn status_cmd() -> Result<()> {
             "Local overrides are disabled in this worktree. Run 'kin overrides apply' to re-enable them."
         );
     }
+    if crate::commands::checkout::hydration_in_progress(&repo) {
+        println!(
+            "Checkout hydration in progress. Run 'kin continue' to resume or 'kin abort' to stop."
+        );
+        return Ok(());
+    }
     if crate::commands::run::run_state_exists(&repo) {
         let run_state = crate::commands::run::load_run_state(&repo)?;
         let processed = run_state.current_index.min(run_state.target_branches.len());

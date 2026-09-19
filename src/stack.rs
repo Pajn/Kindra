@@ -3095,3 +3095,206 @@ pub fn branches_forking_from_range(
     }
     Ok(branches)
 }
+
+#[derive(Default)]
+struct BranchGraph {
+    nodes: HashSet<String>,
+    edges: HashMap<String, HashSet<String>>,
+}
+
+/// Discover PR ancestors and descendants of the requested branch from one snapshot.
+/// Ancestor siblings are excluded; the upstream branch terminates the base chain.
+pub fn discover_pr_connected_stack(
+    repo: &Repository,
+    branch: &str,
+    upstream_name: Option<&str>,
+    prs: &HashMap<String, crate::gh::OpenPr>,
+) -> Result<(String, Vec<String>)> {
+    // A real local branch takes precedence over a remote-like prefix in its name.
+    let normalized = if repo.find_branch(branch, git2::BranchType::Local).is_ok() {
+        branch.to_string()
+    } else {
+        let remotes = repo.remotes()?;
+        remotes
+            .iter()
+            .flatten()
+            .filter_map(|remote| branch.strip_prefix(&format!("{remote}/")))
+            .next()
+            .unwrap_or(branch)
+            .to_string()
+    };
+    let branch = normalized.as_str();
+    let mut graph = BranchGraph::default();
+    graph.nodes.insert(branch.to_string());
+
+    collect_pr_base_chain(branch, upstream_name, &mut graph, prs)?;
+    collect_pr_descendants(
+        branch,
+        &mut graph,
+        &mut Vec::new(),
+        &mut HashSet::new(),
+        prs,
+    )?;
+
+    Ok((normalized, topo_sort_branches(&graph)?))
+}
+
+fn collect_pr_base_chain(
+    branch: &str,
+    upstream_name: Option<&str>,
+    graph: &mut BranchGraph,
+    prs: &HashMap<String, crate::gh::OpenPr>,
+) -> Result<()> {
+    let mut current = branch.to_string();
+    let mut seen_positions = HashMap::new();
+    let mut chain = Vec::new();
+
+    loop {
+        if let Some(&start_idx) = seen_positions.get(&current) {
+            let mut cycle = chain[start_idx..].to_vec();
+            cycle.push(current.clone());
+            return Err(anyhow!("Detected PR base cycle: {}", cycle.join(" -> ")));
+        }
+
+        seen_positions.insert(current.clone(), chain.len());
+        chain.push(current.clone());
+        graph.nodes.insert(current.clone());
+
+        let Some(pr) = prs.get(&current).filter(|pr| !pr.is_cross_repository) else {
+            break;
+        };
+
+        let base_branch = pr.base_branch.clone();
+        add_edge(graph, &base_branch, &current);
+
+        if upstream_name.is_some_and(|upstream| branch_names_match(&base_branch, upstream)) {
+            break;
+        }
+
+        current = base_branch;
+    }
+
+    Ok(())
+}
+
+fn collect_pr_descendants(
+    branch: &str,
+    graph: &mut BranchGraph,
+    path: &mut Vec<String>,
+    visited: &mut HashSet<String>,
+    prs: &HashMap<String, crate::gh::OpenPr>,
+) -> Result<()> {
+    if visited.contains(branch) {
+        return Ok(());
+    }
+
+    if let Some(idx) = path.iter().position(|node| node == branch) {
+        let mut cycle = path[idx..].to_vec();
+        cycle.push(branch.to_string());
+        return Err(anyhow!(
+            "Detected PR descendant cycle: {}",
+            cycle.join(" -> ")
+        ));
+    }
+
+    path.push(branch.to_string());
+
+    let mut children: Vec<_> = prs
+        .iter()
+        .filter(|(_, pr)| !pr.is_cross_repository && pr.base_branch == branch)
+        .map(|(head, _)| head)
+        .collect();
+    children.sort();
+
+    for child in children {
+        add_edge(graph, branch, child);
+        collect_pr_descendants(child, graph, path, visited, prs)?;
+    }
+
+    path.pop();
+    visited.insert(branch.to_string());
+    Ok(())
+}
+
+fn add_edge(graph: &mut BranchGraph, base_branch: &str, child_branch: &str) {
+    graph.nodes.insert(base_branch.to_string());
+    graph.nodes.insert(child_branch.to_string());
+    graph
+        .edges
+        .entry(base_branch.to_string())
+        .or_default()
+        .insert(child_branch.to_string());
+}
+
+fn topo_sort_branches(graph: &BranchGraph) -> Result<Vec<String>> {
+    let mut state = HashMap::<String, VisitState>::new();
+    let mut stack = Vec::new();
+    let mut order = Vec::new();
+    let mut nodes = graph.nodes.iter().cloned().collect::<Vec<_>>();
+    nodes.sort();
+
+    for node in nodes {
+        visit_branch(&node, graph, &mut state, &mut stack, &mut order)?;
+    }
+
+    order.reverse();
+    Ok(order)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VisitState {
+    Visiting,
+    Done,
+}
+
+fn visit_branch(
+    branch: &str,
+    graph: &BranchGraph,
+    state: &mut HashMap<String, VisitState>,
+    stack: &mut Vec<String>,
+    order: &mut Vec<String>,
+) -> Result<()> {
+    match state.get(branch) {
+        Some(VisitState::Done) => return Ok(()),
+        Some(VisitState::Visiting) => {
+            let start_idx = stack.iter().position(|node| node == branch).unwrap_or(0);
+            let mut cycle = stack[start_idx..].to_vec();
+            cycle.push(branch.to_string());
+            return Err(anyhow!("Detected PR graph cycle: {}", cycle.join(" -> ")));
+        }
+        None => {}
+    }
+
+    state.insert(branch.to_string(), VisitState::Visiting);
+    stack.push(branch.to_string());
+
+    let mut children = graph
+        .edges
+        .get(branch)
+        .map(|children| children.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    children.sort();
+
+    for child in children {
+        visit_branch(&child, graph, state, stack, order)?;
+    }
+
+    stack.pop();
+    state.insert(branch.to_string(), VisitState::Done);
+    order.push(branch.to_string());
+    Ok(())
+}
+
+fn branch_names_match(left: &str, right: &str) -> bool {
+    normalize_branch_name(left) == normalize_branch_name(right)
+}
+
+fn normalize_branch_name(name: &str) -> &str {
+    if let Some(rest) = name.strip_prefix("origin/") {
+        return rest;
+    }
+    if let Some(rest) = name.strip_prefix("upstream/") {
+        return rest;
+    }
+    name
+}
