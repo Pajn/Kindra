@@ -353,6 +353,20 @@ fn full_stack_discovery_is_proportional_to_stack_size_not_branch_count() {
     );
 }
 
+/// The fastest of a few `plan_tree_sync` runs after a warm-up. The minimum is
+/// less sensitive to a busy machine than the mean.
+fn fastest_plan(repo: &Repository, stack: &[StackBranch], merge_base: git2::Oid) -> Duration {
+    let _ = plan_tree_sync(repo, stack, "main", merge_base).unwrap();
+    (0..3)
+        .map(|_| {
+            let start = Instant::now();
+            let _ = plan_tree_sync(repo, stack, "main", merge_base).unwrap();
+            start.elapsed()
+        })
+        .min()
+        .unwrap()
+}
+
 /// Planning a tree sync asks the same questions about the same local branches
 /// once per branch in the stack. Answering them per branch makes the plan cost
 /// stack size × local branches graph walks, which on a repo with a few hundred
@@ -382,6 +396,13 @@ fn tree_sync_planning_is_proportional_to_stack_not_local_branch_count() {
     }
 
     let upstream_tip = append_commits(&repo, "refs/heads/main", 50);
+    let merge_base = resolve_merge_base(&repo, upstream_tip, tip).unwrap();
+
+    // The cost of the stack alone, measured on the same machine moments before
+    // the noise branches exist, so runner speed and load cancel out of the
+    // comparison below.
+    pack_objects(dir.path());
+    let baseline = fastest_plan(&repo, &stack, merge_base);
 
     // Unrelated branches, spread across main so they do not share one boundary.
     let main_commits: Vec<git2::Oid> = {
@@ -404,18 +425,7 @@ fn tree_sync_planning_is_proportional_to_stack_not_local_branch_count() {
     }
 
     pack_objects(dir.path());
-
-    let merge_base = resolve_merge_base(&repo, upstream_tip, tip).unwrap();
-    let _ = plan_tree_sync(&repo, &stack, "main", merge_base).unwrap();
-
-    const RUNS: u32 = 3;
-    let mut total = Duration::ZERO;
-    for _ in 0..RUNS {
-        let start = Instant::now();
-        let _ = plan_tree_sync(&repo, &stack, "main", merge_base).unwrap();
-        total += start.elapsed();
-    }
-    let avg = total / RUNS;
+    let with_noise = fastest_plan(&repo, &stack, merge_base);
 
     let plan = plan_tree_sync(&repo, &stack, "main", merge_base).unwrap();
     assert_eq!(
@@ -425,18 +435,23 @@ fn tree_sync_planning_is_proportional_to_stack_not_local_branch_count() {
         plan.remaining
     );
 
-    // Answering the branch-independent questions once leaves this well under a
-    // second. Re-asking them per branch takes tens of seconds on a stack and a
-    // branch list this size.
+    // Answering the branch-independent questions once means the unrelated
+    // branches add a single pass over the branch list, a small fraction of the
+    // stack's own cost. Re-asking them per branch multiplies that cost by the
+    // stack size, so the noisy repo comes out an order of magnitude slower.
+    // The ratio is what is asserted: absolute times swing with the machine
+    // and with whatever else the runner is doing.
+    const MAX_SLOWDOWN: u32 = 4;
     assert!(
-        avg < Duration::from_secs(4),
-        "Tree sync planning averaged {avg:?} over {RUNS} runs — expected <4s.\n\
+        with_noise < baseline * MAX_SLOWDOWN + Duration::from_millis(500),
+        "Tree sync planning took {with_noise:?} with {NOISE_BRANCHES} unrelated branches \
+         against {baseline:?} without them — expected at most {MAX_SLOWDOWN}x.\n\
          This suggests the per-branch scan over every local branch is back.\n\
-         Scenario: {STACK_BRANCHES}-branch stack, 1050-commit main, {NOISE_BRANCHES} unrelated branches."
+         Scenario: {STACK_BRANCHES}-branch stack, 1050-commit main."
     );
 
     eprintln!(
-        "✓ Tree sync planning: {avg:?} avg over {RUNS} runs \
-         ({STACK_BRANCHES}-branch stack, {NOISE_BRANCHES} unrelated branches)"
+        "✓ Tree sync planning: {with_noise:?} with {NOISE_BRANCHES} unrelated branches, \
+         {baseline:?} without ({STACK_BRANCHES}-branch stack)"
     );
 }
