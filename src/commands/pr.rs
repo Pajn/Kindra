@@ -286,8 +286,10 @@ fn run_pr_create_or_update_preflight(
         .collect::<Vec<_>>();
     // `kin pr` exposes no --allow-base-push: a PR whose head branch was pushed to a
     // differently-named base ref is incoherent (the head ref never lands under its
-    // own name). A per-branch config opt-in still applies.
-    crate::commands::push::push_stack_branches(repo, &branch_names, &[])?;
+    // own name). A per-branch config opt-in still applies. It exposes no --force
+    // either: this push is a preflight the user did not ask for by name, so it must
+    // not relax a safety check on their behalf — run `kin push --force` first.
+    crate::commands::push::push_stack_branches(repo, &branch_names, &[], false)?;
     println!();
 
     Ok(flattened)
