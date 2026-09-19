@@ -30,7 +30,10 @@ pub fn restack(args: &RestackArgs) -> Result<()> {
 }
 
 fn restack_locked(repo: &git2::Repository, args: &RestackArgs) -> Result<()> {
-    if passively_reconcile_rebase_state(repo)? || crate::commands::run::run_state_exists(repo) {
+    if passively_reconcile_rebase_state(repo)?
+        || crate::commands::run::run_state_exists(repo)
+        || crate::commands::checkout::hydration_in_progress(repo)
+    {
         return Err(anyhow!(
             "A Kindra-managed operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));

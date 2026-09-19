@@ -382,11 +382,14 @@ main -> [A1'] -> (feature-A) -> [B1'] -> (feature-B)
 
 ```bash
 kin checkout [--all]
+kin checkout <branch>
 kin checkout [subcommand]
 ```
 
 - `kin co`: Opens an interactive selection menu for branches in the current stack.
 - `kin co --all`: Opens an interactive selection menu for all local branches.
+- `kin co <branch>`: Fetches remotes, hydrates the requested branch's PR stack ancestors and descendants from GitHub, creates any missing local tracking branches, and checks out `<branch>`. Requires an authenticated `gh` CLI. Existing local branches retain their commits; PRs from forks and siblings of ancestors are excluded.
+- Interrupted named checkout: `kin continue` resumes the saved hydration plan and retries checkout; `kin abort` cancels it, retaining branches already created. Local overrides stay suspended until recovery finishes. Remote-qualified names (for example, `origin/feature`) hydrate and check out the corresponding local branch. Missing branches must resolve to the same repository as the GitHub PR query.
 - `kin co up`: Checkout the branch immediately "above" the current one in the stack.
 - `kin co down`: Checkout the branch immediately "below" the current one in the stack.
 - `kin co top`: Checkout the branch at the very top of the current stack.

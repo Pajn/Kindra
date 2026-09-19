@@ -37,7 +37,11 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
         // This escape hatch deliberately does not deserialize state: it must
         // also work for malformed files or overlapping interrupted operations.
         // Keep Git's rebase, refs, index, worktree and stash entries untouched.
-        for state_file in [&path, &crate::commands::run::run_state_path(repo)] {
+        for state_file in [
+            &path,
+            &crate::commands::run::run_state_path(repo),
+            &crate::commands::checkout::hydration_state_path(repo),
+        ] {
             match std::fs::remove_file(state_file) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -56,6 +60,20 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
         return Ok(());
     }
 
+    if crate::commands::checkout::hydration_in_progress(repo) {
+        if has_rebase_state || has_run_state {
+            return Err(anyhow!(
+                "Multiple Kindra operations are persisted. Resolve state manually before aborting."
+            ));
+        }
+        crate::commands::checkout::abort_hydration(repo)?;
+        settle.action = if git_rebase_in_progress(repo) {
+            SettleAction::Leave
+        } else {
+            SettleAction::Finalize
+        };
+        return Ok(());
+    }
     if has_rebase_state && has_run_state {
         return Err(anyhow!(
             "Multiple Kindra operations are persisted. Resolve state manually before aborting."

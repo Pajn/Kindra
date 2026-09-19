@@ -54,7 +54,10 @@ pub fn absorb(args: &AbsorbArgs) -> Result<()> {
 }
 
 fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
-    if passively_reconcile_rebase_state(repo)? || crate::commands::run::run_state_exists(repo) {
+    if passively_reconcile_rebase_state(repo)?
+        || crate::commands::run::run_state_exists(repo)
+        || crate::commands::checkout::hydration_in_progress(repo)
+    {
         return Err(anyhow!(
             "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));
