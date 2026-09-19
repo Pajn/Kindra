@@ -7,6 +7,125 @@ use std::fs;
 use tempfile::tempdir;
 
 #[test]
+fn sync_candidates_cache_distinguishes_upstream_aliases_at_the_same_tip() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let base_id = make_commit(&repo, "refs/heads/main", "base.txt", "base\n", "base", &[]);
+    let base = repo.find_commit(base_id).unwrap();
+    repo.branch("alias", &base, false).unwrap();
+    let feature_id = make_commit(
+        &repo,
+        "refs/heads/feature",
+        "feature.txt",
+        "feature\n",
+        "feature",
+        &[&base],
+    );
+    let branches = vec![kindra::stack::StackBranch {
+        name: "feature".to_string(),
+        id: feature_id,
+    }];
+
+    for targets in [["main", "alias"], ["alias", "main"]] {
+        let mut cache = kindra::stack::SyncScanCache::default();
+        for target in targets {
+            let boundary = kindra::stack::find_sync_boundary_cached(
+                &repo, "feature", target, &branches, &mut cache,
+            )
+            .unwrap();
+            assert_eq!(boundary.old_base, Some(base_id));
+            assert!(
+                !boundary.merged_branches.contains(&target.to_string()),
+                "upstream {target} must not be scheduled for cleanup with target order {targets:?}",
+            );
+            let fresh =
+                kindra::stack::find_sync_boundary(&repo, "feature", target, &branches).unwrap();
+            assert_eq!(boundary.merged_branches, fresh.merged_branches);
+        }
+    }
+}
+
+#[test]
+fn sync_history_cache_distinguishes_target_tips_for_the_same_paths() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "shared.txt",
+        "base\n",
+        "base",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+    let feature_id = make_commit(
+        &repo,
+        "refs/heads/feature",
+        "shared.txt",
+        "feature\n",
+        "feature",
+        &[&base],
+    );
+    let integrated_id = make_commit(
+        &repo,
+        "refs/heads/integrated",
+        "shared.txt",
+        "feature\n",
+        "cherry-picked feature",
+        &[&base],
+    );
+    let integrated = repo.find_commit(integrated_id).unwrap();
+    // Neither target tip matches the feature's tree, so containment must use
+    // target history. Only one target contains the feature's patch.
+    make_commit(
+        &repo,
+        "refs/heads/integrated",
+        "shared.txt",
+        "later\n",
+        "later edit",
+        &[&integrated],
+    );
+    make_commit(
+        &repo,
+        "refs/heads/unintegrated",
+        "shared.txt",
+        "other\n",
+        "other edit",
+        &[&base],
+    );
+    let branches = vec![kindra::stack::StackBranch {
+        name: "feature".to_string(),
+        id: feature_id,
+    }];
+
+    for targets in [
+        ["integrated", "unintegrated"],
+        ["unintegrated", "integrated"],
+    ] {
+        let mut cache = kindra::stack::SyncScanCache::default();
+        for target in targets {
+            let boundary = kindra::stack::find_sync_boundary_cached(
+                &repo, "feature", target, &branches, &mut cache,
+            )
+            .unwrap();
+            assert_eq!(
+                boundary.old_base,
+                if target == "integrated" {
+                    None
+                } else {
+                    Some(base_id)
+                },
+                "incorrect boundary for {target} with target order {targets:?}",
+            );
+            assert_eq!(
+                boundary.merged_branches.contains(&"feature".to_string()),
+                target == "integrated",
+            );
+        }
+    }
+}
+
+#[test]
 fn sync_aborts_deletions_if_fallback_checkout_is_blocked() {
     let dir = tempdir().unwrap();
     let repo = repo_init(dir.path());

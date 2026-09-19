@@ -3109,6 +3109,56 @@ fn test_sync_blocked_by_stale_run_state() {
     assert!(dir.path().join(".git/kindra_run_state.json").exists());
 }
 
+/// A top branch whose only commit was cherry-picked onto upstream has nothing
+/// left to rebase, and upstream does not reach its tip. It is integrated by
+/// content exactly like a lower branch would be, so the boundary must report
+/// it merged, and a tree sync must schedule it for cleanup rather than skip it.
+#[test]
+fn cherry_picked_top_branch_is_reported_merged_and_cleaned_up() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base\n",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+    let feature_id = make_commit(
+        &repo,
+        "refs/heads/feature",
+        "feature.txt",
+        "feature\n",
+        "feature change",
+        &[&base],
+    );
+
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    run_ok("git", &["cherry-pick", &feature_id.to_string()], dir.path());
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let main_tip = repo.revparse_single("main").unwrap().id();
+    assert!(
+        !repo.graph_descendant_of(main_tip, feature_id).unwrap(),
+        "the cherry-pick must not make upstream reach the branch tip"
+    );
+
+    let stack = vec![kindra::stack::StackBranch {
+        name: "feature".to_string(),
+        id: feature_id,
+    }];
+    let boundary = kindra::stack::find_sync_boundary(&repo, "feature", "main", &stack).unwrap();
+    assert_eq!(boundary.old_base, None);
+    assert_eq!(boundary.merged_branches, vec!["feature".to_string()]);
+
+    let plan = kindra::stack::plan_tree_sync(&repo, &stack, "main", base_id).unwrap();
+    assert!(plan.remaining.is_empty(), "nothing is left to rebase");
+    assert_eq!(plan.merged, vec!["feature".to_string()]);
+}
+
 /// A squash merge lands a branch's commits as one upstream commit, so no
 /// individual commit's patch id matches anything upstream — only the branch's
 /// combined range does. Detection has to recognise that, or sync replays
