@@ -42,7 +42,10 @@ fn current_branch_name(repo: &Repository) -> Result<String> {
 
 fn rename_branch(repo: &Repository, old_name: &str, new_name: &str) -> Result<()> {
     let _lock = crate::state_io::RepoLock::acquire(repo)?;
-    if passively_reconcile_rebase_state(repo)? || crate::commands::run::run_state_exists(repo) {
+    if passively_reconcile_rebase_state(repo)?
+        || crate::commands::run::run_state_exists(repo)
+        || crate::commands::checkout::hydration_in_progress(repo)
+    {
         return Err(anyhow!(
             "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
         ));

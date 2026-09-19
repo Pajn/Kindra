@@ -124,6 +124,65 @@ impl OpenPr {
 /// Fetch every open PR in the repository in a single `gh pr list` call, keyed by
 /// head branch name. This replaces N per-branch `gh pr view` subprocesses with one.
 pub fn list_open_prs() -> Result<HashMap<String, OpenPr>> {
+    list_open_prs_in_repository(None)
+}
+
+/// Resolve gh's selected repository once and pin the PR query to that identity.
+/// Remote selection must use this same repository, not an assumed origin.
+pub fn checkout_pr_snapshot() -> Result<(String, HashMap<String, OpenPr>)> {
+    #[derive(Deserialize)]
+    struct RepoView {
+        url: String,
+    }
+    let output = Command::new("gh")
+        .args(["repo", "view", "--json", "url"])
+        .output()
+        .context("Failed to identify the PR repository")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Could not identify PR repository: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let view: RepoView =
+        serde_json::from_slice(&output.stdout).context("Invalid PR repository identity")?;
+    let identity = repository_identity(&view.url)
+        .ok_or_else(|| anyhow!("Could not identify PR repository from its URL"))?;
+    Ok((identity, list_open_prs_in_repository(Some(&view.url))?))
+}
+
+/// Canonical host/owner/repository for HTTPS, SSH URL and scp-style Git URLs.
+/// Unrecognized URLs fail closed rather than guessing which repository they name.
+pub(crate) fn repository_identity(url: &str) -> Option<String> {
+    let (host, path) = if let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .or_else(|| url.strip_prefix("ssh://"))
+    {
+        let (authority, path) = rest.split_once('/')?;
+        (authority.rsplit('@').next()?, path)
+    } else {
+        let (authority, path) = url.split_once(':')?;
+        (authority.rsplit('@').next()?, path)
+    };
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let parts: Vec<_> = path.split('/').collect();
+    if host.is_empty()
+        || parts.len() != 2
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || *part == "." || *part == "..")
+        || url
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '?' | '#' | '%' | '\\'))
+    {
+        return None;
+    }
+    Some(format!("{host}/{path}").to_ascii_lowercase())
+}
+
+fn list_open_prs_in_repository(repository: Option<&str>) -> Result<HashMap<String, OpenPr>> {
     #[derive(Deserialize)]
     struct User {
         login: String,
@@ -169,8 +228,8 @@ pub fn list_open_prs() -> Result<HashMap<String, OpenPr>> {
         review_requests: Vec<ReviewRequest>,
     }
 
-    let output = Command::new("gh")
-        .args([
+    let mut command = Command::new("gh");
+    command.args([
             "pr",
             "list",
             "--state",
@@ -179,9 +238,11 @@ pub fn list_open_prs() -> Result<HashMap<String, OpenPr>> {
             "500",
             "--json",
             "number,headRefName,isCrossRepository,baseRefName,isDraft,author,title,body,url,labels,reviewRequests",
-        ])
-        .output()
-        .context("Failed to run `gh pr list`")?;
+        ]);
+    if let Some(repository) = repository {
+        command.args(["--repo", repository]);
+    }
+    let output = command.output().context("Failed to run `gh pr list`")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

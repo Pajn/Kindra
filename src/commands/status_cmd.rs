@@ -13,7 +13,29 @@ pub fn status_cmd() -> Result<()> {
             "Local overrides are disabled in this worktree. Run 'kin overrides apply' to re-enable them."
         );
     }
-    if crate::commands::run::run_state_exists(&repo) {
+    let has_hydration_state = crate::commands::checkout::hydration_in_progress(&repo);
+    let has_rebase_state = crate::rebase_utils::state_path(&repo).exists();
+    let has_run_state = crate::commands::run::run_state_exists(&repo);
+    // Detect overlapping files before deserializing or passively reconciling
+    // any one operation, even when another operation's state is malformed.
+    if [has_hydration_state, has_rebase_state, has_run_state]
+        .into_iter()
+        .filter(|present| *present)
+        .count()
+        > 1
+    {
+        println!(
+            "Multiple Kindra operations are persisted. Resolve state manually before continuing or aborting."
+        );
+        return Ok(());
+    }
+    if has_hydration_state {
+        println!(
+            "Checkout hydration in progress. Run 'kin continue' to resume or 'kin abort' to stop."
+        );
+        return Ok(());
+    }
+    if has_run_state {
         let run_state = crate::commands::run::load_run_state(&repo)?;
         let processed = run_state.current_index.min(run_state.target_branches.len());
         let status_name = match run_state.status {
