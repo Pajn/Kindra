@@ -565,10 +565,17 @@ pub fn current_parent_name_map(
     merge_base: Oid,
     upstream_name: &str,
 ) -> Result<HashMap<String, String>> {
+    // One shared ancestry walk for the whole set, rather than rebuilding it per
+    // branch: the parent of every branch is the same computation, and the walk is
+    // what costs.
+    let parent_ids = find_parents_in_stack(repo, branches, merge_base)?;
     let mut parent_map = HashMap::new();
 
     for branch in branches {
-        let parent_id = find_parent_in_stack(repo, &branch.name, branches, merge_base)?;
+        let parent_id = parent_ids
+            .get(&branch.name)
+            .copied()
+            .ok_or_else(|| anyhow!("Failed to resolve parent branch for '{}'.", branch.name))?;
         let parent_name = if parent_id == merge_base {
             upstream_name.to_string()
         } else {
