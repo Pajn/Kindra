@@ -13,6 +13,16 @@ pub fn continue_cmd() -> Result<()> {
 }
 
 fn continue_cmd_locked(repo: &git2::Repository) -> Result<()> {
+    if crate::commands::checkout::hydration_in_progress(repo) {
+        if crate::rebase_utils::state_path(repo).exists()
+            || crate::commands::run::run_state_exists(repo)
+        {
+            return Err(anyhow!(
+                "Multiple Kindra operations are persisted. Resolve state before continuing."
+            ));
+        }
+        return crate::commands::checkout::continue_hydration(repo);
+    }
     let rebase_state = reconcile_saved_rebase_state(repo, ReconcileMode::Continue)?;
     let has_rebase_state = rebase_state.is_some();
     let has_run_state = crate::commands::run::run_state_exists(repo);

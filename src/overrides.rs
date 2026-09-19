@@ -178,6 +178,7 @@ fn busy(repo: &Repository) -> bool {
     repo.state() != RepositoryState::Clean
         || crate::rebase_utils::state_path(repo).exists()
         || crate::commands::run::run_state_exists(repo)
+        || crate::commands::checkout::hydration_in_progress(repo)
 }
 
 fn check_staged(repo: &Repository, config: &Config) -> Result<()> {

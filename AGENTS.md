@@ -27,6 +27,7 @@
 ### Safety & State
 - Operations that modify multiple branches (like `move`) must persist their state to allow for `continue`/`abort` workflows.
 - Always validate the exit status of system commands (e.g., `git checkout`, `git rebase`). Do not assume success.
+- Named checkout persists source refs/OIDs and per-branch checkpoints in the worktree's `kindra_checkout_state.json` before creating branches. Continue retries creation at the recorded OID; abort retains created branches to protect edits. Keep hydration state in operation guards and override busy checks.
 - Absorb preserves unnamed fork points with `update-ref` todo instructions placed after each autosquash group. Its temporary `refs/kindra/absorb/` anchors are recorded in the worktree's `new_base_map`; keep them through conflicts and delete only that operation's anchors when clearing recovery state.
 
 ## Development Workflow

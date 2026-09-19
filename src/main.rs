@@ -96,8 +96,10 @@ enum Commands {
     Checkout {
         #[command(subcommand)]
         subcommand: Option<CheckoutSubcommand>,
+        /// Checkout a branch directly, hydrating its PR stack first
+        branch: Option<String>,
         /// List all local branches instead of just the stack
-        #[arg(long)]
+        #[arg(long, conflicts_with = "branch")]
         all: bool,
     },
     /// Move current branch stack onto another branch
@@ -302,7 +304,11 @@ fn dispatch() -> Result<()> {
                 },
             )?
         }
-        Commands::Checkout { subcommand, all } => checkout(subcommand, *all)?,
+        Commands::Checkout {
+            subcommand,
+            branch,
+            all,
+        } => checkout(subcommand, branch, *all)?,
         Commands::Move(args) => move_cmd(args)?,
         Commands::Rename(args) => rename(args)?,
         Commands::Reorder(args) => reorder(args)?,

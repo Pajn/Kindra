@@ -1,12 +1,30 @@
 use super::CheckoutSubcommand;
 use super::find_upstream;
-use crate::stack::{get_immediate_successors, get_stack_tips, visualize_stack};
-use anyhow::{Result, anyhow};
-use git2::BranchType;
+use crate::gh;
+use crate::stack::{
+    discover_pr_connected_stack, get_immediate_successors, get_stack_tips, visualize_stack,
+};
+use crate::worktree::git::repo_root;
+use anyhow::{Context, Result, anyhow};
+use git2::{BranchType, Repository};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::process::Command;
 
-pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()> {
+pub fn checkout(
+    subcommand: &Option<CheckoutSubcommand>,
+    branch: &Option<String>,
+    all: bool,
+) -> Result<()> {
     let repo = crate::open_repo()?;
+
+    if let Some(branch) = branch {
+        let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+        ensure_checkout_available(&repo)?;
+        return crate::overrides::with_suspended(&repo, false, || {
+            checkout_branch_with_pr_hydration(&repo, branch)
+        });
+    }
 
     if all && subcommand.is_none() {
         let mut branch_names = Vec::new();
@@ -152,18 +170,221 @@ pub fn checkout(subcommand: &Option<CheckoutSubcommand>, all: bool) -> Result<()
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct HydrationStep {
+    branch: String,
+    remote_ref: Option<String>,
+    tip: String,
+    completed: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HydrationState {
+    branch: String,
+    repository: String,
+    steps: Vec<HydrationStep>,
+}
+
+pub(crate) fn hydration_state_path(repo: &Repository) -> PathBuf {
+    repo.path().join("kindra_checkout_state.json")
+}
+
+pub(crate) fn hydration_in_progress(repo: &Repository) -> bool {
+    hydration_state_path(repo).exists()
+}
+
+fn save_hydration(repo: &Repository, state: &HydrationState) -> Result<()> {
+    crate::state_io::write_atomic(
+        &hydration_state_path(repo),
+        &serde_json::to_string_pretty(state)?,
+    )
+}
+
+fn ensure_checkout_available(repo: &Repository) -> Result<()> {
+    if hydration_in_progress(repo)
+        || crate::rebase_utils::state_path(repo).exists()
+        || crate::commands::run::run_state_exists(repo)
+    {
+        return Err(anyhow!(
+            "A Kindra operation is in progress. Use 'kin continue' or 'kin abort'."
+        ));
+    }
+    crate::commands::sync::ensure_no_native_git_operation(repo)
+}
+
+fn checkout_branch_with_pr_hydration(repo: &Repository, branch: &str) -> Result<()> {
+    fetch_all_remotes(repo)?;
+    gh::check_gh()?;
+
+    let upstream_name = find_upstream(repo)?;
+    let (repository, prs) = gh::checkout_pr_snapshot()?;
+    let (branch, creation_order) =
+        discover_pr_connected_stack(repo, branch, upstream_name.as_deref(), &prs)?;
+    let mut steps = Vec::new();
+    for name in creation_order {
+        let local = repo.find_branch(&name, BranchType::Local).ok();
+        let remote_ref = if local.is_some() {
+            None
+        } else {
+            Some(resolve_remote_tracking_ref(repo, &name, &repository)?.ok_or_else(|| anyhow!(
+                "No remote-tracking branch found for discovered stack branch '{}' in PR repository '{}'.", name, repository
+            ))?)
+        };
+        let tip = if let Some(local) = &local {
+            local.get().peel_to_commit()?.id()
+        } else {
+            repo.find_branch(remote_ref.as_ref().unwrap(), BranchType::Remote)?
+                .get()
+                .peel_to_commit()?
+                .id()
+        };
+        steps.push(HydrationStep {
+            branch: name,
+            remote_ref,
+            tip: tip.to_string(),
+            completed: local.is_some(),
+        });
+    }
+    let state = HydrationState {
+        branch,
+        repository,
+        steps,
+    };
+    // Persist every source OID before creating any refs. A restart never fetches
+    // again or silently switches to a different remote/commit halfway through.
+    save_hydration(repo, &state)?;
+    continue_hydration(repo)
+}
+
+pub(crate) fn continue_hydration(repo: &Repository) -> Result<()> {
+    crate::commands::sync::ensure_no_native_git_operation(repo)?;
+    let mut state: HydrationState =
+        serde_json::from_str(&std::fs::read_to_string(hydration_state_path(repo))?)?;
+    for i in 0..state.steps.len() {
+        if state.steps[i].completed {
+            continue;
+        }
+        ensure_local_branch_for_checkout(repo, &state.steps[i])
+            .context("Checkout hydration stopped. Fix the error and run 'kin continue', or 'kin abort' to stop hydration")?;
+        state.steps[i].completed = true;
+        save_hydration(repo, &state)?;
+    }
+    git_checkout(&state.branch).context(
+        "Checkout hydration stopped. Run 'kin continue' to retry checkout or 'kin abort'",
+    )?;
+    std::fs::remove_file(hydration_state_path(repo))?;
+    Ok(())
+}
+
+pub(crate) fn abort_hydration(repo: &Repository) -> Result<()> {
+    // Hydration only adds branches; retaining them avoids deleting edits made
+    // during an interruption (including a crash between creation and checkpoint).
+    std::fs::remove_file(hydration_state_path(repo))?;
+    println!("Checkout hydration aborted. Already-created branches were retained.");
+    Ok(())
+}
+
+fn fetch_all_remotes(repo: &Repository) -> Result<()> {
+    let output = Command::new("git")
+        .current_dir(repo_root(repo)?)
+        .args(["fetch", "--all", "--prune"])
+        .output()
+        .context("Failed to run `git fetch --all --prune`")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git fetch --all --prune failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(())
+}
+
+fn ensure_local_branch_for_checkout(repo: &Repository, step: &HydrationStep) -> Result<()> {
+    let tip = git2::Oid::from_str(&step.tip)?;
+    let mut branch = match repo.find_branch(&step.branch, BranchType::Local) {
+        Ok(branch) => {
+            // Creation may have succeeded just before a checkpoint failed.
+            if branch.get().target() != Some(tip) {
+                return Err(anyhow!(
+                    "Branch '{}' changed since hydration was planned; refusing to overwrite it",
+                    step.branch
+                ));
+            }
+            branch
+        }
+        Err(err) if err.code() == git2::ErrorCode::NotFound => {
+            repo.branch(&step.branch, &repo.find_commit(tip)?, false)?
+        }
+        Err(err) => return Err(err.into()),
+    };
+    branch.set_upstream(step.remote_ref.as_deref())?;
+    Ok(())
+}
+
+fn resolve_remote_tracking_ref(
+    repo: &Repository,
+    branch: &str,
+    repository: &str,
+) -> Result<Option<String>> {
+    let mut candidates = Vec::new();
+    for name in repo.remotes()?.iter().flatten() {
+        let remote = repo.find_remote(name)?;
+        // libgit2 applies insteadOf to remote.url(); retain the configured
+        // GitHub identity when a transport rewrite uses a local/SSH alias.
+        let configured = repo
+            .config()?
+            .get_string(&format!("remote.{name}.url"))
+            .ok();
+        let identity = remote
+            .url()
+            .and_then(gh::repository_identity)
+            .or_else(|| configured.as_deref().and_then(gh::repository_identity));
+        if identity.as_deref() != Some(repository) {
+            continue;
+        }
+        let tracking = format!("{name}/{branch}");
+        if let Ok(reference) = repo.find_branch(&tracking, BranchType::Remote) {
+            candidates.push((tracking, reference.get().peel_to_commit()?.id()));
+        }
+    }
+    candidates.sort();
+    if let Some((_, first)) = candidates.first()
+        && candidates.iter().any(|(_, tip)| tip != first)
+    {
+        return Err(anyhow!(
+            "Ambiguous remote-tracking branches for '{}' in PR repository '{}'",
+            branch,
+            repository
+        ));
+    }
+    Ok(candidates.into_iter().next().map(|(name, _)| name))
+}
+
 fn perform_git_checkout(name: &str) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    crate::overrides::with_suspended(&repo, false, || {
-        let status = Command::new("git").arg("checkout").arg(name).status()?;
+    ensure_checkout_available(&repo)?;
+    crate::overrides::with_suspended(&repo, false, || git_checkout(name))
+}
 
-        if !status.success() {
-            return Err(anyhow!("git checkout failed"));
-        }
+fn git_checkout(name: &str) -> Result<()> {
+    let output = Command::new("git")
+        .arg("checkout")
+        .arg(name)
+        .output()
+        .with_context(|| format!("Failed to run `git checkout {name}`"))?;
 
-        Ok(())
-    })
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git checkout failed for branch '{}': {}",
+            name,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(())
 }
 
 fn find_first_parent_branches_via_git_log(
