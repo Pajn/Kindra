@@ -31,7 +31,32 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
         ));
     }
 
-    let head = repo.head()?;
+    let mut parsed = parse_commit_args(args)?;
+    let head = match repo.head() {
+        Ok(head) => head,
+        Err(err) if err.code() == git2::ErrorCode::UnbornBranch => {
+            // Before the initial commit there is no base or stack to discover.
+            // Keep argument parsing and operation guards, then let Git create HEAD.
+            if parsed.on_target.is_some()
+                || parsed.interactive
+                || parsed.fixup_target.is_some()
+                || parsed.new_branch.is_some()
+            {
+                return Err(anyhow!(
+                    "Create an initial commit before using --on, --interactive, --fixup, or --new-branch."
+                ));
+            }
+            let status = Command::new("git")
+                .arg("commit")
+                .args(&parsed.git_commit_args)
+                .status()?;
+            if !status.success() {
+                return Err(anyhow!("git commit failed"));
+            }
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
     let current_branch_name = if !repo.head_detached()? {
         head.shorthand().map(|s| s.to_string())
     } else {
@@ -45,7 +70,6 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
     let upstream_obj = repo.revparse_single(&upstream_name)?;
     let upstream_id = upstream_obj.id();
     let head_id = head.peel_to_commit()?.id();
-    let mut parsed = parse_commit_args(args)?;
     let autostash = resolve_rebase_autostash(repo, parsed.autostash)?;
     let on_flag = parsed.on_target.is_some();
 
