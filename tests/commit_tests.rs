@@ -579,6 +579,82 @@ fn test_commit_forked_stack() {
 }
 
 #[test]
+fn test_commit_initial_commit() {
+    for branch in ["main", "custom-default"] {
+        let dir = tempdir().unwrap();
+        let repo = repo_init(dir.path());
+        repo.set_head(&format!("refs/heads/{branch}")).unwrap();
+        stage(dir.path(), "first.txt", "initial content\n");
+
+        kin_commit(dir.path())
+            .args(["-m", "initial commit", "--yes"])
+            .assert()
+            .success();
+
+        assert_eq!(current_branch(dir.path()), branch);
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(commit.parent_count(), 0);
+        assert_eq!(commit.message(), Some("initial commit\n"));
+        assert!(commit.tree().unwrap().get_name("first.txt").is_some());
+        assert_no_staged_changes(dir.path());
+        assert_no_rebase_in_progress(dir.path());
+    }
+}
+
+#[test]
+fn test_commit_initial_rejects_stack_options() {
+    for args in [
+        vec!["--on", "main"],
+        vec!["--interactive"],
+        vec!["--fixup", "HEAD"],
+        vec!["--new-branch", "topic"],
+    ] {
+        let dir = tempdir().unwrap();
+        let repo = repo_init(dir.path());
+        stage(dir.path(), "first.txt", "initial content\n");
+        kin_commit(dir.path())
+            .args(args)
+            .args(["-m", "initial commit"])
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("Create an initial commit before"));
+        assert_eq!(
+            repo.head().err().unwrap().code(),
+            git2::ErrorCode::UnbornBranch
+        );
+        assert_eq!(
+            git_stdout(dir.path(), &["diff", "--cached", "--name-only"]).trim(),
+            "first.txt"
+        );
+        assert_no_rebase_in_progress(dir.path());
+    }
+}
+
+#[test]
+fn test_commit_initial_failure_preserves_staged_changes() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    repo.set_head("refs/heads/main").unwrap();
+    stage(dir.path(), "first.txt", "initial content\n");
+
+    kin_commit(dir.path())
+        .args(["-m", ""])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("git commit failed"));
+
+    assert_eq!(
+        repo.head().err().unwrap().code(),
+        git2::ErrorCode::UnbornBranch
+    );
+    assert_eq!(
+        git_stdout(dir.path(), &["diff", "--cached", "--name-only"]).trim(),
+        "first.txt"
+    );
+    assert_no_rebase_in_progress(dir.path());
+}
+
+#[test]
 fn test_commit_on_main() {
     let (dir, repo) = setup_repo();
 
