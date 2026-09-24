@@ -44,6 +44,8 @@ struct TargetPathHistory {
     /// The history holds the target commits not reachable from this commit.
     floor: Oid,
     commits: Vec<TargetPathCommit>,
+    /// Ancestry among `commits`, for a history loaded without a pathspec.
+    ancestry: Option<Ancestry>,
 }
 
 struct TargetPathCommit {
@@ -57,12 +59,20 @@ impl TargetPathHistory {
     /// can carry its changes: anything reachable from the base predates the
     /// branch, and walking it would scan the whole of the target's history.
     fn load(repo: &Repository, floor: Oid, target_tip: Oid, paths: &[String]) -> Result<Self> {
-        let output = Command::new("git")
+        let unfiltered = paths.is_empty();
+        let mut log = Command::new("git");
+        // Names are matched against real tree paths, so they must not be quoted.
+        log.args(["-c", "core.quotePath=false"])
             .arg("log")
-            .arg("--format=__KINDRA_COMMIT__%H")
+            .arg("--format=__KINDRA_COMMIT__%H %P")
             .arg("--name-only")
             .arg("--no-renames")
-            .arg("--no-ext-diff")
+            .arg("--no-ext-diff");
+        if unfiltered {
+            // Parents before children when reversed, for building the ancestry.
+            log.arg("--topo-order");
+        }
+        let output = log
             .arg(format!("{floor}..{target_tip}"))
             .arg("--")
             .args(paths)
@@ -77,15 +87,21 @@ impl TargetPathHistory {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut commits = Vec::new();
+        let mut parents = Vec::new();
         let mut current: Option<TargetPathCommit> = None;
 
         for line in stdout.lines() {
-            if let Some(raw_oid) = line.strip_prefix("__KINDRA_COMMIT__") {
+            if let Some(header) = line.strip_prefix("__KINDRA_COMMIT__") {
                 if let Some(commit) = current.take() {
                     commits.push(commit);
                 }
+                let mut ids = header.split_whitespace().map(Oid::from_str);
+                let id = ids
+                    .next()
+                    .ok_or_else(|| anyhow!("git log printed a commit without an id."))??;
+                parents.push(ids.collect::<Result<Vec<_>, _>>()?);
                 current = Some(TargetPathCommit {
-                    id: Oid::from_str(raw_oid.trim())?,
+                    id,
                     changed_paths: HashSet::new(),
                 });
                 continue;
@@ -104,7 +120,18 @@ impl TargetPathHistory {
             commits.push(commit);
         }
 
-        Ok(Self { floor, commits })
+        // A pathspec rewrites parents to the commits that touch it, so only an
+        // unfiltered history describes real ancestry.
+        let ancestry = if unfiltered {
+            Ancestry::build(&commits, &parents)
+        } else {
+            None
+        };
+        Ok(Self {
+            floor,
+            commits,
+            ancestry,
+        })
     }
 
     /// Commits after `base_id` that touch every one of `touched_paths`. A history
@@ -125,14 +152,81 @@ impl TargetPathHistory {
             if !covers {
                 continue;
             }
-            if self.floor != base_id
-                && (commit.id == base_id || repo.graph_descendant_of(base_id, commit.id)?)
-            {
+            if self.floor != base_id && self.base_contains(repo, base_id, commit.id)? {
                 continue;
             }
             covering.push(commit.id);
         }
         Ok(covering)
+    }
+
+    /// Whether `base_id`, a commit of the target, contains `commit`, one of
+    /// this history's commits.
+    fn base_contains(&self, repo: &Repository, base_id: Oid, commit: Oid) -> Result<bool> {
+        if commit == base_id {
+            return Ok(true);
+        }
+        match &self.ancestry {
+            // A base outside the history is reachable from the floor, and no
+            // commit of the history is, so it cannot contain one.
+            Some(ancestry) => Ok(ancestry.is_ancestor(commit, base_id).unwrap_or(false)),
+            None => Ok(repo.graph_descendant_of(base_id, commit)?),
+        }
+    }
+}
+
+/// Which commits of a history reach which, as one bitset of ancestors per
+/// commit. Answers in constant time what would otherwise be a graph walk per
+/// question, which libgit2 cannot shortcut with a split commit-graph.
+struct Ancestry {
+    index: HashMap<Oid, usize>,
+    ancestors: Vec<Vec<u64>>,
+}
+
+impl Ancestry {
+    /// Beyond this many commits the bitsets cost more memory than the walks
+    /// they save are worth (8192 commits take 8 MiB).
+    const MAX_COMMITS: usize = 8192;
+
+    /// `commits` in topological order, children first, with `parents[i]` the
+    /// parents of `commits[i]`. Parents outside the history are ignored.
+    fn build(commits: &[TargetPathCommit], parents: &[Vec<Oid>]) -> Option<Self> {
+        if commits.len() > Self::MAX_COMMITS {
+            return None;
+        }
+        let index: HashMap<Oid, usize> = commits
+            .iter()
+            .enumerate()
+            .map(|(i, commit)| (commit.id, i))
+            .collect();
+        let words = commits.len().div_ceil(64);
+        let mut ancestors = vec![vec![0u64; words]; commits.len()];
+        for i in (0..commits.len()).rev() {
+            ancestors[i][i / 64] |= 1 << (i % 64);
+            for parent in &parents[i] {
+                let Some(&p) = index.get(parent) else {
+                    continue;
+                };
+                // Topological order puts every parent after its children, so its
+                // ancestors are already complete; anything else is not trusted.
+                if p <= i {
+                    return None;
+                }
+                let (head, tail) = ancestors.split_at_mut(p);
+                for (word, bits) in head[i].iter_mut().zip(&tail[0]) {
+                    *word |= bits;
+                }
+            }
+        }
+        Some(Self { index, ancestors })
+    }
+
+    /// Whether `ancestor` is `of` or reachable from it, or `None` when either
+    /// is outside the history.
+    fn is_ancestor(&self, ancestor: Oid, of: Oid) -> Option<bool> {
+        let a = *self.index.get(&ancestor)?;
+        let o = *self.index.get(&of)?;
+        Some(self.ancestors[o][a / 64] & (1 << (a % 64)) != 0)
     }
 }
 
@@ -254,6 +348,7 @@ impl SyncScanCache {
             return Ok(Rc::new(TargetPathHistory {
                 floor: base_id,
                 commits: Vec::new(),
+                ancestry: None,
             }));
         }
         if let Some((target, floor)) = self.shared_floor
@@ -882,9 +977,10 @@ pub fn collect_merged_local_branches(
     // Branches here share ranges and path sets, so the memoised lookups pay off
     // across the loop even though the per-stack answers are not reused.
     let mut cache = SyncScanCache::default();
+    let tips_in_target = local_branches_merged_into(repo, target_id)?;
     let mut unmerged_by_graph = Vec::new();
     for (name, branch_id) in branches {
-        if target_id == branch_id || repo.graph_descendant_of(target_id, branch_id)? {
+        if tips_in_target.contains(&name) {
             merged_branches.push(name);
         } else if let Ok(merge_base) = repo.merge_base(branch_id, target_id) {
             unmerged_by_graph.push((name, branch_id, merge_base));
@@ -906,6 +1002,29 @@ pub fn collect_merged_local_branches(
 
     merged_branches.sort();
     Ok(merged_branches)
+}
+
+/// Local branches whose tips `target_id` contains, in one query. Git reads the
+/// commit-graph, split chains included, where libgit2 would walk the commits
+/// behind every branch separately.
+fn local_branches_merged_into(repo: &Repository, target_id: Oid) -> Result<HashSet<String>> {
+    let output = Command::new("git")
+        .arg("for-each-ref")
+        .arg(format!("--merged={target_id}"))
+        .arg("--format=%(refname)")
+        .arg("refs/heads/")
+        .current_dir(repo_root(repo)?)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git for-each-ref failed while listing branches merged into the target."
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("refs/heads/"))
+        .map(str::to_string)
+        .collect())
 }
 
 pub struct FloatingTargetContext {
@@ -1808,49 +1927,12 @@ fn ensure_patch_ids(
 }
 
 fn compute_patch_ids(repo: &Repository, commit_ids: &[Oid]) -> Result<HashMap<Oid, String>> {
-    // Compared only against other commit patch ids, so any context width works
-    // as long as it is the same on both sides.
-    compute_patch_ids_for_commits(repo_root(repo)?, commit_ids, None, DiffContext::Default)
-}
-
-fn compute_commit_patch_ids_for_paths(
-    repo_root: &Path,
-    commit_ids: &[Oid],
-    touched_paths: &[String],
-) -> Result<HashMap<Oid, String>> {
-    // These are compared against a range patch id from `compute_range_patch_id`,
-    // which diffs with zero context. `git patch-id` hashes context lines too, so
-    // both sides have to ask for the same width or no pair can ever match.
-    compute_patch_ids_for_commits(
-        repo_root,
-        commit_ids,
-        Some(touched_paths),
-        DiffContext::Zero,
-    )
-}
-
-/// How much context a diff carries before it is hashed into a patch id. Patch
-/// ids are only comparable between diffs generated with the same width.
-#[derive(Clone, Copy)]
-enum DiffContext {
-    Default,
-    Zero,
-}
-
-impl DiffContext {
-    fn arg(self) -> Option<&'static str> {
-        match self {
-            DiffContext::Default => None,
-            DiffContext::Zero => Some("-U0"),
-        }
-    }
+    compute_patch_ids_for_commits(repo_root(repo)?, commit_ids)
 }
 
 fn compute_patch_ids_for_commits(
     repo_root: &Path,
     commit_ids: &[Oid],
-    touched_paths: Option<&[String]>,
-    context: DiffContext,
 ) -> Result<HashMap<Oid, String>> {
     if commit_ids.is_empty() {
         return Ok(HashMap::new());
@@ -1862,14 +1944,8 @@ fn compute_patch_ids_for_commits(
     for chunk in commit_ids.chunks(PATCH_ID_BATCH_SIZE) {
         let mut show = Command::new("git");
         show.arg("show").arg("--no-ext-diff").arg("--no-color");
-        if let Some(context_arg) = context.arg() {
-            show.arg(context_arg);
-        }
         for oid in chunk {
             show.arg(oid.to_string());
-        }
-        if let Some(paths) = touched_paths {
-            show.arg("--").args(paths);
         }
 
         let mut show_child = show.current_dir(repo_root).stdout(Stdio::piped()).spawn()?;
@@ -1934,27 +2010,25 @@ fn range_touched_paths(repo: &Repository, base_id: Oid, branch_tip: Oid) -> Resu
         return Ok(Vec::new());
     }
 
-    let output = Command::new("git")
-        .arg("diff")
-        .arg("--name-only")
-        .arg("--no-renames")
-        .arg("--no-ext-diff")
-        .arg(base_id.to_string())
-        .arg(branch_tip.to_string())
-        .current_dir(repo_root(repo)?)
-        .output()?;
+    let base_tree = repo.find_commit(base_id)?.tree()?;
+    let tip_tree = repo.find_commit(branch_tip)?.tree()?;
+    let mut opts = git2::DiffOptions::new();
+    opts.include_typechange(true);
+    let diff = repo.diff_tree_to_tree(Some(&base_tree), Some(&tip_tree), Some(&mut opts))?;
 
-    if !output.status.success() {
-        return Err(anyhow!(
-            "git diff failed while checking whether branch changes are present in target."
-        ));
+    // The paths are looked up in trees verbatim, so they must be the real names:
+    // never lossily converted, and never quoted the way `git diff` prints them.
+    let mut paths = Vec::new();
+    for delta in diff.deltas() {
+        let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path()) else {
+            continue;
+        };
+        let path = path
+            .to_str()
+            .ok_or_else(|| anyhow!("Path {} is not valid UTF-8.", path.display()))?;
+        paths.push(path.to_string());
     }
-
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| line.to_string())
-        .collect())
+    Ok(paths)
 }
 
 /// Answers containment from the touched paths' contents alone, when the target
@@ -1994,19 +2068,13 @@ fn range_changes_present_in_history(
         return Ok(false);
     }
 
-    let repo_root = repo_root(repo)?;
-    let branch_patch_id = compute_range_patch_id(
-        repo_root,
-        &format!("{base_id}..{branch_tip}"),
-        touched_paths,
-    )?
-    .ok_or_else(|| anyhow!("Missing branch patch id while checking target containment."))?;
-    let target_patch_ids =
-        compute_commit_patch_ids_for_paths(repo_root, &candidate_commits, touched_paths)?;
+    let base_tree = repo.find_commit(base_id)?.tree()?;
+    let tip_tree = repo.find_commit(branch_tip)?.tree()?;
+    let branch_patch_id = paths_patch_id(repo, Some(&base_tree), &tip_tree, touched_paths)?
+        .ok_or_else(|| anyhow!("Missing branch patch id while checking target containment."))?;
+    let target_patch_ids = commit_patch_ids_for_paths(repo, &candidate_commits, touched_paths)?;
 
-    Ok(target_patch_ids
-        .values()
-        .any(|patch_id| patch_id == &branch_patch_id))
+    Ok(target_patch_ids.contains(&branch_patch_id))
 }
 
 fn commits_match_on_paths(
@@ -2037,54 +2105,51 @@ fn tree_entry_state(tree: &git2::Tree<'_>, path: &Path) -> Result<Option<(Oid, i
     }
 }
 
-fn compute_range_patch_id(
-    repo_root: &Path,
-    range_spec: &str,
-    touched_paths: &[String],
-) -> Result<Option<String>> {
-    let mut diff_child = Command::new("git")
-        .arg("diff")
-        // Must match the width used for the commit patch ids this is compared
-        // against, in `compute_commit_patch_ids_for_paths`.
-        .arg(DiffContext::Zero.arg().unwrap_or("-U0"))
-        .arg("--no-ext-diff")
-        .arg(range_spec)
-        .arg("--")
-        .args(touched_paths)
-        .current_dir(repo_root)
-        .stdout(Stdio::piped())
-        .spawn()?;
-
-    let diff_stdout = diff_child.stdout.take().ok_or_else(|| {
-        anyhow!("Failed to capture git diff output while computing range patch id.")
-    })?;
-
-    let patch_output = Command::new("git")
-        .arg("patch-id")
-        .arg("--stable")
-        .current_dir(repo_root)
-        .stdin(Stdio::from(diff_stdout))
-        .output()?;
-
-    let diff_status = diff_child.wait()?;
-    if !diff_status.success() {
-        return Err(anyhow!(
-            "git diff failed while computing range patch id for target containment."
-        ));
+/// Patch id of the change from `old` to `new` on `paths`, or `None` when the
+/// paths do not change. Hashed without context, so a change still matches
+/// after upstream has moved the lines around it; both sides of a comparison
+/// must come from here for the ids to be comparable.
+fn paths_patch_id(
+    repo: &Repository,
+    old: Option<&git2::Tree<'_>>,
+    new: &git2::Tree<'_>,
+    paths: &[String],
+) -> Result<Option<Oid>> {
+    let mut opts = git2::DiffOptions::new();
+    opts.context_lines(0)
+        .include_typechange(true)
+        .disable_pathspec_match(true);
+    for path in paths {
+        opts.pathspec(path);
     }
-    if !patch_output.status.success() {
-        return Err(anyhow!(
-            "git patch-id failed while computing range patch id for target containment."
-        ));
+    let diff = repo.diff_tree_to_tree(old, Some(new), Some(&mut opts))?;
+    if diff.deltas().len() == 0 {
+        return Ok(None);
     }
+    Ok(Some(diff.patchid(None)?))
+}
 
-    Ok(String::from_utf8_lossy(&patch_output.stdout)
-        .lines()
-        .find_map(|line| {
-            line.split_whitespace()
-                .next()
-                .map(|patch_id| patch_id.to_string())
-        }))
+/// Patch ids of the non-merge `commit_ids` against their parent, on `paths`.
+/// A merge commit has no single change to compare, so it is skipped.
+fn commit_patch_ids_for_paths(
+    repo: &Repository,
+    commit_ids: &[Oid],
+    paths: &[String],
+) -> Result<Vec<Oid>> {
+    let mut patch_ids = Vec::new();
+    for &commit_id in commit_ids {
+        let commit = repo.find_commit(commit_id)?;
+        let parent_tree = match commit.parent_count() {
+            0 => None,
+            1 => Some(commit.parent(0)?.tree()?),
+            _ => continue,
+        };
+        if let Some(patch_id) = paths_patch_id(repo, parent_tree.as_ref(), &commit.tree()?, paths)?
+        {
+            patch_ids.push(patch_id);
+        }
+    }
+    Ok(patch_ids)
 }
 
 fn ordered_stack_lineage(

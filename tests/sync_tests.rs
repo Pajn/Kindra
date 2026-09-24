@@ -3314,3 +3314,35 @@ fn change_reverted_before_fork_does_not_mark_branch_merged() {
         "a branch re-applying a reverted change has not landed, got {merged:?}"
     );
 }
+
+/// `git diff --name-only` quotes non-ASCII paths, and a quoted name is found in
+/// neither tree, so the two sides looked equal and the branch looked merged.
+/// Touched paths must be the real names for the tree comparison to mean anything.
+#[test]
+fn branch_touching_only_non_ascii_path_is_not_merged() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let root = dir.path();
+    run_ok("git", &["config", "user.name", "Test User"], root);
+    run_ok("git", &["config", "user.email", "test@example.com"], root);
+
+    fs::write(root.join("base.txt"), "base\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "base"], root);
+
+    run_ok("git", &["checkout", "-b", "feature"], root);
+    fs::write(root.join("ä.txt"), "feature\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "feature: add ä"], root);
+
+    run_ok("git", &["checkout", "main"], root);
+    fs::write(root.join("base.txt"), "moved on\n").unwrap();
+    run_ok("git", &["commit", "-am", "upstream: unrelated edit"], root);
+
+    let repo = Repository::open(repo.path()).unwrap();
+    let merged = kindra::stack::collect_merged_local_branches(&repo, "main", &["main"]).unwrap();
+    assert!(
+        merged.is_empty(),
+        "a branch whose change has not landed must not be merged, got {merged:?}"
+    );
+}
