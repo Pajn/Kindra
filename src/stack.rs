@@ -61,9 +61,11 @@ impl TargetPathHistory {
     fn load(repo: &Repository, floor: Oid, target_tip: Oid, paths: &[String]) -> Result<Self> {
         let unfiltered = paths.is_empty();
         let mut log = Command::new("git");
-        // Names are matched against real tree paths, so they must not be quoted.
-        log.args(["-c", "core.quotePath=false"])
+        // Names are matched against real tree paths, so they are read NUL-framed
+        // and unquoted, and the touched paths are matched literally, not as globs.
+        log.args(["--literal-pathspecs", "-c", "core.quotePath=false"])
             .arg("log")
+            .arg("-z")
             .arg("--format=__KINDRA_COMMIT__%H %P")
             .arg("--name-only")
             .arg("--no-renames")
@@ -85,16 +87,19 @@ impl TargetPathHistory {
             ));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let mut commits = Vec::new();
         let mut parents = Vec::new();
         let mut current: Option<TargetPathCommit> = None;
 
-        for line in stdout.lines() {
-            if let Some(header) = line.strip_prefix("__KINDRA_COMMIT__") {
+        // Each commit is its NUL-terminated header, then its paths, each
+        // NUL-terminated, the first preceded by one newline.
+        let mut first_path = false;
+        for field in output.stdout.split(|&b| b == 0) {
+            if let Some(header) = field.strip_prefix(b"__KINDRA_COMMIT__".as_slice()) {
                 if let Some(commit) = current.take() {
                     commits.push(commit);
                 }
+                let header = std::str::from_utf8(header)?;
                 let mut ids = header.split_whitespace().map(Oid::from_str);
                 let id = ids
                     .next()
@@ -104,15 +109,22 @@ impl TargetPathHistory {
                     id,
                     changed_paths: HashSet::new(),
                 });
+                first_path = true;
                 continue;
             }
 
-            if line.trim().is_empty() {
+            let path = match field.strip_prefix(b"\n".as_slice()) {
+                Some(path) if first_path => path,
+                _ => field,
+            };
+            first_path = false;
+            // Touched paths are always UTF-8, so a path that is not can never
+            // complete a covering set; skipping it cannot claim a false match.
+            let (Some(commit), Ok(path)) = (current.as_mut(), std::str::from_utf8(path)) else {
                 continue;
-            }
-
-            if let Some(commit) = current.as_mut() {
-                commit.changed_paths.insert(line.to_string());
+            };
+            if !path.is_empty() {
+                commit.changed_paths.insert(path.to_string());
             }
         }
 

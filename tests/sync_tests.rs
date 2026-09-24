@@ -3346,3 +3346,41 @@ fn branch_touching_only_non_ascii_path_is_not_merged() {
         "a branch whose change has not landed must not be merged, got {merged:?}"
     );
 }
+
+/// Git quotes a path containing `"` or `\` even with `core.quotePath=false`, so
+/// a history read line by line records a name no touched path matches. The
+/// squash commit then never covers the branch, and a landed branch is kept.
+#[test]
+fn squash_merged_branch_with_quoted_path_is_detected_as_merged() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let root = dir.path();
+    run_ok("git", &["config", "user.name", "Test User"], root);
+    run_ok("git", &["config", "user.email", "test@example.com"], root);
+
+    let name = "we\"ird\\name.txt";
+    let base_lines: Vec<String> = (1..=12).map(|n| format!("line {n}")).collect();
+    fs::write(root.join(name), base_lines.join("\n") + "\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "base"], root);
+
+    run_ok("git", &["checkout", "-b", "feature"], root);
+    let mut edited = base_lines.clone();
+    edited[6] = "line 7 changed on feature".to_string();
+    fs::write(root.join(name), edited.join("\n") + "\n").unwrap();
+    run_ok("git", &["commit", "-am", "feature: edit"], root);
+
+    run_ok("git", &["checkout", "main"], root);
+    run_ok("git", &["merge", "--squash", "feature"], root);
+    run_ok("git", &["commit", "-m", "squash: feature (#1)"], root);
+
+    // Upstream edits the same file again, so only the history search can tell.
+    let mut after = edited.clone();
+    after[0] = "line 1 changed upstream".to_string();
+    fs::write(root.join(name), after.join("\n") + "\n").unwrap();
+    run_ok("git", &["commit", "-am", "upstream: later edit"], root);
+
+    let repo = Repository::open(repo.path()).unwrap();
+    let merged = kindra::stack::collect_merged_local_branches(&repo, "main", &["main"]).unwrap();
+    assert_eq!(merged, vec!["feature".to_string()]);
+}
