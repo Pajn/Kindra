@@ -3208,3 +3208,47 @@ fn squash_merged_branch_is_detected_as_merged() {
         "squash-merged branch should be detected as merged, got {merged:?}"
     );
 }
+
+/// A change upstream applied and then reverted before a branch forked is not
+/// the branch's change landing: only upstream commits after the fork point can
+/// carry it. Matching the older commit's patch id would report the branch
+/// merged, and sync would delete it with its work still unlanded.
+#[test]
+fn change_reverted_before_fork_does_not_mark_branch_merged() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let root = dir.path();
+    run_ok("git", &["config", "user.name", "Test User"], root);
+    run_ok("git", &["config", "user.email", "test@example.com"], root);
+
+    let base_lines: Vec<String> = (1..=12).map(|n| format!("line {n}")).collect();
+    fs::write(root.join("a.txt"), base_lines.join("\n") + "\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "base"], root);
+
+    let mut edited = base_lines.clone();
+    edited[6] = "line 7 changed".to_string();
+    fs::write(root.join("a.txt"), edited.join("\n") + "\n").unwrap();
+    run_ok("git", &["commit", "-am", "upstream: change line 7"], root);
+    run_ok("git", &["revert", "--no-edit", "HEAD"], root);
+
+    // The branch forks after the revert and makes the same change again.
+    run_ok("git", &["checkout", "-b", "feature"], root);
+    fs::write(root.join("a.txt"), edited.join("\n") + "\n").unwrap();
+    run_ok("git", &["commit", "-am", "feature: change line 7"], root);
+
+    // Upstream moves on in the same file, so neither tree comparison settles it
+    // and the upstream history has to be searched.
+    run_ok("git", &["checkout", "main"], root);
+    let mut after = base_lines.clone();
+    after[0] = "line 1 changed upstream".to_string();
+    fs::write(root.join("a.txt"), after.join("\n") + "\n").unwrap();
+    run_ok("git", &["commit", "-am", "upstream: later edit"], root);
+
+    let repo = Repository::open(repo.path()).unwrap();
+    let merged = kindra::stack::collect_merged_local_branches(&repo, "main", &["main"]).unwrap();
+    assert!(
+        merged.is_empty(),
+        "a branch re-applying a reverted change has not landed, got {merged:?}"
+    );
+}

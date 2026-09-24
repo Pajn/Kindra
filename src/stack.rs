@@ -51,7 +51,10 @@ struct TargetPathCommit {
 }
 
 impl TargetPathHistory {
-    fn load(repo: &Repository, target_tip: Oid, paths: &[String]) -> Result<Self> {
+    /// Indexes the target commits after `base_id` that touch `paths`. Only those
+    /// can carry a branch's changes: anything reachable from the base predates
+    /// the branch, and walking it would scan the whole of the target's history.
+    fn load(repo: &Repository, base_id: Oid, target_tip: Oid, paths: &[String]) -> Result<Self> {
         if paths.is_empty() {
             return Ok(Self::default());
         }
@@ -62,7 +65,7 @@ impl TargetPathHistory {
             .arg("--name-only")
             .arg("--no-renames")
             .arg("--no-ext-diff")
-            .arg(target_tip.to_string())
+            .arg(format!("{base_id}..{target_tip}"))
             .arg("--")
             .args(paths)
             .current_dir(repo_root(repo)?)
@@ -138,8 +141,8 @@ pub struct SyncScanCache {
     /// Paths a commit range touches, by `(base, tip)`. The lineages of a tree
     /// stack overlap heavily, so the same ranges are asked for repeatedly.
     touched_paths: HashMap<(Oid, Oid), Rc<Vec<String>>>,
-    /// Target history indexed by the target tip and exact path set it was loaded for.
-    histories: HashMap<(Oid, Vec<String>), Rc<TargetPathHistory>>,
+    /// Target history indexed by the base, target tip and exact path set it was loaded for.
+    histories: HashMap<(Oid, Oid, Vec<String>), Rc<TargetPathHistory>>,
 }
 
 impl SyncScanCache {
@@ -225,14 +228,15 @@ impl SyncScanCache {
     fn history(
         &mut self,
         repo: &Repository,
+        base_id: Oid,
         target_tip: Oid,
         paths: &[String],
     ) -> Result<Rc<TargetPathHistory>> {
-        let key = (target_tip, paths.to_vec());
+        let key = (base_id, target_tip, paths.to_vec());
         if let Some(known) = self.histories.get(&key) {
             return Ok(Rc::clone(known));
         }
-        let history = Rc::new(TargetPathHistory::load(repo, target_tip, paths)?);
+        let history = Rc::new(TargetPathHistory::load(repo, base_id, target_tip, paths)?);
         self.histories.insert(key, Rc::clone(&history));
         Ok(history)
     }
@@ -289,7 +293,8 @@ pub fn find_sync_boundary_cached(
         .into_iter()
         .collect::<Vec<_>>();
     union_paths.sort();
-    let target_history = cache.history(repo, upstream_id, &union_paths)?;
+    // Loaded on first need: most commits are settled by graph or tree checks.
+    let mut target_history = None;
     let mut prefix_end: isize = -1;
 
     for (idx, (&commit_id, touched_paths)) in first_parent_chain
@@ -304,14 +309,34 @@ pub fn find_sync_boundary_cached(
             continue;
         }
 
-        if range_changes_present_in_target_with_history(
+        let present = match range_changes_settled_by_trees(
             repo,
             branch_cutoff,
             commit_id,
             upstream_id,
             touched_paths,
-            &target_history,
         )? {
+            Some(present) => present,
+            None => {
+                let history = match &target_history {
+                    Some(history) => Rc::clone(history),
+                    None => Rc::clone(target_history.insert(cache.history(
+                        repo,
+                        branch_cutoff,
+                        upstream_id,
+                        &union_paths,
+                    )?)),
+                };
+                range_changes_present_in_history(
+                    repo,
+                    branch_cutoff,
+                    commit_id,
+                    touched_paths,
+                    &history,
+                )?
+            }
+        };
+        if present {
             prefix_end = idx as isize;
         }
     }
@@ -1840,19 +1865,14 @@ fn range_changes_present_in_target(
 ) -> Result<bool> {
     let touched_paths = cache.touched_paths(repo, base_id, branch_tip)?;
 
-    if touched_paths.is_empty() {
-        return Ok(true);
+    if let Some(present) =
+        range_changes_settled_by_trees(repo, base_id, branch_tip, target_tip, &touched_paths)?
+    {
+        return Ok(present);
     }
 
-    let target_history = cache.history(repo, target_tip, &touched_paths)?;
-    range_changes_present_in_target_with_history(
-        repo,
-        base_id,
-        branch_tip,
-        target_tip,
-        &touched_paths,
-        &target_history,
-    )
+    let target_history = cache.history(repo, base_id, target_tip, &touched_paths)?;
+    range_changes_present_in_history(repo, base_id, branch_tip, &touched_paths, &target_history)
 }
 
 fn range_touched_paths(repo: &Repository, base_id: Oid, branch_tip: Oid) -> Result<Vec<String>> {
@@ -1883,26 +1903,38 @@ fn range_touched_paths(repo: &Repository, base_id: Oid, branch_tip: Oid) -> Resu
         .collect())
 }
 
-fn range_changes_present_in_target_with_history(
+/// Answers containment from the touched paths' contents alone, when the target
+/// either matches the branch tip or still matches the base. `None` means the
+/// target history has to be searched for the branch's patch.
+fn range_changes_settled_by_trees(
     repo: &Repository,
     base_id: Oid,
     branch_tip: Oid,
     target_tip: Oid,
     touched_paths: &[String],
-    target_history: &TargetPathHistory,
-) -> Result<bool> {
+) -> Result<Option<bool>> {
     if touched_paths.is_empty() {
-        return Ok(true);
+        return Ok(Some(true));
     }
 
     if commits_match_on_paths(repo, branch_tip, target_tip, touched_paths)? {
-        return Ok(true);
+        return Ok(Some(true));
     }
 
     if commits_match_on_paths(repo, base_id, target_tip, touched_paths)? {
-        return Ok(false);
+        return Ok(Some(false));
     }
 
+    Ok(None)
+}
+
+fn range_changes_present_in_history(
+    repo: &Repository,
+    base_id: Oid,
+    branch_tip: Oid,
+    touched_paths: &[String],
+    target_history: &TargetPathHistory,
+) -> Result<bool> {
     let candidate_commits = target_history.covering_commits(touched_paths);
     if candidate_commits.is_empty() {
         return Ok(false);
