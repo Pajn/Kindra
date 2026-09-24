@@ -141,22 +141,21 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
 
     let boundary = find_sync_boundary(repo, &top_branch, &rebase_onto_name, &stack_branches)?;
 
-    let mut branches_to_check = stack_branches
+    let mut merged_branches = if args.no_delete {
+        Vec::new()
+    } else {
+        boundary.merged_branches.clone()
+    };
+    crate::rebase_utils::keep_merged_branches_checked_out_elsewhere(&mut merged_branches)?;
+
+    // Merged branches sit at or below the rebase's old base, so only the rest
+    // of the stack is rewritten and must not be checked out elsewhere.
+    let branches_to_check = stack_branches
         .iter()
+        .filter(|sb| !boundary.merged_branches.contains(&sb.name))
         .map(|sb| sb.name.clone())
         .collect::<Vec<_>>();
-
-    if !args.no_delete {
-        for mb in &boundary.merged_branches {
-            if !branches_to_check.contains(mb) {
-                branches_to_check.push(mb.clone());
-            }
-        }
-    }
-
-    if !branches_to_check.is_empty() {
-        crate::rebase_utils::check_worktrees(&branches_to_check, args.force)?;
-    }
+    crate::rebase_utils::check_worktrees(&branches_to_check, args.force)?;
 
     if let Some(old_base) = boundary.old_base {
         crate::rebase_utils::ensure_git_supports_update_refs()?;
@@ -187,11 +186,7 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
             suppress_editor: false,
             unstage_on_restore: false,
             autostash,
-            cleanup_merged_branches: if args.no_delete {
-                Vec::new()
-            } else {
-                boundary.merged_branches.clone()
-            },
+            cleanup_merged_branches: merged_branches.clone(),
             cleanup_checkout_fallback: Some(local_upstream.clone()),
         };
 
@@ -236,9 +231,7 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
         );
     }
 
-    if !args.no_delete {
-        delete_merged_branches(repo, &boundary.merged_branches, &local_upstream)?;
-    }
+    delete_merged_branches(repo, &merged_branches, &local_upstream)?;
 
     // The undo guard settles the pending snapshot on return: it records the
     // merged-branch deletions (if any) or drops the snapshot when nothing
@@ -252,15 +245,12 @@ fn sync_upstream_branch(
     upstream_name: &str,
     rebase_onto_name: &str,
 ) -> Result<()> {
-    let merged_branches = if args.no_delete {
+    let mut merged_branches = if args.no_delete {
         Vec::new()
     } else {
         collect_merged_local_branches(repo, rebase_onto_name, &[upstream_name])?
     };
-
-    if !merged_branches.is_empty() {
-        crate::rebase_utils::check_worktrees(&merged_branches, args.force)?;
-    }
+    crate::rebase_utils::keep_merged_branches_checked_out_elsewhere(&mut merged_branches)?;
 
     let upstream_id = repo.revparse_single(upstream_name)?.id();
     let rebase_onto_id = repo.revparse_single(rebase_onto_name)?.id();
@@ -547,17 +537,17 @@ fn sync_tree(
         parents,
         merged,
     } = crate::stack::plan_tree_sync(repo, branches, upstream, merge_base)?;
-    let mut check: Vec<_> = branches.iter().map(|b| b.name.clone()).collect();
-    if !args.no_delete {
-        check.extend(merged.iter().cloned());
-    }
+    // The plan never rebases a merged branch, so only the others are checked.
+    let check: Vec<_> = branches
+        .iter()
+        .filter(|b| !merged.contains(&b.name))
+        .map(|b| b.name.clone())
+        .collect();
     crate::rebase_utils::check_worktrees(&check, args.force)?;
+    let mut merged = if args.no_delete { Vec::new() } else { merged };
+    crate::rebase_utils::keep_merged_branches_checked_out_elsewhere(&mut merged)?;
     if remaining.is_empty() {
-        return if args.no_delete {
-            Ok(())
-        } else {
-            delete_merged_branches(repo, &merged, local_upstream)
-        };
+        return delete_merged_branches(repo, &merged, local_upstream);
     }
     let original = caller.unwrap_or(&remaining[0]).to_string();
     let autostash =
@@ -586,7 +576,7 @@ fn sync_tree(
         suppress_editor: false,
         unstage_on_restore: false,
         autostash,
-        cleanup_merged_branches: if args.no_delete { Vec::new() } else { merged },
+        cleanup_merged_branches: merged,
         cleanup_checkout_fallback: Some(local_upstream.to_string()),
     };
     state.stash_ref = crate::rebase_utils::take_autostash(repo, autostash)?;

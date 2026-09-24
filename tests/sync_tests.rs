@@ -2695,30 +2695,84 @@ fn sync_refuses_to_delete_branch_checked_out_in_other_worktree() {
 
     run_ok("git", &["checkout", "-f", "feature-b"], dir.path());
 
+    // Git cannot delete a branch another worktree has checked out, and sync has
+    // nothing else to do with a merged branch, so it keeps it and carries on.
     let mut cmd = kin_cmd();
     cmd.arg("sync")
-        .current_dir(dir.path())
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("is checked out in"));
-
-    let repo = Repository::open(dir.path()).unwrap();
-    assert!(repo.find_branch("feature-a", BranchType::Local).is_ok());
-
-    // Force should proceed but git branch -D will still warn and skip deletion
-    let mut cmd = kin_cmd();
-    cmd.arg("sync")
-        .arg("--force")
         .current_dir(dir.path())
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Warning: Failed to delete merged branch: feature-a",
+            "Keeping merged branch feature-a: it is checked out in",
         ));
 
     let repo = Repository::open(dir.path()).unwrap();
-    // It remains because git refused to delete it even with -D (it's checked out in another worktree)
     assert!(repo.find_branch("feature-a", BranchType::Local).is_ok());
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-b"));
+}
+
+#[test]
+fn sync_on_main_keeps_merged_branch_checked_out_in_other_worktree() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+    let open_id = make_commit(
+        &repo,
+        "refs/heads/merged-open",
+        "open.txt",
+        "open",
+        "merged, checked out elsewhere",
+        &[&base],
+    );
+    let open = repo.find_commit(open_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/merged-idle",
+        "idle.txt",
+        "idle",
+        "merged, not checked out",
+        &[&open],
+    );
+
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    run_ok("git", &["merge", "--ff-only", "merged-idle"], dir.path());
+
+    let wt_dir = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "worktree",
+            "add",
+            wt_dir.path().to_str().unwrap(),
+            "merged-open",
+        ],
+        dir.path(),
+    );
+
+    kin_cmd()
+        .arg("sync")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Keeping merged branch merged-open: it is checked out in",
+        ))
+        .stdout(predicate::str::contains(
+            "Deleted merged branch: merged-idle",
+        ));
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert!(repo.find_branch("merged-open", BranchType::Local).is_ok());
+    assert!(repo.find_branch("merged-idle", BranchType::Local).is_err());
 }
 
 #[test]
@@ -3207,4 +3261,126 @@ fn squash_merged_branch_is_detected_as_merged() {
         merged.iter().any(|b| b == "feature"),
         "squash-merged branch should be detected as merged, got {merged:?}"
     );
+}
+
+/// A change upstream applied and then reverted before a branch forked is not
+/// the branch's change landing: only upstream commits after the fork point can
+/// carry it. Matching the older commit's patch id would report the branch
+/// merged, and sync would delete it with its work still unlanded.
+#[test]
+fn change_reverted_before_fork_does_not_mark_branch_merged() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let root = dir.path();
+    run_ok("git", &["config", "user.name", "Test User"], root);
+    run_ok("git", &["config", "user.email", "test@example.com"], root);
+
+    let base_lines: Vec<String> = (1..=12).map(|n| format!("line {n}")).collect();
+    fs::write(root.join("a.txt"), base_lines.join("\n") + "\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "base"], root);
+
+    // An unmerged branch forked before the change lowers the common floor, so
+    // a history shared across both ranges holds the reverted change too.
+    run_ok("git", &["checkout", "-b", "older"], root);
+    fs::write(root.join("b.txt"), "older work\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "older: add b"], root);
+    run_ok("git", &["checkout", "main"], root);
+
+    let mut edited = base_lines.clone();
+    edited[6] = "line 7 changed".to_string();
+    fs::write(root.join("a.txt"), edited.join("\n") + "\n").unwrap();
+    run_ok("git", &["commit", "-am", "upstream: change line 7"], root);
+    run_ok("git", &["revert", "--no-edit", "HEAD"], root);
+
+    // The branch forks after the revert and makes the same change again.
+    run_ok("git", &["checkout", "-b", "feature"], root);
+    fs::write(root.join("a.txt"), edited.join("\n") + "\n").unwrap();
+    run_ok("git", &["commit", "-am", "feature: change line 7"], root);
+
+    // Upstream moves on in the same file, so neither tree comparison settles it
+    // and the upstream history has to be searched.
+    run_ok("git", &["checkout", "main"], root);
+    let mut after = base_lines.clone();
+    after[0] = "line 1 changed upstream".to_string();
+    fs::write(root.join("a.txt"), after.join("\n") + "\n").unwrap();
+    run_ok("git", &["commit", "-am", "upstream: later edit"], root);
+
+    let repo = Repository::open(repo.path()).unwrap();
+    let merged = kindra::stack::collect_merged_local_branches(&repo, "main", &["main"]).unwrap();
+    assert!(
+        merged.is_empty(),
+        "a branch re-applying a reverted change has not landed, got {merged:?}"
+    );
+}
+
+/// `git diff --name-only` quotes non-ASCII paths, and a quoted name is found in
+/// neither tree, so the two sides looked equal and the branch looked merged.
+/// Touched paths must be the real names for the tree comparison to mean anything.
+#[test]
+fn branch_touching_only_non_ascii_path_is_not_merged() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let root = dir.path();
+    run_ok("git", &["config", "user.name", "Test User"], root);
+    run_ok("git", &["config", "user.email", "test@example.com"], root);
+
+    fs::write(root.join("base.txt"), "base\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "base"], root);
+
+    run_ok("git", &["checkout", "-b", "feature"], root);
+    fs::write(root.join("ä.txt"), "feature\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "feature: add ä"], root);
+
+    run_ok("git", &["checkout", "main"], root);
+    fs::write(root.join("base.txt"), "moved on\n").unwrap();
+    run_ok("git", &["commit", "-am", "upstream: unrelated edit"], root);
+
+    let repo = Repository::open(repo.path()).unwrap();
+    let merged = kindra::stack::collect_merged_local_branches(&repo, "main", &["main"]).unwrap();
+    assert!(
+        merged.is_empty(),
+        "a branch whose change has not landed must not be merged, got {merged:?}"
+    );
+}
+
+/// Git quotes a path containing `"` or `\` even with `core.quotePath=false`, so
+/// a history read line by line records a name no touched path matches. The
+/// squash commit then never covers the branch, and a landed branch is kept.
+#[test]
+fn squash_merged_branch_with_quoted_path_is_detected_as_merged() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let root = dir.path();
+    run_ok("git", &["config", "user.name", "Test User"], root);
+    run_ok("git", &["config", "user.email", "test@example.com"], root);
+
+    let name = "we\"ird\\name.txt";
+    let base_lines: Vec<String> = (1..=12).map(|n| format!("line {n}")).collect();
+    fs::write(root.join(name), base_lines.join("\n") + "\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "base"], root);
+
+    run_ok("git", &["checkout", "-b", "feature"], root);
+    let mut edited = base_lines.clone();
+    edited[6] = "line 7 changed on feature".to_string();
+    fs::write(root.join(name), edited.join("\n") + "\n").unwrap();
+    run_ok("git", &["commit", "-am", "feature: edit"], root);
+
+    run_ok("git", &["checkout", "main"], root);
+    run_ok("git", &["merge", "--squash", "feature"], root);
+    run_ok("git", &["commit", "-m", "squash: feature (#1)"], root);
+
+    // Upstream edits the same file again, so only the history search can tell.
+    let mut after = edited.clone();
+    after[0] = "line 1 changed upstream".to_string();
+    fs::write(root.join(name), after.join("\n") + "\n").unwrap();
+    run_ok("git", &["commit", "-am", "upstream: later edit"], root);
+
+    let repo = Repository::open(repo.path()).unwrap();
+    let merged = kindra::stack::collect_merged_local_branches(&repo, "main", &["main"]).unwrap();
+    assert_eq!(merged, vec!["feature".to_string()]);
 }
