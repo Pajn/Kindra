@@ -285,7 +285,7 @@ kin sync [--force] [--no-delete] [--autostash|--no-autostash]
 ```
 
 **Arguments:**
-- `--force`: Force the sync even if branches in the stack are checked out in other worktrees.
+- `--force`: Force the sync even if branches it has to rebase are checked out in other worktrees.
 - `--no-delete`: Do not automatically delete branches that have already been integrated into the upstream branch.
 - `--autostash`: Allow the sync rebase to use Git autostash.
 - `--no-autostash`: Disable Git autostash even if configured globally or for the repo.
@@ -296,7 +296,7 @@ kin sync [--force] [--no-delete] [--autostash|--no-autostash]
 - Finds the top branch in your current stack.
 - Detects the first commit that still needs replaying (while handling lower PRs already landed via merge, rebase/cherry-pick, or squash).
 - Checks out the top branch and runs one `git rebase --update-refs --onto <upstream> <old-base> <top>`.
-- **Automatically deletes local branches** in the stack that are already merged into the upstream branch (unless `--no-delete` is used).
+- **Automatically deletes local branches** in the stack that are already merged into the upstream branch (unless `--no-delete` is used). A merged branch checked out in another worktree is kept, with a note, since Git cannot delete it; this does not stop the sync.
 - If your current branch is deleted because it was merged, Kindra automatically switches you to the upstream branch.
 
 **When to use it:** Use this after one or more lower PRs in your stack have already landed on the upstream branch, and you want to sync all remaining branches and clean up the merged ones in one pass.

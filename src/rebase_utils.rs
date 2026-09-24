@@ -525,10 +525,50 @@ fn current_branch_name(repo: &Repository) -> Result<Option<String>> {
 }
 
 pub fn check_worktrees(branches: &[String], force: bool) -> Result<()> {
-    if force {
+    if force || branches.is_empty() {
         return Ok(());
     }
 
+    let elsewhere = branches_checked_out_elsewhere()?;
+    for branch in branches {
+        if let Some(path) = elsewhere.get(branch) {
+            return Err(anyhow!(
+                "{} is checked out in {}, aborting as a full rebase can not be completed. Use --force to ignore this check.",
+                branch,
+                path
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Removes the branches another worktree has checked out from `branches`,
+/// which are about to be deleted as merged, and says which were kept. Git
+/// refuses to delete a branch checked out elsewhere, and nothing else in a sync
+/// touches a merged branch, so keeping them never needs to block the sync.
+pub fn keep_merged_branches_checked_out_elsewhere(branches: &mut Vec<String>) -> Result<()> {
+    if branches.is_empty() {
+        return Ok(());
+    }
+
+    let elsewhere = branches_checked_out_elsewhere()?;
+    branches.retain(|branch| match elsewhere.get(branch) {
+        Some(path) => {
+            println!(
+                "Keeping merged branch {}: it is checked out in {}.",
+                branch, path
+            );
+            false
+        }
+        None => true,
+    });
+    Ok(())
+}
+
+/// Branches checked out in a worktree other than the current one, mapped to
+/// that worktree's path.
+fn branches_checked_out_elsewhere() -> Result<HashMap<String, String>> {
     let current_worktree_output = Command::new("git")
         .arg("rev-parse")
         .arg("--show-toplevel")
@@ -566,19 +606,8 @@ pub fn check_worktrees(branches: &[String], force: bool) -> Result<()> {
         }
     }
 
-    for branch in branches {
-        if let Some(path) = worktree_map.get(branch)
-            && path != &current_worktree
-        {
-            return Err(anyhow!(
-                "{} is checked out in {}, aborting as a full rebase can not be completed. Use --force to ignore this check.",
-                branch,
-                path
-            ));
-        }
-    }
-
-    Ok(())
+    worktree_map.retain(|_, path| path != &current_worktree);
+    Ok(worktree_map)
 }
 
 /// True if the working tree has tracked changes that a rebase or checkout would

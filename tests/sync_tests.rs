@@ -2695,30 +2695,84 @@ fn sync_refuses_to_delete_branch_checked_out_in_other_worktree() {
 
     run_ok("git", &["checkout", "-f", "feature-b"], dir.path());
 
+    // Git cannot delete a branch another worktree has checked out, and sync has
+    // nothing else to do with a merged branch, so it keeps it and carries on.
     let mut cmd = kin_cmd();
     cmd.arg("sync")
-        .current_dir(dir.path())
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("is checked out in"));
-
-    let repo = Repository::open(dir.path()).unwrap();
-    assert!(repo.find_branch("feature-a", BranchType::Local).is_ok());
-
-    // Force should proceed but git branch -D will still warn and skip deletion
-    let mut cmd = kin_cmd();
-    cmd.arg("sync")
-        .arg("--force")
         .current_dir(dir.path())
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Warning: Failed to delete merged branch: feature-a",
+            "Keeping merged branch feature-a: it is checked out in",
         ));
 
     let repo = Repository::open(dir.path()).unwrap();
-    // It remains because git refused to delete it even with -D (it's checked out in another worktree)
     assert!(repo.find_branch("feature-a", BranchType::Local).is_ok());
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-b"));
+}
+
+#[test]
+fn sync_on_main_keeps_merged_branch_checked_out_in_other_worktree() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let base_id = make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    let base = repo.find_commit(base_id).unwrap();
+    let open_id = make_commit(
+        &repo,
+        "refs/heads/merged-open",
+        "open.txt",
+        "open",
+        "merged, checked out elsewhere",
+        &[&base],
+    );
+    let open = repo.find_commit(open_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/merged-idle",
+        "idle.txt",
+        "idle",
+        "merged, not checked out",
+        &[&open],
+    );
+
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    run_ok("git", &["merge", "--ff-only", "merged-idle"], dir.path());
+
+    let wt_dir = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "worktree",
+            "add",
+            wt_dir.path().to_str().unwrap(),
+            "merged-open",
+        ],
+        dir.path(),
+    );
+
+    kin_cmd()
+        .arg("sync")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Keeping merged branch merged-open: it is checked out in",
+        ))
+        .stdout(predicate::str::contains(
+            "Deleted merged branch: merged-idle",
+        ));
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert!(repo.find_branch("merged-open", BranchType::Local).is_ok());
+    assert!(repo.find_branch("merged-idle", BranchType::Local).is_err());
 }
 
 #[test]
