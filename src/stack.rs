@@ -40,8 +40,9 @@ pub struct GraphReorderPlan {
     pub new_base_map: HashMap<String, String>,
 }
 
-#[derive(Default)]
 struct TargetPathHistory {
+    /// The history holds the target commits not reachable from this commit.
+    floor: Oid,
     commits: Vec<TargetPathCommit>,
 }
 
@@ -51,21 +52,18 @@ struct TargetPathCommit {
 }
 
 impl TargetPathHistory {
-    /// Indexes the target commits after `base_id` that touch `paths`. Only those
-    /// can carry a branch's changes: anything reachable from the base predates
-    /// the branch, and walking it would scan the whole of the target's history.
-    fn load(repo: &Repository, base_id: Oid, target_tip: Oid, paths: &[String]) -> Result<Self> {
-        if paths.is_empty() {
-            return Ok(Self::default());
-        }
-
+    /// Indexes the target commits after `floor` that touch `paths`, or every
+    /// commit after it when `paths` is empty. Only commits after a branch's base
+    /// can carry its changes: anything reachable from the base predates the
+    /// branch, and walking it would scan the whole of the target's history.
+    fn load(repo: &Repository, floor: Oid, target_tip: Oid, paths: &[String]) -> Result<Self> {
         let output = Command::new("git")
             .arg("log")
             .arg("--format=__KINDRA_COMMIT__%H")
             .arg("--name-only")
             .arg("--no-renames")
             .arg("--no-ext-diff")
-            .arg(format!("{base_id}..{target_tip}"))
+            .arg(format!("{floor}..{target_tip}"))
             .arg("--")
             .args(paths)
             .current_dir(repo_root(repo)?)
@@ -106,20 +104,35 @@ impl TargetPathHistory {
             commits.push(commit);
         }
 
-        Ok(Self { commits })
+        Ok(Self { floor, commits })
     }
 
-    fn covering_commits(&self, touched_paths: &[String]) -> Vec<Oid> {
-        self.commits
-            .iter()
-            .filter(|commit| {
-                commit.changed_paths.len() >= touched_paths.len()
-                    && touched_paths
-                        .iter()
-                        .all(|path| commit.changed_paths.contains(path))
-            })
-            .map(|commit| commit.id)
-            .collect()
+    /// Commits after `base_id` that touch every one of `touched_paths`. A history
+    /// shared from a lower floor also holds commits the base already contains;
+    /// those predate the range and are dropped.
+    fn covering_commits(
+        &self,
+        repo: &Repository,
+        base_id: Oid,
+        touched_paths: &[String],
+    ) -> Result<Vec<Oid>> {
+        let mut covering = Vec::new();
+        for commit in &self.commits {
+            let covers = commit.changed_paths.len() >= touched_paths.len()
+                && touched_paths
+                    .iter()
+                    .all(|path| commit.changed_paths.contains(path));
+            if !covers {
+                continue;
+            }
+            if self.floor != base_id
+                && (commit.id == base_id || repo.graph_descendant_of(base_id, commit.id)?)
+            {
+                continue;
+            }
+            covering.push(commit.id);
+        }
+        Ok(covering)
     }
 }
 
@@ -143,6 +156,11 @@ pub struct SyncScanCache {
     touched_paths: HashMap<(Oid, Oid), Rc<Vec<String>>>,
     /// Target history indexed by the base, target tip and exact path set it was loaded for.
     histories: HashMap<(Oid, Oid, Vec<String>), Rc<TargetPathHistory>>,
+    /// A floor below every base about to be scanned against a target, set by
+    /// [`SyncScanCache::share_history`]; the history above it loads on first need.
+    shared_floor: Option<(Oid, Oid)>,
+    /// The unfiltered target history above `shared_floor`, once loaded.
+    shared_history: Option<Rc<TargetPathHistory>>,
 }
 
 impl SyncScanCache {
@@ -232,6 +250,22 @@ impl SyncScanCache {
         target_tip: Oid,
         paths: &[String],
     ) -> Result<Rc<TargetPathHistory>> {
+        if paths.is_empty() {
+            return Ok(Rc::new(TargetPathHistory {
+                floor: base_id,
+                commits: Vec::new(),
+            }));
+        }
+        if let Some((target, floor)) = self.shared_floor
+            && target == target_tip
+        {
+            if let Some(shared) = &self.shared_history {
+                return Ok(Rc::clone(shared));
+            }
+            let shared = Rc::new(TargetPathHistory::load(repo, floor, target_tip, &[])?);
+            self.shared_history = Some(Rc::clone(&shared));
+            return Ok(shared);
+        }
         let key = (base_id, target_tip, paths.to_vec());
         if let Some(known) = self.histories.get(&key) {
             return Ok(Rc::clone(known));
@@ -239,6 +273,20 @@ impl SyncScanCache {
         let history = Rc::new(TargetPathHistory::load(repo, base_id, target_tip, paths)?);
         self.histories.insert(key, Rc::clone(&history));
         Ok(history)
+    }
+
+    /// Serves every later history request against `target_tip` from one walk of
+    /// the target above the common ancestor of `bases`, rather than one
+    /// path-limited walk per range. Every base must be an ancestor of the target.
+    fn share_history(&mut self, repo: &Repository, target_tip: Oid, bases: &[Oid]) {
+        if bases.len() < 2 {
+            return;
+        }
+        // Without a common ancestor there is no single floor; keep per-range walks.
+        if let Ok(floor) = repo.merge_base_octopus(bases) {
+            self.shared_floor = Some((target_tip, floor));
+            self.shared_history = None;
+        }
     }
 }
 
@@ -834,18 +882,24 @@ pub fn collect_merged_local_branches(
     // Branches here share ranges and path sets, so the memoised lookups pay off
     // across the loop even though the per-stack answers are not reused.
     let mut cache = SyncScanCache::default();
+    let mut unmerged_by_graph = Vec::new();
     for (name, branch_id) in branches {
-        let merged_by_graph =
-            target_id == branch_id || repo.graph_descendant_of(target_id, branch_id)?;
-        let merged_by_content = if merged_by_graph {
-            false
+        if target_id == branch_id || repo.graph_descendant_of(target_id, branch_id)? {
+            merged_branches.push(name);
         } else if let Ok(merge_base) = repo.merge_base(branch_id, target_id) {
-            range_changes_present_in_target(repo, merge_base, branch_id, target_id, &mut cache)?
-        } else {
-            false
-        };
+            unmerged_by_graph.push((name, branch_id, merge_base));
+        }
+    }
 
-        if merged_by_graph || merged_by_content {
+    // Each range differs in its base, so per-range walks of the target rarely
+    // repeat; one walk above all the bases answers every range instead.
+    let bases = unmerged_by_graph
+        .iter()
+        .map(|&(_, _, merge_base)| merge_base)
+        .collect::<Vec<_>>();
+    cache.share_history(repo, target_id, &bases);
+    for (name, branch_id, merge_base) in unmerged_by_graph {
+        if range_changes_present_in_target(repo, merge_base, branch_id, target_id, &mut cache)? {
             merged_branches.push(name);
         }
     }
@@ -1935,7 +1989,7 @@ fn range_changes_present_in_history(
     touched_paths: &[String],
     target_history: &TargetPathHistory,
 ) -> Result<bool> {
-    let candidate_commits = target_history.covering_commits(touched_paths);
+    let candidate_commits = target_history.covering_commits(repo, base_id, touched_paths)?;
     if candidate_commits.is_empty() {
         return Ok(false);
     }

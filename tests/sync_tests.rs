@@ -3226,6 +3226,14 @@ fn change_reverted_before_fork_does_not_mark_branch_merged() {
     run_ok("git", &["add", "."], root);
     run_ok("git", &["commit", "-m", "base"], root);
 
+    // An unmerged branch forked before the change lowers the common floor, so
+    // a history shared across both ranges holds the reverted change too.
+    run_ok("git", &["checkout", "-b", "older"], root);
+    fs::write(root.join("b.txt"), "older work\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "older: add b"], root);
+    run_ok("git", &["checkout", "main"], root);
+
     let mut edited = base_lines.clone();
     edited[6] = "line 7 changed".to_string();
     fs::write(root.join("a.txt"), edited.join("\n") + "\n").unwrap();
