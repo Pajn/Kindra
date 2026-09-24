@@ -277,6 +277,9 @@ impl SyncScanCache {
             .ok()
             .and_then(|r| r.name().map(|s| s.to_string()));
 
+        // A lineage runs from the merge base up, so a branch below it can
+        // never be in one, whichever tip is being asked about.
+        let above_merge_base = local_branches_by_ancestry(repo, "--contains", merge_base)?;
         let mut candidates = Vec::new();
         for res in repo.branches(Some(git2::BranchType::Local))? {
             let (branch, _) = res?;
@@ -300,9 +303,7 @@ impl SyncScanCache {
                 }
             }
 
-            // A lineage runs from the merge base up, so a branch below it can
-            // never be in one, whichever tip is being asked about.
-            if !(repo.graph_descendant_of(id, merge_base)? || id == merge_base) {
+            if !above_merge_base.contains(&name) {
                 continue;
             }
             candidates.push((name, id));
@@ -977,7 +978,7 @@ pub fn collect_merged_local_branches(
     // Branches here share ranges and path sets, so the memoised lookups pay off
     // across the loop even though the per-stack answers are not reused.
     let mut cache = SyncScanCache::default();
-    let tips_in_target = local_branches_merged_into(repo, target_id)?;
+    let tips_in_target = local_branches_by_ancestry(repo, "--merged", target_id)?;
     let mut unmerged_by_graph = Vec::new();
     for (name, branch_id) in branches {
         if tips_in_target.contains(&name) {
@@ -1004,20 +1005,25 @@ pub fn collect_merged_local_branches(
     Ok(merged_branches)
 }
 
-/// Local branches whose tips `target_id` contains, in one query. Git reads the
-/// commit-graph, split chains included, where libgit2 would walk the commits
-/// behind every branch separately.
-fn local_branches_merged_into(repo: &Repository, target_id: Oid) -> Result<HashSet<String>> {
+/// Local branches related to `commit` by `filter`: `--merged` for tips that
+/// `commit` contains, `--contains` for tips that contain `commit`. One query
+/// answers for every branch, and git reads the commit-graph, split chains
+/// included, where libgit2 would walk the commits behind each branch in turn.
+fn local_branches_by_ancestry(
+    repo: &Repository,
+    filter: &str,
+    commit: Oid,
+) -> Result<HashSet<String>> {
     let output = Command::new("git")
         .arg("for-each-ref")
-        .arg(format!("--merged={target_id}"))
+        .arg(format!("{filter}={commit}"))
         .arg("--format=%(refname)")
         .arg("refs/heads/")
         .current_dir(repo_root(repo)?)
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
-            "git for-each-ref failed while listing branches merged into the target."
+            "git for-each-ref {filter} failed while relating local branches to {commit}."
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout)
