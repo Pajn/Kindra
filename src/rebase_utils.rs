@@ -842,7 +842,11 @@ pub fn restore_set_aside_changes(stash_ref: Option<String>) {
 /// staged changes are kept in place (the `kin commit --on` contract); without
 /// it everything is set aside, in which case restoring with
 /// [`apply_state_stash`] brings staged hunks back staged.
-pub fn stash_push_changes(keep_index: bool, message_prefix: &str) -> Result<Option<String>> {
+pub fn stash_push_changes(
+    repo: &Repository,
+    keep_index: bool,
+    message_prefix: &str,
+) -> Result<Option<String>> {
     let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let message = format!("{}-{}-{}", message_prefix, std::process::id(), ts);
     let mut cmd = Command::new("git");
@@ -857,6 +861,9 @@ pub fn stash_push_changes(keep_index: bool, message_prefix: &str) -> Result<Opti
         .arg("--include-untracked")
         .arg("-m")
         .arg(&message)
+        // Untracked overlay files stay in place for the operation.
+        .arg("--")
+        .args(crate::overrides::stash_pathspecs(repo)?)
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
@@ -981,8 +988,27 @@ pub fn unstage_all() -> Result<()> {
     Ok(())
 }
 
+/// Everything a rebase state still checks out or replays, for local overrides.
+pub fn override_plan(repo: &Repository, state: &RebaseState) -> Result<crate::overrides::Plan> {
+    let mut plan = crate::overrides::Plan::default();
+    for name in [&state.original_branch, &state.target_branch]
+        .into_iter()
+        .chain(&state.caller_branch)
+        .chain(&state.cleanup_checkout_fallback)
+    {
+        plan.checkout_rev(repo, name);
+    }
+    for name in &state.remaining_branches {
+        let (old_parent, new_base) = branch_rebase_target(state, name)?;
+        plan.checkout_rev(repo, &new_base)
+            .replay_revs(repo, &old_parent, name);
+    }
+    Ok(plan)
+}
+
 pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> {
     ensure_git_supports_update_refs()?;
+    crate::overrides::prepare(repo, &override_plan(repo, &state)?)?;
 
     // The caller can have uncommitted edits on the parent. Git's per-rebase
     // autostash would restore those edits on a child, where they may conflict

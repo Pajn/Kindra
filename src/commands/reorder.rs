@@ -22,7 +22,7 @@ pub struct ReorderArgs {
 pub fn reorder(args: &ReorderArgs) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    crate::overrides::with_suspended(&repo, false, || reorder_locked(&repo, args))
+    crate::overrides::with_planned(&repo, false, || reorder_locked(&repo, args))
 }
 
 fn reorder_locked(repo: &git2::Repository, args: &ReorderArgs) -> Result<()> {

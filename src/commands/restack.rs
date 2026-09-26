@@ -26,7 +26,7 @@ pub struct RestackArgs {
 pub fn restack(args: &RestackArgs) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    crate::overrides::with_suspended(&repo, false, || restack_locked(&repo, args))
+    crate::overrides::with_planned(&repo, false, || restack_locked(&repo, args))
 }
 
 fn restack_locked(repo: &git2::Repository, args: &RestackArgs) -> Result<()> {

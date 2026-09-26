@@ -36,7 +36,7 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
     let repo = crate::open_repo()?;
 
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    crate::overrides::with_suspended(&repo, false, || sync_locked(&repo, args))
+    crate::overrides::with_planned(&repo, false, || sync_locked(&repo, args))
 }
 
 fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
@@ -190,6 +190,8 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
             cleanup_checkout_fallback: Some(local_upstream.clone()),
         };
 
+        crate::overrides::prepare(repo, &crate::rebase_utils::override_plan(repo, &state)?)?;
+
         // Git's autostash runs too late to protect the checkout to the tip.
         // Keep these changes in Kindra's state until we return to the caller,
         // including across rebase conflicts and aborts.
@@ -286,6 +288,8 @@ fn sync_upstream_branch(
             cleanup_checkout_fallback: Some(upstream_name.to_string()),
         };
 
+        crate::overrides::prepare(repo, &crate::rebase_utils::override_plan(repo, &state)?)?;
+
         let mut rebase = Command::new("git");
         rebase
             .arg("rebase")
@@ -335,6 +339,8 @@ fn delete_merged_branches(
             "Current branch '{}' is merged. Switching to '{}' before deletion.",
             cb, checkout_fallback
         );
+        let mut plan = crate::overrides::Plan::default();
+        crate::overrides::prepare(repo, plan.checkout_rev(repo, checkout_fallback))?;
         checkout_branch(checkout_fallback).map_err(|e| {
             anyhow!(
                 "fallback git checkout failed for branch '{}': {}",

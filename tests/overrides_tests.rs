@@ -1186,3 +1186,237 @@ fn diff_uses_one_head_snapshot_if_the_branch_moves_during_inspection() {
     assert!(output.contains("-feature\n+local override\n"), "{output}");
     assert!(!output.contains("unrelated.txt"), "{output}");
 }
+// The hook logs what it found at AGENTS.md: the overlay if it stayed in place,
+// or the branch's original contents if Kindra suspended it first.
+fn logging_setup(extra_config: &str) -> TempDir {
+    let dir = setup();
+    fs::write(
+        dir.path().join(".git/apply.sh"),
+        "printf '%s %s\\n' \"$(cat AGENTS.md)\" \"${KINDRA_WORKTREE_BRANCH-unset}\" >> \"$(git rev-parse --git-common-dir)/hook.log\"\n\
+         printf 'local override\\n' > AGENTS.md\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join(".git/kindra.toml"),
+        format!("[overrides]\npaths = ['AGENTS.md']\napply = ['sh \"$(git rev-parse --git-common-dir)/apply.sh\"']\n{extra_config}"),
+    )
+    .unwrap();
+    run_ok("git", &["checkout", "-b", "sibling"], dir.path());
+    commit(dir.path(), "sibling.txt", "sibling\n");
+    run_ok("git", &["checkout", "-b", "child", "feature"], dir.path());
+    commit(dir.path(), "child.txt", "child\n");
+    dir
+}
+fn hook_log(path: &Path) -> String {
+    fs::read_to_string(path.join(".git/hook.log")).unwrap_or_default()
+}
+#[test]
+fn checkout_keeps_matching_overlays_and_reruns_the_hook_for_the_new_branch() {
+    let dir = logging_setup("");
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["checkout", "down"])
+        .assert()
+        .success();
+    assert_eq!(hook_log(dir.path()), "local override feature\n");
+    assert_applied(dir.path());
+}
+#[test]
+fn checkout_suspends_overlays_when_the_target_changes_an_override_path() {
+    let dir = logging_setup("");
+    for _ in 0..2 {
+        kin_cmd()
+            .current_dir(dir.path())
+            .args(["checkout", "down"])
+            .assert()
+            .success();
+    }
+    assert_eq!(hook_log(dir.path()), "local override feature\nbase main\n");
+    assert_applied(dir.path());
+}
+#[test]
+fn branch_env_can_be_disabled_to_skip_rerunning_the_hook() {
+    let dir = logging_setup("branch_env = false\n");
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["checkout", "down"])
+        .assert()
+        .success();
+    assert_eq!(hook_log(dir.path()), "");
+    assert_applied(dir.path());
+    kin_cmd()
+        .current_dir(dir.path())
+        .env("KINDRA_WORKTREE_BRANCH", "inherited")
+        .args(["overrides", "apply"])
+        .assert()
+        .success();
+    assert_eq!(hook_log(dir.path()), "feature unset\n");
+}
+#[test]
+fn rebase_keeps_overlays_when_replayed_commits_do_not_touch_them() {
+    let dir = logging_setup("");
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["move", "--onto", "sibling"])
+        .assert()
+        .success();
+    run_ok(
+        "git",
+        &["merge-base", "--is-ancestor", "sibling", "child"],
+        dir.path(),
+    );
+    assert_eq!(hook_log(dir.path()), "");
+    assert_applied(dir.path());
+}
+#[test]
+fn rebase_suspends_overlays_when_a_replayed_commit_touches_them() {
+    let dir = logging_setup("");
+    // The branch changes AGENTS.md and changes it back: both ends match HEAD,
+    // but replaying the range rewrites the file.
+    for content in ["child edit\n", "feature\n"] {
+        run_ok(
+            "git",
+            &["update-index", "--no-skip-worktree", "AGENTS.md"],
+            dir.path(),
+        );
+        commit(dir.path(), "AGENTS.md", content);
+    }
+    fs::write(dir.path().join("AGENTS.md"), "local override\n").unwrap();
+    run_ok(
+        "git",
+        &["update-index", "--skip-worktree", "AGENTS.md"],
+        dir.path(),
+    );
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["move", "--onto", "sibling"])
+        .assert()
+        .success();
+    assert_eq!(hook_log(dir.path()), "feature child\n");
+    assert_applied(dir.path());
+}
+#[test]
+fn run_commands_see_the_overlays() {
+    let dir = logging_setup("");
+    kin_cmd()
+        .current_dir(dir.path())
+        .args([
+            "run",
+            "--command",
+            "cat AGENTS.md >> \"$(git rev-parse --git-common-dir)/run.log\"",
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".git/run.log")).unwrap(),
+        "local override\nlocal override\n"
+    );
+    assert_eq!(hook_log(dir.path()), "");
+    assert_applied(dir.path());
+}
+#[test]
+fn commit_on_keeps_untracked_overlays_out_of_its_stash() {
+    let dir = logging_setup("");
+    fs::write(
+        dir.path().join(".git/kindra.toml"),
+        "[overrides]\npaths = ['AGENTS.md', '.claude']\napply = ['sh \"$(git rev-parse --git-common-dir)/apply.sh\"', 'mkdir -p .claude && printf local > .claude/settings.json']\n",
+    )
+    .unwrap();
+    fs::create_dir(dir.path().join(".claude")).unwrap();
+    fs::write(dir.path().join(".claude/settings.json"), "local").unwrap();
+    fs::write(dir.path().join("staged.txt"), "staged\n").unwrap();
+    run_ok("git", &["add", "staged.txt"], dir.path());
+    fs::write(dir.path().join("scratch.txt"), "unstaged\n").unwrap();
+    // Stashing the overlay would restore it afterwards, but hide it meanwhile.
+    let hook = dir.path().join(".git/hooks/pre-commit");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(&hook, "#!/bin/sh\ntest -f .claude/settings.json\n").unwrap();
+    run_ok("chmod", &["+x", hook.to_str().unwrap()], dir.path());
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["commit", "--on", "sibling", "-m", "on sibling"])
+        .assert()
+        .success();
+    assert_eq!(
+        git(dir.path(), &["log", "-1", "--format=%s", "sibling"]).trim(),
+        "on sibling"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap(),
+        "local"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "unstaged\n"
+    );
+    assert_eq!(git(dir.path(), &["stash", "list"]), "");
+    assert_eq!(hook_log(dir.path()), "");
+    assert_applied(dir.path());
+}
+#[test]
+fn planned_operation_refuses_staged_override_changes_before_saving_state() {
+    let dir = logging_setup("");
+    run_ok(
+        "git",
+        &["update-index", "--no-skip-worktree", "AGENTS.md"],
+        dir.path(),
+    );
+    run_ok("git", &["add", "AGENTS.md"], dir.path());
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["move", "--onto", "sibling"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("staged"));
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert_eq!(git(dir.path(), &["show", ":AGENTS.md"]), "local override\n");
+}
+#[test]
+fn kept_overlays_survive_a_conflict_until_continue_or_abort() {
+    for recovery in ["continue", "abort"] {
+        let dir = logging_setup("");
+        run_ok("git", &["checkout", "sibling"], dir.path());
+        commit(dir.path(), "shared.txt", "sibling\n");
+        run_ok("git", &["checkout", "child"], dir.path());
+        commit(dir.path(), "shared.txt", "child\n");
+        let child = git(dir.path(), &["rev-parse", "child"]);
+        kin_cmd()
+            .current_dir(dir.path())
+            .args(["move", "--onto", "sibling"])
+            .assert()
+            .failure();
+        assert_applied(dir.path());
+        if recovery == "continue" {
+            fs::write(dir.path().join("shared.txt"), "resolved\n").unwrap();
+            run_ok("git", &["add", "shared.txt"], dir.path());
+        }
+        kin_cmd()
+            .current_dir(dir.path())
+            .arg(recovery)
+            .assert()
+            .success();
+        assert_eq!(
+            git(dir.path(), &["branch", "--show-current"]).trim(),
+            "child"
+        );
+        if recovery == "abort" {
+            assert_eq!(git(dir.path(), &["rev-parse", "child"]), child);
+        } else {
+            run_ok(
+                "git",
+                &["merge-base", "--is-ancestor", "sibling", "child"],
+                dir.path(),
+            );
+        }
+        // Recovery starts on the rebase's detached HEAD, so the branch-aware
+        // hook may rerun, but it never sees the originals.
+        assert!(
+            hook_log(dir.path())
+                .lines()
+                .all(|line| line.starts_with("local override ")),
+            "{}",
+            hook_log(dir.path())
+        );
+        assert_applied(dir.path());
+    }
+}

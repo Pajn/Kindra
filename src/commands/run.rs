@@ -82,7 +82,7 @@ pub(crate) struct RunState {
 pub fn run(args: &RunArgs) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    crate::overrides::with_suspended(&repo, false, || run_locked(&repo, args))
+    crate::overrides::with_planned(&repo, false, || run_locked(&repo, args))
 }
 
 fn run_locked(repo: &git2::Repository, args: &RunArgs) -> Result<()> {
@@ -153,6 +153,12 @@ fn run_locked(repo: &git2::Repository, args: &RunArgs) -> Result<()> {
         repo,
         crate::commands::autostash_override(args.autostash, args.no_autostash),
     )?;
+    let mut plan = crate::overrides::Plan::default();
+    plan.checkout(head_id);
+    for branch in &stack_branches {
+        plan.checkout(branch.id);
+    }
+    crate::overrides::prepare(repo, &plan)?;
     let stash_ref = crate::rebase_utils::take_autostash(repo, autostash)?;
 
     let mut run_state = RunState {

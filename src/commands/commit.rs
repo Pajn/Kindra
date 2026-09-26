@@ -18,7 +18,7 @@ use std::process::Command;
 pub fn commit(args: &[String]) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    crate::overrides::with_suspended(&repo, false, || commit_locked(&repo, args))
+    crate::overrides::with_planned(&repo, false, || commit_locked(&repo, args))
 }
 
 fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
@@ -326,6 +326,18 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
 
     let pre_commit_state_required = switching_branches || will_rebase;
     if pre_commit_state_required || needs_autosquash || moving_onto_ancestor {
+        // Dependent restacks are declared by the rebase loop itself.
+        let mut plan = crate::overrides::Plan::default();
+        plan.checkout(target_old_head_id)
+            .checkout(requested_target_old_head_id);
+        if moving_onto_ancestor {
+            plan.replay(Some(requested_target_old_head_id), head_id);
+        }
+        if needs_autosquash {
+            let base = autosquash_base(&repo.find_commit(Oid::from_str(&fixup_commit_id)?)?)?;
+            plan.replay(base, head_id).replay(base, target_old_head_id);
+        }
+        crate::overrides::prepare(repo, &plan)?;
         let (parent_id_map, parent_name_map) = if will_rebase {
             crate::stack::build_parent_maps(
                 repo,
@@ -405,7 +417,7 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
         // the fallible planning above — so a failure there can't strand the user's
         // changes, and record it in the saved state right away.
         if switching_branches {
-            state.stash_ref = stash_non_staged_changes()?;
+            state.stash_ref = stash_non_staged_changes(repo)?;
         }
 
         // The move path has nothing to recover until its commit exists, so it
@@ -480,7 +492,7 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
             // `--keep-index` stash captures genuinely unstaged leftovers instead
             // of re-capturing what we just committed. If stashing fails, undo the
             // commit so the failure can't strand it outside a recoverable state.
-            state.stash_ref = match stash_non_staged_changes() {
+            state.stash_ref = match stash_non_staged_changes(repo) {
                 Ok(stash_ref) => stash_ref,
                 Err(err) => {
                     match Command::new("git")
@@ -578,7 +590,7 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
                 // stashing fails, undo the fixup commit we just created so the
                 // failure can't strand a `fixup!` commit without a recoverable
                 // state.
-                state.stash_ref = match stash_non_staged_changes() {
+                state.stash_ref = match stash_non_staged_changes(repo) {
                     Ok(stash_ref) => stash_ref,
                     Err(err) => {
                         // Roll back the fixup commit we just created. If the reset
@@ -844,7 +856,7 @@ fn commit_on_new_branch(
 
     // Set aside unstaged changes so the child rebases run on a clean tree; the
     // rebase loop restores them and returns us to the new branch when it finishes.
-    state.stash_ref = stash_non_staged_changes().with_context(|| inserted_note.clone())?;
+    state.stash_ref = stash_non_staged_changes(repo).with_context(|| inserted_note.clone())?;
     if let Err(err) = save_state(repo, &state) {
         restore_stashed_changes(state.stash_ref.take());
         return Err(err.context(inserted_note));
@@ -1576,7 +1588,7 @@ fn carry_staged_changes_onto(
         anyhow!("Internal error: no caller branch recorded for the branch switch.")
     })?;
 
-    let carry_stash = stash_push_changes(false, "kin-commit-on-index").with_context(|| {
+    let carry_stash = stash_push_changes(repo, false, "kin-commit-on-index").with_context(|| {
         "Failed to set the staged changes aside for the branch switch. Use 'kin abort' to restore original state."
     })?;
     let Some(carry_stash) = carry_stash else {
@@ -1670,8 +1682,8 @@ fn unwind_carry_to_caller(carry_stash: &str, caller_branch: &str) -> Result<()> 
     }
 }
 
-fn stash_non_staged_changes() -> Result<Option<String>> {
-    let stash_ref = stash_push_changes(true, "kin-commit-on")?;
+fn stash_non_staged_changes(repo: &Repository) -> Result<Option<String>> {
+    let stash_ref = stash_push_changes(repo, true, "kin-commit-on")?;
     if stash_ref.is_some() {
         // stash_push_changes captures git's own "Saved working directory…"
         // confirmation (it would leak the internal stash token), so tell the

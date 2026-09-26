@@ -665,7 +665,7 @@ fn checkout_abort_clears_partial_hydration_without_deleting_local_work() {
 }
 
 #[test]
-fn checkout_recovery_keeps_overrides_suspended_until_continue_or_abort() {
+fn interrupted_hydration_keeps_overrides_applied_until_it_checks_out() {
     for recovery in ["continue", "abort"] {
         let dir = hydration_fixture();
         fs::write(
@@ -688,11 +688,12 @@ fn checkout_recovery_keeps_overrides_suspended_until_continue_or_abort() {
             .env("PATH", mocked_path(dir.path()))
             .assert()
             .failure();
+        // Branch creation stopped before the checkout that changes file.txt.
         let overlay_state = dir.path().join(".git/kindra_overrides_state.json");
-        assert!(overlay_state.exists());
+        assert!(!overlay_state.exists());
         assert_eq!(
             fs::read_to_string(dir.path().join("file.txt")).unwrap(),
-            "main\n"
+            "overlay\n"
         );
         fs::remove_file(lock).unwrap();
         kin_cmd()

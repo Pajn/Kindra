@@ -21,7 +21,7 @@ pub fn checkout(
     if let Some(branch) = branch {
         let _lock = crate::state_io::RepoLock::acquire(&repo)?;
         ensure_checkout_available(&repo)?;
-        return crate::overrides::with_suspended(&repo, false, || {
+        return crate::overrides::with_planned(&repo, false, || {
             checkout_branch_with_pr_hydration(&repo, branch)
         });
     }
@@ -269,6 +269,8 @@ pub(crate) fn continue_hydration(repo: &Repository) -> Result<()> {
         state.steps[i].completed = true;
         save_hydration(repo, &state)?;
     }
+    let mut plan = crate::overrides::Plan::default();
+    crate::overrides::prepare(repo, plan.checkout_rev(repo, &state.branch))?;
     git_checkout(&state.branch).context(
         "Checkout hydration stopped. Run 'kin continue' to retry checkout or 'kin abort'",
     )?;
@@ -366,7 +368,11 @@ fn perform_git_checkout(name: &str) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
     ensure_checkout_available(&repo)?;
-    crate::overrides::with_suspended(&repo, false, || git_checkout(name))
+    crate::overrides::with_planned(&repo, false, || {
+        let mut plan = crate::overrides::Plan::default();
+        crate::overrides::prepare(&repo, plan.checkout_rev(&repo, name))?;
+        git_checkout(name)
+    })
 }
 
 fn git_checkout(name: &str) -> Result<()> {
