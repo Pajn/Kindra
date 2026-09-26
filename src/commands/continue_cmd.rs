@@ -9,7 +9,7 @@ use std::process::Command;
 pub fn continue_cmd() -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    crate::overrides::with_suspended(&repo, true, || continue_cmd_locked(&repo))
+    crate::overrides::with_planned(&repo, true, || continue_cmd_locked(&repo))
 }
 
 fn continue_cmd_locked(repo: &git2::Repository) -> Result<()> {

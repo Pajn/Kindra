@@ -2,10 +2,15 @@
 //! intermediate checkouts. Callers hold RepoLock until finalization completes.
 //! State lives in the worktree's private git directory: linked worktrees share
 //! configuration, but must never share suspended contents or recovery state.
+//!
+//! Planned operations keep overlays in place: they declare the commits they
+//! will check out or replay, and suspension happens only when one of those
+//! differs from HEAD at an override path.
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use git2::{Repository, RepositoryState};
+use git2::{Oid, Repository, RepositoryState};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
@@ -17,6 +22,14 @@ use std::process::{Command, Stdio};
 struct Config {
     paths: Vec<String>,
     apply: Vec<String>,
+    // Hooks that read KINDRA_WORKTREE_BRANCH are rerun whenever an operation
+    // ends on another branch. Hooks that don't can opt out of both.
+    #[serde(default = "default_branch_env")]
+    branch_env: bool,
+}
+
+fn default_branch_env() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -219,8 +232,8 @@ fn safe_path(repo: &Repository, name: &str) -> Result<PathBuf> {
     Ok(full)
 }
 
-fn snapshot(repo: &Repository, config: Config) -> Result<State> {
-    check_staged(repo, &config)?;
+fn check_supported(repo: &Repository, config: &Config) -> Result<()> {
+    check_staged(repo, config)?;
     // skip-worktree belongs to sparse checkout too; do not fight its index rules.
     if repo
         .config()?
@@ -229,6 +242,11 @@ fn snapshot(repo: &Repository, config: Config) -> Result<State> {
     {
         bail!("Local overrides are not supported with sparse checkout");
     }
+    Ok(())
+}
+
+fn snapshot(repo: &Repository, config: Config) -> Result<State> {
+    check_supported(repo, &config)?;
     let tracked: BTreeSet<_> = paths(repo, &config, &["ls-files", "--cached", "-z"])?
         .into_iter()
         .collect();
@@ -326,7 +344,7 @@ fn suspend(repo: &Repository, state: &mut State) -> Result<()> {
     save(repo, state)
 }
 
-fn prepare(repo: &Repository, mut state: State) -> Result<State> {
+fn begin_suspension(repo: &Repository, mut state: State) -> Result<State> {
     // Failure here must leave the original files and flags untouched.
     save(repo, &state)?;
     if let Err(err) = suspend(repo, &mut state) {
@@ -425,14 +443,15 @@ fn apply(repo: &Repository, state: &mut State) -> Result<()> {
             c.args(["-c", script]);
             c
         };
-        let status = command
+        command
             .current_dir(root(repo)?)
-            .env("KINDRA_WORKTREE_PATH", root(repo)?)
-            .env(
-                "KINDRA_WORKTREE_BRANCH",
-                repo.head()?.shorthand().unwrap_or("HEAD"),
-            )
-            .status()?;
+            .env("KINDRA_WORKTREE_PATH", root(repo)?);
+        if state.config.branch_env {
+            command.env("KINDRA_WORKTREE_BRANCH", branch(repo)?);
+        } else {
+            command.env_remove("KINDRA_WORKTREE_BRANCH");
+        }
+        let status = command.status()?;
         if !status.success() {
             bail!(
                 "Override apply hook failed ({status}). Fix the hook and run 'kin continue' in {}. Recovery state: {}",
@@ -459,7 +478,7 @@ pub fn with_suspended<T>(
     recovery: bool,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    let mut state = if state_path(repo).exists() {
+    let state = if state_path(repo).exists() {
         if !recovery {
             bail!(
                 "Local overrides are suspended or awaiting recovery. Run 'kin continue' or 'kin abort' in {}.",
@@ -493,9 +512,13 @@ pub fn with_suspended<T>(
                 "Cannot suspend local overrides while a Git or Kindra operation is in progress. Finish it with continue/abort first."
             );
         }
-        prepare(repo, snapshot(repo, config)?)?
+        begin_suspension(repo, snapshot(repo, config)?)?
     };
     let result = operation();
+    finish_suspended(repo, state, result)
+}
+
+fn finish_suspended<T>(repo: &Repository, mut state: State, result: Result<T>) -> Result<T> {
     if busy(repo) {
         eprintln!(
             "Local overrides remain suspended. They will be reapplied after 'kin continue' or 'kin abort' completes."
@@ -510,6 +533,231 @@ pub fn with_suspended<T>(
             "{err:#}\nReapplying local overrides also failed: {restore:#}"
         )),
     }
+}
+
+fn branch(repo: &Repository) -> Result<String> {
+    Ok(repo.head()?.shorthand().unwrap_or("HEAD").to_owned())
+}
+
+enum Session {
+    Kept { config: Config, branch: String },
+    Suspended(State),
+}
+
+thread_local! {
+    static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
+}
+
+/// The commits an operation will check out, and the ranges it will replay.
+#[derive(Default)]
+pub struct Plan {
+    commits: Vec<Oid>,
+    ranges: Vec<(Option<Oid>, Oid)>,
+    unresolved: bool,
+}
+
+impl Plan {
+    pub fn checkout(&mut self, id: Oid) -> &mut Self {
+        self.commits.push(id);
+        self
+    }
+
+    /// A revision that cannot be resolved forces suspension.
+    pub fn checkout_rev(&mut self, repo: &Repository, rev: &str) -> &mut Self {
+        match resolve(repo, rev) {
+            Some(id) => self.checkout(id),
+            None => {
+                self.unresolved = true;
+                self
+            }
+        }
+    }
+
+    /// Commits in `base..tip` are replayed. The resulting trees match HEAD at
+    /// the override paths if the new base does and no replayed commit changes
+    /// them. A `None` base replays the whole history.
+    pub fn replay(&mut self, base: Option<Oid>, tip: Oid) -> &mut Self {
+        self.ranges.push((base, tip));
+        self
+    }
+
+    pub fn replay_revs(&mut self, repo: &Repository, base: &str, tip: &str) -> &mut Self {
+        match (resolve(repo, base), resolve(repo, tip)) {
+            (Some(base), Some(tip)) => self.replay(Some(base), tip),
+            _ => {
+                self.unresolved = true;
+                self
+            }
+        }
+    }
+}
+
+fn resolve(repo: &Repository, rev: &str) -> Option<Oid> {
+    repo.revparse_single(rev)
+        .and_then(|object| object.peel_to_commit())
+        .map(|commit| commit.id())
+        .ok()
+}
+
+fn changes_paths(repo: &Repository, config: &Config, args: &[&str]) -> Result<bool> {
+    Ok(!paths(repo, config, args)?.is_empty())
+}
+
+// Skip-worktree entries whose blobs are identical on both sides survive every
+// checkout, rebase, and reset, as do untracked files at paths neither side tracks.
+fn plan_keeps_overlays(repo: &Repository, config: &Config, plan: &Plan) -> Result<bool> {
+    if plan.unresolved {
+        return Ok(false);
+    }
+    let Some(head) = resolve(repo, "HEAD") else {
+        return Ok(false);
+    };
+    let head = head.to_string();
+    if changes_paths(repo, config, &["diff", "--cached", "--name-only", "-z"])? {
+        return Ok(false);
+    }
+    for id in &plan.commits {
+        let id = id.to_string();
+        if id != head
+            && changes_paths(
+                repo,
+                config,
+                &[
+                    "diff-tree",
+                    "-r",
+                    "--name-only",
+                    "-z",
+                    "--no-renames",
+                    &head,
+                    &id,
+                ],
+            )?
+        {
+            return Ok(false);
+        }
+    }
+    for (base, tip) in &plan.ranges {
+        let tip = tip.to_string();
+        let hide = base.map(|base| format!("^{base}"));
+        let mut args = vec![
+            "rev-list",
+            "--full-history",
+            "--no-merges",
+            "--max-count=1",
+            &tip,
+        ];
+        args.extend(hide.as_deref());
+        if changes_paths(repo, config, &args)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Like [`with_suspended`], but overlays stay applied unless the operation's
+/// [`prepare`] calls declare a commit that changes an override path. Every
+/// working-tree change in `operation` must be covered by a prior `prepare`.
+pub fn with_planned<T>(
+    repo: &Repository,
+    recovery: bool,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if SESSION.with(|session| session.borrow().is_some()) {
+        return operation();
+    }
+    if state_path(repo).exists() {
+        return with_suspended(repo, recovery, operation);
+    }
+    if is_disabled(repo) {
+        return operation();
+    }
+    let Some(config) = config(repo)? else {
+        return operation();
+    };
+    if !recovery {
+        if busy(repo) {
+            bail!(
+                "Cannot suspend local overrides while a Git or Kindra operation is in progress. Finish it with continue/abort first."
+            );
+        }
+        // Refuse before the operation saves any state, as eager suspension does.
+        check_supported(repo, &config)?;
+    }
+    let start = branch(repo)?;
+    SESSION.with(|session| {
+        *session.borrow_mut() = Some(Session::Kept {
+            config,
+            branch: start,
+        })
+    });
+    let result = operation();
+    match SESSION.with(|session| session.borrow_mut().take()) {
+        Some(Session::Suspended(state)) => finish_suspended(repo, state, result),
+        Some(Session::Kept {
+            config,
+            branch: start,
+        }) if config.branch_env && !busy(repo) && branch(repo)? != start => {
+            let reapplied = snapshot(repo, config).and_then(|mut state| apply(repo, &mut state));
+            match (result, reapplied) {
+                (Ok(value), Ok(())) => Ok(value),
+                (Err(err), Ok(())) | (Ok(_), Err(err)) => Err(err),
+                (Err(err), Err(restore)) => Err(anyhow!(
+                    "{err:#}\nReapplying local overrides also failed: {restore:#}"
+                )),
+            }
+        }
+        _ => result,
+    }
+}
+
+/// Declare the next working-tree changes of a planned operation. Suspends the
+/// overlays first if the plan would touch an override path.
+pub fn prepare(repo: &Repository, plan: &Plan) -> Result<()> {
+    let config = SESSION.with(|session| match &*session.borrow() {
+        Some(Session::Kept { config, .. }) => Some(config.clone()),
+        _ => None,
+    });
+    let Some(config) = config else {
+        return Ok(());
+    };
+    if plan_keeps_overlays(repo, &config, plan)? {
+        return Ok(());
+    }
+    // A resumed rebase was planned in full before it first stopped.
+    if repo.state() != RepositoryState::Clean {
+        bail!(
+            "Local overrides would change during this operation, but a Git operation is already in progress. Run 'kin abort', then retry."
+        );
+    }
+    let state = begin_suspension(repo, snapshot(repo, config)?)?;
+    SESSION.with(|session| *session.borrow_mut() = Some(Session::Suspended(state)));
+    Ok(())
+}
+
+/// Pathspecs that keep untracked overlay files out of a Kindra stash, or none.
+/// Overlays replacing tracked files are skip-worktree, which stash leaves alone.
+pub fn stash_pathspecs(repo: &Repository) -> Result<Vec<String>> {
+    if state_path(repo).exists() || is_disabled(repo) {
+        return Ok(Vec::new());
+    }
+    let Some(config) = config(repo)? else {
+        return Ok(Vec::new());
+    };
+    let untracked = paths(
+        repo,
+        &config,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?;
+    if untracked.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(std::iter::once(":/".to_owned())
+        .chain(
+            untracked
+                .into_iter()
+                .map(|path| format!(":(top,exclude,literal){path}")),
+        )
+        .collect())
 }
 
 pub fn apply_current(repo: &Repository) -> Result<()> {
@@ -537,7 +785,7 @@ pub fn apply_current(repo: &Repository) -> Result<()> {
                 "Override paths have uncommitted changes. Commit, stash, or move those edits before running 'kin overrides apply'. Overrides remain disabled."
             );
         }
-        let mut state = prepare(repo, state)?;
+        let mut state = begin_suspension(repo, state)?;
         apply(repo, &mut state)
     } else {
         with_suspended(repo, false, || Ok(()))
@@ -562,7 +810,7 @@ pub fn remove_current(repo: &Repository) -> Result<()> {
     let config = config(repo)?.context("No [overrides] configuration found")?;
     let mut state = snapshot(repo, config)?;
     state.removing = true;
-    prepare(repo, state)?;
+    begin_suspension(repo, state)?;
     finish_removal(repo)
 }
 

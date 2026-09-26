@@ -808,14 +808,21 @@ state: `kin continue` or `kin abort` completes removal without applying overlays
 (or restores the original snapshot if preparation was incomplete). A failed
 re-enable keeps the disabled marker and recovery state until a retry succeeds.
 
-Kindra saves the managed contents, clears their `skip-worktree` flags, and
-restores tracked files **from the index** before an operation. Matching untracked
+Most operations keep overlays in place. Before changing the working tree, Kindra
+checks every commit the operation will check out, and every commit it will
+replay, against `HEAD`. If none of them changes a configured path, Git leaves the
+overlay files and their `skip-worktree` flags alone, and Kindra does nothing more.
+Kindra's own stashes leave untracked overlay files in place.
+
+Otherwise Kindra suspends the overlays just before the first such change. It
+saves the managed contents, clears their `skip-worktree` flags, and restores
+tracked files **from the index**. Matching untracked
 and ignored overlay files are also saved and removed so they cannot obstruct a
 branch that tracks them. It never resets the index. Staged changes in a managed
 path cause a refusal before any files are changed; staged changes elsewhere are
 left for the command to handle normally.
 
-On completion, Kindra runs `apply` and sets `skip-worktree` on matching files
+After a suspended operation completes, Kindra runs `apply` and sets `skip-worktree` on matching files
 tracked by the destination branch. The apply script must recreate the desired
 overlay, including intentional deletions and symlinks, and be safe to run again.
 Files that are untracked on that branch cannot receive `skip-worktree`; use Git
@@ -824,8 +831,11 @@ such as `.env` files, are left on disk during suspension.
 
 The lifecycle covers `checkout`, `commit`, `absorb`, `move`, `reorder`, `sync`,
 `restack`, `split`, `run`, `undo`, and `redo`, plus review worktree switching.
-Overrides remain suspended throughout all intermediate checkouts, including
-commands executed by `kin run`. New worktrees apply overrides before their
+`absorb`, `split`, and review worktree switching always suspend overrides; the
+other commands keep them when they can. Once suspended, overrides stay
+suspended throughout all intermediate checkouts, including commands executed by
+`kin run`. When `kin run` keeps them, its commands see the overlays on every
+branch. New worktrees apply overrides before their
 `on_create` hooks; review switches apply before `on_checkout`. Ordinary
 `kin checkout` reapplies overrides but does not run worktree setup hooks.
 Read-only commands do not apply overrides. Direct `git` commands bypass this
@@ -835,6 +845,19 @@ Apply commands run through `sh -c` (`cmd /C` on Windows), in the target worktree
 root, with `KINDRA_WORKTREE_PATH` and `KINDRA_WORKTREE_BRANCH` set. Relative source
 paths such as `../overrides` must exist relative to **every** worktree; use an
 absolute source path if worktrees live at different directory depths.
+
+Because the hook sees the branch, Kindra also reruns it when an operation that
+kept the overlays ends on a different branch. If your hook's output does not
+depend on the branch, turn this off:
+
+```toml
+[overrides]
+branch_env = false
+```
+
+With `branch_env = false`, `KINDRA_WORKTREE_BRANCH` is not set for apply
+commands. Kindra then runs them only after suspending overlays, or when you run
+`kin overrides apply`.
 
 **Conflicts and recovery:**
 

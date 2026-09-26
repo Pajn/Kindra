@@ -301,7 +301,7 @@ pub fn discard(repo: &Repository) -> Result<()> {
 pub fn undo(force: bool) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    crate::overrides::with_suspended(&repo, false, || undo_locked(&repo, force))
+    crate::overrides::with_planned(&repo, false, || undo_locked(&repo, force))
 }
 
 fn undo_locked(repo: &git2::Repository, force: bool) -> Result<()> {
@@ -328,7 +328,7 @@ fn undo_locked(repo: &git2::Repository, force: bool) -> Result<()> {
 pub fn redo(force: bool) -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    crate::overrides::with_suspended(&repo, false, || redo_locked(&repo, force))
+    crate::overrides::with_planned(&repo, false, || redo_locked(&repo, force))
 }
 
 fn redo_locked(repo: &git2::Repository, force: bool) -> Result<()> {
@@ -472,6 +472,8 @@ fn restore(repo: &Repository, entry: &Entry, dir: Direction, force: bool) -> Res
     // in with `--force`: a plain checkout still refuses to clobber untracked
     // files obstructing the target, which the dirty-tree guard above misses
     // because `working_tree_dirty` ignores untracked paths.
+    let mut plan = crate::overrides::Plan::default();
+    crate::overrides::prepare(repo, plan.checkout(head_oid))?;
     let head_oid_str = head_oid.to_string();
     let mut detach_args = vec!["checkout", "--quiet"];
     if force {

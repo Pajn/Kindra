@@ -13,7 +13,7 @@ pub fn abort_cmd(clear_state_only: bool) -> Result<()> {
     if clear_state_only {
         return abort_locked(&repo, clear_state_only);
     }
-    crate::overrides::with_suspended(&repo, true, || abort_locked(&repo, false))
+    crate::overrides::with_planned(&repo, true, || abort_locked(&repo, false))
 }
 
 fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {

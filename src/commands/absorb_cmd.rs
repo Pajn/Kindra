@@ -302,7 +302,7 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
     // left (unabsorbable hunks, unstaged edits, untracked files) must be set
     // aside for the rebases below. Stash it all and restore at the end via the
     // saved state, so `kin continue`/`abort` recover it after a conflict stop.
-    state.stash_ref = match stash_push_changes(false, "kin-absorb") {
+    state.stash_ref = match stash_push_changes(&repo, false, "kin-absorb") {
         Ok(stash_ref) => {
             if stash_ref.is_some() {
                 println!(
