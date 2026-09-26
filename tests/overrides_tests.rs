@@ -1371,3 +1371,52 @@ fn planned_operation_refuses_staged_override_changes_before_saving_state() {
     assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
     assert_eq!(git(dir.path(), &["show", ":AGENTS.md"]), "local override\n");
 }
+#[test]
+fn kept_overlays_survive_a_conflict_until_continue_or_abort() {
+    for recovery in ["continue", "abort"] {
+        let dir = logging_setup("");
+        run_ok("git", &["checkout", "sibling"], dir.path());
+        commit(dir.path(), "shared.txt", "sibling\n");
+        run_ok("git", &["checkout", "child"], dir.path());
+        commit(dir.path(), "shared.txt", "child\n");
+        let child = git(dir.path(), &["rev-parse", "child"]);
+        kin_cmd()
+            .current_dir(dir.path())
+            .args(["move", "--onto", "sibling"])
+            .assert()
+            .failure();
+        assert_applied(dir.path());
+        if recovery == "continue" {
+            fs::write(dir.path().join("shared.txt"), "resolved\n").unwrap();
+            run_ok("git", &["add", "shared.txt"], dir.path());
+        }
+        kin_cmd()
+            .current_dir(dir.path())
+            .arg(recovery)
+            .assert()
+            .success();
+        assert_eq!(
+            git(dir.path(), &["branch", "--show-current"]).trim(),
+            "child"
+        );
+        if recovery == "abort" {
+            assert_eq!(git(dir.path(), &["rev-parse", "child"]), child);
+        } else {
+            run_ok(
+                "git",
+                &["merge-base", "--is-ancestor", "sibling", "child"],
+                dir.path(),
+            );
+        }
+        // Recovery starts on the rebase's detached HEAD, so the branch-aware
+        // hook may rerun, but it never sees the originals.
+        assert!(
+            hook_log(dir.path())
+                .lines()
+                .all(|line| line.starts_with("local override ")),
+            "{}",
+            hook_log(dir.path())
+        );
+        assert_applied(dir.path());
+    }
+}
