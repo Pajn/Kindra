@@ -74,7 +74,13 @@ after_pr = ["some-command --flag", "another"]
 
 `after_pr` runs at the end of every `kin pr` and `kin pr flatten` run that publishes the stack, once pushing and creating or updating PRs has finished — also when nothing changed in that run. It does not run for the other `kin pr` subcommands, when there is nothing to publish, or when the command fails first. `[hooks]` is read before anything is pushed, so an invalid section stops the run with nothing changed. Hooks run after `kin pr` releases the repository lock, so a hook may run other `kin` commands.
 
-Each command runs through `sh -c` (`cmd /C` on Windows) from the root of the current worktree, with `KINDRA_HOOK_EVENT=after_pr` set, the payload below on stdin, and its output shown. Commands run in order and the first failure stops the list. A failing hook, or one that cannot be started, makes `kin` exit non-zero with ``Pull requests were published, but the after_pr hook `<command>` failed (exit status N).`` Nothing is rolled back: the pushes and PRs stay as published.
+Each command runs through `sh -c` (`cmd /C` on Windows) from the root of the current worktree, with `KINDRA_HOOK_EVENT=after_pr` set, the payload below on stdin, and its output shown. Commands run in order and the first failure stops the list. A hook that fails makes `kin` exit non-zero with a message saying which hook and how:
+
+- ``Pull requests were published, but the after_pr hook `<command>` failed (exit status N).`` when it exits with a non-zero status,
+- ``… `<command>` was terminated by a signal.`` when a signal ends it,
+- ``… `<command>` could not be started (<error>).`` when the shell cannot be run.
+
+Nothing is rolled back: the pushes and PRs stay as published.
 
 The payload is one JSON object:
 
