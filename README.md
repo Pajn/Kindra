@@ -106,11 +106,20 @@ branch feature-a parent feature-c
 branch feature-b parent feature-c
 ```
 
+## Configuration
+
+Kindra reads two optional TOML files:
+
+- **Repository config**: `kindra.toml` in the repository's common Git directory (`.git/kindra.toml` in a standard clone; `git rev-parse --git-common-dir` prints the directory). It applies to every worktree of the repository, including linked worktrees.
+- **Global config**: `kindra/config.toml` in the platform config directory — `$XDG_CONFIG_HOME` or `~/.config` on Linux, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows. It applies to every repository, supports the `[restack]` and `[rebase]` sections, and is overridden by repository config.
+
+A syntax error in either file stops the commands that read it, naming the file. Unknown top-level keys in repository config print a warning. See the [CLI reference](docs/cli_reference.md#configuration) for every key.
+
 ## Upstream Branch Selection
 
-Commands that need an upstream/base branch (for example `sync`, `split`, `push`, `commit`, and `move`) resolve it in this order:
+Commands that need the trunk — the upstream/base branch stacks are built on (for example `sync`, `split`, `push`, `commit`, and `move`) — resolve it in this order:
 
-1. Repository override in `.git/kindra.toml`:
+1. `upstream_branch` in repository config (an error if no such branch exists):
 
    ```toml
    upstream_branch = "branch-name"
@@ -200,7 +209,7 @@ The wrapper intercepts `kin wt cd` and forwards everything else straight to `kin
 
 ### Worktree config
 
-Managed worktrees use repo-local config in `.git/kindra.toml`:
+Managed worktrees are configured in the `[worktrees]` section of repository config:
 
 ```toml
 [worktrees]
@@ -227,7 +236,7 @@ delete_merged = true
 
 Notes:
 
-- `main` is pinned to the configured trunk branch.
+- `main` is pinned to the trunk: `worktrees.trunk` if set, otherwise the resolved trunk from [Upstream Branch Selection](#upstream-branch-selection).
 - `review` reuses a fixed path and refuses to discard local changes unless you confirm or pass `--force`.
 - `add` worktrees default to `add_path_template`; by default that is a sibling directory, or `<repo>/worktrees/{branch}` when the repo has no parent directory. Pass `--path` to override. Unlike the role paths it isn't required to live under the managed root.
 - `cleanup` only targets Kindra-managed `temp` worktrees, never `main`, `review`, or plain/added worktrees.
@@ -242,8 +251,8 @@ Notes:
 Resolution order:
 
 1. CLI override: `kin restack --history-limit <n>`
-2. Repository config in `.git/kindra.toml`
-3. Global config in the standard platform config directory as `kindra/config.toml`
+2. Repository config
+3. Global config
 4. Built-in default: `100`
 
 Use `0` to disable the bound and scan the full first-parent history.
@@ -257,14 +266,15 @@ history_limit = 250
 
 ## Rebase Autostash
 
-Commands that start a Git rebase (`commit`, `move`, `sync`, and `restack`) default to `--no-autostash` so dirty tracked changes do not get hidden implicitly.
+Commands that rebase or check out branches (`commit`, `move`, `sync`, `restack`, `reorder`, `split`, and `run`) default to `--no-autostash` so dirty tracked changes do not get hidden implicitly.
 
 Resolution order:
 
 1. CLI override: `--autostash` or `--no-autostash`
-2. Repository config in `.git/kindra.toml`
-3. Global config in the standard platform config directory as `kindra/config.toml`
-4. Built-in default: `false`
+2. Repository config: `[rebase] autostash`
+3. Global config: `[rebase] autostash`
+4. Git config: `rebase.autostash`
+5. Built-in default: `false`
 
 Example config:
 

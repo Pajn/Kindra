@@ -1,12 +1,106 @@
 use assert_cmd::Command;
 use git2::{Repository, Signature};
+use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// Environment variables that would let the invoking user's Git setup reach a
+/// test: they redirect which config files, repository or work tree Git uses.
+const LEAKY_GIT_ENV: &[&str] = &[
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
+/// A home directory shared by every test in this process that contains
+/// nothing but a Git identity. Pointing `HOME` (and the platform config
+/// variables) here keeps global Git config — which libgit2 reads from `HOME` —
+/// and the global Kindra config out of tests.
+fn hermetic_home() -> &'static Path {
+    static HOME: OnceLock<PathBuf> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join("hermetic-home");
+        fs::create_dir_all(&home).unwrap();
+        // Test binaries run concurrently and share this directory, so publish
+        // the file with an atomic rename rather than writing it in place.
+        let mut staged = tempfile::NamedTempFile::new_in(&home).unwrap();
+        staged
+            .write_all(b"[user]\n\tname = Test User\n\temail = test@example.com\n")
+            .unwrap();
+        staged.persist(home.join(".gitconfig")).unwrap();
+        home
+    })
+}
+
+/// The environment [`kin_cmd`], [`run_ok`] and [`git_command`] run with:
+/// `(variable, value)` pairs to set, plus [`LEAKY_GIT_ENV`] to remove.
+/// [`apply_global_config_env`] overrides the home-related entries.
+fn hermetic_env() -> Vec<(&'static str, OsString)> {
+    hermetic_env_for(hermetic_home())
+}
+
+fn hermetic_env_for(home: &Path) -> Vec<(&'static str, OsString)> {
+    vec![
+        ("HOME", home.into()),
+        ("XDG_CONFIG_HOME", home.join(".config").into()),
+        ("APPDATA", home.join("AppData").join("Roaming").into()),
+        ("LOCALAPPDATA", home.join("AppData").join("Local").into()),
+        ("GIT_CONFIG_GLOBAL", home.join(".gitconfig").into()),
+        ("GIT_CONFIG_NOSYSTEM", "1".into()),
+    ]
+}
+
+fn hermetic_std_command(program: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    for name in LEAKY_GIT_ENV {
+        command.env_remove(name);
+    }
+    command.envs(hermetic_env());
+    command
+}
+
+/// Where the global Kindra config lives for a home directory at `root`, as
+/// resolved by `dirs::config_dir` on this platform.
+#[allow(dead_code)]
+pub fn test_global_config_dir(root: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        return root
+            .join("Library")
+            .join("Application Support")
+            .join("kindra");
+    }
+    if cfg!(target_os = "windows") {
+        return root.join("AppData").join("Roaming").join("kindra");
+    }
+
+    root.join(".config").join("kindra")
+}
+
+/// Point `cmd` at a home directory rooted at `root`, so a global Kindra config
+/// written under [`test_global_config_dir`] is picked up.
+#[allow(dead_code)]
+pub fn apply_global_config_env(cmd: &mut Command, root: &Path) {
+    cmd.envs(hermetic_env_for(root));
+}
 
 #[allow(dead_code)]
 pub fn kin_cmd() -> Command {
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("kin");
-    cmd.env("GIT_AUTHOR_NAME", "Test User")
+    for name in LEAKY_GIT_ENV {
+        cmd.env_remove(name);
+    }
+    cmd.envs(hermetic_env())
+        .env("GIT_AUTHOR_NAME", "Test User")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test User")
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
@@ -22,7 +116,7 @@ pub fn kin_cmd() -> Command {
 
 #[allow(dead_code)]
 pub fn run_ok(program: &str, args: &[&str], cwd: &std::path::Path) {
-    let output = std::process::Command::new(program)
+    let output = hermetic_std_command(program)
         .args(args)
         .current_dir(cwd)
         .env("GIT_AUTHOR_NAME", "Run Ok User")
@@ -43,7 +137,7 @@ pub fn run_ok(program: &str, args: &[&str], cwd: &std::path::Path) {
 
 #[allow(dead_code)]
 pub fn git_command(cwd: &std::path::Path) -> std::process::Command {
-    let mut command = std::process::Command::new("git");
+    let mut command = hermetic_std_command("git");
     command
         .current_dir(cwd)
         .env("GIT_AUTHOR_NAME", "Run Ok User")
@@ -167,6 +261,15 @@ pub fn setup_worktree_repo() -> tempfile::TempDir {
 #[allow(dead_code)]
 pub fn write_repo_config(repo_root: &Path, contents: &str) {
     fs::write(repo_root.join(".git").join("kindra.toml"), contents).unwrap();
+}
+
+/// The repository config path as Kindra reports it in messages: inside the
+/// canonicalized common Git directory of the repository at `repo_root`.
+#[allow(dead_code)]
+pub fn repo_config_path(repo_root: &Path) -> PathBuf {
+    fs::canonicalize(repo_root.join(".git"))
+        .unwrap()
+        .join("kindra.toml")
 }
 
 #[allow(dead_code)]
@@ -366,4 +469,19 @@ pub fn remote_tip(remote_dir: &std::path::Path, refname: &str) -> git2::Oid {
         .unwrap()
         .target()
         .unwrap()
+}
+
+/// Add a linked worktree for `branch` in a fresh temp directory outside the
+/// repository. Returns the temp dir (keep it alive for the test) and the
+/// worktree's path.
+#[allow(dead_code)]
+pub fn add_linked_worktree(repo_root: &Path, branch: &str) -> (tempfile::TempDir, PathBuf) {
+    let parent = tempfile::tempdir().unwrap();
+    let path = parent.path().join("linked");
+    run_ok(
+        "git",
+        &["worktree", "add", path.to_str().unwrap(), branch],
+        repo_root,
+    );
+    (parent, path)
 }

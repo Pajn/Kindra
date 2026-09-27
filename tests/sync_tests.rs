@@ -1,6 +1,8 @@
 mod common;
 
-use common::{kin_cmd, make_commit, repo_init, run_ok};
+use common::{
+    apply_global_config_env, kin_cmd, make_commit, repo_init, run_ok, test_global_config_dir,
+};
 use git2::{BranchType, Repository};
 use kindra::rebase_utils::{Operation, RebaseState, load_state, save_state};
 use predicates::prelude::*;
@@ -8,33 +10,6 @@ use std::collections::HashMap;
 use std::fs;
 use tempfile::TempDir;
 use tempfile::tempdir;
-
-fn test_global_config_dir(root: &std::path::Path) -> std::path::PathBuf {
-    if cfg!(target_os = "macos") {
-        return root
-            .join("Library")
-            .join("Application Support")
-            .join("kindra");
-    }
-    if cfg!(target_os = "windows") {
-        return root.join("AppData").join("Roaming").join("kindra");
-    }
-
-    root.join(".config").join("kindra")
-}
-
-fn apply_global_config_env(cmd: &mut assert_cmd::Command, root: &std::path::Path) {
-    cmd.env("HOME", root);
-
-    if cfg!(target_os = "linux") || cfg!(target_os = "freebsd") || cfg!(target_os = "openbsd") {
-        cmd.env("XDG_CONFIG_HOME", root.join(".config"));
-    }
-
-    if cfg!(target_os = "windows") {
-        cmd.env("APPDATA", root.join("AppData").join("Roaming"));
-        cmd.env("LOCALAPPDATA", root.join("AppData").join("Local"));
-    }
-}
 
 #[test]
 fn sync_handles_rebased_lower_branch() {

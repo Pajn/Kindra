@@ -23,6 +23,7 @@
 
 ### Shared Logic
 - Stack discovery and branch relationship logic must be centralized in `src/stack.rs`. Avoid duplicating Git graph traversal logic across different commands.
+- Read Kindra config only through `src/config.rs`: repository config lives in the common Git directory (never `repo.path()`), and each module deserializes its own section with `ConfigFile::section`. Register new top-level keys in `KNOWN_REPO_KEYS`. Resolve the trunk only through `src/trunk.rs`.
 
 ### Safety & State
 - Operations that modify multiple branches (like `move`) must persist their state to allow for `continue`/`abort` workflows.

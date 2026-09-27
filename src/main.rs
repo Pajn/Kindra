@@ -1,4 +1,5 @@
 mod commands;
+mod config;
 mod editor;
 mod gh;
 mod interaction;
@@ -10,6 +11,7 @@ mod repository;
 mod runtime;
 mod stack;
 mod state_io;
+mod trunk;
 mod worktree;
 
 use crate::commands::abort_cmd::abort_cmd;

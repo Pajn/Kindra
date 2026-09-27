@@ -61,7 +61,7 @@ fn rename_branch(repo: &Repository, old_name: &str, new_name: &str) -> Result<()
         return Ok(());
     }
 
-    // The stack is derived relative to the upstream branch, and .git/kindra.toml
+    // The stack is derived relative to the upstream branch, and repository config
     // may pin it by name, so renaming it would leave the base dangling.
     if let Some(upstream) = find_upstream(repo)? {
         if old_name == upstream {
@@ -85,20 +85,22 @@ fn rename_branch(repo: &Repository, old_name: &str, new_name: &str) -> Result<()
         }
     }
 
-    // A managed main worktree pins its branch in .git/kindra.toml, which Kindra
+    // A managed main worktree pins its branch in repository config, which Kindra
     // can't rewrite. Renaming that branch would leave the pin dangling, so the
     // next `kin wt main` would recreate a phantom branch off trunk and the main
     // worktree would get stuck. Refuse it (the default pin == trunk is already
     // covered by the upstream guard above; this catches an explicit non-trunk pin).
-    if let Ok(wt_config) = crate::worktree::config::load_worktree_config(repo)
-        && wt_config.main.enabled
-        && old_name == wt_config.main.branch
-    {
-        return Err(anyhow!(
-            "Branch '{}' is pinned as the managed main worktree branch in .git/kindra.toml. \
-             Update `worktrees.main.branch` there instead of renaming.",
-            old_name
-        ));
+    // Bare repositories have no managed worktrees to protect.
+    if !repo.is_bare() {
+        let wt_config = crate::worktree::config::load_worktree_config(repo)?;
+        if wt_config.main.enabled && old_name == wt_config.main.branch {
+            return Err(anyhow!(
+                "Branch '{}' is pinned as the managed main worktree branch in {}. \
+                 Update `worktrees.main.branch` there instead of renaming.",
+                old_name,
+                wt_config.config_path.display()
+            ));
+        }
     }
 
     if repo.find_branch(new_name, BranchType::Local).is_ok() {

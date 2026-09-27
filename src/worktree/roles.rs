@@ -76,7 +76,10 @@ pub struct CleanupSummary {
 pub fn ensure_main(repo: &Repository) -> Result<EnsureResult> {
     let ctx = load_context(repo)?;
     if !ctx.config.main.enabled {
-        return Err(anyhow!("Main worktrees are disabled in .git/kindra.toml."));
+        return Err(anyhow!(
+            "Main worktrees are disabled in {}.",
+            ctx.config.config_path.display()
+        ));
     }
 
     let branch = ctx.config.main.branch.clone();
@@ -126,7 +129,8 @@ pub fn ensure_review(
     let ctx = load_context(repo)?;
     if !ctx.config.review.enabled {
         return Err(anyhow!(
-            "Review worktrees are disabled in .git/kindra.toml."
+            "Review worktrees are disabled in {}.",
+            ctx.config.config_path.display()
         ));
     }
     if !ctx.config.review.reuse {
@@ -210,7 +214,10 @@ pub fn ensure_review(
 pub fn ensure_temp(repo: &Repository, requested_branch: Option<&str>) -> Result<EnsureResult> {
     let ctx = load_context(repo)?;
     if !ctx.config.temp.enabled {
-        return Err(anyhow!("Temp worktrees are disabled in .git/kindra.toml."));
+        return Err(anyhow!(
+            "Temp worktrees are disabled in {}.",
+            ctx.config.config_path.display()
+        ));
     }
 
     let branch = resolve_requested_branch(repo, requested_branch)?;
@@ -284,7 +291,10 @@ pub fn ensure_temp_new_branch(
 ) -> Result<EnsureResult> {
     let ctx = load_context(repo)?;
     if !ctx.config.temp.enabled {
-        return Err(anyhow!("Temp worktrees are disabled in .git/kindra.toml."));
+        return Err(anyhow!(
+            "Temp worktrees are disabled in {}.",
+            ctx.config.config_path.display()
+        ));
     }
 
     ensure_local_branch_is_new(repo, branch)?;

@@ -5,6 +5,7 @@ This document provides a detailed overview of the commands available in Kindra v
 ## Table of Contents
 
 - [Core Concepts](#core-concepts)
+- [Configuration](#configuration)
 - [Command Reference](#command-reference)
   - [absorb](#absorb)
   - [commit](#commit)
@@ -31,6 +32,35 @@ This document provides a detailed overview of the commands available in Kindra v
 Kindra is built around the idea of a **stack** of branches. A stack is a linear sequence of branches where each branch builds on top of the previous one, ultimately originating from a "base" branch (like `main` or `master`).
 
 Kindra automatically identifies your stack by looking for local branches that are descendants of the merge base between your current branch and the base branch.
+
+The base branch is the **trunk**. Kindra resolves it in this order: `upstream_branch` in [repository config](#configuration) (an error if it names no existing branch; a name that exists only as `origin/<name>` resolves to that), otherwise `git config init.defaultBranch`, `main`, `master` and `trunk`. All of those are first looked up as local branches, in that order, and only if none exists as `origin/<name>`, in the same order. For example, with `init.defaultBranch = develop`, a local `main` is chosen over `origin/develop`.
+
+---
+
+## Configuration
+
+Kindra reads two TOML files:
+
+- **Repository config**: `kindra.toml` in the repository's common Git directory — `.git/kindra.toml` in a standard clone; `git rev-parse --git-common-dir` prints the directory. The one file applies to every worktree of the repository, including linked worktrees created with `git worktree add` or `kin wt`.
+- **Global config**: `kindra/config.toml` in the platform config directory, applying to every repository. It supports the `[restack]` and `[rebase]` sections; repository config overrides it.
+
+| Platform | Global config path |
+| --- | --- |
+| Linux | `$XDG_CONFIG_HOME/kindra/config.toml`, or `~/.config/kindra/config.toml` when `XDG_CONFIG_HOME` is unset |
+| macOS | `~/Library/Application Support/kindra/config.toml` |
+| Windows | `%APPDATA%\kindra\config.toml` (the roaming application data folder) |
+
+Repository config keys:
+
+| Key | Purpose |
+| --- | --- |
+| `upstream_branch` | The trunk; see [Core Concepts](#core-concepts). |
+| `[rebase]` | `autostash`; see [restack](#restack) for the resolution order. |
+| `[restack]` | `history_limit`; see [restack](#restack). |
+| `[worktrees]` | Managed worktrees; see [worktree](#worktree-alias-wt). |
+| `[overrides]` | Local file replacements; see [Local overrides](#local-overrides). |
+
+A TOML syntax error stops every command that reads the file, with an error naming its path. A value of the wrong type fails only the commands that use that section. Unknown top-level keys are reported as warnings and otherwise ignored.
 
 ---
 
@@ -223,7 +253,7 @@ kin rename <old-branch> <new-name>
 
 **Restrictions:**
 
-- Refuses to rename the resolved upstream/base branch (e.g. `main`), because the stack is derived relative to it and `.git/kindra.toml` may pin it by name.
+- Refuses to rename the resolved upstream/base branch (e.g. `main`), because the stack is derived relative to it and repository config may pin it by name.
 - Refuses to overwrite an existing branch.
 
 **When to use it:** Use this to give a branch a better name without breaking the branches stacked on top of it. Renaming with plain `git branch -m` also works, but `kin rename` additionally guards against renaming the base branch and refuses while an operation is in progress.
@@ -292,7 +322,7 @@ kin sync [--force] [--no-delete] [--autostash|--no-autostash]
 
 **What it does:**
 
-- Finds the resolved upstream/base branch using `find_upstream()` logic. This detection covers `.git/kindra.toml`, `init.defaultBranch`, common names like `main`/`master`/`trunk`, and remote-qualified bases.
+- Finds the trunk as described in [Core Concepts](#core-concepts): `upstream_branch` in repository config, `init.defaultBranch`, common names like `main`/`master`/`trunk`, and remote-qualified bases.
 - Finds the top branch in your current stack.
 - Detects the first commit that still needs replaying (while handling lower PRs already landed via merge, rebase/cherry-pick, or squash).
 - Checks out the top branch and runs one `git rebase --update-refs --onto <upstream> <old-base> <top>`.
@@ -328,8 +358,8 @@ kin restack [--history-limit <n>] [--autostash|--no-autostash] [--pick]
 
 **History limit resolution order:**
 - CLI override: `--history-limit <n>`
-- Repository config: `.git/kindra.toml`
-- Global config: the standard platform config directory as `kindra/config.toml`
+- [Repository config](#configuration)
+- [Global config](#configuration)
 - Default: `100`
 
 Example config:
@@ -339,10 +369,11 @@ Example config:
 history_limit = 250
 ```
 
-**Rebase autostash resolution order:**
+**Rebase autostash resolution order** (shared by every command that accepts `--autostash`: `commit`, `move`, `sync`, `restack`, `reorder`, `split` and `run`):
 - CLI override: `--autostash` or `--no-autostash`
-- Repository config: `.git/kindra.toml`
-- Global config: the standard platform config directory as `kindra/config.toml`
+- [Repository config](#configuration): `[rebase] autostash`
+- [Global config](#configuration): `[rebase] autostash`
+- Git config: `rebase.autostash`
 - Default: `false`
 
 Example config:
@@ -486,7 +517,7 @@ A CLI process cannot change its parent shell's directory, so `kin wt cd` relies 
 
 **Configuration:**
 
-Managed worktrees are configured in `.git/kindra.toml`:
+Managed worktrees are configured in the `[worktrees]` section of [repository config](#configuration):
 
 ```toml
 [worktrees]
@@ -520,7 +551,7 @@ delete_merged = true
 
 Configuration notes:
 
-- `worktrees.trunk` defaults to Kindra's resolved upstream branch and falls back to `main` when no better upstream can be found.
+- `worktrees.trunk` defaults to the resolved trunk (see [Core Concepts](#core-concepts)), so a configured `upstream_branch` applies here too and is an error if it names no existing branch. It falls back to `main` when no trunk can be found. An explicit `worktrees.trunk` is used as written.
 - `worktrees.main.branch` defaults to `worktrees.trunk`.
 - If `worktrees.trunk` resolves to a remote ref such as `origin/main`, Kindra bootstraps the local main worktree branch from that remote.
 - `worktrees.temp.path_template` must include `{branch}` as its final path component; templates like `temp-{branch}` or `temp/{branch}/nested` are rejected.
@@ -722,8 +753,8 @@ kin pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--reviewe
 
 ### Local overrides
 
-Configure local file replacements in the repository's `.git/kindra.toml`. Linked
-worktrees share this configuration through their common Git directory.
+Configure local file replacements in the `[overrides]` section of
+[repository config](#configuration), which every worktree shares.
 
 ```toml
 [overrides]

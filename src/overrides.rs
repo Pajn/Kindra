@@ -32,11 +32,6 @@ fn default_branch_env() -> bool {
     true
 }
 
-#[derive(Deserialize)]
-struct RepoConfig {
-    overrides: Option<Config>,
-}
-
 #[derive(Deserialize, Serialize, PartialEq, Eq)]
 enum Phase {
     Preparing,
@@ -85,15 +80,7 @@ pub fn is_disabled(repo: &Repository) -> bool {
 }
 
 fn config(repo: &Repository) -> Result<Option<Config>> {
-    let path = repo.commondir().join("kindra.toml");
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    let config = toml::from_str::<RepoConfig>(&text)
-        .with_context(|| format!("Failed to parse {}", path.display()))?
-        .overrides;
+    let config = crate::config::repo_config(repo)?.section::<Config>("overrides")?;
     if let Some(config) = &config
         && (config.paths.is_empty()
             || config.paths.iter().any(|p| p.trim().is_empty())

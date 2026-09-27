@@ -15,7 +15,10 @@ fn find_floating_base(
 }
 
 mod common;
-use common::{assert_no_rebase_in_progress, kin_cmd, make_commit, repo_init, run_ok};
+use common::{
+    apply_global_config_env, assert_no_rebase_in_progress, kin_cmd, make_commit, repo_init, run_ok,
+    test_global_config_dir,
+};
 
 #[test]
 fn test_restack_parent_gains_commit_preserves_children_and_siblings() {
@@ -1243,33 +1246,6 @@ fn setup_deep_rewritten_base_scenario() -> (TempDir, Repository, git2::Oid, git2
     (temp, repo, old_feat_oid, rewritten_main_oid)
 }
 
-fn test_global_config_dir(root: &std::path::Path) -> std::path::PathBuf {
-    if cfg!(target_os = "macos") {
-        return root
-            .join("Library")
-            .join("Application Support")
-            .join("kindra");
-    }
-    if cfg!(target_os = "windows") {
-        return root.join("AppData").join("Roaming").join("kindra");
-    }
-
-    root.join(".config").join("kindra")
-}
-
-fn apply_global_config_env(cmd: &mut assert_cmd::Command, root: &std::path::Path) {
-    cmd.env("HOME", root);
-
-    if cfg!(target_os = "linux") || cfg!(target_os = "freebsd") || cfg!(target_os = "openbsd") {
-        cmd.env("XDG_CONFIG_HOME", root.join(".config"));
-    }
-
-    if cfg!(target_os = "windows") {
-        cmd.env("APPDATA", root.join("AppData").join("Roaming"));
-        cmd.env("LOCALAPPDATA", root.join("AppData").join("Local"));
-    }
-}
-
 #[test]
 fn test_restack_default_history_limit_skips_deep_rewritten_base() {
     let (temp, repo, old_feat_oid, _rewritten_main_oid) = setup_deep_rewritten_base_scenario();
@@ -1336,6 +1312,35 @@ fn test_restack_repo_config_overrides_default_history_limit() {
         .parent_id(0)
         .unwrap();
 
+    assert_ne!(new_feat_oid, old_feat_oid);
+    assert_eq!(new_feat_parent, rewritten_main_oid);
+}
+
+/// Repository config is shared by every worktree, so `[restack]
+/// history_limit` must also apply to a restack run from a linked worktree.
+#[test]
+fn test_restack_repo_config_history_limit_applies_in_linked_worktree() {
+    let (temp, repo, old_feat_oid, rewritten_main_oid) = setup_deep_rewritten_base_scenario();
+    let repo_path = temp.path();
+
+    common::write_repo_config(repo_path, "[restack]\nhistory_limit = 300\n");
+    // `main` can only be checked out in one worktree at a time.
+    run_ok("git", &["checkout", "--detach"], repo_path);
+    let (_wt_parent, wt) = common::add_linked_worktree(repo_path, "main");
+
+    kin_cmd().current_dir(&wt).arg("restack").assert().success();
+
+    let new_feat_oid = repo
+        .find_branch("feat", git2::BranchType::Local)
+        .unwrap()
+        .get()
+        .target()
+        .unwrap();
+    let new_feat_parent = repo
+        .find_commit(new_feat_oid)
+        .unwrap()
+        .parent_id(0)
+        .unwrap();
     assert_ne!(new_feat_oid, old_feat_oid);
     assert_eq!(new_feat_parent, rewritten_main_oid);
 }

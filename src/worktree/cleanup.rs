@@ -82,6 +82,7 @@ mod tests {
     fn config_for(dir: &Path) -> WorktreeConfig {
         let root = dir.join(".git/kindra-worktrees");
         WorktreeConfig {
+            config_path: dir.join(".git/kindra.toml"),
             root: root.clone(),
             trunk: "main".to_string(),
             hooks: HookListConfig::default(),

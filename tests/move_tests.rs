@@ -1963,6 +1963,57 @@ fn test_move_repo_config_enables_autostash_and_persists_in_state() {
     );
 }
 
+/// Repository config is shared by every worktree, so `[rebase] autostash` must
+/// also apply to a move started from a linked worktree.
+#[test]
+fn test_move_repo_config_enables_autostash_in_linked_worktree() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let base_id = make_commit(&repo, "refs/heads/main", "file.txt", "base\n", "base", &[]);
+    let base = repo.find_commit(base_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/target",
+        "file.txt",
+        "base\ntarget\n",
+        "target",
+        &[&base],
+    );
+    make_commit(
+        &repo,
+        "refs/heads/feature",
+        "file.txt",
+        "base\nfeature\n",
+        "feature",
+        &[&base],
+    );
+
+    common::write_repo_config(dir.path(), "[rebase]\nautostash = true\n");
+    let (_wt_parent, wt) = common::add_linked_worktree(dir.path(), "feature");
+    fs::write(wt.join("file.txt"), "base\nfeature\ndirty\n").unwrap();
+
+    let output = kin_cmd()
+        .arg("move")
+        .arg("--onto")
+        .arg("target")
+        .current_dir(&wt)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let linked = Repository::open(&wt).unwrap();
+    assert!(
+        linked.path().join("rebase-merge").exists() || linked.path().join("rebase-apply").exists(),
+        "move should start rebasing with autostash\nstderr:\n{stderr}"
+    );
+    let state = kindra::rebase_utils::load_state(&linked).unwrap();
+    assert!(
+        state.stash_ref.is_some(),
+        "operation must own the autostash"
+    );
+}
+
 #[test]
 fn test_move_fails_immediately_does_not_skip_branch() {
     let (dir, repo) = setup_repo();
