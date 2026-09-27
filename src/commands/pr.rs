@@ -165,10 +165,13 @@ fn pr_create_or_update(
     // now would push (or merge) a half-rebased stack. The lock is held until
     // publication is done, so no other `kin` process rewrites the branches
     // being published.
-    let _lock = crate::operation_state::lock_and_ensure_idle(
+    let lock = crate::operation_state::lock_and_ensure_idle(
         &repo,
         crate::operation_state::Allow::PUBLISH,
     )?;
+    // Read hooks before publishing anything, so a config error stops the run
+    // while nothing has changed yet.
+    let after_pr = crate::hooks::after_pr_commands(&repo)?;
 
     // A single `gh pr list` snapshot serves scope filtering, the flatten-need
     // check, and per-branch processing — instead of ~4 `gh pr view` subprocesses
@@ -223,6 +226,7 @@ fn pr_create_or_update(
     );
 
     let mut processed_prs = Vec::new();
+    let mut drafts = HashMap::new();
     for (sb, _remote_upstream) in &branches_with_upstream {
         let git_base = base_map
             .get(&sb.name)
@@ -230,9 +234,10 @@ fn pr_create_or_update(
             .unwrap_or_else(|| upstream_name.clone());
         let gh_base = normalize_base_for_gh(&git_base);
 
-        if let Some(pr) =
+        if let Some((pr, draft)) =
             process_branch_pr(&open_prs, &repo, &sb.name, &git_base, &gh_base, options)?
         {
+            drafts.insert(sb.name.clone(), draft);
             processed_prs.push(StackPr {
                 branch_name: sb.name.clone(),
                 pr,
@@ -256,7 +261,111 @@ fn pr_create_or_update(
     // (including merged ones parsed from existing descriptions).
     sync_stack_descriptions(&processed_prs, &base_map)?;
 
+    if !after_pr.is_empty() {
+        let prs = processed_prs
+            .iter()
+            .map(|stack_pr| {
+                // Prefer GitHub's current draft state; a PR created moments ago
+                // may be missing from the refreshed list.
+                let draft = latest_prs
+                    .get(&stack_pr.branch_name)
+                    .map(|fresh| fresh.is_draft)
+                    .or_else(|| drafts.get(&stack_pr.branch_name).copied())
+                    .unwrap_or(false);
+                let pr = crate::hooks::AfterPrPullRequest {
+                    number: stack_pr.pr.number,
+                    url: stack_pr.pr.url.clone(),
+                    draft,
+                };
+                (stack_pr.branch_name.clone(), pr)
+            })
+            .collect();
+        // Publishing is done: release the lock so hooks can run `kin` too.
+        drop(lock);
+        run_after_pr_hooks(
+            &repo,
+            &after_pr,
+            &upstream_name,
+            &branches_with_upstream,
+            &base_map,
+            prs,
+        )?;
+    }
+
     Ok(())
+}
+
+/// Build the `after_pr` payload for the branches this run published and run
+/// the configured hooks with it.
+///
+/// `trunk_ref` is the trunk ref the run bases PRs on (the stack boundary, e.g.
+/// `origin/main`). Each branch's parent comes from `base_map`, falling back to
+/// the trunk; the payload names parents the way PR bases name them, and
+/// computes fork points against the same refs `kin pr` compares commits with.
+fn run_after_pr_hooks(
+    repo: &Repository,
+    commands: &[String],
+    trunk_ref: &str,
+    branches: &[(StackBranch, String)],
+    base_map: &HashMap<String, String>,
+    mut prs: HashMap<String, crate::hooks::AfterPrPullRequest>,
+) -> Result<()> {
+    let payload = (|| -> Result<crate::hooks::AfterPrPayload> {
+        let mut entries = Vec::with_capacity(branches.len());
+        for (sb, _remote_upstream) in branches {
+            let git_base = base_map
+                .get(&sb.name)
+                .map(String::as_str)
+                .unwrap_or(trunk_ref);
+            let base_id = repo
+                .revparse_single(git_base)
+                .and_then(|object| object.peel_to_commit())
+                .with_context(|| format!("Could not resolve '{git_base}'"))?
+                .id();
+            let fork_point = resolve_merge_base(repo, base_id, sb.id)?;
+            entries.push(crate::hooks::AfterPrBranch {
+                name: sb.name.clone(),
+                parent: normalize_base_for_gh(git_base),
+                head_sha: sb.id.to_string(),
+                fork_point: fork_point.to_string(),
+                pr: prs.remove(&sb.name),
+            });
+        }
+        let remote = branches.iter().find_map(|(sb, _)| {
+            repo.branch_upstream_remote(&format!("refs/heads/{}", sb.name))
+                .ok()
+                .and_then(|remote| remote.as_str().map(str::to_string))
+        });
+        let remote_url = remote.as_deref().and_then(|remote| push_url(repo, remote));
+        Ok(crate::hooks::AfterPrPayload {
+            event: crate::hooks::AFTER_PR_EVENT,
+            trunk: normalize_base_for_gh(trunk_ref),
+            remote,
+            remote_url,
+            branches: entries,
+        })
+    })()
+    .context("Pull requests were published, but the after_pr hook payload could not be built")?;
+
+    let root = repo
+        .workdir()
+        .ok_or_else(|| anyhow!("after_pr hooks need a worktree"))?;
+    crate::hooks::run_after_pr(commands, root, &payload)
+}
+
+/// `git remote get-url --push <remote>`, or `None` if Git cannot answer.
+fn push_url(repo: &Repository, remote: &str) -> Option<String> {
+    let mut command = std::process::Command::new("git");
+    command.args(["remote", "get-url", "--push", remote]);
+    if let Some(root) = repo.workdir() {
+        command.current_dir(root);
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!url.is_empty()).then_some(url)
 }
 
 /// Returns `true` if a flatten was performed (so the caller should refresh its
@@ -569,10 +678,11 @@ fn pr_flatten() -> Result<()> {
     // now would push (or merge) a half-rebased stack. The lock is held until
     // publication is done, so no other `kin` process rewrites the branches
     // being published.
-    let _lock = crate::operation_state::lock_and_ensure_idle(
+    let lock = crate::operation_state::lock_and_ensure_idle(
         &repo,
         crate::operation_state::Allow::PUBLISH,
     )?;
+    let after_pr = crate::hooks::after_pr_commands(&repo)?;
     let (upstream_name, branches_with_upstream) = discover_stack_branches_with_upstream(&repo)?;
 
     if branches_with_upstream.is_empty() {
@@ -582,7 +692,39 @@ fn pr_flatten() -> Result<()> {
     }
 
     let open_prs = gh::list_open_prs()?;
-    flatten_stack_prs_to_upstream(&open_prs, &branches_with_upstream, &upstream_name)
+    flatten_stack_prs_to_upstream(&open_prs, &branches_with_upstream, &upstream_name)?;
+
+    if !after_pr.is_empty() {
+        // Flatten changes only PR bases, so the snapshot's numbers, URLs and
+        // draft states are still current. It pushes nothing.
+        // Flatten based every PR on the trunk; the payload reports PR bases,
+        // so every branch's parent is the trunk.
+        let base_map = HashMap::new();
+        let prs = branches_with_upstream
+            .iter()
+            .filter_map(|(sb, _remote_upstream)| {
+                let open = open_prs.get(&sb.name)?;
+                let pr = crate::hooks::AfterPrPullRequest {
+                    number: open.number,
+                    url: open.url.clone(),
+                    draft: open.is_draft,
+                };
+                Some((sb.name.clone(), pr))
+            })
+            .collect();
+        // Publishing is done: release the lock so hooks can run `kin` too.
+        drop(lock);
+        run_after_pr_hooks(
+            &repo,
+            &after_pr,
+            &upstream_name,
+            &branches_with_upstream,
+            &base_map,
+            prs,
+        )?;
+    }
+
+    Ok(())
 }
 
 fn flatten_stack_prs_to_upstream(
@@ -1155,7 +1297,7 @@ fn process_branch_pr(
     git_base: &str,
     gh_base: &str,
     options: &PrCreateOptions,
-) -> Result<Option<crate::gh::EditablePr>> {
+) -> Result<Option<(crate::gh::EditablePr, bool)>> {
     println!("── {} ──", branch_name);
 
     // Check for an existing open PR in the snapshot.
@@ -1169,7 +1311,7 @@ fn process_branch_pr(
             } else {
                 println!("  Base is already '{}'. Nothing to update.", gh_base);
             }
-            Ok(Some(existing.to_editable()))
+            Ok(Some((existing.to_editable(), existing.is_draft)))
         }
         None => {
             // New PR: run the creation wizard (or apply supplied flags).
@@ -1188,7 +1330,7 @@ fn create_pr_interactive(
     git_base: &str,
     gh_base: &str,
     options: &PrCreateOptions,
-) -> Result<Option<crate::gh::EditablePr>> {
+) -> Result<Option<(crate::gh::EditablePr, bool)>> {
     let commits = get_branch_commits(repo, branch_name, git_base)?;
 
     if commits.is_empty() {
@@ -1271,14 +1413,17 @@ fn create_pr_interactive(
     } else {
         println!("  ✓ PR created: {}", url);
     }
-    Ok(Some(gh::EditablePr {
-        number: parse_pr_number_from_url(&url)?,
-        title,
-        body,
-        url,
-        labels: submission.labels,
-        reviewers,
-    }))
+    Ok(Some((
+        gh::EditablePr {
+            number: parse_pr_number_from_url(&url)?,
+            title,
+            body,
+            url,
+            labels: submission.labels,
+            reviewers,
+        },
+        submission.draft,
+    )))
 }
 
 fn sync_stack_descriptions(prs: &[StackPr], base_map: &HashMap<String, String>) -> Result<()> {

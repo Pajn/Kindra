@@ -115,6 +115,8 @@ Kindra reads two optional TOML files:
 
 A syntax error in either file stops the commands that read it, naming the file. Unknown top-level keys in repository config print a warning. See the [CLI reference](docs/cli_reference.md#configuration) for every key.
 
+Repository config can also run commands after `kin pr` publishes the stack, receiving the stack as JSON on stdin: `[hooks] after_pr = ["…"]`. See [Hooks](docs/cli_reference.md#hooks).
+
 ## Upstream Branch Selection
 
 Commands that need the trunk — the upstream/base branch stacks are built on (for example `sync`, `split`, `push`, `commit`, and `move`) — resolve it in this order:

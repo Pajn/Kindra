@@ -7684,3 +7684,506 @@ fi"#,
         "the cascade must delete the merged branch: {output:?}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `[hooks] after_pr`
+//
+// A stateful mock `gh` remembers the PRs it created (in `$MOCK_GH_STATE/prs`)
+// and serves them from `gh pr list`, so a second `kin pr` sees them as existing.
+// Hooks record their stdin, environment and working directory under `$HOOK_OUT`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const AFTER_PR_GH_MOCK: &str = r#"#!/bin/bash
+state="$MOCK_GH_STATE"
+echo "$*" >> "$state/calls"
+if [[ "$1" == "auth" ]]; then exit 0; fi
+if [[ "$1" == "pr" && "$2" == "list" ]]; then
+    printf '['
+    sep=""
+    if [[ -f "$state/prs" ]]; then
+        while read -r number head base draft; do
+            printf '%s{"number":%s,"headRefName":"%s","baseRefName":"%s","isDraft":%s,"title":"T","body":"","url":"https://github.com/owner/repo/pull/%s","labels":[],"reviewRequests":[]}' \
+                "$sep" "$number" "$head" "$base" "$draft" "$number"
+            sep=","
+        done < "$state/prs"
+    fi
+    echo ']'
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "create" ]]; then
+    if [[ -n "$MOCK_GH_FAIL_CREATE" ]]; then
+        echo "simulated create failure" >&2
+        exit 1
+    fi
+    head=""; base=""; draft=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --head) head="$2"; shift ;;
+            --base) base="$2"; shift ;;
+            --title|--body|--label|--reviewer) shift ;;
+            --draft) draft=true ;;
+        esac
+        shift
+    done
+    count=$(cat "$state/prs" 2>/dev/null | wc -l)
+    number=$((101 + count))
+    echo "$number $head $base $draft" >> "$state/prs"
+    echo "https://github.com/owner/repo/pull/$number"
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "edit" ]]; then exit 0; fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then
+    echo '{"url":"https://github.com/owner/repo/pull/101","state":"OPEN"}'
+    exit 0
+fi
+echo "mock gh: unexpected command: $*" >&2
+exit 1
+"#;
+
+/// Records the payload, event variable and working directory of one hook run
+/// as `$HOOK_OUT/<label>.{json,event,cwd}`.
+const RECORD_HOOK: &str = r#"#!/bin/sh
+cat > "$HOOK_OUT/$1.json"
+printf '%s' "$KINDRA_HOOK_EVENT" > "$HOOK_OUT/$1.event"
+pwd -P > "$HOOK_OUT/$1.cwd"
+"#;
+
+/// Repository config running [`RECORD_HOOK`] under `label`.
+fn record_hook_config(label: &str) -> String {
+    format!("[hooks]\nafter_pr = ['sh \"$HOOK_BIN/record-hook\" {label}']\n")
+}
+
+struct AfterPrFixture {
+    dir: tempfile::TempDir,
+    /// Mock `gh`, hook scripts, the bare remote, and everything the mocks
+    /// record — kept out of the repository's working tree.
+    tools: tempfile::TempDir,
+}
+
+impl AfterPrFixture {
+    /// `main → feature-a → feature-b` (plus `feature-c` on `feature-a` when
+    /// `branching`), all pushed with upstreams; then one more commit on
+    /// `feature-b`, so only `feature-b` needs pushing. HEAD is `feature-b`.
+    fn new(branching: bool) -> Self {
+        let (dir, _repo) = setup_two_level_stack();
+        if branching {
+            run_ok(
+                "git",
+                &["checkout", "-b", "feature-c", "feature-a"],
+                dir.path(),
+            );
+            fs::write(dir.path().join("c.txt"), "c").unwrap();
+            run_ok("git", &["add", "c.txt"], dir.path());
+            run_ok("git", &["commit", "-m", "feat: c"], dir.path());
+            run_ok("git", &["checkout", "feature-b"], dir.path());
+        }
+
+        let tools = tempdir().unwrap();
+        let remote = tools.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_ok("git", &["init", "--bare"], &remote);
+        run_ok(
+            "git",
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+            dir.path(),
+        );
+        let mut push = vec!["push", "-u", "origin", "main", "feature-a", "feature-b"];
+        if branching {
+            push.push("feature-c");
+        }
+        run_ok("git", &push, dir.path());
+
+        fs::write(dir.path().join("b2.txt"), "b2").unwrap();
+        run_ok("git", &["add", "b2.txt"], dir.path());
+        run_ok("git", &["commit", "-m", "feat: b2"], dir.path());
+
+        write_script(&tools.path().join("gh"), AFTER_PR_GH_MOCK);
+        write_script(&tools.path().join("record-hook"), RECORD_HOOK);
+        fs::create_dir_all(tools.path().join("out")).unwrap();
+
+        Self { dir, tools }
+    }
+
+    fn root(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+
+    fn remote(&self) -> std::path::PathBuf {
+        self.tools.path().join("remote.git")
+    }
+
+    fn out(&self) -> std::path::PathBuf {
+        self.tools.path().join("out")
+    }
+
+    fn kin_cmd(&self, cwd: &std::path::Path, args: &[&str]) -> assert_cmd::Command {
+        let mut cmd = kin_cmd();
+        cmd.args(args)
+            .current_dir(cwd)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.tools.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("MOCK_GH_STATE", self.tools.path())
+            .env("HOOK_BIN", self.tools.path())
+            .env("HOOK_OUT", self.out());
+        cmd
+    }
+
+    fn kin(&self, cwd: &std::path::Path, args: &[&str]) -> std::process::Output {
+        self.kin_cmd(cwd, args).output().unwrap()
+    }
+
+    /// Non-interactive `kin pr` that creates PRs without prompting.
+    fn kin_pr(&self, cwd: &std::path::Path) -> std::process::Output {
+        self.kin(cwd, &["pr", "--title", "T", "--body-from-commits"])
+    }
+
+    fn gh_calls(&self) -> String {
+        fs::read_to_string(self.tools.path().join("calls")).unwrap_or_default()
+    }
+
+    fn payload(&self, label: &str) -> serde_json::Value {
+        let raw = fs::read_to_string(self.out().join(format!("{label}.json")))
+            .unwrap_or_else(|err| panic!("hook `{label}` did not run: {err}"));
+        serde_json::from_str(&raw).unwrap_or_else(|err| panic!("invalid payload {raw}: {err}"))
+    }
+
+    fn hook_ran(&self, label: &str) -> bool {
+        self.out().join(format!("{label}.json")).exists()
+    }
+
+    fn rev(&self, spec: &str) -> String {
+        let repo = Repository::open(self.root()).unwrap();
+        repo.revparse_single(spec).unwrap().id().to_string()
+    }
+
+    fn merge_base(&self, a: &str, b: &str) -> String {
+        let repo = Repository::open(self.root()).unwrap();
+        let a = repo.revparse_single(a).unwrap().id();
+        let b = repo.revparse_single(b).unwrap().id();
+        repo.merge_base(a, b).unwrap().to_string()
+    }
+
+    fn remote_tip(&self, branch: &str) -> Option<String> {
+        let remote = Repository::open_bare(self.remote()).unwrap();
+        remote
+            .find_reference(&format!("refs/heads/{branch}"))
+            .ok()
+            .and_then(|reference| reference.target())
+            .map(|oid| oid.to_string())
+    }
+}
+
+fn assert_success(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "kin failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn payload_branch<'a>(payload: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    payload["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|branch| branch["name"] == name)
+        .unwrap_or_else(|| panic!("{name} missing from payload {payload}"))
+}
+
+fn payload_branch_names(payload: &serde_json::Value) -> Vec<String> {
+    payload["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|branch| branch["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn after_pr_hook_receives_stack_payload() {
+    let fx = AfterPrFixture::new(false);
+    write_repo_config(fx.root(), &record_hook_config("run"));
+    let subdir = fx.root().join("sub");
+    fs::create_dir_all(&subdir).unwrap();
+
+    let output = fx.kin_pr(&subdir);
+    assert_success(&output);
+
+    let payload = fx.payload("run");
+    assert_eq!(payload["event"], "after_pr");
+    assert_eq!(payload["trunk"], "main");
+    assert_eq!(payload["remote"], "origin");
+    assert_eq!(payload["remote_url"], fx.remote().to_str().unwrap());
+    assert_eq!(payload_branch_names(&payload), ["feature-a", "feature-b"]);
+
+    let a = payload_branch(&payload, "feature-a");
+    assert_eq!(a["parent"], "main");
+    assert_eq!(a["head_sha"], fx.rev("feature-a"));
+    assert_eq!(a["fork_point"], fx.merge_base("origin/main", "feature-a"));
+    assert_eq!(a["pr"]["number"], 101);
+    assert_eq!(a["pr"]["url"], "https://github.com/owner/repo/pull/101");
+    assert_eq!(a["pr"]["draft"], false);
+    let mut keys: Vec<_> = a.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["fork_point", "head_sha", "name", "parent", "pr"]);
+
+    let b = payload_branch(&payload, "feature-b");
+    assert_eq!(b["parent"], "feature-a");
+    assert_eq!(b["head_sha"], fx.rev("feature-b"));
+    assert_eq!(b["fork_point"], fx.rev("feature-a"));
+    assert_eq!(b["pr"]["number"], 102);
+    assert_eq!(b["pr"]["url"], "https://github.com/owner/repo/pull/102");
+    assert_eq!(b["pr"]["draft"], false);
+
+    assert_eq!(
+        fs::read_to_string(fx.out().join("run.event")).unwrap(),
+        "after_pr"
+    );
+    assert_eq!(
+        fs::read_to_string(fx.out().join("run.cwd")).unwrap().trim(),
+        fs::canonicalize(fx.root()).unwrap().to_str().unwrap(),
+        "hooks run from the worktree root, not the invocation directory"
+    );
+}
+
+#[test]
+fn after_pr_hook_orders_branching_tree_parents_first() {
+    let fx = AfterPrFixture::new(true);
+    write_repo_config(fx.root(), &record_hook_config("run"));
+
+    let output = fx.kin(
+        fx.root(),
+        &["pr", "--title", "T", "--body-from-commits", "--draft"],
+    );
+    assert_success(&output);
+
+    let payload = fx.payload("run");
+    let names = payload_branch_names(&payload);
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(sorted, ["feature-a", "feature-b", "feature-c"]);
+    let position = |name: &str| names.iter().position(|n| n == name).unwrap();
+    assert!(position("feature-a") < position("feature-b"), "{names:?}");
+    assert!(position("feature-a") < position("feature-c"), "{names:?}");
+
+    for (branch, parent) in [
+        ("feature-a", "main"),
+        ("feature-b", "feature-a"),
+        ("feature-c", "feature-a"),
+    ] {
+        let entry = payload_branch(&payload, branch);
+        assert_eq!(entry["parent"], parent, "{branch}");
+        assert_eq!(entry["head_sha"], fx.rev(branch), "{branch}");
+        let fork_parent = if parent == "main" {
+            "origin/main"
+        } else {
+            parent
+        };
+        assert_eq!(
+            entry["fork_point"],
+            fx.merge_base(fork_parent, branch),
+            "{branch}"
+        );
+        assert_eq!(entry["pr"]["draft"], true, "{branch}");
+        assert!(entry["pr"]["number"].as_u64().is_some(), "{branch}");
+    }
+}
+
+#[test]
+fn after_pr_hook_runs_when_nothing_changed() {
+    let fx = AfterPrFixture::new(false);
+    write_repo_config(fx.root(), &record_hook_config("first"));
+    assert_success(&fx.kin_pr(fx.root()));
+    assert!(fx.hook_ran("first"));
+    assert_eq!(fx.gh_calls().matches("pr create").count(), 2);
+
+    write_repo_config(fx.root(), &record_hook_config("second"));
+    assert_success(&fx.kin_pr(fx.root()));
+    assert_eq!(
+        fx.gh_calls().matches("pr create").count(),
+        2,
+        "the second run finds the existing PRs"
+    );
+    let payload = fx.payload("second");
+    assert_eq!(payload_branch_names(&payload), ["feature-a", "feature-b"]);
+    for (branch, number) in [("feature-a", 101), ("feature-b", 102)] {
+        let entry = payload_branch(&payload, branch);
+        assert_eq!(entry["pr"]["number"], number, "{branch}");
+    }
+}
+
+#[test]
+fn after_pr_hook_failure_fails_kin_pr_but_keeps_published_prs() {
+    let fx = AfterPrFixture::new(false);
+    write_repo_config(fx.root(), "[hooks]\nafter_pr = [\"exit 7\"]\n");
+
+    let output = fx.kin_pr(fx.root());
+    assert!(!output.status.success(), "a failing hook must fail kin pr");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "Pull requests were published, but the after_pr hook `exit 7` failed (exit status 7)."
+        ),
+        "{stderr}"
+    );
+    assert_eq!(fx.gh_calls().matches("pr create").count(), 2);
+    assert_eq!(fx.remote_tip("feature-b"), Some(fx.rev("feature-b")));
+}
+
+#[test]
+fn after_pr_hooks_run_in_order_and_stop_at_first_failure() {
+    let fx = AfterPrFixture::new(false);
+    write_repo_config(
+        fx.root(),
+        r#"[hooks]
+after_pr = [
+    'echo one >> "$HOOK_OUT/order"',
+    'echo two >> "$HOOK_OUT/order"; exit 3',
+    'echo three >> "$HOOK_OUT/order"',
+]
+"#,
+    );
+
+    let output = fx.kin_pr(fx.root());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed (exit status 3)"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(fx.out().join("order")).unwrap(),
+        "one\ntwo\n"
+    );
+}
+
+/// Hooks run once publishing is done and the repository lock is released, so
+/// a hook can run a `kin` command that takes the lock itself.
+#[test]
+fn after_pr_hooks_can_run_kin_commands_that_take_the_lock() {
+    let fx = AfterPrFixture::new(false);
+    let config = format!(
+        "[hooks]\nafter_pr = ['\"{}\" restack > \"$HOOK_OUT/nested.out\" 2>&1; echo $? > \"$HOOK_OUT/nested.status\"']\n",
+        env!("CARGO_BIN_EXE_kin")
+    );
+    let nested = |what: &str| {
+        let out = fs::read_to_string(fx.out().join("nested.out")).unwrap();
+        assert!(
+            !out.contains("Another 'kin' process"),
+            "a hook after {what} must not find the repository locked:\n{out}"
+        );
+        assert_eq!(
+            fs::read_to_string(fx.out().join("nested.status"))
+                .unwrap()
+                .trim(),
+            "0",
+            "{what}: {out}"
+        );
+    };
+
+    write_repo_config(fx.root(), &config);
+    assert_success(&fx.kin_pr(fx.root()));
+    nested("kin pr");
+
+    fs::remove_file(fx.out().join("nested.out")).unwrap();
+    assert_success(&fx.kin(fx.root(), &["pr", "flatten"]));
+    nested("kin pr flatten");
+}
+
+#[test]
+fn after_pr_hook_does_not_run_for_read_only_subcommands() {
+    let fx = AfterPrFixture::new(false);
+    assert_success(&fx.kin_pr(fx.root()));
+    write_repo_config(fx.root(), &record_hook_config("run"));
+    let open_mock = write_script(&fx.tools.path().join("mock-open"), "#!/bin/sh\nexit 0\n");
+
+    let output = fx
+        .kin_cmd(fx.root(), &["pr", "open"])
+        .env("GITS_OPEN_COMMAND", &open_mock)
+        .env("KIN_TEST_SELECTIONS", "0")
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert!(!fx.hook_ran("run"), "kin pr open must not run after_pr");
+}
+
+#[test]
+fn after_pr_hook_runs_after_flatten() {
+    let fx = AfterPrFixture::new(false);
+    assert_success(&fx.kin_pr(fx.root()));
+    write_repo_config(fx.root(), &record_hook_config("run"));
+
+    assert_success(&fx.kin(fx.root(), &["pr", "flatten"]));
+    let payload = fx.payload("run");
+    assert_eq!(payload_branch_names(&payload), ["feature-a", "feature-b"]);
+    for (branch, number) in [("feature-a", 101), ("feature-b", 102)] {
+        let entry = payload_branch(&payload, branch);
+        assert_eq!(entry["pr"]["number"], number, "{branch}");
+        // Every PR now bases on the trunk, and `parent` names the PR base.
+        assert_eq!(entry["parent"], "main", "{branch}");
+    }
+}
+
+#[test]
+fn after_pr_hook_does_not_run_when_kin_pr_fails() {
+    let fx = AfterPrFixture::new(false);
+    write_repo_config(fx.root(), &record_hook_config("run"));
+
+    let output = fx
+        .kin_cmd(fx.root(), &["pr", "--title", "T", "--body-from-commits"])
+        .env("MOCK_GH_FAIL_CREATE", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!fx.hook_ran("run"));
+}
+
+#[test]
+fn after_pr_hooks_reject_unknown_keys_before_publishing() {
+    let fx = AfterPrFixture::new(false);
+    let pushed_before = fx.remote_tip("feature-b");
+    write_repo_config(fx.root(), "[hooks]\nafterpr = [\"true\"]\n");
+
+    let output = fx.kin_pr(fx.root());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Invalid `hooks`"), "{stderr}");
+    assert!(stderr.contains("afterpr"), "{stderr}");
+    assert_eq!(fx.remote_tip("feature-b"), pushed_before, "nothing pushed");
+    assert!(!fx.gh_calls().contains("pr create"));
+}
+
+#[test]
+fn kin_pr_without_hooks_section_is_unchanged() {
+    let fx = AfterPrFixture::new(false);
+    let output = fx.kin_pr(fx.root());
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("after_pr"), "{stderr}");
+    assert!(!stderr.contains("unknown key"), "{stderr}");
+    assert!(fs::read_dir(fx.out()).unwrap().next().is_none());
+    assert_eq!(fx.gh_calls().matches("pr create").count(), 2);
+}
+
+#[test]
+fn after_pr_hook_runs_in_linked_worktree_with_shared_config() {
+    let fx = AfterPrFixture::new(false);
+    write_repo_config(fx.root(), &record_hook_config("run"));
+    run_ok("git", &["checkout", "main"], fx.root());
+    let (_parent, linked) = common::add_linked_worktree(fx.root(), "feature-b");
+
+    let output = fx.kin_pr(&linked);
+    assert_success(&output);
+
+    let payload = fx.payload("run");
+    assert_eq!(payload_branch_names(&payload), ["feature-a", "feature-b"]);
+    assert_eq!(
+        fs::read_to_string(fx.out().join("run.cwd")).unwrap().trim(),
+        fs::canonicalize(&linked).unwrap().to_str().unwrap()
+    );
+}
