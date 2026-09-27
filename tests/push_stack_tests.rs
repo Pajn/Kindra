@@ -1502,3 +1502,70 @@ fn push_refuses_while_a_kindra_operation_is_paused() {
         feature_before
     );
 }
+
+/// `kin push` holds the repository lock from its idle check until the push
+/// is done, so another `kin` process cannot rewrite the branches it pushes.
+#[cfg(unix)]
+#[test]
+fn push_holds_the_repository_lock_while_pushing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let main_id = make_commit(&repo, "refs/heads/main", "main.txt", "m", "main", &[]);
+    let main_commit = repo.find_commit(main_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature",
+        "f.txt",
+        "f",
+        "feature",
+        &[&main_commit],
+    );
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+    let remote_dir = tempdir().unwrap();
+    run_ok("git", &["init", "--bare"], remote_dir.path());
+    run_ok(
+        "git",
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    let feature_id = make_commit(
+        &repo,
+        "refs/heads/feature",
+        "f2.txt",
+        "f2",
+        "more feature",
+        &[&head],
+    );
+    let hook = repo.path().join("hooks").join("pre-push");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\n{}\nexit 0\n", common::BLOCK_UNTIL_RELEASED),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut push = kin_cmd();
+    push.arg("push").current_dir(dir.path());
+    let output = common::run_while_blocked(push, || common::assert_repository_locked(dir.path()));
+    assert!(output.status.success(), "kin push failed: {output:?}");
+    assert_eq!(
+        remote_tip(remote_dir.path(), "refs/heads/feature"),
+        feature_id
+    );
+}

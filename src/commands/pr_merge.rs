@@ -2,9 +2,10 @@ use crate::commands::pr::{
     PrMergeArgs, StackPr, collect_open_stack_prs, discover_stack_branches_with_upstream,
     normalize_base_for_gh, parse_github_owner_repo_from_pr_url, select_stack_pr,
 };
-use crate::commands::sync::{SyncArgs, sync};
+use crate::commands::sync::{SyncArgs, sync_holding_lock};
 use crate::gh;
 use crate::stack::{StackBranch, compute_base_map};
+use crate::state_io::RepoLock;
 use anyhow::{Context, Result, anyhow};
 use git2::Repository;
 
@@ -128,7 +129,12 @@ pub(crate) fn pr_merge(args: &PrMergeArgs) -> Result<()> {
     let repo = crate::open_repo()?;
     // Refuse before merging anything on GitHub: the local cascade after the
     // merge could not run, and the stack being merged may be half-rebased.
-    crate::operation_state::ensure_idle_now(&repo, crate::operation_state::Allow::PUBLISH)?;
+    // The lock is held through the merge, the child retargets and the local
+    // cascade, so no other `kin` process rewrites the stack meanwhile.
+    let lock = crate::operation_state::lock_and_ensure_idle(
+        &repo,
+        crate::operation_state::Allow::PUBLISH,
+    )?;
     let (upstream_name, branches_with_upstream) = discover_stack_branches_with_upstream(&repo)?;
 
     if branches_with_upstream.is_empty() {
@@ -166,6 +172,7 @@ pub(crate) fn pr_merge(args: &PrMergeArgs) -> Result<()> {
         );
         return merge_and_cascade(
             &repo,
+            &lock,
             args,
             &upstream_name,
             &branches_with_upstream,
@@ -188,6 +195,7 @@ pub(crate) fn pr_merge(args: &PrMergeArgs) -> Result<()> {
         if confirmed {
             return merge_and_cascade(
                 &repo,
+                &lock,
                 args,
                 &upstream_name,
                 &branches_with_upstream,
@@ -217,8 +225,10 @@ pub(crate) fn pr_merge(args: &PrMergeArgs) -> Result<()> {
 /// part of that step, which always happens on a successful merge — then, unless
 /// `--no-cascade`, run the local cascade: restack the children onto the resolved
 /// trunk and delete the merged branch locally and on the remote.
+#[allow(clippy::too_many_arguments)]
 fn merge_and_cascade(
     repo: &Repository,
+    lock: &RepoLock,
     args: &PrMergeArgs,
     upstream_name: &str,
     branches_with_upstream: &[(StackBranch, String)],
@@ -257,13 +267,17 @@ fn merge_and_cascade(
     // Restack the remaining stack onto the freshly-updated trunk. `sync` fetches
     // trunk, detects the (squash-)merged branch, rebases children with
     // `--update-refs`, and deletes the merged branch locally with a recoverable
-    // SHA (undoable via `kin undo`). It acquires its own repo lock and oplog
-    // entry, so `pr_merge` must not hold either here.
+    // SHA (undoable via `kin undo`). It runs under the lock `pr_merge` holds
+    // and records its own oplog entry.
     println!("Restacking children onto {upstream_name}...");
-    let sync_result = sync(&SyncArgs {
-        no_delete: args.no_delete,
-        ..SyncArgs::default()
-    })
+    let sync_result = sync_holding_lock(
+        repo,
+        lock,
+        &SyncArgs {
+            no_delete: args.no_delete,
+            ..SyncArgs::default()
+        },
+    )
     .with_context(|| format!("merged PR #{pr_number}, but the local restack (`kin sync`) failed"));
 
     // Clean up the remote branch even if the restack failed. The PR is already

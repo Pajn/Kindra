@@ -344,11 +344,13 @@ pub fn ensure_idle(repo: &Repository, lock: &RepoLock, allow: Allow) -> Result<A
     }
 }
 
-/// [`ensure_idle`] for commands that do not otherwise hold the lock (push,
-/// pr): the lock is held only for the check.
-pub fn ensure_idle_now(repo: &Repository, allow: Allow) -> Result<()> {
+/// Acquire the lock and pass [`ensure_idle`], returning the lock. Publishing
+/// commands (push, pr) keep it until publication is complete, so no other
+/// `kin` process rewrites the branches they are selecting and pushing.
+pub fn lock_and_ensure_idle(repo: &Repository, allow: Allow) -> Result<RepoLock> {
     let lock = RepoLock::acquire(repo)?;
-    ensure_idle(repo, &lock, allow).map(drop)
+    ensure_idle(repo, &lock, allow)?;
+    Ok(lock)
 }
 
 #[cfg(test)]
@@ -464,6 +466,26 @@ mod tests {
         assert_eq!(
             fs::read_to_string(PersistedOperation::Rebase.path(&repo)).unwrap(),
             saved
+        );
+    }
+
+    #[test]
+    fn override_recovery_state_that_cannot_be_read_still_counts_as_pending() {
+        let recovering = Some(OverrideRecovery { removing: false });
+        let (_dir, unparseable) = repo();
+        fs::write(crate::overrides::state_path(&unparseable), "not json").unwrap();
+        assert_eq!(query(&unparseable).override_recovery, recovering);
+
+        // Reading a directory fails with an error other than NotFound.
+        let (_dir, unreadable) = repo();
+        fs::create_dir(crate::overrides::state_path(&unreadable)).unwrap();
+        let active = query(&unreadable);
+        assert_eq!(active.override_recovery, recovering);
+        assert!(
+            active
+                .refusal(&unreadable, Allow::NOTHING)
+                .unwrap()
+                .contains("Local overrides are suspended")
         );
     }
 

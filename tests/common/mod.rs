@@ -624,3 +624,66 @@ pub fn assert_no_kindra_operation(cwd: &Path) {
         );
     }
 }
+
+/// A shell snippet for a mock (`gh`) or Git hook that pauses the `kin`
+/// process running it: it creates `$KIN_TEST_BLOCK_DIR/started`, then waits up
+/// to 30 seconds for `$KIN_TEST_BLOCK_DIR/release`. Used with
+/// [`run_while_blocked`].
+#[allow(dead_code)]
+pub const BLOCK_UNTIL_RELEASED: &str = r#"touch "$KIN_TEST_BLOCK_DIR/started"
+for _ in $(seq 1 300); do
+    [ -e "$KIN_TEST_BLOCK_DIR/release" ] && break
+    sleep 0.1
+done"#;
+
+/// Run `cmd`, whose mock or hook contains [`BLOCK_UNTIL_RELEASED`], and call
+/// `during` while it is paused there; then release it and return its output.
+/// `cmd` is released even when `during` panics, and waiting for it to pause
+/// is bounded, so a failure cannot hang the suite.
+#[allow(dead_code)]
+pub fn run_while_blocked(mut cmd: Command, during: impl FnOnce()) -> std::process::Output {
+    struct Release(PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, "");
+        }
+    }
+
+    let block_dir = tempfile::tempdir().unwrap();
+    cmd.env("KIN_TEST_BLOCK_DIR", block_dir.path());
+    let started = block_dir.path().join("started");
+    let release = Release(block_dir.path().join("release"));
+    let running = std::thread::spawn(move || cmd.output().unwrap());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !started.exists() {
+        if running.is_finished() {
+            drop(release);
+            panic!(
+                "command finished before reaching the blocking point: {:?}",
+                running.join().unwrap()
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "command did not reach the blocking point"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    during();
+    drop(release);
+    running.join().unwrap()
+}
+
+/// Assert that a command which rewrites branches (`kin restack`) is refused in
+/// `cwd` because another `kin` process holds the repository lock.
+#[allow(dead_code)]
+pub fn assert_repository_locked(cwd: &Path) {
+    kin_cmd()
+        .arg("restack")
+        .current_dir(cwd)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "Another 'kin' process is operating on this repository",
+        ));
+}

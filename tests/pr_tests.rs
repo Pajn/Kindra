@@ -7556,3 +7556,131 @@ exit 0
         }
     }
 }
+
+/// A `kin` command in `dir` with the mock `gh` ahead on PATH.
+fn kin_with_gh_mock(dir: &std::path::Path, args: &[&str]) -> assert_cmd::Command {
+    let mut cmd = kin_cmd();
+    cmd.args(args).current_dir(dir).env(
+        "PATH",
+        format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
+    );
+    cmd
+}
+
+/// `kin pr` holds the repository lock from its idle check until the PRs are
+/// created, so another `kin` process cannot rewrite the branches it pushes.
+#[test]
+fn pr_holds_the_repository_lock_while_publishing() {
+    let (dir, _repo) = setup_simple_stack();
+    init_origin_and_push(dir.path(), &["main"]);
+    run_ok("git", &["checkout", "feature"], dir.path());
+    write_gh_mock(
+        dir.path(),
+        &format!(
+            r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then echo '[]'; exit 0; fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo "no pull requests found for branch" >&2
+    exit 1
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
+{}
+    echo "https://github.com/test/repo/pull/1"
+    exit 0
+fi"#,
+            common::BLOCK_UNTIL_RELEASED
+        ),
+    );
+
+    let mut pr = kin_with_gh_mock(dir.path(), &["pr"]);
+    pr.env("KIN_TEST_MULTI_SELECTIONS", "0");
+    let output = common::run_while_blocked(pr, || common::assert_repository_locked(dir.path()));
+    assert!(output.status.success(), "kin pr failed: {output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("https://github.com/test/repo/pull/1"),
+        "{output:?}"
+    );
+}
+
+/// `kin pr flatten` holds the repository lock while it retargets PR bases.
+#[test]
+fn pr_flatten_holds_the_repository_lock_while_publishing() {
+    let (dir, _repo) = setup_two_level_stack();
+    init_origin_and_push(dir.path(), &["main", "feature-a", "feature-b"]);
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+    write_gh_mock(
+        dir.path(),
+        &format!(
+            r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{{"number":10,"baseRefName":"other","state":"OPEN","isDraft":false,"headRefName":"feature-a"}},{{"number":11,"baseRefName":"feature-a","state":"OPEN","isDraft":false,"headRefName":"feature-b"}}]'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then
+{}
+    exit 0
+fi"#,
+            common::BLOCK_UNTIL_RELEASED
+        ),
+    );
+
+    let flatten = kin_with_gh_mock(dir.path(), &["pr", "flatten"]);
+    let output =
+        common::run_while_blocked(flatten, || common::assert_repository_locked(dir.path()));
+    assert!(output.status.success(), "kin pr flatten failed: {output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("updated=2"),
+        "{output:?}"
+    );
+}
+
+/// `kin pr merge` holds the repository lock through the merge, the child PR
+/// retargets and the local cascade, which runs under that same lock.
+#[test]
+fn pr_merge_holds_the_repository_lock_through_the_cascade() {
+    let (dir, repo) = setup_two_level_stack();
+    init_origin_and_push(dir.path(), &["main", "feature-a", "feature-b"]);
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+    write_gh_mock(
+        dir.path(),
+        &format!(
+            r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{{"headRefName":"feature-a","number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}},{{"headRefName":"feature-b","number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}}]'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    if [[ "$3" == "10" ]]; then echo '{{"state":"MERGED"}}'; exit 0; fi
+    if [[ "$3" == "feature-a" ]]; then
+        echo '{{"number":10,"title":"A title","body":"A body","url":"https://github.com/test/repo/pull/10","state":"OPEN","labels":[],"reviewRequests":[]}}'
+        exit 0
+    fi
+    if [[ "$3" == "feature-b" ]]; then
+        echo '{{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","state":"OPEN","labels":[],"reviewRequests":[]}}'
+        exit 0
+    fi
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{{"data":{{"repository":{{"pr0":{{"reviewThreads":{{"nodes":[]}},"reviewRequests":{{"nodes":[]}},"latestReviews":{{"nodes":[{{"state":"APPROVED","author":{{"login":"alice"}}}}]}},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{{"contexts":{{"nodes":[]}}}}}}}}]}}}}}}}}}}'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "edit" ]]; then exit 0; fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "merge" ]]; then
+{}
+    git push origin feature-a:main >/dev/null 2>&1
+    exit 0
+fi"#,
+            common::BLOCK_UNTIL_RELEASED
+        ),
+    );
+
+    let mut merge = pr_merge_cmd(dir.path());
+    merge.env("KIN_TEST_SELECTIONS", "0");
+    let output = common::run_while_blocked(merge, || common::assert_repository_locked(dir.path()));
+    assert!(output.status.success(), "kin pr merge failed: {output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Restacking children onto"),
+        "{output:?}"
+    );
+    assert!(
+        repo.find_branch("feature-a", BranchType::Local).is_err(),
+        "the cascade must delete the merged branch: {output:?}"
+    );
+}

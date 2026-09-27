@@ -80,14 +80,19 @@ pub fn is_disabled(repo: &Repository) -> bool {
 }
 
 /// Whether override recovery is pending, and if so whether it is an
-/// interrupted removal. Unreadable recovery state still counts as pending.
+/// interrupted removal. Recovery state that exists but cannot be read or
+/// parsed still counts as pending, as a recovery rather than a removal.
 pub fn recovery_removing(repo: &Repository) -> Option<bool> {
     #[derive(Deserialize)]
     struct Intent {
         #[serde(default)]
         removing: bool,
     }
-    let text = fs::read_to_string(state_path(repo)).ok()?;
+    let text = match fs::read_to_string(state_path(repo)) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(false),
+    };
     Some(
         serde_json::from_str::<Intent>(&text)
             .map(|intent| intent.removing)
