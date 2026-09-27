@@ -56,7 +56,6 @@ pub struct AfterPrBranch {
     pub head_sha: String,
     pub fork_point: String,
     pub pr: Option<AfterPrPullRequest>,
-    pub pushed: bool,
 }
 
 #[derive(Debug, Serialize)]

@@ -7931,7 +7931,9 @@ fn after_pr_hook_receives_stack_payload() {
     assert_eq!(a["pr"]["number"], 101);
     assert_eq!(a["pr"]["url"], "https://github.com/owner/repo/pull/101");
     assert_eq!(a["pr"]["draft"], false);
-    assert_eq!(a["pushed"], false, "feature-a was already up to date");
+    let mut keys: Vec<_> = a.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["fork_point", "head_sha", "name", "parent", "pr"]);
 
     let b = payload_branch(&payload, "feature-b");
     assert_eq!(b["parent"], "feature-a");
@@ -7940,7 +7942,6 @@ fn after_pr_hook_receives_stack_payload() {
     assert_eq!(b["pr"]["number"], 102);
     assert_eq!(b["pr"]["url"], "https://github.com/owner/repo/pull/102");
     assert_eq!(b["pr"]["draft"], false);
-    assert_eq!(b["pushed"], true);
 
     assert_eq!(
         fs::read_to_string(fx.out().join("run.event")).unwrap(),
@@ -7994,8 +7995,6 @@ fn after_pr_hook_orders_branching_tree_parents_first() {
         assert_eq!(entry["pr"]["draft"], true, "{branch}");
         assert!(entry["pr"]["number"].as_u64().is_some(), "{branch}");
     }
-    assert_eq!(payload_branch(&payload, "feature-b")["pushed"], true);
-    assert_eq!(payload_branch(&payload, "feature-c")["pushed"], false);
 }
 
 #[test]
@@ -8017,7 +8016,6 @@ fn after_pr_hook_runs_when_nothing_changed() {
     assert_eq!(payload_branch_names(&payload), ["feature-a", "feature-b"]);
     for (branch, number) in [("feature-a", 101), ("feature-b", 102)] {
         let entry = payload_branch(&payload, branch);
-        assert_eq!(entry["pushed"], false, "{branch}");
         assert_eq!(entry["pr"]["number"], number, "{branch}");
     }
 }
@@ -8092,7 +8090,6 @@ fn after_pr_hook_runs_after_flatten() {
     assert_eq!(payload_branch_names(&payload), ["feature-a", "feature-b"]);
     for (branch, number) in [("feature-a", 101), ("feature-b", 102)] {
         let entry = payload_branch(&payload, branch);
-        assert_eq!(entry["pushed"], false, "{branch}");
         assert_eq!(entry["pr"]["number"], number, "{branch}");
         // Every PR now bases on the trunk, and `parent` names the PR base.
         assert_eq!(entry["parent"], "main", "{branch}");
@@ -8152,7 +8149,6 @@ fn after_pr_hook_runs_in_linked_worktree_with_shared_config() {
 
     let payload = fx.payload("run");
     assert_eq!(payload_branch_names(&payload), ["feature-a", "feature-b"]);
-    assert_eq!(payload_branch(&payload, "feature-b")["pushed"], true);
     assert_eq!(
         fs::read_to_string(fx.out().join("run.cwd")).unwrap().trim(),
         fs::canonicalize(&linked).unwrap().to_str().unwrap()

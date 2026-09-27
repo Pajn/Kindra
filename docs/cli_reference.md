@@ -90,8 +90,7 @@ The payload is one JSON object:
       "parent": "main",
       "head_sha": "<40-hex commit>",
       "fork_point": "<40-hex commit>",
-      "pr": { "number": 123, "url": "https://github.com/owner/repo/pull/123", "draft": false },
-      "pushed": true
+      "pr": { "number": 123, "url": "https://github.com/owner/repo/pull/123", "draft": false }
     }
   ]
 }
@@ -109,7 +108,6 @@ The payload is one JSON object:
 | `branches[].head_sha` | The local branch tip. |
 | `branches[].fork_point` | `git merge-base <parent> <branch>`, using the local parent branch, or for a branch based on the trunk the trunk ref `kin pr` compares commits against — the remote-tracking trunk (such as `origin/main`) when it exists, otherwise the local trunk. |
 | `branches[].pr` | The branch's open PR after the run — `number`, `url` and `draft` — or `null` if it has none (for example, a branch that was skipped). |
-| `branches[].pushed` | Whether this run's push updated the branch on the remote. Always `false` for `kin pr --no-push` and `kin pr flatten`. |
 
 Fields may be added in later versions; existing fields keep their meaning.
 

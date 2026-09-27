@@ -182,20 +182,6 @@ fn pr_create_or_update(
     let scoped_stack_branches =
         filter_stack_branches_for_pr_scope(&open_prs, all_stack_branches.clone(), include_all)?;
 
-    // Remote-tracking tips before the preflight push; a branch whose tip moved
-    // was pushed by this run. Only the after_pr payload needs this.
-    let tracking_before = (!after_pr.is_empty() && !skip_preflight).then(|| {
-        scoped_stack_branches
-            .iter()
-            .map(|branch| {
-                (
-                    branch.name.clone(),
-                    remote_tracking_tip(&repo, &branch.name),
-                )
-            })
-            .collect::<HashMap<_, _>>()
-    });
-
     if !skip_preflight {
         let flattened = run_pr_create_or_update_preflight(
             &open_prs,
@@ -294,12 +280,6 @@ fn pr_create_or_update(
                 (stack_pr.branch_name.clone(), pr)
             })
             .collect();
-        let pushed = |name: &str| {
-            tracking_before
-                .as_ref()
-                .and_then(|before| before.get(name))
-                .is_some_and(|before| *before != remote_tracking_tip(&repo, name))
-        };
         run_after_pr_hooks(
             &repo,
             &after_pr,
@@ -307,21 +287,10 @@ fn pr_create_or_update(
             &branches_with_upstream,
             &base_map,
             prs,
-            pushed,
         )?;
     }
 
     Ok(())
-}
-
-/// The tip of `branch`'s remote-tracking branch, if it has one.
-fn remote_tracking_tip(repo: &Repository, branch: &str) -> Option<git2::Oid> {
-    repo.find_branch(branch, BranchType::Local)
-        .ok()?
-        .upstream()
-        .ok()?
-        .get()
-        .target()
 }
 
 /// Build the `after_pr` payload for the branches this run published and run
@@ -338,7 +307,6 @@ fn run_after_pr_hooks(
     branches: &[(StackBranch, String)],
     base_map: &HashMap<String, String>,
     mut prs: HashMap<String, crate::hooks::AfterPrPullRequest>,
-    pushed: impl Fn(&str) -> bool,
 ) -> Result<()> {
     let payload = (|| -> Result<crate::hooks::AfterPrPayload> {
         let mut entries = Vec::with_capacity(branches.len());
@@ -359,7 +327,6 @@ fn run_after_pr_hooks(
                 head_sha: sb.id.to_string(),
                 fork_point: fork_point.to_string(),
                 pr: prs.remove(&sb.name),
-                pushed: pushed(&sb.name),
             });
         }
         let remote = branches.iter().find_map(|(sb, _)| {
@@ -750,7 +717,6 @@ fn pr_flatten() -> Result<()> {
             &branches_with_upstream,
             &base_map,
             prs,
-            |_| false,
         )?;
     }
 
