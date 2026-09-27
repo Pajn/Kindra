@@ -3927,6 +3927,80 @@ fn test_commit_fixup_with_dependents_pre_start_hook_rejection_rolls_back() {
     check_fixup_with_dependents_pre_start_failure("--autostash", "false", true);
 }
 
+/// When rolling back a fold that never started cannot finish, the saved state
+/// must still point at the stash entry holding the set-aside changes, so that
+/// `kin abort` can bring them back.
+#[test]
+fn test_commit_fixup_failed_rollback_keeps_the_unrestored_stash_in_state() {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a1.txt",
+        "a1",
+        "commit a1",
+        &[&main_commit],
+    );
+    let a1_commit = repo.find_commit(a1_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2.txt",
+        "a2",
+        "commit a2",
+        &[&a1_commit],
+    );
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("a1.txt"), "fixed a1").unwrap();
+    run_ok("git", &["add", "a1.txt"], dir.path());
+    fs::write(dir.path().join("a2.txt"), "unstaged a2").unwrap();
+    run_ok("git", &["config", "rebase.autostash", "false"], dir.path());
+
+    // Refuse the rebase after making both rollback steps fail: an edit to the
+    // stashed file blocks the stash from applying, and a held lock on the
+    // branch ref blocks the reset.
+    fs::write(
+        dir.path().join(".git/hooks/pre-rebase"),
+        "#!/bin/sh\nprintf 'hook edit' > a2.txt\ntouch \"$(git rev-parse --git-dir)/refs/heads/feature-a.lock\"\nexit 1\n",
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", ".git/hooks/pre-rebase"], dir.path());
+
+    let output = kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg(a1_id.to_string())
+        .arg("--autostash")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the fold should have failed");
+    assert!(
+        stderr.contains("run 'kin abort'"),
+        "expected the rollback failure to point at kin abort, got:\n{stderr}"
+    );
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(dir.path().join(".git/kindra_rebase_state.json"))
+            .expect("the unfinished rollback must keep its state"),
+    )
+    .unwrap();
+    let stash_ref = state["stash_ref"]
+        .as_str()
+        .unwrap_or_else(|| panic!("state lost the stash reference: {state}"));
+    let stashes = git_stdout(dir.path(), &["stash", "list", "--format=%H %gs"]);
+    assert!(
+        stashes.lines().any(|line| line.contains(stash_ref)),
+        "state points at {stash_ref}, which is not in the stash list:\n{stashes}"
+    );
+}
+
 /// A fold that git refuses before starting must not leave the saved state
 /// behind: nothing was folded, so a later `kin continue` would restack the
 /// dependents onto the raw `fixup!` commit. Like absorb, the fixup commit is

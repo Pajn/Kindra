@@ -1600,12 +1600,21 @@ fn unwind_unstarted_rebase(
     err: anyhow::Error,
 ) -> anyhow::Error {
     let target = target_old_head_id.to_string();
+    // The state keeps naming the stash until its changes are back, so a
+    // rollback that stops partway still leaves `kin abort` able to find them.
+    let restore_set_aside = |state: &mut RebaseState| {
+        let restored = try_restore_set_aside_changes(state.stash_ref.clone());
+        if restored {
+            state.stash_ref = None;
+        }
+        restored
+    };
     let unwound = match state.caller_branch.clone() {
         // In place: the set-aside stash (if any) is based on the new commit, so
         // it goes back first; the soft reset then returns the commit's content
         // to the index.
         None => {
-            let restored = try_restore_set_aside_changes(state.stash_ref.take());
+            let restored = restore_set_aside(state);
             run_git(&["reset", "--soft", &target]).map(|()| restored)
         }
         // Checkout path: the stash taken on the caller branch before the switch
@@ -1613,7 +1622,7 @@ fn unwind_unstarted_rebase(
         // commit can be dropped outright and the stash applied back on its base.
         Some(caller_branch) => run_git(&["reset", "--hard", &target])
             .and_then(|()| checkout_branch(&caller_branch))
-            .map(|()| try_restore_set_aside_changes(state.stash_ref.take())),
+            .map(|()| restore_set_aside(state)),
     };
     match unwound.and_then(|restored| clear_state(repo).map(|()| restored)) {
         Ok(true) => anyhow!(
