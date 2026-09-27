@@ -38,6 +38,8 @@ const KNOWN_REPO_KEYS: &[&str] = &[
     "worktrees",
     // `crate::overrides`.
     "overrides",
+    // `crate::hooks`.
+    "hooks",
 ];
 
 /// Default for `[restack] history_limit`.

@@ -2,6 +2,7 @@ mod commands;
 mod config;
 mod editor;
 mod gh;
+mod hooks;
 mod interaction;
 mod operation_state;
 mod oplog;

@@ -1,8 +1,8 @@
+use crate::hooks::shell_command;
 use crate::worktree::WorktreeRole;
 use crate::worktree::config::{HookListConfig, WorktreeConfig};
 use anyhow::{Result, anyhow};
 use std::path::Path;
-use std::process::Command;
 use std::process::Stdio;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,18 +121,6 @@ fn hooks_from_list(list: &HookListConfig, event: HookEvent) -> Vec<String> {
         HookEvent::Create => list.on_create.clone(),
         HookEvent::Checkout => list.on_checkout.clone(),
         HookEvent::Remove => list.on_remove.clone(),
-    }
-}
-
-fn shell_command(script: &str) -> Command {
-    if cfg!(windows) {
-        let mut command = Command::new("cmd");
-        command.args(["/C", script]);
-        command
-    } else {
-        let mut command = Command::new("sh");
-        command.args(["-c", script]);
-        command
     }
 }
 

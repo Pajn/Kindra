@@ -10,6 +10,7 @@ pub mod commands;
 pub mod config;
 pub mod editor;
 pub mod gh;
+pub mod hooks;
 pub mod interaction;
 pub(crate) mod operation_state;
 pub mod oplog;

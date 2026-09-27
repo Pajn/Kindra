@@ -59,8 +59,59 @@ Repository config keys:
 | `[restack]` | `history_limit`; see [restack](#restack). |
 | `[worktrees]` | Managed worktrees; see [worktree](#worktree-alias-wt). |
 | `[overrides]` | Local file replacements; see [Local overrides](#local-overrides). |
+| `[hooks]` | Commands run after Kindra commands; see [Hooks](#hooks). |
 
 A TOML syntax error stops every command that reads the file, with an error naming its path. A value of the wrong type fails only the commands that use that section. Unknown top-level keys are reported as warnings and otherwise ignored.
+
+### Hooks
+
+The `[hooks]` section of repository config lists shell commands to run at fixed points. Global config does not support it. Unknown keys in the section are an error.
+
+```toml
+[hooks]
+after_pr = ["some-command --flag", "another"]
+```
+
+`after_pr` runs at the end of every `kin pr` and `kin pr flatten` run that publishes the stack, once pushing and creating or updating PRs has finished — also when nothing changed in that run. It does not run for the other `kin pr` subcommands, when there is nothing to publish, or when the command fails first. `[hooks]` is read before anything is pushed, so an invalid section stops the run with nothing changed.
+
+Each command runs through `sh -c` (`cmd /C` on Windows) from the root of the current worktree, with `KINDRA_HOOK_EVENT=after_pr` set, the payload below on stdin, and its output shown. Commands run in order and the first failure stops the list. A failing hook, or one that cannot be started, makes `kin` exit non-zero with ``Pull requests were published, but the after_pr hook `<command>` failed (exit status N).`` Nothing is rolled back: the pushes and PRs stay as published.
+
+The payload is one JSON object:
+
+```json
+{
+  "event": "after_pr",
+  "trunk": "main",
+  "remote": "origin",
+  "remote_url": "git@github.com:owner/repo.git",
+  "branches": [
+    {
+      "name": "feature-a",
+      "parent": "main",
+      "head_sha": "<40-hex commit>",
+      "fork_point": "<40-hex commit>",
+      "pr": { "number": 123, "url": "https://github.com/owner/repo/pull/123", "draft": false },
+      "pushed": true
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `event` | Always `after_pr`. |
+| `trunk` | The trunk as named in PR bases: the trunk ref `kin pr` bases the stack on, without an `origin/` or `upstream/` prefix. |
+| `remote` | The remote the stack's branches push to (the first branch's upstream remote); `null` if none can be determined. |
+| `remote_url` | That remote's push URL, as `git remote get-url --push` prints it; `null` if Git cannot give one. |
+| `branches` | Every branch the run covered, including unchanged ones, ordered so each branch comes after its parent (bottom first). |
+| `branches[].name` | The local branch name. |
+| `branches[].parent` | The branch the PR is based on, as published by this run: the parent in the stack, or `trunk` for a branch sitting directly on the trunk. After `kin pr flatten`, every PR bases on the trunk, so this is `trunk` for every branch. |
+| `branches[].head_sha` | The local branch tip. |
+| `branches[].fork_point` | `git merge-base <parent> <branch>`, using the local parent branch, or for a branch based on the trunk the trunk ref `kin pr` compares commits against — the remote-tracking trunk (such as `origin/main`) when it exists, otherwise the local trunk. |
+| `branches[].pr` | The branch's open PR after the run — `number`, `url` and `draft` — or `null` if it has none (for example, a branch that was skipped). |
+| `branches[].pushed` | Whether this run's push updated the branch on the remote. Always `false` for `kin pr --no-push` and `kin pr flatten`. |
+
+Fields may be added in later versions; existing fields keep their meaning.
 
 ---
 
@@ -725,6 +776,8 @@ kin pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--reviewe
 `kin pr merge` automatically merges when the PR has no unresolved review comments, no outstanding review state, no running/failed checks, and GitHub reports the PR as mergeable. If issues remain but GitHub would still allow merging, Kindra prints the outstanding reviews/checks and asks for confirmation. If GitHub/repository rules block the merge, Kindra exits with a clear reason instead of attempting it.
 
 `kin pr flatten` only updates PR base branches on GitHub. It does not modify local git refs, stack relationships, PR titles, or PR bodies.
+
+`kin pr` and `kin pr flatten` run the repository's `after_pr` hooks once they have published the stack; see [Hooks](#hooks).
 
 `kin pr review` defaults to unresolved threads only, includes both human and bot comments, and keeps outdated comments unless you opt out.
 
