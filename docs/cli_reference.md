@@ -33,7 +33,7 @@ Kindra is built around the idea of a **stack** of branches. A stack is a linear 
 
 Kindra automatically identifies your stack by looking for local branches that are descendants of the merge base between your current branch and the base branch.
 
-The base branch is the **trunk**. Kindra resolves it in this order: `upstream_branch` in [repository config](#configuration) (an error if it names no existing branch; a name that exists only as `origin/<name>` resolves to that), then `git config init.defaultBranch`, then `main`, `master` and `trunk` — each checked as a local branch first, then as `origin/<name>`.
+The base branch is the **trunk**. Kindra resolves it in this order: `upstream_branch` in [repository config](#configuration) (an error if it names no existing branch; a name that exists only as `origin/<name>` resolves to that), otherwise `git config init.defaultBranch`, `main`, `master` and `trunk`. All of those are first looked up as local branches, in that order, and only if none exists as `origin/<name>`, in the same order. For example, with `init.defaultBranch = develop`, a local `main` is chosen over `origin/develop`.
 
 ---
 
