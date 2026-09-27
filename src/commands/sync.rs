@@ -35,8 +35,18 @@ pub fn sync(args: &SyncArgs) -> Result<()> {
     let repo = crate::open_repo()?;
 
     let lock = crate::state_io::RepoLock::acquire(&repo)?;
-    crate::operation_state::ensure_idle(&repo, &lock, crate::operation_state::Allow::NOTHING)?;
-    crate::overrides::with_planned(&repo, false, || sync_locked(&repo, args))
+    sync_holding_lock(&repo, &lock, args)
+}
+
+/// `kin sync` for a caller that already holds the repository lock: the local
+/// cascade of `kin pr merge`.
+pub(crate) fn sync_holding_lock(
+    repo: &git2::Repository,
+    lock: &crate::state_io::RepoLock,
+    args: &SyncArgs,
+) -> Result<()> {
+    crate::operation_state::ensure_idle(repo, lock, crate::operation_state::Allow::NOTHING)?;
+    crate::overrides::with_planned(repo, false, || sync_locked(repo, args))
 }
 
 fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
