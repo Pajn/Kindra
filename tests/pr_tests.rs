@@ -8062,6 +8062,39 @@ after_pr = [
     );
 }
 
+/// Hooks run once publishing is done and the repository lock is released, so
+/// a hook can run a `kin` command that takes the lock itself.
+#[test]
+fn after_pr_hooks_can_run_kin_commands_that_take_the_lock() {
+    let fx = AfterPrFixture::new(false);
+    let config = format!(
+        "[hooks]\nafter_pr = ['\"{}\" restack > \"$HOOK_OUT/nested.out\" 2>&1; echo $? > \"$HOOK_OUT/nested.status\"']\n",
+        env!("CARGO_BIN_EXE_kin")
+    );
+    let nested = |what: &str| {
+        let out = fs::read_to_string(fx.out().join("nested.out")).unwrap();
+        assert!(
+            !out.contains("Another 'kin' process"),
+            "a hook after {what} must not find the repository locked:\n{out}"
+        );
+        assert_eq!(
+            fs::read_to_string(fx.out().join("nested.status"))
+                .unwrap()
+                .trim(),
+            "0",
+            "{what}: {out}"
+        );
+    };
+
+    write_repo_config(fx.root(), &config);
+    assert_success(&fx.kin_pr(fx.root()));
+    nested("kin pr");
+
+    fs::remove_file(fx.out().join("nested.out")).unwrap();
+    assert_success(&fx.kin(fx.root(), &["pr", "flatten"]));
+    nested("kin pr flatten");
+}
+
 #[test]
 fn after_pr_hook_does_not_run_for_read_only_subcommands() {
     let fx = AfterPrFixture::new(false);

@@ -165,7 +165,7 @@ fn pr_create_or_update(
     // now would push (or merge) a half-rebased stack. The lock is held until
     // publication is done, so no other `kin` process rewrites the branches
     // being published.
-    let _lock = crate::operation_state::lock_and_ensure_idle(
+    let lock = crate::operation_state::lock_and_ensure_idle(
         &repo,
         crate::operation_state::Allow::PUBLISH,
     )?;
@@ -280,6 +280,8 @@ fn pr_create_or_update(
                 (stack_pr.branch_name.clone(), pr)
             })
             .collect();
+        // Publishing is done: release the lock so hooks can run `kin` too.
+        drop(lock);
         run_after_pr_hooks(
             &repo,
             &after_pr,
@@ -676,7 +678,7 @@ fn pr_flatten() -> Result<()> {
     // now would push (or merge) a half-rebased stack. The lock is held until
     // publication is done, so no other `kin` process rewrites the branches
     // being published.
-    let _lock = crate::operation_state::lock_and_ensure_idle(
+    let lock = crate::operation_state::lock_and_ensure_idle(
         &repo,
         crate::operation_state::Allow::PUBLISH,
     )?;
@@ -710,6 +712,8 @@ fn pr_flatten() -> Result<()> {
                 Some((sb.name.clone(), pr))
             })
             .collect();
+        // Publishing is done: release the lock so hooks can run `kin` too.
+        drop(lock);
         run_after_pr_hooks(
             &repo,
             &after_pr,
