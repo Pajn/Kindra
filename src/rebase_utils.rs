@@ -814,24 +814,33 @@ pub fn restore_stashed_changes(stash_ref: Option<String>) {
 /// on a clean apply; a conflicted or failed apply keeps it and says where the
 /// changes are.
 pub fn restore_set_aside_changes(stash_ref: Option<String>) {
+    try_restore_set_aside_changes(stash_ref);
+}
+
+/// [`restore_set_aside_changes`], returning whether the changes came back
+/// cleanly (or there were none to restore).
+pub fn try_restore_set_aside_changes(stash_ref: Option<String>) -> bool {
     let Some(stash_ref) = stash_ref else {
-        return;
+        return true;
     };
     match apply_stash_with_outcome(&stash_ref, true) {
         Ok(StashApplyOutcome::Applied) => {
             let _ = drop_stash(&stash_ref);
+            true
         }
         Ok(StashApplyOutcome::ConflictsLeftInTree) => {
             eprintln!(
                 "Warning: restoring the set-aside changes left conflicts in the working tree; the stash entry '{}' was preserved as a backup.",
                 stash_ref
             );
+            false
         }
         Err(_) => {
             eprintln!(
                 "Warning: could not restore the set-aside changes; they remain in stash entry '{}'.",
                 stash_ref
             );
+            false
         }
     }
 }

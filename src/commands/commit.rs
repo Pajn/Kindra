@@ -4,6 +4,7 @@ use crate::rebase_utils::{
     checkout_branch, clear_state, drop_stash, git_rebase_in_progress, local_branch_tips_in_range,
     passively_reconcile_rebase_state, record_branch_tips_in_range, restore_set_aside_changes,
     restore_stashed_changes, run_rebase_loop, save_state, stash_push_changes,
+    try_restore_set_aside_changes,
 };
 use crate::stack::{
     StackBranch, StackCommit, build_parent_maps, collect_descendants, collect_descendants_of_id,
@@ -551,12 +552,26 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
             .arg("--no-autosquash")
             .arg("--no-rebase-merges")
             .arg("--update-refs");
-            if autostash {
-                cmd.arg("--autostash");
-            }
+            // Pass the resolved choice either way so git's own
+            // `rebase.autostash` cannot override it.
+            cmd.arg(if autostash {
+                "--autostash"
+            } else {
+                "--no-autostash"
+            });
             cmd.arg(ancestor_target);
 
-            if !cmd.status()?.success() {
+            let failure = match cmd.status() {
+                Ok(status) if status.success() => None,
+                Ok(_) => Some(anyhow!(
+                    "Moving the commit onto '{}' failed before the rebase started.",
+                    ancestor_target
+                )),
+                Err(err) => Some(anyhow::Error::from(err).context(format!(
+                    "failed to run the rebase moving the commit onto '{ancestor_target}'."
+                ))),
+            };
+            if let Some(err) = failure {
                 if git_rebase_in_progress(repo) {
                     // Record which branch is mid-rebase so `kin continue` matches
                     // the saved state, exactly as the autosquash path does.
@@ -567,10 +582,14 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
                         ancestor_target
                     ));
                 }
-                return Err(anyhow!(
-                    "Failed to move the commit onto '{}'. The commit is still on '{}'; run 'kin abort' to undo it and get the changes back staged.",
-                    ancestor_target,
-                    current_branch_name
+                // Nothing moved, so `kin continue` must not find state to
+                // finish: it would restack the dependents onto the commit
+                // left on this branch and report the move as completed.
+                return Err(unwind_unstarted_rebase(
+                    repo,
+                    &mut state,
+                    target_old_head_id,
+                    err,
                 ));
             }
 
@@ -628,9 +647,13 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
                 .arg("rebase")
                 .arg("-i")
                 .arg("--autosquash");
-            if autostash {
-                cmd.arg("--autostash");
-            }
+            // Pass the resolved choice either way so git's own
+            // `rebase.autostash` cannot override it.
+            cmd.arg(if autostash {
+                "--autostash"
+            } else {
+                "--no-autostash"
+            });
             // Always move the branch tips inside the rewritten range with the fold
             // rather than relying on the ambient `rebase.updateRefs` git config
             // (off by default): this moves an inline fixup's below-HEAD ancestor
@@ -642,9 +665,18 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
             cmd.arg("--update-refs");
             cmd.arg(&autosquash_base_arg);
 
-            let status = cmd.status()?;
+            // A spawn error means no rebase started at all, so it takes the same
+            // unwind as a pre-start rejection rather than `?`-returning past it
+            // with the fixup commit and saved state left behind.
+            let failure = match cmd.status() {
+                Ok(status) if status.success() => None,
+                Ok(_) => Some(anyhow!("git rebase --autosquash failed before starting.")),
+                Err(err) => {
+                    Some(anyhow::Error::from(err).context("failed to run git rebase --autosquash."))
+                }
+            };
 
-            if !status.success() {
+            if let Some(err) = failure {
                 if git_rebase_in_progress(repo) {
                     // The autosquash rebase paused on a conflict. Record which
                     // branch is mid-rebase so `kin continue` matches the saved
@@ -652,15 +684,15 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
                     // (a missing in_progress_branch makes `kin continue` refuse).
                     state.in_progress_branch = Some(target_branch.clone());
                     save_state(repo, &state)?;
-                } else if autosquash_state_required {
-                    // autosquash_state_required implies no dependents/switch, so
-                    // this only runs on the single-branch path. The rebase failed
-                    // without a resumable state, so put the user's autostash back
-                    // before surfacing the error.
-                    restore_autostash(repo, &mut state)?;
+                    return Err(anyhow!(
+                        "git rebase --autosquash failed. Resolve conflicts and run 'kin continue', or run 'kin abort'."
+                    ));
                 }
-                return Err(anyhow!(
-                    "git rebase --autosquash failed. Resolve conflicts and run 'kin continue', or run 'kin abort'."
+                return Err(unwind_unstarted_rebase(
+                    repo,
+                    &mut state,
+                    target_old_head_id,
+                    err,
                 ));
             }
 
@@ -1549,6 +1581,62 @@ fn restore_autostash(repo: &Repository, state: &mut RebaseState) -> Result<()> {
     state.stash_ref = None;
     state.in_progress_branch = None;
     save_state(repo, state)
+}
+
+/// Undo the commit of a fixup or `--on` move whose rebase git refused before
+/// starting (e.g. a rejecting `pre-rebase` hook, or unstaged changes without
+/// autostash).
+///
+/// Nothing was rewritten, so the saved state must not survive: `kin continue`
+/// would restack the dependents onto the raw `fixup!` commit, or onto the
+/// commit that never moved. As absorb does, take the new commit back off and
+/// return the changes to where they were before the command, then clear the
+/// state. If the unwind cannot complete, the state is kept so `kin abort` can
+/// still recover.
+fn unwind_unstarted_rebase(
+    repo: &Repository,
+    state: &mut RebaseState,
+    target_old_head_id: Oid,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    let target = target_old_head_id.to_string();
+    let unwound = match state.caller_branch.clone() {
+        // In place: the set-aside stash (if any) is based on the new commit, so
+        // it goes back first; the soft reset then returns the commit's content
+        // to the index.
+        None => {
+            let restored = try_restore_set_aside_changes(state.stash_ref.take());
+            run_git(&["reset", "--soft", &target]).map(|()| restored)
+        }
+        // Checkout path: the stash taken on the caller branch before the switch
+        // holds the staged changes as well as the non-staged ones, so the fixup
+        // commit can be dropped outright and the stash applied back on its base.
+        Some(caller_branch) => run_git(&["reset", "--hard", &target])
+            .and_then(|()| checkout_branch(&caller_branch))
+            .map(|()| try_restore_set_aside_changes(state.stash_ref.take())),
+    };
+    match unwound.and_then(|restored| clear_state(repo).map(|()| restored)) {
+        Ok(true) => anyhow!(
+            "{err:#} The commit was rolled back and your changes were restored as they were."
+        ),
+        Ok(false) => anyhow!(
+            "{err:#} The commit was rolled back, but your changes could not all be restored; see the warning above for where they are."
+        ),
+        Err(unwind_err) => {
+            let _ = save_state(repo, state);
+            anyhow!(
+                "{err:#} Rolling back the commit did not complete ({unwind_err:#}); run 'kin abort' to restore the original state."
+            )
+        }
+    }
+}
+
+fn run_git(args: &[&str]) -> Result<()> {
+    let status = Command::new("git").args(args).status()?;
+    if !status.success() {
+        return Err(anyhow!("git {} failed", args.join(" ")));
+    }
+    Ok(())
 }
 
 /// The commit id at HEAD, read through git so it reflects a commit just made by
