@@ -290,6 +290,7 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         // squash! folds must never open a commit-message editor, including
         // when `kin continue` resumes one after a conflict.
         suppress_editor: true,
+        abort_only: false,
         unstage_on_restore: false,
         // The stash below empties the working tree, so the rebases never have
         // anything to autostash.

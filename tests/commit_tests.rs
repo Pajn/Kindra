@@ -81,6 +81,7 @@ fn write_commit_rebase_state_fixture(repo: &Repository, stash_ref: &str) {
         carry_stash_ref: None,
         preserve_content_on_abort: false,
         suppress_editor: false,
+        abort_only: false,
         unstage_on_restore: false,
         autostash: false,
         cleanup_merged_branches: Vec::new(),
@@ -2219,6 +2220,77 @@ fn test_commit_on_ancestor_moves_branches_in_and_above_the_range() {
     assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
 }
 
+#[test]
+#[cfg(unix)]
+fn test_commit_on_ancestor_pre_start_rebase_failure_rolls_back() {
+    // When git refuses the move before starting, nothing moved: the commit comes
+    // back off `upper` with its content staged, and no state is left for
+    // `kin continue` to restack `top` onto the unmoved commit and report success.
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    repo_init(repo_path);
+    setup_diverged_line_stack(repo_path);
+    run_ok("git", &["checkout", "-b", "top"], repo_path);
+    edit_line(repo_path, 38, "38-top");
+    run_ok("git", &["commit", "-am", "top edit"], repo_path);
+    run_ok("git", &["checkout", "upper"], repo_path);
+    let tip = |branch: &str| {
+        git_stdout(repo_path, &["rev-parse", branch])
+            .trim()
+            .to_string()
+    };
+    let (lower_tip, upper_tip, top_tip) = (tip("lower"), tip("upper"), tip("top"));
+
+    edit_line(repo_path, 20, "20-staged");
+    run_ok("git", &["add", "f.txt"], repo_path);
+    edit_line(repo_path, 35, "35-unstaged");
+    fs::write(repo_path.join("untracked.txt"), "untracked").unwrap();
+    let pre_rebase_hook = repo_path.join(".git/hooks/pre-rebase");
+    fs::write(&pre_rebase_hook, "#!/bin/sh\nexit 1\n").unwrap();
+    run_ok("chmod", &["+x", ".git/hooks/pre-rebase"], repo_path);
+
+    let output = kin_cmd()
+        .current_dir(repo_path)
+        .args(["commit", "--on", "lower", "-m", "onto lower"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the move should have failed");
+    assert!(
+        stderr.contains("failed before the rebase started"),
+        "expected a pre-start failure message, got:\n{stderr}"
+    );
+
+    assert_no_rebase_in_progress(repo_path);
+    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    assert_eq!(current_branch(repo_path), "upper");
+    assert_eq!(tip("lower"), lower_tip);
+    assert_eq!(tip("upper"), upper_tip, "the commit is rolled back");
+    assert_eq!(tip("top"), top_tip);
+    assert!(
+        git_stdout(repo_path, &["diff", "--cached"]).contains("20-staged"),
+        "the rolled-back commit's content must come back staged"
+    );
+    assert!(
+        git_stdout(repo_path, &["diff"]).contains("35-unstaged"),
+        "the set-aside unstaged edit must come back unstaged"
+    );
+    assert_eq!(
+        fs::read_to_string(repo_path.join("untracked.txt")).unwrap(),
+        "untracked"
+    );
+    assert_eq!(git_stdout(repo_path, &["stash", "list"]).trim(), "");
+
+    fs::remove_file(&pre_rebase_hook).unwrap();
+    kin_cmd()
+        .current_dir(repo_path)
+        .arg("continue")
+        .assert()
+        .success();
+    assert_eq!(tip("upper"), upper_tip);
+    assert_eq!(tip("top"), top_tip);
+}
+
 /// A `git commit` that fails takes the whole operation with it: the move path
 /// has nothing to recover before its commit exists, so it must leave no state
 /// file, no stash, and no moved branch behind.
@@ -2900,7 +2972,7 @@ fn test_commit_interactive_fixup_no_autostash_unwinds_pre_start_rebase_failure()
         &[&a1_commit],
     );
     let a2_commit = repo.find_commit(a2_id).unwrap();
-    let _a3_id = make_commit(
+    let a3_id = make_commit(
         &repo,
         "refs/heads/feature-a",
         "a3.txt",
@@ -2939,16 +3011,20 @@ fn test_commit_interactive_fixup_no_autostash_unwinds_pre_start_rebase_failure()
         .failure()
         .stderr(predicates::str::contains("rebase --autosquash failed"));
 
-    let state_path = dir.path().join(".git/kindra_rebase_state.json");
-    let state_content = fs::read_to_string(&state_path).unwrap();
     assert!(
-        state_content.contains("\"in_progress_branch\": null"),
-        "Pre-start autosquash failure should not persist an in-progress branch, got: {state_content}"
+        !dir.path().join(".git/kindra_rebase_state.json").exists(),
+        "Pre-start autosquash failure should not leave resumable state"
     );
-    assert!(
-        state_content.contains("\"stash_ref\": null"),
-        "Pre-start autosquash failure should unwind the temporary stash, got: {state_content}"
+    assert_eq!(
+        repo.revparse_single("feature-a").unwrap().id(),
+        a3_id,
+        "Pre-start autosquash failure should roll the fixup commit back"
     );
+    assert_eq!(
+        git_stdout(dir.path(), &["diff", "--cached", "--name-only"]).trim(),
+        "a2.txt"
+    );
+    assert!(git_stdout(dir.path(), &["stash", "list"]).trim().is_empty());
     assert_eq!(
         fs::read_to_string(dir.path().join("file.txt")).unwrap(),
         "dirty tracked change"
@@ -3832,6 +3908,406 @@ fn test_commit_fixup_autosquash_conflict_with_dependents_can_continue() {
         .unwrap();
     let new_b_commit = repo.find_commit(new_b).unwrap();
     assert_eq!(new_b_commit.parent_id(0).unwrap(), new_a);
+}
+
+#[test]
+#[cfg(unix)]
+fn test_commit_fixup_with_dependents_pre_start_unstaged_refusal_rolls_back() {
+    // Without autostash, git refuses to start over the unstaged edit.
+    check_fixup_with_dependents_pre_start_failure("--no-autostash", "false", true);
+}
+
+#[test]
+fn test_commit_fixup_no_autostash_overrides_git_rebase_autostash() {
+    // `--no-autostash` must reach git: with git's own `rebase.autostash` on
+    // and no hook, git would otherwise stash the edit and fold anyway.
+    check_fixup_with_dependents_pre_start_failure("--no-autostash", "true", false);
+}
+
+#[test]
+#[cfg(unix)]
+fn test_commit_fixup_with_dependents_pre_start_hook_rejection_rolls_back() {
+    // With autostash, git stashes the edit, then the pre-rebase hook refuses.
+    check_fixup_with_dependents_pre_start_failure("--autostash", "false", true);
+}
+
+/// When rolling back a fold that never started cannot finish, the saved state
+/// must still point at the stash entry holding the set-aside changes, so that
+/// `kin abort` can bring them back.
+#[test]
+#[cfg(unix)]
+fn test_commit_fixup_failed_rollback_keeps_the_unrestored_stash_in_state() {
+    // A held lock on the branch ref also blocks the reset.
+    let (dir, stash_ref) = fixup_rollback_with_unrestorable_stash(true);
+    let stashes = git_stdout(dir.path(), &["stash", "list", "--format=%H %gs"]);
+    assert!(
+        stashes.lines().any(|line| line.contains(&stash_ref)),
+        "state points at {stash_ref}, which is not in the stash list:\n{stashes}"
+    );
+    assert_continue_refuses_rollback_state(dir.path());
+}
+
+/// A rolled-back commit has nothing left to continue: `kin continue` must
+/// refuse and leave the state for `kin abort`.
+fn assert_continue_refuses_rollback_state(dir: &Path) {
+    let head_before = git_stdout(dir, &["rev-parse", "HEAD"]);
+    let output = kin_cmd().arg("continue").current_dir(dir).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "continue should refuse a rolled-back commit, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("kin abort"),
+        "continue should point at kin abort, got:\n{stderr}"
+    );
+    assert_eq!(git_stdout(dir, &["rev-parse", "HEAD"]), head_before);
+    assert!(dir.join(".git/kindra_rebase_state.json").exists());
+}
+
+/// If the rollback itself succeeds but the set-aside changes cannot be put
+/// back, the state stays so that `kin abort` can restore them once the way is
+/// clear.
+#[test]
+#[cfg(unix)]
+fn test_commit_fixup_rollback_keeps_state_until_set_aside_changes_are_restored() {
+    let (dir, _) = fixup_rollback_with_unrestorable_stash(false);
+    // The rollback itself went through: the fixup commit is gone again.
+    assert_eq!(
+        git_stdout(dir.path(), &["log", "-1", "--format=%s"]).trim(),
+        "commit a2"
+    );
+
+    // Clear the edit that blocked the restore, then let abort finish it.
+    run_ok("git", &["checkout", "--", "a2.txt"], dir.path());
+    assert_continue_refuses_rollback_state(dir.path());
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a2.txt")).unwrap(),
+        "unstaged a2"
+    );
+    assert!(git_stdout(dir.path(), &["stash", "list"]).trim().is_empty());
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+}
+
+/// Runs `kin commit --fixup` on a branch without dependents while a
+/// pre-rebase hook refuses the rebase and edits the stashed file, so the
+/// set-aside changes cannot be restored during rollback. With
+/// `lock_branch_ref`, the hook also blocks the reset. Returns the stash entry
+/// the saved state points at.
+fn fixup_rollback_with_unrestorable_stash(lock_branch_ref: bool) -> (tempfile::TempDir, String) {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a1.txt",
+        "a1",
+        "commit a1",
+        &[&main_commit],
+    );
+    let a1_commit = repo.find_commit(a1_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2.txt",
+        "a2",
+        "commit a2",
+        &[&a1_commit],
+    );
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("a1.txt"), "fixed a1").unwrap();
+    run_ok("git", &["add", "a1.txt"], dir.path());
+    fs::write(dir.path().join("a2.txt"), "unstaged a2").unwrap();
+    run_ok("git", &["config", "rebase.autostash", "false"], dir.path());
+
+    let lock = if lock_branch_ref {
+        "touch \"$(git rev-parse --git-dir)/refs/heads/feature-a.lock\"\n"
+    } else {
+        ""
+    };
+    fs::write(
+        dir.path().join(".git/hooks/pre-rebase"),
+        format!("#!/bin/sh\nprintf 'hook edit' > a2.txt\n{lock}exit 1\n"),
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", ".git/hooks/pre-rebase"], dir.path());
+
+    let output = kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg(a1_id.to_string())
+        .arg("--autostash")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the fold should have failed");
+    assert!(
+        stderr.contains("run 'kin abort'"),
+        "expected the failure to point at kin abort, got:\n{stderr}"
+    );
+    fs::remove_file(dir.path().join(".git/hooks/pre-rebase")).unwrap();
+    if lock_branch_ref {
+        fs::remove_file(dir.path().join(".git/refs/heads/feature-a.lock")).unwrap();
+    }
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(dir.path().join(".git/kindra_rebase_state.json"))
+            .expect("the state must stay until the set-aside changes are back"),
+    )
+    .unwrap();
+    let stash_ref = state["stash_ref"]
+        .as_str()
+        .unwrap_or_else(|| panic!("state lost the stash reference: {state}"))
+        .to_string();
+    (dir, stash_ref)
+}
+
+/// A fold that git refuses before starting must not leave the saved state
+/// behind: nothing was folded, so a later `kin continue` would restack the
+/// dependents onto the raw `fixup!` commit. Like absorb, the fixup commit is
+/// rolled back and its content staged again.
+fn check_fixup_with_dependents_pre_start_failure(
+    autostash_flag: &str,
+    git_rebase_autostash: &str,
+    reject_in_pre_rebase_hook: bool,
+) {
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    // feature-a: a1 -> a2, feature-b on top of feature-a.
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a1.txt",
+        "a1",
+        "commit a1",
+        &[&main_commit],
+    );
+    let a1_commit = repo.find_commit(a1_id).unwrap();
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2.txt",
+        "a2",
+        "commit a2",
+        &[&a1_commit],
+    );
+    let a2_commit = repo.find_commit(a2_id).unwrap();
+    let b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "commit b",
+        &[&a2_commit],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("a1.txt"), "fixed a1").unwrap();
+    run_ok("git", &["add", "a1.txt"], dir.path());
+    fs::write(dir.path().join("a2.txt"), "unstaged a2").unwrap();
+    fs::write(dir.path().join("scratch.txt"), "WIP").unwrap();
+    run_ok(
+        "git",
+        &["config", "rebase.autostash", git_rebase_autostash],
+        dir.path(),
+    );
+
+    let pre_rebase_hook = dir.path().join(".git/hooks/pre-rebase");
+    if reject_in_pre_rebase_hook {
+        fs::write(&pre_rebase_hook, "#!/bin/sh\nexit 1\n").unwrap();
+        run_ok("chmod", &["+x", ".git/hooks/pre-rebase"], dir.path());
+    }
+
+    let output = kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg(a1_id.to_string())
+        .arg(autostash_flag)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the fold should have failed");
+    assert!(
+        stderr.contains("failed before starting"),
+        "expected a pre-start failure message, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Resolve conflicts"),
+        "a rebase that never started has no conflicts to resolve, got:\n{stderr}"
+    );
+
+    assert_no_rebase_in_progress(dir.path());
+    assert!(
+        !dir.path().join(".git/kindra_rebase_state.json").exists(),
+        "a fold that never started must not leave resumable state"
+    );
+    let ref_id = |name: &str| {
+        repo.find_reference(&format!("refs/heads/{name}"))
+            .unwrap()
+            .target()
+            .unwrap()
+    };
+    assert_eq!(
+        ref_id("feature-a"),
+        a2_id,
+        "the fixup commit is rolled back"
+    );
+    assert_eq!(ref_id("feature-b"), b_id);
+    assert_eq!(current_branch(dir.path()), "feature-a");
+    assert_eq!(
+        git_stdout(dir.path(), &["diff", "--cached", "--name-only"]).trim(),
+        "a1.txt",
+        "the fixup content returns to the index"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a1.txt")).unwrap(),
+        "fixed a1"
+    );
+    assert_has_unstaged_file(dir.path(), "a2.txt");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a2.txt")).unwrap(),
+        "unstaged a2"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "WIP"
+    );
+    assert!(git_stdout(dir.path(), &["stash", "list"]).trim().is_empty());
+
+    // Nothing is left for `kin continue` to restack onto the unfolded fixup.
+    if reject_in_pre_rebase_hook {
+        fs::remove_file(&pre_rebase_hook).unwrap();
+    }
+    kin_cmd()
+        .arg("continue")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(ref_id("feature-a"), a2_id);
+    assert_eq!(ref_id("feature-b"), b_id);
+}
+
+#[test]
+#[cfg(unix)]
+fn test_commit_fixup_on_other_branch_unwinds_pre_start_rebase_failure() {
+    // Folding into a commit above HEAD takes the checkout path. When git refuses
+    // the fold before starting, the user must end up back on their own branch
+    // with their changes as they were, and no state for `kin continue` to
+    // restack feature-c onto the raw `fixup!` commit.
+    let (dir, repo) = setup_repo();
+    let main_id = repo.revparse_single("main").unwrap().id();
+    let main_commit = repo.find_commit(main_id).unwrap();
+
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "commit a",
+        &[&main_commit],
+    );
+    let a_commit = repo.find_commit(a_id).unwrap();
+    let b_id = make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "commit b",
+        &[&a_commit],
+    );
+    let b_commit = repo.find_commit(b_id).unwrap();
+    let c_id = make_commit(
+        &repo,
+        "refs/heads/feature-c",
+        "c.txt",
+        "c",
+        "commit c",
+        &[&b_commit],
+    );
+
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("fix.txt"), "fix for b").unwrap();
+    run_ok("git", &["add", "fix.txt"], dir.path());
+    fs::write(dir.path().join("a.txt"), "unstaged edit").unwrap();
+    fs::write(dir.path().join("scratch.txt"), "WIP").unwrap();
+
+    let pre_rebase_hook = dir.path().join(".git/hooks/pre-rebase");
+    fs::write(&pre_rebase_hook, "#!/bin/sh\nexit 1\n").unwrap();
+    run_ok("chmod", &["+x", ".git/hooks/pre-rebase"], dir.path());
+
+    let output = kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg(b_id.to_string())
+        .arg("--no-autostash")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the fold should have failed");
+    assert!(
+        stderr.contains("failed before starting"),
+        "expected a pre-start failure message, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Resolve conflicts"),
+        "a rebase that never started has no conflicts to resolve, got:\n{stderr}"
+    );
+
+    assert_no_rebase_in_progress(dir.path());
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    let ref_id = |name: &str| {
+        repo.find_reference(&format!("refs/heads/{name}"))
+            .unwrap()
+            .target()
+            .unwrap()
+    };
+    assert_eq!(ref_id("feature-a"), a_id);
+    assert_eq!(ref_id("feature-b"), b_id, "the fixup commit is rolled back");
+    assert_eq!(ref_id("feature-c"), c_id);
+    assert_eq!(current_branch(dir.path()), "feature-a");
+    assert_eq!(
+        git_stdout(dir.path(), &["diff", "--cached", "--name-only"]).trim(),
+        "fix.txt"
+    );
+    assert_has_unstaged_file(dir.path(), "a.txt");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "unstaged edit"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "WIP"
+    );
+    assert!(git_stdout(dir.path(), &["stash", "list"]).trim().is_empty());
+
+    fs::remove_file(&pre_rebase_hook).unwrap();
+    kin_cmd()
+        .arg("continue")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(ref_id("feature-b"), b_id);
+    assert_eq!(ref_id("feature-c"), c_id);
 }
 
 fn blob_text(repo: &git2::Repository, commit: git2::Oid, name: &str) -> String {

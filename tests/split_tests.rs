@@ -729,6 +729,7 @@ fn test_split_refuses_when_kindra_operation_in_progress() {
         carry_stash_ref: None,
         preserve_content_on_abort: false,
         suppress_editor: false,
+        abort_only: false,
         unstage_on_restore: false,
         autostash: false,
         cleanup_merged_branches: Vec::new(),
