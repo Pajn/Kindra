@@ -28,6 +28,7 @@
 ### Safety & State
 - Operations that modify multiple branches (like `move`) must persist their state to allow for `continue`/`abort` workflows.
 - Always validate the exit status of system commands (e.g., `git checkout`, `git rebase`). Do not assume success.
+- `src/operation_state.rs` owns what is in progress: the registry of persisted operation-state files (register new ones in `PersistedOperation`; never rename existing files), a pure `query` of the Kindra operation, native Git operation and override recovery facets, the explicit `reconcile` (needs `RepoLock`), and the `ensure_idle` gate. Every command calls the gate first, holding `RepoLock` and choosing an `Allow` set, before any overrides wrapper, `oplog::begin` or `save_state`, so a refused command persists nothing. Tell a native rebase from `git am` through `NativeOperation`, not by the presence of `rebase-apply/`.
 - Named checkout persists source refs/OIDs and per-branch checkpoints in the worktree's `kindra_checkout_state.json` before creating branches. Continue retries creation at the recorded OID; abort retains created branches to protect edits. Keep hydration state in operation guards and override busy checks.
 - Absorb preserves unnamed fork points with `update-ref` todo instructions placed after each autosquash group. Its temporary `refs/kindra/absorb/` anchors are recorded in the worktree's `new_base_map`; keep them through conflicts and delete only that operation's anchors when clearing recovery state.
 

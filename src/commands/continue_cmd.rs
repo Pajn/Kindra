@@ -1,3 +1,4 @@
+use crate::operation_state::{KindraOperation, NativeOperation};
 use crate::rebase_utils::{
     Operation, RebaseState, ReconcileMode, git_rebase_in_progress, has_staged_changes,
     reconcile_saved_rebase_state, run_rebase_loop,
@@ -9,46 +10,54 @@ use std::process::Command;
 pub fn continue_cmd() -> Result<()> {
     let repo = crate::open_repo()?;
     let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    crate::overrides::with_planned(&repo, true, || continue_cmd_locked(&repo))
+    let active = crate::operation_state::query(&repo);
+    match (&active.kindra, active.native) {
+        (KindraOperation::Conflicting(kinds), _) => {
+            return Err(anyhow!(crate::operation_state::conflicting_advice(kinds)));
+        }
+        // A paused operation's own stopped rebase is what continue resumes.
+        (KindraOperation::Rebase(_), NativeOperation::Rebase) | (_, NativeOperation::None) => {}
+        (KindraOperation::None, native) => return Err(anyhow!(native.advice())),
+        (_, native) => {
+            return Err(anyhow!("{} Then run 'kin continue'.", native.advice()));
+        }
+    }
+    crate::overrides::with_planned(&repo, true, || continue_cmd_locked(&repo, &active.kindra))
 }
 
-fn continue_cmd_locked(repo: &git2::Repository) -> Result<()> {
-    if crate::commands::checkout::hydration_in_progress(repo) {
-        if crate::rebase_utils::state_path(repo).exists()
-            || crate::commands::run::run_state_exists(repo)
-        {
+fn continue_cmd_locked(repo: &git2::Repository, kindra: &KindraOperation) -> Result<()> {
+    match kindra {
+        KindraOperation::Hydration => return crate::commands::checkout::continue_hydration(repo),
+        KindraOperation::Run => {
+            // `kin run` is not resumable: it restores the working tree and clears
+            // its state on every normal exit. Leftover state means a run was
+            // interrupted before it could restore (e.g. it failed to check the
+            // original branch back out), which `kin continue` cannot resolve.
             return Err(anyhow!(
-                "Multiple Kindra operations are persisted. Resolve state before continuing."
+                "A previous 'kin run' was interrupted before it could restore the working tree. Use 'kin abort' to restore it."
             ));
         }
-        return crate::commands::checkout::continue_hydration(repo);
+        KindraOperation::None => {
+            println!("No operation in progress.");
+            return Ok(());
+        }
+        KindraOperation::Rebase(_) | KindraOperation::Conflicting(_) => {}
     }
     if crate::rebase_utils::load_state(repo).is_ok_and(|state| state.abort_only) {
         return Err(anyhow!(
             "The saved operation was already rolled back and only needs its set-aside changes restored. Run 'kin abort' to finish it."
         ));
     }
-    let rebase_state = reconcile_saved_rebase_state(repo, ReconcileMode::Continue)?;
-    let has_rebase_state = rebase_state.is_some();
-    let has_run_state = crate::commands::run::run_state_exists(repo);
-
-    if has_rebase_state && has_run_state {
-        return Err(anyhow!(
-            "Multiple Kindra operations are persisted. Run 'kin abort' to clear state before continuing."
-        ));
-    }
+    let Some(state) = reconcile_saved_rebase_state(repo, ReconcileMode::Continue)? else {
+        println!("No operation in progress.");
+        return Ok(());
+    };
 
     if git_rebase_in_progress(repo) {
-        if !has_rebase_state {
-            return Err(anyhow!(
-                "A native git rebase is in progress. Use 'git rebase --continue'."
-            ));
-        }
-
         let repaired = repair_stalled_pick_commit(repo)?;
 
         println!("Continuing git rebase...");
-        let status = git_rebase_step(rebase_state.as_ref(), "--continue")?;
+        let status = git_rebase_step(&state, "--continue")?;
         if !status.success() {
             // A repaired stall re-executes the pick whose changes were just
             // committed; that replay usually comes up empty and stops. Nothing
@@ -56,7 +65,7 @@ fn continue_cmd_locked(repo: &git2::Repository) -> Result<()> {
             // with --skip is the completion of the recovery, not a decision.
             if repaired && rebase_stopped_on_empty_pick(repo)? {
                 println!("The recovered commit made the replayed pick empty; skipping it...");
-                let status = git_rebase_step(rebase_state.as_ref(), "--skip")?;
+                let status = git_rebase_step(&state, "--skip")?;
                 if !status.success() {
                     return Err(continue_failure_error());
                 }
@@ -66,37 +75,19 @@ fn continue_cmd_locked(repo: &git2::Repository) -> Result<()> {
         }
     }
 
-    if let Some(state) = rebase_state {
-        return match state.operation {
-            Operation::Sync if state.parent_name_map.is_empty() => {
-                crate::commands::sync::finish_sync_after_rebase(repo, state)
-            }
-            _ => run_rebase_loop(repo, state),
-        };
+    match state.operation {
+        Operation::Sync if state.parent_name_map.is_empty() => {
+            crate::commands::sync::finish_sync_after_rebase(repo, state)
+        }
+        _ => run_rebase_loop(repo, state),
     }
-
-    if has_run_state {
-        // `kin run` is not resumable: it restores the working tree and clears its
-        // state on every normal exit. Leftover state means a run was interrupted
-        // before it could restore (e.g. it failed to check the original branch
-        // back out), which `kin continue` cannot resolve.
-        return Err(anyhow!(
-            "A previous 'kin run' was interrupted before it could restore the working tree. Use 'kin abort' to restore it."
-        ));
-    }
-
-    println!("No operation in progress.");
-    Ok(())
 }
 
 /// Run `git rebase <step>` with the editor resolved per the saved state.
-fn git_rebase_step(
-    rebase_state: Option<&RebaseState>,
-    step: &str,
-) -> Result<std::process::ExitStatus> {
+fn git_rebase_step(rebase_state: &RebaseState, step: &str) -> Result<std::process::ExitStatus> {
     let mut git = Command::new("git");
     git.envs(std::env::vars_os());
-    if rebase_state.is_some_and(|state| state.suppress_editor) {
+    if rebase_state.suppress_editor {
         // The paused operation ran its rebase editor-less (absorb pins
         // GIT_EDITOR so squash! folds never open a commit-message editor);
         // resuming must do the same or the remaining squashes open the

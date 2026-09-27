@@ -3,7 +3,7 @@ use git2::{Oid, Repository};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -104,7 +104,7 @@ pub enum ReconcileMode {
 }
 
 pub fn state_path(repo: &Repository) -> PathBuf {
-    repo.path().join("kindra_rebase_state.json")
+    crate::operation_state::PersistedOperation::Rebase.path(repo)
 }
 
 pub fn save_state(repo: &Repository, state: &RebaseState) -> Result<()> {
@@ -137,8 +137,11 @@ pub fn checkout_branch(branch_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether a native `git rebase` is in progress. A stopped `git am` also uses
+/// `rebase-apply/` but is not a rebase: `git rebase --continue` cannot finish it.
 pub fn git_rebase_in_progress(repo: &Repository) -> bool {
-    repo.path().join("rebase-merge").exists() || repo.path().join("rebase-apply").exists()
+    crate::operation_state::native_operation(repo)
+        == crate::operation_state::NativeOperation::Rebase
 }
 
 // Each absorb owns a unique namespace recorded in its worktree's saved state.
@@ -225,23 +228,6 @@ pub fn reconcile_saved_rebase_state(
     }
 
     Ok(Some(state))
-}
-
-pub fn passively_reconcile_rebase_state(repo: &Repository) -> Result<bool> {
-    if !state_path(repo).exists() {
-        return Ok(false);
-    }
-
-    match reconcile_saved_rebase_state(repo, ReconcileMode::Passive) {
-        Ok(state) => Ok(state.is_some()),
-        Err(err) => {
-            eprintln!(
-                "Warning: failed to reconcile saved Kindra rebase state; treating it as active: {}",
-                err
-            );
-            Ok(true)
-        }
-    }
 }
 
 /// `owned_tip_state_matches` treats an empty `state.owned_tip_map` as a deliberate
@@ -470,8 +456,14 @@ fn active_git_rebase_matches_state(repo: &Repository, state: &RebaseState) -> Re
 }
 
 fn active_git_rebase_branch(repo: &Repository) -> Result<Option<String>> {
+    rebase_head_branch(repo.path())
+}
+
+/// The branch a native rebase in the worktree whose Git directory is `git_dir`
+/// is rewriting, from the `head-name` Git records when the rebase starts.
+fn rebase_head_branch(git_dir: &Path) -> Result<Option<String>> {
     for rebase_dir in ["rebase-merge", "rebase-apply"] {
-        let head_name_path = repo.path().join(rebase_dir).join("head-name");
+        let head_name_path = git_dir.join(rebase_dir).join("head-name");
         if !head_name_path.exists() {
             continue;
         }
@@ -488,6 +480,32 @@ fn active_git_rebase_branch(repo: &Repository) -> Result<Option<String>> {
     }
 
     Ok(None)
+}
+
+/// The branch a native bisect in the worktree whose Git directory is
+/// `git_dir` returns to on `git bisect reset` (a commit id when it was
+/// started detached, which never matches a branch name).
+fn bisect_start_branch(git_dir: &Path) -> Option<String> {
+    let start = fs::read_to_string(git_dir.join("BISECT_START")).ok()?;
+    let start = start.trim();
+    (!start.is_empty()).then(|| start.to_string())
+}
+
+/// The Git directory of the worktree checked out at `worktree`: `.git`
+/// itself for the main worktree, or the directory a linked worktree's `.git`
+/// file points at.
+fn worktree_git_dir(worktree: &Path) -> Option<PathBuf> {
+    let dot_git = worktree.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let pointer = fs::read_to_string(&dot_git).ok()?;
+    let git_dir = Path::new(pointer.trim().strip_prefix("gitdir:")?.trim());
+    Some(if git_dir.is_absolute() {
+        git_dir.to_path_buf()
+    } else {
+        worktree.join(git_dir)
+    })
 }
 
 fn sync_rebase_completed(repo: &Repository, state: &RebaseState) -> Result<bool> {
@@ -535,11 +553,11 @@ pub fn check_worktrees(branches: &[String], force: bool) -> Result<()> {
 
     let elsewhere = branches_checked_out_elsewhere()?;
     for branch in branches {
-        if let Some(path) = elsewhere.get(branch) {
+        if let Some(held) = elsewhere.get(branch) {
             return Err(anyhow!(
-                "{} is checked out in {}, aborting as a full rebase can not be completed. Use --force to ignore this check.",
+                "{} is {}, aborting as a full rebase can not be completed. Use --force to ignore this check.",
                 branch,
-                path
+                held
             ));
         }
     }
@@ -558,11 +576,8 @@ pub fn keep_merged_branches_checked_out_elsewhere(branches: &mut Vec<String>) ->
 
     let elsewhere = branches_checked_out_elsewhere()?;
     branches.retain(|branch| match elsewhere.get(branch) {
-        Some(path) => {
-            println!(
-                "Keeping merged branch {}: it is checked out in {}.",
-                branch, path
-            );
+        Some(held) => {
+            println!("Keeping merged branch {}: it is {}.", branch, held);
             false
         }
         None => true,
@@ -570,9 +585,27 @@ pub fn keep_merged_branches_checked_out_elsewhere(branches: &mut Vec<String>) ->
     Ok(())
 }
 
-/// Branches checked out in a worktree other than the current one, mapped to
-/// that worktree's path.
-fn branches_checked_out_elsewhere() -> Result<HashMap<String, String>> {
+/// How another worktree holds a branch.
+enum HeldBy {
+    CheckedOut(String),
+    Rebased(String),
+    Bisected(String),
+}
+
+impl std::fmt::Display for HeldBy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeldBy::CheckedOut(path) => write!(f, "checked out in {path}"),
+            HeldBy::Rebased(path) => write!(f, "being rebased in {path}"),
+            HeldBy::Bisected(path) => write!(f, "being bisected in {path}"),
+        }
+    }
+}
+
+/// Branches held by a worktree other than the current one: checked out
+/// there, or detached from while a native rebase rewrites it or a bisect will
+/// return to it. Git refuses to rewrite such a branch from another worktree.
+fn branches_checked_out_elsewhere() -> Result<HashMap<String, HeldBy>> {
     let current_worktree_output = Command::new("git")
         .arg("rev-parse")
         .arg("--show-toplevel")
@@ -594,23 +627,41 @@ fn branches_checked_out_elsewhere() -> Result<HashMap<String, String>> {
     }
 
     let stdout = String::from_utf8_lossy(&worktree_list_output.stdout);
-    let mut worktree_map: HashMap<String, String> = HashMap::new(); // branch_name -> worktree_path
+    let mut worktree_map: HashMap<String, HeldBy> = HashMap::new();
     let mut current_path = String::new();
 
     for line in stdout.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
             current_path = path.trim().to_string();
+            if current_path == current_worktree {
+                continue;
+            }
+            // A worktree mid-rebase or bisecting is listed as detached; its
+            // own Git directory records the branch it is working on.
+            let Some(git_dir) = worktree_git_dir(Path::new(&current_path)) else {
+                continue;
+            };
+            if let Some(branch) = rebase_head_branch(&git_dir)? {
+                worktree_map.insert(branch, HeldBy::Rebased(current_path.clone()));
+            }
+            if let Some(branch) = bisect_start_branch(&git_dir) {
+                worktree_map
+                    .entry(branch)
+                    .or_insert_with(|| HeldBy::Bisected(current_path.clone()));
+            }
         } else if let Some(branch_ref) = line.strip_prefix("branch ") {
+            if current_path == current_worktree {
+                continue;
+            }
             let branch_name = branch_ref
                 .strip_prefix("refs/heads/")
                 .unwrap_or(branch_ref)
                 .trim()
                 .to_string();
-            worktree_map.insert(branch_name, current_path.clone());
+            worktree_map.insert(branch_name, HeldBy::CheckedOut(current_path.clone()));
         }
     }
 
-    worktree_map.retain(|_, path| path != &current_worktree);
     Ok(worktree_map)
 }
 

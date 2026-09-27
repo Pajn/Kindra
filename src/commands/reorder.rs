@@ -1,7 +1,5 @@
 use crate::commands::find_upstream;
-use crate::rebase_utils::{
-    Operation, RebaseState, passively_reconcile_rebase_state, run_rebase_loop, save_state,
-};
+use crate::rebase_utils::{Operation, RebaseState, run_rebase_loop, save_state};
 use anyhow::{Result, anyhow};
 use clap::Args;
 use std::collections::{HashMap, HashSet};
@@ -21,21 +19,12 @@ pub struct ReorderArgs {
 
 pub fn reorder(args: &ReorderArgs) -> Result<()> {
     let repo = crate::open_repo()?;
-    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+    let lock = crate::state_io::RepoLock::acquire(&repo)?;
+    crate::operation_state::ensure_idle(&repo, &lock, crate::operation_state::Allow::NOTHING)?;
     crate::overrides::with_planned(&repo, false, || reorder_locked(&repo, args))
 }
 
 fn reorder_locked(repo: &git2::Repository, args: &ReorderArgs) -> Result<()> {
-    if passively_reconcile_rebase_state(repo)?
-        || crate::commands::run::run_state_exists(repo)
-        || crate::commands::checkout::hydration_in_progress(repo)
-    {
-        return Err(anyhow!(
-            "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
-        ));
-    }
-    crate::commands::sync::ensure_no_native_git_operation(repo)?;
-
     let head = repo.head()?;
     let current_branch_name = head
         .shorthand()

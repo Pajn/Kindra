@@ -126,6 +126,9 @@ pub(crate) fn pr_merge(args: &PrMergeArgs) -> Result<()> {
     gh::check_gh().context("GitHub CLI check failed")?;
 
     let repo = crate::open_repo()?;
+    // Refuse before merging anything on GitHub: the local cascade after the
+    // merge could not run, and the stack being merged may be half-rebased.
+    crate::operation_state::ensure_idle_now(&repo, crate::operation_state::Allow::PUBLISH)?;
     let (upstream_name, branches_with_upstream) = discover_stack_branches_with_upstream(&repo)?;
 
     if branches_with_upstream.is_empty() {

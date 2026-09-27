@@ -1420,3 +1420,47 @@ fn kept_overlays_survive_a_conflict_until_continue_or_abort() {
         assert_applied(dir.path());
     }
 }
+
+#[test]
+fn native_operation_refusal_does_not_depend_on_override_configuration() {
+    let mut refusals = Vec::new();
+    for configured in [true, false] {
+        let dir = setup();
+        if !configured {
+            fs::remove_file(dir.path().join(".git/kindra.toml")).unwrap();
+        }
+        run_ok("git", &["config", "rebase.autostash", "false"], dir.path());
+        common::stop_native_operation(dir.path(), common::NativeStop::Merge, false);
+        let output = kin_cmd()
+            .current_dir(dir.path())
+            .args(["move", "--onto", "main"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        refusals.push(String::from_utf8_lossy(&output.stderr).into_owned());
+        common::assert_no_kindra_operation(dir.path());
+        assert!(!dir.path().join(".git/kindra_overrides_state.json").exists());
+    }
+    assert!(refusals[0].contains("git merge --abort"), "{}", refusals[0]);
+    assert_eq!(refusals[0], refusals[1]);
+}
+
+#[test]
+fn commit_finishes_a_resolved_native_merge_with_overrides_configured() {
+    let dir = setup();
+    common::stop_native_operation(dir.path(), common::NativeStop::Merge, true);
+    let before = git(dir.path(), &["rev-parse", "HEAD"]);
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["commit", "-m", "merge side"])
+        .assert()
+        .success();
+    assert_eq!(
+        git(dir.path(), &["rev-parse", "HEAD^1"]),
+        before,
+        "the merge commit's first parent is the old tip"
+    );
+    git(dir.path(), &["rev-parse", "--verify", "HEAD^2"]);
+    assert!(!dir.path().join(".git/MERGE_HEAD").exists());
+    assert_applied(dir.path());
+}

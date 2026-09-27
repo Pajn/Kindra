@@ -502,3 +502,31 @@ fn run_tree_from_detached_head_still_covers_the_component() {
         detached_head
     );
 }
+
+#[test]
+fn run_refuses_resolved_native_cherry_pick_with_autostash() {
+    let dir = setup_run_repo();
+    run_ok("git", &["config", "rebase.autostash", "true"], dir.path());
+    common::stop_native_operation(dir.path(), common::NativeStop::CherryPick, true);
+    let log_path = dir.path().join("run.log");
+
+    kin_cmd()
+        .arg("run")
+        .arg("--command")
+        .arg("echo \"$(git branch --show-current)\" >> run.log")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(contains("git cherry-pick --continue"));
+
+    assert!(read_lines(&log_path).is_empty());
+    assert!(dir.path().join(".git/CHERRY_PICK_HEAD").exists());
+    assert_eq!(
+        git_stdout(
+            dir.path(),
+            &["show", &format!(":{}", common::NATIVE_CONFLICT_FILE)]
+        ),
+        "resolved"
+    );
+    common::assert_no_kindra_operation(dir.path());
+}

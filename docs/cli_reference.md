@@ -169,6 +169,8 @@ How it gets the commit there depends on where the target is:
 
 Either way the staged changes travel by merge, not by copy, so a file the target branch also changed is no obstacle — only a genuine conflict with the target stops the operation.
 
+**Finishing a native merge or cherry-pick.** While a `git merge` or single-commit `git cherry-pick` stopped on conflicts, a plain `kin commit` of the staged resolution makes the operation's final commit exactly as `git commit` would (a merge commit, or the picked commit with its message and author) and then restacks dependent branches. It refuses while paths are still unmerged, and refuses `--on`, `--fixup`, `--interactive`, `--new-branch`, `--amend`, `--patch` and pathspecs, which would rewrite or switch branches underneath the native operation. Other native operations (rebase, am, revert, bisect) must be finished with Git first.
+
 **When to use it:** Use this instead of `git commit` when you are working on a branch that has other branches building on top of it. It saves you from having to manually rebase each dependent branch.
 
 **ASCII-Art Visualization:**
@@ -616,7 +618,7 @@ kin push --allow-base-push <branch>
 - `--allow-base-push <BRANCH>`: Allow `<BRANCH>` to push onto the base branch it tracks. Repeatable; each branch must be named explicitly.
 - `--force`: Replace `--force-if-includes` with `--no-force-if-includes`, keeping `--atomic` and `--force-with-lease`.
 
-This command performs an atomic push of all branches in the stack using `force-with-lease` to ensure safety.
+This command performs an atomic push of all branches in the stack using `force-with-lease` to ensure safety. It refuses while a Kindra operation is paused, since only part of the stack has been rewritten; `kin pr`, `kin pr flatten` and `kin pr merge` refuse for the same reason, `kin pr merge` before it merges anything on GitHub.
 
 **What `--force` does and does not relax.** Normal pushes use `--atomic --force-with-lease --force-if-includes`. The lease refuses to overwrite a remote branch whose tip has moved since your remote-tracking ref was last updated; `--force-if-includes` adds a stricter requirement: the remote-tracking tip must have been integrated into your local branch at some point, which Git checks by looking for it in the branch's reflog. A fetch alone does not satisfy it; a rebase onto or merge of the fetched commits does, even if you later rewrote them away. `kin push --force` replaces `--force-if-includes` with `--no-force-if-includes` to turn off that stricter check for the run, so a push rejected only on those grounds lands. `--atomic` (the stack lands as one unit or not at all) and `--force-with-lease` still apply, as does the base-branch refusal below; `--force` is not `git push --force`. Relaxed pushes are labelled in the output.
 
@@ -959,7 +961,11 @@ If a `kin commit`, `kin move`, `kin reorder`, `kin sync`, or `kin restack` opera
 - **`kin status`**: Shows the current state of the interrupted operation, including which branch is currently being rebased and which ones are remaining.
 - **`kin continue`**: Resumes the operation after you've resolved conflicts. It handles the underlying `git rebase --continue` and then proceeds with the remaining branches in the stack.
 - **`kin abort`**: Cancels the current operation and cleans up the state.
-- If there is no saved Kindra state and Git itself is in the middle of a native rebase, use `git rebase --continue` or `git rebase --abort`.
+- If there is no saved Kindra state and Git itself is in the middle of a native operation, `kin continue`, `kin abort` and `kin status` name it and the Git command that finishes it (for example `git am --continue` or `git bisect reset`).
+- If more than one operation's state is saved, nothing can resume them: `kin status`, `kin continue` and `kin abort` all point to `kin abort --clear-state`.
+- `kin status` takes the repository lock so the operation it reports is what the next command sees. While another `kin` process holds the lock, it says so and reports the saved state as it is.
+
+**Commands refuse to start in the middle of something.** Commands that rewrite branches or change the working tree (`move`, `restack`, `reorder`, `sync`, `absorb`, `split`, `run`, `checkout`, `undo`, `redo`) refuse while a Kindra operation is paused or a native Git operation — rebase, am, merge, cherry-pick, revert or bisect — is in progress, and they refuse before saving any state, so nothing needs cleaning up afterwards. `rename` and `reflog` refuse the same operations. `kin commit` can finish a resolved native merge or cherry-pick (see [`commit`](#commit)). A branch another worktree is rebasing or bisecting counts as checked out there, like a branch that worktree has checked out.
 
 ---
 

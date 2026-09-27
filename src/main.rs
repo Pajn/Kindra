@@ -3,6 +3,7 @@ mod config;
 mod editor;
 mod gh;
 mod interaction;
+mod operation_state;
 mod oplog;
 mod overrides;
 mod rebase_todo;

@@ -19,8 +19,8 @@ pub fn checkout(
     let repo = crate::open_repo()?;
 
     if let Some(branch) = branch {
-        let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-        ensure_checkout_available(&repo)?;
+        let lock = crate::state_io::RepoLock::acquire(&repo)?;
+        crate::operation_state::ensure_idle(&repo, &lock, crate::operation_state::Allow::NOTHING)?;
         return crate::overrides::with_planned(&repo, false, || {
             checkout_branch_with_pr_hydration(&repo, branch)
         });
@@ -186,11 +186,7 @@ struct HydrationState {
 }
 
 pub(crate) fn hydration_state_path(repo: &Repository) -> PathBuf {
-    repo.path().join("kindra_checkout_state.json")
-}
-
-pub(crate) fn hydration_in_progress(repo: &Repository) -> bool {
-    hydration_state_path(repo).exists()
+    crate::operation_state::PersistedOperation::Hydration.path(repo)
 }
 
 fn save_hydration(repo: &Repository, state: &HydrationState) -> Result<()> {
@@ -198,18 +194,6 @@ fn save_hydration(repo: &Repository, state: &HydrationState) -> Result<()> {
         &hydration_state_path(repo),
         &serde_json::to_string_pretty(state)?,
     )
-}
-
-fn ensure_checkout_available(repo: &Repository) -> Result<()> {
-    if hydration_in_progress(repo)
-        || crate::rebase_utils::state_path(repo).exists()
-        || crate::commands::run::run_state_exists(repo)
-    {
-        return Err(anyhow!(
-            "A Kindra operation is in progress. Use 'kin continue' or 'kin abort'."
-        ));
-    }
-    crate::commands::sync::ensure_no_native_git_operation(repo)
 }
 
 fn checkout_branch_with_pr_hydration(repo: &Repository, branch: &str) -> Result<()> {
@@ -257,7 +241,10 @@ fn checkout_branch_with_pr_hydration(repo: &Repository, branch: &str) -> Result<
 }
 
 pub(crate) fn continue_hydration(repo: &Repository) -> Result<()> {
-    crate::commands::sync::ensure_no_native_git_operation(repo)?;
+    let native = crate::operation_state::native_operation(repo);
+    if native != crate::operation_state::NativeOperation::None {
+        return Err(anyhow!("{} Then run 'kin continue'.", native.advice()));
+    }
     let mut state: HydrationState =
         serde_json::from_str(&std::fs::read_to_string(hydration_state_path(repo))?)?;
     for i in 0..state.steps.len() {
@@ -366,8 +353,8 @@ fn resolve_remote_tracking_ref(
 
 fn perform_git_checkout(name: &str) -> Result<()> {
     let repo = crate::open_repo()?;
-    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    ensure_checkout_available(&repo)?;
+    let lock = crate::state_io::RepoLock::acquire(&repo)?;
+    crate::operation_state::ensure_idle(&repo, &lock, crate::operation_state::Allow::NOTHING)?;
     crate::overrides::with_planned(&repo, false, || {
         let mut plan = crate::overrides::Plan::default();
         crate::overrides::prepare(&repo, plan.checkout_rev(&repo, name))?;

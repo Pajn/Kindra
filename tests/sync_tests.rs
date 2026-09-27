@@ -3360,3 +3360,27 @@ fn squash_merged_branch_with_quoted_path_is_detected_as_merged() {
     let merged = kindra::stack::collect_merged_local_branches(&repo, "main", &["main"]).unwrap();
     assert_eq!(merged, vec!["feature".to_string()]);
 }
+
+#[test]
+fn sync_names_the_native_operation_it_refuses_to_run_during() {
+    for (op, hint) in [
+        (common::NativeStop::Am, "git am --abort"),
+        (common::NativeStop::Revert, "git revert --abort"),
+    ] {
+        let dir = common::setup_repo();
+        common::stop_native_operation(dir.path(), op, false);
+        let state = Repository::open(dir.path()).unwrap().state();
+
+        let output = kin_cmd()
+            .arg("sync")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{op:?}");
+        assert!(stderr.contains(hint), "{op:?}: {stderr}");
+        assert!(!stderr.contains("git rebase"), "{op:?}: {stderr}");
+        assert_eq!(Repository::open(dir.path()).unwrap().state(), state);
+        common::assert_no_kindra_operation(dir.path());
+    }
+}

@@ -79,6 +79,22 @@ pub fn is_disabled(repo: &Repository) -> bool {
     disabled_path(repo).exists()
 }
 
+/// Whether override recovery is pending, and if so whether it is an
+/// interrupted removal. Unreadable recovery state still counts as pending.
+pub fn recovery_removing(repo: &Repository) -> Option<bool> {
+    #[derive(Deserialize)]
+    struct Intent {
+        #[serde(default)]
+        removing: bool,
+    }
+    let text = fs::read_to_string(state_path(repo)).ok()?;
+    Some(
+        serde_json::from_str::<Intent>(&text)
+            .map(|intent| intent.removing)
+            .unwrap_or(false),
+    )
+}
+
 fn config(repo: &Repository) -> Result<Option<Config>> {
     let config = crate::config::repo_config(repo)?.section::<Config>("overrides")?;
     if let Some(config) = &config
@@ -175,10 +191,7 @@ fn save(repo: &Repository, state: &State) -> Result<()> {
 }
 
 fn busy(repo: &Repository) -> bool {
-    repo.state() != RepositoryState::Clean
-        || crate::rebase_utils::state_path(repo).exists()
-        || crate::commands::run::run_state_exists(repo)
-        || crate::commands::checkout::hydration_in_progress(repo)
+    crate::operation_state::query(repo).any_operation()
 }
 
 fn check_staged(repo: &Repository, config: &Config) -> Result<()> {
@@ -649,6 +662,23 @@ pub fn with_planned<T>(
     recovery: bool,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    with_planned_during(
+        repo,
+        recovery,
+        crate::operation_state::NativeOperation::None,
+        operation,
+    )
+}
+
+/// [`with_planned`] for an operation that finishes the native Git operation
+/// `finishing` (`kin commit` making a merge's final commit). That operation
+/// does not count as busy when deciding whether overlays may stay applied.
+pub fn with_planned_during<T>(
+    repo: &Repository,
+    recovery: bool,
+    finishing: crate::operation_state::NativeOperation,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     if SESSION.with(|session| session.borrow().is_some()) {
         return operation();
     }
@@ -662,7 +692,11 @@ pub fn with_planned<T>(
         return operation();
     };
     if !recovery {
-        if busy(repo) {
+        let active = crate::operation_state::query(repo);
+        if active.kindra != crate::operation_state::KindraOperation::None
+            || (active.native != crate::operation_state::NativeOperation::None
+                && active.native != finishing)
+        {
             bail!(
                 "Cannot suspend local overrides while a Git or Kindra operation is in progress. Finish it with continue/abort first."
             );

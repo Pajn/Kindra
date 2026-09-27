@@ -1,6 +1,7 @@
+use crate::operation_state::{KindraOperation, NativeOperation};
 use crate::rebase_utils::{
     StashApplyOutcome, checkout_branch, drop_stash, git_rebase_in_progress, load_state,
-    owned_tip_state_matches, save_state, state_path, unstage_all,
+    owned_tip_state_matches, save_state, unstage_all,
 };
 use anyhow::{Result, anyhow};
 use git2::Oid;
@@ -13,13 +14,33 @@ pub fn abort_cmd(clear_state_only: bool) -> Result<()> {
     if clear_state_only {
         return abort_locked(&repo, clear_state_only);
     }
+    let active = crate::operation_state::query(&repo);
+    match (&active.kindra, active.native) {
+        (KindraOperation::Conflicting(kinds), _) => {
+            return Err(anyhow!(crate::operation_state::conflicting_advice(kinds)));
+        }
+        // Rolling a paused operation back checks out and resets branches,
+        // which would tear through another native operation's state.
+        (
+            KindraOperation::Rebase(_) | KindraOperation::Run,
+            native @ (NativeOperation::Am
+            | NativeOperation::Merge
+            | NativeOperation::CherryPick
+            | NativeOperation::Revert
+            | NativeOperation::Bisect),
+        ) => {
+            return Err(anyhow!(
+                "{} Then run 'kin abort', or run 'kin abort --clear-state' to discard Kindra's saved state without touching Git.",
+                native.advice()
+            ));
+        }
+        _ => {}
+    }
     crate::overrides::with_planned(&repo, true, || abort_locked(&repo, false))
 }
 
 fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
-    let path = state_path(repo);
-    let has_rebase_state = path.exists();
-    let has_run_state = crate::commands::run::run_state_exists(repo);
+    let kindra = crate::operation_state::kindra_operation(repo);
     // Settle the pending oplog snapshot on *every* exit from here on, including
     // the early `?` returns below. Default is `Leave`: only once we have actually
     // finished handling the saved state do we switch to `Discard` (pre-operation
@@ -37,12 +58,8 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
         // This escape hatch deliberately does not deserialize state: it must
         // also work for malformed files or overlapping interrupted operations.
         // Keep Git's rebase, refs, index, worktree and stash entries untouched.
-        for state_file in [
-            &path,
-            &crate::commands::run::run_state_path(repo),
-            &crate::commands::checkout::hydration_state_path(repo),
-        ] {
-            match std::fs::remove_file(state_file) {
+        for kind in crate::operation_state::PersistedOperation::ALL {
+            match std::fs::remove_file(kind.path(repo)) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err.into()),
@@ -52,20 +69,20 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
             settle.action = SettleAction::Finalize;
         }
         println!("Kindra operation state cleared. Git state and saved stashes were left intact.");
-        if git_rebase_in_progress(repo) {
-            println!(
+        match crate::operation_state::native_operation(repo) {
+            NativeOperation::None => {}
+            NativeOperation::Rebase => println!(
                 "The Git rebase is still in progress; manage it with git rebase --continue or --abort."
-            );
+            ),
+            native => println!("{}", native.advice()),
         }
         return Ok(());
     }
 
-    if crate::commands::checkout::hydration_in_progress(repo) {
-        if has_rebase_state || has_run_state {
-            return Err(anyhow!(
-                "Multiple Kindra operations are persisted. Resolve state manually before aborting."
-            ));
-        }
+    if let KindraOperation::Conflicting(kinds) = &kindra {
+        return Err(anyhow!(crate::operation_state::conflicting_advice(kinds)));
+    }
+    if kindra == KindraOperation::Hydration {
         crate::commands::checkout::abort_hydration(repo)?;
         settle.action = if git_rebase_in_progress(repo) {
             SettleAction::Leave
@@ -74,13 +91,8 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
         };
         return Ok(());
     }
-    if has_rebase_state && has_run_state {
-        return Err(anyhow!(
-            "Multiple Kindra operations are persisted. Resolve state manually before aborting."
-        ));
-    }
 
-    if has_rebase_state {
+    if matches!(kindra, KindraOperation::Rebase(_)) {
         let mut parsed_state = load_state(repo)?;
         let git_rebase_active = git_rebase_in_progress(repo);
         let kindra_owns_current_state = owned_tip_state_matches(repo, &parsed_state)?;
@@ -162,12 +174,13 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
                 );
             }
         }
-    } else if has_run_state {
+    } else if kindra == KindraOperation::Run {
         crate::commands::run::abort_run(repo)?;
-    } else if git_rebase_in_progress(repo) {
-        println!("A native git rebase is in progress. Use 'git rebase --abort'.");
     } else {
-        println!("No operation in progress.");
+        match crate::operation_state::native_operation(repo) {
+            NativeOperation::None => println!("No operation in progress."),
+            native => println!("{}", native.advice()),
+        }
     }
 
     // `settle` drops here (and on every early return above), finalizing or

@@ -1,8 +1,8 @@
 use crate::commands::find_upstream;
 use crate::rebase_utils::{
     RebaseState, check_worktrees, clear_state, ensure_git_supports_update_refs,
-    git_rebase_in_progress, local_branch_tips_in_range, passively_reconcile_rebase_state,
-    restore_set_aside_changes, run_rebase_loop, save_state, stash_push_changes,
+    git_rebase_in_progress, local_branch_tips_in_range, restore_set_aside_changes, run_rebase_loop,
+    save_state, stash_push_changes,
 };
 use crate::stack::{collect_descendants, get_stack_branches_from_merge_base};
 use anyhow::{Context, Result, anyhow};
@@ -49,20 +49,12 @@ pub struct AbsorbArgs {
 /// restack dependent branches — so an absorb never sets the stack adrift.
 pub fn absorb(args: &AbsorbArgs) -> Result<()> {
     let repo = crate::open_repo()?;
-    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+    let lock = crate::state_io::RepoLock::acquire(&repo)?;
+    crate::operation_state::ensure_idle(&repo, &lock, crate::operation_state::Allow::NOTHING)?;
     crate::overrides::with_suspended(&repo, false, || absorb_locked(&repo, args))
 }
 
 fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
-    if passively_reconcile_rebase_state(repo)?
-        || crate::commands::run::run_state_exists(repo)
-        || crate::commands::checkout::hydration_in_progress(repo)
-    {
-        return Err(anyhow!(
-            "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
-        ));
-    }
-
     let head = repo.head()?;
     let current_branch_name = if !repo.head_detached()? {
         head.shorthand().map(|s| s.to_string())

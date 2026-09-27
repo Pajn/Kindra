@@ -19,21 +19,12 @@ pub struct SplitArgs {
 
 pub fn split(args: &SplitArgs) -> Result<()> {
     let repo = crate::open_repo()?;
-    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+    let lock = crate::state_io::RepoLock::acquire(&repo)?;
+    crate::operation_state::ensure_idle(&repo, &lock, crate::operation_state::Allow::NOTHING)?;
     crate::overrides::with_suspended(&repo, false, || split_locked(&repo, args))
 }
 
 fn split_locked(repo: &git2::Repository, args: &SplitArgs) -> Result<()> {
-    if crate::rebase_utils::passively_reconcile_rebase_state(repo)?
-        || crate::commands::run::run_state_exists(repo)
-        || crate::commands::checkout::hydration_in_progress(repo)
-    {
-        return Err(anyhow!(
-            "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
-        ));
-    }
-    crate::commands::sync::ensure_no_native_git_operation(repo)?;
-
     // Enforce the uniform clean-or-autostash contract up front (before any
     // oplog entry or ref mutation); the actual stash is taken later, right
     // before the mutations in `apply_split`.

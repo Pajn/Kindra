@@ -2,9 +2,8 @@ use crate::commands::{find_upstream, resolve_rebase_autostash};
 use crate::rebase_utils::{
     RebaseState, StashApplyOutcome, apply_stash, apply_stash_with_outcome, check_worktrees,
     checkout_branch, clear_state, drop_stash, git_rebase_in_progress, local_branch_tips_in_range,
-    passively_reconcile_rebase_state, record_branch_tips_in_range, restore_set_aside_changes,
-    restore_stashed_changes, run_rebase_loop, save_state, stash_push_changes,
-    try_restore_set_aside_changes,
+    record_branch_tips_in_range, restore_set_aside_changes, restore_stashed_changes,
+    run_rebase_loop, save_state, stash_push_changes, try_restore_set_aside_changes,
 };
 use crate::stack::{
     StackBranch, StackCommit, build_parent_maps, collect_descendants, collect_descendants_of_id,
@@ -18,21 +17,59 @@ use std::process::Command;
 
 pub fn commit(args: &[String]) -> Result<()> {
     let repo = crate::open_repo()?;
-    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    crate::overrides::with_planned(&repo, false, || commit_locked(&repo, args))
+    let lock = crate::state_io::RepoLock::acquire(&repo)?;
+    let active =
+        crate::operation_state::ensure_idle(&repo, &lock, crate::operation_state::Allow::COMMIT)?;
+    let parsed = parse_commit_args(args)?;
+    ensure_commit_can_finish(&repo, active.native, &parsed)?;
+    crate::overrides::with_planned_during(&repo, false, active.native, || {
+        commit_locked(&repo, parsed)
+    })
 }
 
-fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
-    if passively_reconcile_rebase_state(repo)?
-        || crate::commands::run::run_state_exists(repo)
-        || crate::commands::checkout::hydration_in_progress(repo)
-    {
+/// `kin commit` may make the final commit of a resolved native merge (a merge
+/// commit) or single-commit cherry-pick, exactly as `git commit` would, and
+/// then restack dependents. Anything else would rewrite or switch branches
+/// underneath the native operation, so it is refused before any state exists.
+fn ensure_commit_can_finish(
+    repo: &Repository,
+    native: crate::operation_state::NativeOperation,
+    parsed: &ParsedCommitArgs,
+) -> Result<()> {
+    if native == crate::operation_state::NativeOperation::None {
+        return Ok(());
+    }
+    let advice = native.advice();
+    if repo.index()?.has_conflicts() {
         return Err(anyhow!(
-            "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
+            "{advice} It has unmerged paths: resolve and stage them, then run 'kin commit' to finish it."
         ));
     }
+    if repo.state() == git2::RepositoryState::CherryPickSequence {
+        return Err(anyhow!(
+            "{advice} 'kin commit' finishes only a single-commit cherry-pick."
+        ));
+    }
+    let rewrites = parsed.on_target.is_some()
+        || parsed.interactive
+        || parsed.fixup_target.is_some()
+        || parsed.new_branch.is_some()
+        || parsed.git_commit_args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "--amend" | "-p" | "--patch" | "-o" | "--only" | "-i" | "--include"
+            )
+        })
+        || has_forwarded_pathspec(&parsed.git_commit_args);
+    if rewrites {
+        return Err(anyhow!(
+            "{advice} 'kin commit' can also finish it, but only by committing the staged resolution on the current branch (without --on, --fixup, --interactive, --new-branch, --amend, --patch or pathspecs)."
+        ));
+    }
+    Ok(())
+}
 
-    let mut parsed = parse_commit_args(args)?;
+fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Result<()> {
     let head = match repo.head() {
         Ok(head) => head,
         Err(err) if err.code() == git2::ErrorCode::UnbornBranch => {

@@ -6242,3 +6242,180 @@ fn check_fixup_sibling_tree(recovery: Option<&str>) {
     assert_eq!(current_branch(dir.path()), "left");
     assert_no_rebase_in_progress(dir.path());
 }
+
+/// `main` <- `feature-a` <- `feature-b`, with a native `op` ("merge" or
+/// "cherry-pick") of a branchless side commit stopped on a conflict on
+/// feature-a. Returns the side commit's id.
+fn native_stop_below_dependent(dir: &Path, op: &str, resolve: bool) -> git2::Oid {
+    repo_init(dir);
+    let commit = |file: &str, content: &str, message: &str| {
+        fs::write(dir.join(file), content).unwrap();
+        run_ok("git", &["add", file], dir);
+        run_ok("git", &["commit", "-q", "-m", message], dir);
+    };
+    commit("file.txt", "base\n", "base");
+    run_ok("git", &["switch", "-q", "-c", "side"], dir);
+    commit("conflict.txt", "side\n", "side commit");
+    let side = Repository::open(dir)
+        .unwrap()
+        .revparse_single("side")
+        .unwrap()
+        .id();
+    run_ok("git", &["switch", "-q", "main"], dir);
+    run_ok("git", &["switch", "-q", "-c", "feature-a"], dir);
+    commit("conflict.txt", "ours\n", "feature-a");
+    run_ok("git", &["switch", "-q", "-c", "feature-b"], dir);
+    commit("b.txt", "b\n", "feature-b");
+    run_ok("git", &["switch", "-q", "feature-a"], dir);
+    run_ok("git", &["branch", "-q", "-D", "side"], dir);
+
+    let side_arg = side.to_string();
+    let mut args = vec![op];
+    if op == "merge" {
+        args.push("--no-edit");
+    }
+    args.push(&side_arg);
+    let output = git_command(dir).args(&args).output().unwrap();
+    assert!(!output.status.success(), "{op} was expected to conflict");
+    if resolve {
+        fs::write(dir.join("conflict.txt"), "resolved\n").unwrap();
+        run_ok("git", &["add", "conflict.txt"], dir);
+    }
+    side
+}
+
+fn assert_dependent_restacked_onto(repo: &Repository, tip: git2::Oid) {
+    let b = repo
+        .revparse_single("feature-b")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    assert_eq!(b.parent_id(0).unwrap(), tip, "feature-b was not restacked");
+    assert_eq!(
+        b.tree()
+            .unwrap()
+            .get_path(Path::new("conflict.txt"))
+            .unwrap()
+            .to_object(repo)
+            .unwrap()
+            .peel_to_blob()
+            .unwrap()
+            .content(),
+        b"resolved\n"
+    );
+}
+
+#[test]
+fn commit_finishes_resolved_native_merge_and_restacks_dependents() {
+    let dir = tempdir().unwrap();
+    let side = native_stop_below_dependent(dir.path(), "merge", true);
+    let repo = Repository::open(dir.path()).unwrap();
+    let old_a = repo.revparse_single("feature-a").unwrap().id();
+
+    kin_cmd()
+        .args(["commit", "-m", "Merge side"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let a = repo
+        .revparse_single("feature-a")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    assert_eq!(a.parent_ids().collect::<Vec<_>>(), vec![old_a, side]);
+    assert_eq!(repo.state(), git2::RepositoryState::Clean);
+    assert_eq!(current_branch(dir.path()), "feature-a");
+    assert_dependent_restacked_onto(&repo, a.id());
+    common::assert_no_kindra_operation(dir.path());
+}
+
+#[test]
+fn commit_finishes_resolved_native_cherry_pick_and_restacks_dependents() {
+    let dir = tempdir().unwrap();
+    native_stop_below_dependent(dir.path(), "cherry-pick", true);
+    let repo = Repository::open(dir.path()).unwrap();
+    let old_a = repo.revparse_single("feature-a").unwrap().id();
+
+    // Like `git cherry-pick --continue`, a bare commit keeps the picked message.
+    kin_cmd()
+        .arg("commit")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let a = repo
+        .revparse_single("feature-a")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    assert_eq!(a.parent_ids().collect::<Vec<_>>(), vec![old_a]);
+    assert_eq!(a.summary(), Some("side commit"));
+    assert_eq!(repo.state(), git2::RepositoryState::Clean);
+    assert!(!repo.path().join("CHERRY_PICK_HEAD").exists());
+    assert!(!repo.path().join("sequencer").exists());
+    assert_dependent_restacked_onto(&repo, a.id());
+    common::assert_no_kindra_operation(dir.path());
+}
+
+#[test]
+fn commit_refuses_unresolved_native_merge_without_saving_state() {
+    let dir = tempdir().unwrap();
+    native_stop_below_dependent(dir.path(), "merge", false);
+    let repo = Repository::open(dir.path()).unwrap();
+
+    kin_cmd()
+        .args(["commit", "-m", "Merge side"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unmerged"))
+        .stderr(predicates::str::contains("git merge --abort"));
+
+    assert_eq!(repo.state(), git2::RepositoryState::Merge);
+    common::assert_no_kindra_operation(dir.path());
+}
+
+#[test]
+fn commit_refuses_rewriting_flags_during_native_merge() {
+    for args in [
+        vec!["commit", "--amend", "--no-edit"],
+        vec!["commit", "--on", "main", "-m", "elsewhere"],
+        vec!["commit", "-b", "new-branch", "-m", "elsewhere"],
+    ] {
+        let dir = tempdir().unwrap();
+        native_stop_below_dependent(dir.path(), "merge", true);
+        let repo = Repository::open(dir.path()).unwrap();
+        let tip = repo.revparse_single("feature-a").unwrap().id();
+
+        kin_cmd()
+            .args(&args)
+            .current_dir(dir.path())
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("git merge --continue"));
+
+        assert_eq!(repo.state(), git2::RepositoryState::Merge, "{args:?}");
+        assert_eq!(repo.revparse_single("feature-a").unwrap().id(), tip);
+        assert_eq!(current_branch(dir.path()), "feature-a", "{args:?}");
+        common::assert_no_kindra_operation(dir.path());
+    }
+}
+
+#[test]
+fn commit_refuses_native_revert() {
+    let dir = common::setup_repo();
+    common::stop_native_operation(dir.path(), common::NativeStop::Revert, true);
+
+    kin_cmd()
+        .args(["commit", "-m", "revert"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("git revert --continue"));
+    assert_eq!(
+        Repository::open(dir.path()).unwrap().state(),
+        git2::RepositoryState::Revert
+    );
+    common::assert_no_kindra_operation(dir.path());
+}

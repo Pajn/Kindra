@@ -1,7 +1,5 @@
 use crate::commands::find_upstream;
-use crate::rebase_utils::{
-    Operation, RebaseState, passively_reconcile_rebase_state, run_rebase_loop, save_state,
-};
+use crate::rebase_utils::{Operation, RebaseState, run_rebase_loop, save_state};
 use crate::stack::{
     collect_descendants, get_stack_branches_from_merge_base, plan_descendant_reorder,
     visualize_stack,
@@ -36,20 +34,12 @@ pub fn move_cmd(args: &MoveArgs) -> Result<()> {
 }
 
 fn start_move(repo: &Repository, args: &MoveArgs) -> Result<()> {
-    let _lock = crate::state_io::RepoLock::acquire(repo)?;
+    let lock = crate::state_io::RepoLock::acquire(repo)?;
+    crate::operation_state::ensure_idle(repo, &lock, crate::operation_state::Allow::NOTHING)?;
     crate::overrides::with_planned(repo, false, || start_move_locked(repo, args))
 }
 
 fn start_move_locked(repo: &Repository, args: &MoveArgs) -> Result<()> {
-    if passively_reconcile_rebase_state(repo)?
-        || crate::commands::run::run_state_exists(repo)
-        || crate::commands::checkout::hydration_in_progress(repo)
-    {
-        return Err(anyhow!(
-            "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
-        ));
-    }
-
     let head = repo.head()?;
     let head_id = head.peel_to_commit()?.id();
 

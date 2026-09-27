@@ -485,3 +485,142 @@ pub fn add_linked_worktree(repo_root: &Path, branch: &str) -> (tempfile::TempDir
     );
     (parent, path)
 }
+
+/// A native Git operation a test leaves stopped in a worktree.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeStop {
+    Merge,
+    CherryPick,
+    Revert,
+    Am,
+}
+
+/// The file every [`stop_native_operation`] conflict is in.
+#[allow(dead_code)]
+pub const NATIVE_CONFLICT_FILE: &str = "native-conflict.txt";
+
+#[allow(dead_code)]
+fn commit_native_conflict_file(cwd: &Path, content: &str) {
+    fs::write(cwd.join(NATIVE_CONFLICT_FILE), content).unwrap();
+    run_ok("git", &["add", NATIVE_CONFLICT_FILE], cwd);
+    run_ok("git", &["commit", "-m", content.trim()], cwd);
+}
+
+/// Stop `op` on a conflict in [`NATIVE_CONFLICT_FILE`] in the worktree at
+/// `cwd`, after committing "our" side of the conflict to the current branch.
+/// With `resolve`, the conflict is resolved and staged, so only the
+/// operation's final commit is missing. The side commit the operation applies
+/// has no branch, so it never shows up in stack discovery.
+#[allow(dead_code)]
+pub fn stop_native_operation(cwd: &Path, op: NativeStop, resolve: bool) {
+    let output = if op == NativeStop::Revert {
+        commit_native_conflict_file(cwd, "zero\n");
+        commit_native_conflict_file(cwd, "one\n");
+        commit_native_conflict_file(cwd, "two\n");
+        git_command(cwd)
+            .args(["revert", "--no-edit", "HEAD~1"])
+            .output()
+            .unwrap()
+    } else {
+        run_ok("git", &["switch", "-q", "-c", "native-side"], cwd);
+        commit_native_conflict_file(cwd, "side\n");
+        run_ok("git", &["switch", "-q", "-"], cwd);
+        commit_native_conflict_file(cwd, "ours\n");
+        let output = match op {
+            NativeStop::Merge => git_command(cwd)
+                .args(["merge", "--no-edit", "native-side"])
+                .output()
+                .unwrap(),
+            NativeStop::CherryPick => git_command(cwd)
+                .args(["cherry-pick", "native-side"])
+                .output()
+                .unwrap(),
+            _ => {
+                let patch = git_command(cwd)
+                    .args(["format-patch", "-1", "--stdout", "native-side"])
+                    .output()
+                    .unwrap();
+                assert!(patch.status.success());
+                let mut child = git_command(cwd)
+                    .arg("am")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                use std::io::Write;
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(&patch.stdout)
+                    .unwrap();
+                child.wait_with_output().unwrap()
+            }
+        };
+        run_ok("git", &["branch", "-D", "-q", "native-side"], cwd);
+        output
+    };
+    assert!(
+        !output.status.success(),
+        "{op:?} was expected to stop on a conflict\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_ne!(
+        Repository::open(cwd).unwrap().state(),
+        git2::RepositoryState::Clean,
+        "{op:?} did not leave an operation in progress"
+    );
+    if resolve {
+        assert_ne!(
+            op,
+            NativeStop::Am,
+            "git am has no resolved-but-uncommitted state"
+        );
+        fs::write(cwd.join(NATIVE_CONFLICT_FILE), "resolved\n").unwrap();
+        run_ok("git", &["add", NATIVE_CONFLICT_FILE], cwd);
+    }
+}
+
+/// Start a native `git bisect` between `bad` and `good`; Git checks out a
+/// midpoint commit, detaching HEAD.
+#[allow(dead_code)]
+pub fn start_native_bisect(cwd: &Path, bad: &str, good: &str) {
+    run_ok("git", &["bisect", "start", bad, good], cwd);
+    assert_eq!(
+        Repository::open(cwd).unwrap().state(),
+        git2::RepositoryState::Bisect
+    );
+}
+
+/// Persist a paused Kindra operation (a reorder of `branch` stopped
+/// mid-rebase) that reconciliation keeps in place.
+#[allow(dead_code)]
+pub fn write_paused_operation(repo: &Repository, branch: &str) {
+    fs::write(
+        repo.path().join("kindra_rebase_state.json"),
+        format!(
+            r#"{{"operation":"Reorder","original_branch":"{branch}","target_branch":"main",
+            "remaining_branches":[],"in_progress_branch":"{branch}"}}"#
+        ),
+    )
+    .unwrap();
+}
+
+/// Assert no Kindra operation state was persisted in the worktree at `cwd`.
+#[allow(dead_code)]
+pub fn assert_no_kindra_operation(cwd: &Path) {
+    let repo = Repository::open(cwd).unwrap();
+    for name in [
+        "kindra_rebase_state.json",
+        "kindra_run_state.json",
+        "kindra_checkout_state.json",
+    ] {
+        assert!(
+            !repo.path().join(name).exists(),
+            "{name} was persisted by a refused command"
+        );
+    }
+}
