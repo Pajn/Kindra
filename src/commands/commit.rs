@@ -54,16 +54,11 @@ fn ensure_commit_can_finish(
         || parsed.interactive
         || parsed.fixup_target.is_some()
         || parsed.new_branch.is_some()
-        || parsed.git_commit_args.iter().any(|arg| {
-            matches!(
-                arg.as_str(),
-                "--amend" | "-p" | "--patch" | "-o" | "--only" | "-i" | "--include"
-            )
-        })
+        || forwards_non_resolution_commit_flag(&parsed.git_commit_args)
         || has_forwarded_pathspec(&parsed.git_commit_args);
     if rewrites {
         return Err(anyhow!(
-            "{advice} 'kin commit' can also finish it, but only by committing the staged resolution on the current branch (without --on, --fixup, --interactive, --new-branch, --amend, --patch or pathspecs)."
+            "{advice} 'kin commit' can also finish it, but only by committing the staged resolution on the current branch (without --on, --fixup, --interactive, --new-branch, --amend, --all, --patch or pathspecs)."
         ));
     }
     Ok(())
@@ -1562,6 +1557,45 @@ fn has_forwarded_pathspec(args: &[String]) -> bool {
     false
 }
 
+/// Whether the forwarded `git commit` arguments amend, or commit anything other
+/// than exactly what is staged. Short flags may be bundled (`-am`); a bundle
+/// ends at the first short option that takes a value.
+fn forwards_non_resolution_commit_flag(args: &[String]) -> bool {
+    let mut expects_value_for_option = false;
+    for arg in args {
+        if expects_value_for_option {
+            expects_value_for_option = false;
+            continue;
+        }
+        if arg == "--" {
+            return false;
+        }
+        if matches!(
+            arg.as_str(),
+            "--amend" | "--all" | "--patch" | "--only" | "--include"
+        ) {
+            return true;
+        }
+        if let Some(bundle) = arg.strip_prefix('-').filter(|rest| !rest.starts_with('-')) {
+            for (index, flag) in bundle.char_indices() {
+                if matches!(flag, 'a' | 'p' | 'o' | 'i') {
+                    return true;
+                }
+                if matches!(flag, 'm' | 'C' | 'c' | 'F' | 'S' | 't' | 'u') {
+                    // The rest of the bundle is this option's value; a bare
+                    // option takes the next argument instead.
+                    expects_value_for_option =
+                        index + flag.len_utf8() == bundle.len() && option_takes_value(arg);
+                    break;
+                }
+            }
+            continue;
+        }
+        expects_value_for_option = option_takes_value(arg);
+    }
+    false
+}
+
 fn option_takes_value(arg: &str) -> bool {
     if arg.starts_with("--message=")
         || arg.starts_with("--reuse-message=")
@@ -1925,6 +1959,25 @@ fn select_commit_interactive(commits: &[StackCommit]) -> Result<StackCommit> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn non_resolution_commit_flags_are_detected_in_bundles_but_not_in_values() {
+        let detects = |args: &[&str]| {
+            forwards_non_resolution_commit_flag(
+                &args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert!(detects(&["-a", "-m", "msg"]));
+        assert!(detects(&["--all"]));
+        assert!(detects(&["-am", "msg"]));
+        assert!(detects(&["-vp"]));
+        assert!(detects(&["--amend", "--no-edit"]));
+        assert!(!detects(&["-m", "-p"]));
+        assert!(!detects(&["-mall"]));
+        assert!(!detects(&["--message", "--all"]));
+        assert!(!detects(&["-s", "-m", "msg"]));
+        assert!(!detects(&["--", "-a"]));
+    }
+
     use super::*;
 
     fn args(list: &[&str]) -> Vec<String> {

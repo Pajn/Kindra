@@ -6382,6 +6382,9 @@ fn commit_refuses_rewriting_flags_during_native_merge() {
         vec!["commit", "--amend", "--no-edit"],
         vec!["commit", "--on", "main", "-m", "elsewhere"],
         vec!["commit", "-b", "new-branch", "-m", "elsewhere"],
+        vec!["commit", "-a", "-m", "everything"],
+        vec!["commit", "--all", "-m", "everything"],
+        vec!["commit", "-am", "everything"],
     ] {
         let dir = tempdir().unwrap();
         native_stop_below_dependent(dir.path(), "merge", true);
