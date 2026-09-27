@@ -58,7 +58,7 @@ fn ensure_commit_can_finish(
         || has_forwarded_pathspec(&parsed.git_commit_args);
     if rewrites {
         return Err(anyhow!(
-            "{advice} 'kin commit' can also finish it, but only by committing the staged resolution on the current branch (without --on, --fixup, --interactive, --new-branch, --amend, --all, --patch or pathspecs)."
+            "{advice} 'kin commit' can also finish it, but only by committing the staged resolution on the current branch (without --on, --fixup, --interactive, --new-branch, --amend, --all, --patch, --dry-run or pathspecs)."
         ));
     }
     Ok(())
@@ -1557,8 +1557,8 @@ fn has_forwarded_pathspec(args: &[String]) -> bool {
     false
 }
 
-/// Whether the forwarded `git commit` arguments amend, or commit anything other
-/// than exactly what is staged. Short flags may be bundled (`-am`); a bundle
+/// Whether the forwarded `git commit` arguments amend, commit anything other
+/// than exactly what is staged, or commit nothing at all (`--dry-run`). Short flags may be bundled (`-am`); a bundle
 /// ends at the first short option that takes a value.
 fn forwards_non_resolution_commit_flag(args: &[String]) -> bool {
     let mut expects_value_for_option = false;
@@ -1572,7 +1572,7 @@ fn forwards_non_resolution_commit_flag(args: &[String]) -> bool {
         }
         if matches!(
             arg.as_str(),
-            "--amend" | "--all" | "--patch" | "--only" | "--include"
+            "--amend" | "--all" | "--patch" | "--only" | "--include" | "--dry-run"
         ) {
             return true;
         }
