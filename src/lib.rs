@@ -7,6 +7,7 @@
 //! - <https://github.com/Pajn/kindra/blob/main/docs/cli_reference.md>
 
 pub mod commands;
+pub mod config;
 pub mod editor;
 pub mod gh;
 pub mod interaction;
@@ -17,6 +18,7 @@ pub mod rebase_utils;
 pub mod repository;
 pub mod stack;
 pub(crate) mod state_io;
+pub mod trunk;
 pub mod worktree;
 
 pub use commands::CheckoutSubcommand;

@@ -1080,7 +1080,7 @@ fn floating_patch_id_boundary(
     target_id: Oid,
     target_branch: &str,
 ) -> Result<Option<Oid>> {
-    let upstream_name = match crate::commands::find_upstream(repo)? {
+    let upstream_name = match crate::trunk::resolve_trunk(repo)? {
         Some(name) => name,
         None => return Ok(None),
     };
@@ -2399,7 +2399,7 @@ pub fn enumerate_current_fixup_commits(repo: &Repository) -> Result<Vec<StackCom
     if repo.head_detached()? {
         return Ok(Vec::new());
     }
-    let Some(upstream_name) = crate::commands::find_upstream(repo)? else {
+    let Some(upstream_name) = crate::trunk::resolve_trunk(repo)? else {
         return Ok(Vec::new());
     };
     let upstream_id = repo.revparse_single(&upstream_name)?.id();

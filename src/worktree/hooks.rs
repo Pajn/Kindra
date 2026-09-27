@@ -159,6 +159,7 @@ mod tests {
 
     fn sample_config(hook: String) -> WorktreeConfig {
         WorktreeConfig {
+            config_path: PathBuf::from(".git/kindra.toml"),
             root: PathBuf::from(".git/kindra-worktrees"),
             trunk: "main".to_string(),
             hooks: HookListConfig {

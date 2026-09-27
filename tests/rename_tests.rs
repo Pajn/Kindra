@@ -135,7 +135,7 @@ fn refuses_to_rename_to_remote_only_base_name() {
 #[test]
 fn refuses_to_rename_pinned_main_worktree_branch() {
     // A non-trunk branch pinned as the managed main worktree branch in
-    // .git/kindra.toml can't be renamed: Kindra can't rewrite that pin, so a
+    // repository config can't be renamed: Kindra can't rewrite that pin, so a
     // rename would strand it and the next `kin wt main` would recreate a phantom.
     let dir = setup_repo();
     let root = dir.path();
@@ -159,6 +159,37 @@ fn refuses_to_rename_pinned_main_worktree_branch() {
         .stderr(predicates::str::contains(
             "pinned as the managed main worktree branch",
         ));
+
+    assert!(branch_exists(root, "develop"));
+    assert!(!branch_exists(root, "devx"));
+}
+
+#[test]
+fn rename_reports_invalid_worktree_config_instead_of_skipping_the_pin_check() {
+    // An unreadable `[worktrees]` section must not silently disable the pinned
+    // main worktree guard.
+    let dir = setup_repo();
+    let root = dir.path();
+
+    Command::new("git")
+        .args(["branch", "develop"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    common::write_repo_config(
+        root,
+        "[worktrees.main]\nbranch = \"develop\"\nunexpected = true\n",
+    );
+
+    kin_cmd()
+        .current_dir(root)
+        .args(["rename", "develop", "devx"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(format!(
+            "Invalid `worktrees` in repository config at {}",
+            common::repo_config_path(root).display()
+        )));
 
     assert!(branch_exists(root, "develop"));
     assert!(!branch_exists(root, "devx"));

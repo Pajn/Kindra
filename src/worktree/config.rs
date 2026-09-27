@@ -1,9 +1,7 @@
-use crate::commands::find_upstream;
 use crate::worktree::path_resolver::{expand_path_template, normalize_path, temp_template_root};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use git2::{BranchType, Repository};
 use serde::Deserialize;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_ROOT: &str = ".git/kindra-worktrees";
@@ -43,6 +41,9 @@ pub struct TempWorktreeConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorktreeConfig {
+    /// The repository config file these settings come from, for messages that
+    /// point the user at it.
+    pub config_path: PathBuf,
     pub root: PathBuf,
     pub trunk: String,
     pub hooks: HookListConfig,
@@ -55,14 +56,6 @@ pub struct WorktreeConfig {
     /// when the repo has no parent directory, and `add` also accepts an explicit
     /// path that overrides it.
     pub add_path_template: PathBuf,
-}
-
-#[derive(Debug, Deserialize)]
-struct RepoConfigFile {
-    #[serde(default)]
-    upstream_branch: Option<String>,
-    #[serde(default)]
-    worktrees: Option<RawWorktreeConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -162,8 +155,10 @@ pub fn load_worktree_config(repo: &Repository) -> Result<WorktreeConfig> {
             repo.commondir().display()
         )
     })?;
-    let cfg = read_repo_config(repo)?;
-    let raw = cfg.worktrees.unwrap_or_default();
+    let repo_config = crate::config::repo_config(repo)?;
+    let raw = repo_config
+        .section::<RawWorktreeConfig>("worktrees")?
+        .unwrap_or_default();
     let root = resolve_config_path(config_base, raw.root.as_deref().unwrap_or(DEFAULT_ROOT));
     let default_main_path = root.join("main");
     let default_review_path = root.join("review");
@@ -184,14 +179,15 @@ pub fn load_worktree_config(repo: &Repository) -> Result<WorktreeConfig> {
         siblings.join("{branch}")
     };
 
+    // An explicit `worktrees.trunk` is used as written; otherwise the resolved
+    // trunk (which honours `upstream_branch`).
     let trunk = match raw
         .trunk
-        .or(cfg.upstream_branch)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {
         Some(trunk) => trunk,
-        None => find_upstream(repo)?.unwrap_or_else(|| "main".to_string()),
+        None => crate::trunk::resolve_trunk(repo)?.unwrap_or_else(|| "main".to_string()),
     };
 
     let hooks = raw.hooks.map(hook_list).unwrap_or_default();
@@ -246,6 +242,7 @@ pub fn load_worktree_config(repo: &Repository) -> Result<WorktreeConfig> {
         .unwrap_or_else(|| normalize_path(default_add_template));
 
     let config = WorktreeConfig {
+        config_path: repo_config.path().to_path_buf(),
         root: normalize_path(root),
         trunk,
         hooks,
@@ -256,21 +253,6 @@ pub fn load_worktree_config(repo: &Repository) -> Result<WorktreeConfig> {
     };
     validate_config(&config)?;
     Ok(config)
-}
-
-fn read_repo_config(repo: &Repository) -> Result<RepoConfigFile> {
-    let path = repo.commondir().join("kindra.toml");
-    if !path.exists() {
-        return Ok(RepoConfigFile {
-            upstream_branch: None,
-            worktrees: None,
-        });
-    }
-
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read repository config at {}", path.display()))?;
-    toml::from_str(&raw)
-        .with_context(|| format!("Failed to parse repository config at {}", path.display()))
 }
 
 fn resolve_config_path(base: &Path, value: &str) -> PathBuf {
@@ -416,6 +398,66 @@ mod tests {
                 .path_template
                 .ends_with(".git/kindra-worktrees/temp/{branch}")
         );
+    }
+
+    fn repo_with_branch(dir: &TempDir, refname: &str) -> git2::Repository {
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some(refname), &sig, &sig, "initial", &tree, &[])
+            .unwrap();
+        drop(tree);
+        repo
+    }
+
+    #[test]
+    fn default_trunk_is_the_resolved_upstream_branch() {
+        let dir = TempDir::new().unwrap();
+        // Only a remote-tracking `origin/dev` exists; `upstream_branch` resolves
+        // to it, and the main worktree pins the local name.
+        let repo = repo_with_branch(&dir, "refs/remotes/origin/dev");
+        std::fs::write(
+            repo.commondir().join("kindra.toml"),
+            "upstream_branch = \" dev \"\n",
+        )
+        .unwrap();
+
+        let config = load_worktree_config(&repo).unwrap();
+        assert_eq!(config.trunk, "origin/dev");
+        assert_eq!(config.main.branch, "dev");
+    }
+
+    #[test]
+    fn default_trunk_rejects_missing_upstream_branch() {
+        let dir = TempDir::new().unwrap();
+        let repo = repo_with_branch(&dir, "refs/heads/main");
+        std::fs::write(
+            repo.commondir().join("kindra.toml"),
+            "upstream_branch = \"nonexistent\"\n",
+        )
+        .unwrap();
+
+        let err = load_worktree_config(&repo).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Configured upstream branch 'nonexistent'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn explicit_trunk_is_used_as_written() {
+        let dir = TempDir::new().unwrap();
+        let repo = repo_with_branch(&dir, "refs/heads/main");
+        std::fs::write(
+            repo.commondir().join("kindra.toml"),
+            "upstream_branch = \"main\"\n\n[worktrees]\ntrunk = \"release\"\n",
+        )
+        .unwrap();
+
+        let config = load_worktree_config(&repo).unwrap();
+        assert_eq!(config.trunk, "release");
     }
 
     #[test]
