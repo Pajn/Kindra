@@ -2220,6 +2220,7 @@ fn test_commit_on_ancestor_moves_branches_in_and_above_the_range() {
 }
 
 #[test]
+#[cfg(unix)]
 fn test_commit_on_ancestor_pre_start_rebase_failure_rolls_back() {
     // When git refuses the move before starting, nothing moved: the commit comes
     // back off `upper` with its content staged, and no state is left for
@@ -3909,6 +3910,7 @@ fn test_commit_fixup_autosquash_conflict_with_dependents_can_continue() {
 }
 
 #[test]
+#[cfg(unix)]
 fn test_commit_fixup_with_dependents_pre_start_unstaged_refusal_rolls_back() {
     // Without autostash, git refuses to start over the unstaged edit.
     check_fixup_with_dependents_pre_start_failure("--no-autostash", "false", true);
@@ -3922,6 +3924,7 @@ fn test_commit_fixup_no_autostash_overrides_git_rebase_autostash() {
 }
 
 #[test]
+#[cfg(unix)]
 fn test_commit_fixup_with_dependents_pre_start_hook_rejection_rolls_back() {
     // With autostash, git stashes the edit, then the pre-rebase hook refuses.
     check_fixup_with_dependents_pre_start_failure("--autostash", "false", true);
@@ -3931,7 +3934,51 @@ fn test_commit_fixup_with_dependents_pre_start_hook_rejection_rolls_back() {
 /// must still point at the stash entry holding the set-aside changes, so that
 /// `kin abort` can bring them back.
 #[test]
+#[cfg(unix)]
 fn test_commit_fixup_failed_rollback_keeps_the_unrestored_stash_in_state() {
+    // A held lock on the branch ref also blocks the reset.
+    let (dir, stash_ref) = fixup_rollback_with_unrestorable_stash(true);
+    let stashes = git_stdout(dir.path(), &["stash", "list", "--format=%H %gs"]);
+    assert!(
+        stashes.lines().any(|line| line.contains(&stash_ref)),
+        "state points at {stash_ref}, which is not in the stash list:\n{stashes}"
+    );
+}
+
+/// If the rollback itself succeeds but the set-aside changes cannot be put
+/// back, the state stays so that `kin abort` can restore them once the way is
+/// clear.
+#[test]
+#[cfg(unix)]
+fn test_commit_fixup_rollback_keeps_state_until_set_aside_changes_are_restored() {
+    let (dir, _) = fixup_rollback_with_unrestorable_stash(false);
+    // The rollback itself went through: the fixup commit is gone again.
+    assert_eq!(
+        git_stdout(dir.path(), &["log", "-1", "--format=%s"]).trim(),
+        "commit a2"
+    );
+
+    // Clear the edit that blocked the restore, then let abort finish it.
+    run_ok("git", &["checkout", "--", "a2.txt"], dir.path());
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a2.txt")).unwrap(),
+        "unstaged a2"
+    );
+    assert!(git_stdout(dir.path(), &["stash", "list"]).trim().is_empty());
+    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+}
+
+/// Runs `kin commit --fixup` on a branch without dependents while a
+/// pre-rebase hook refuses the rebase and edits the stashed file, so the
+/// set-aside changes cannot be restored during rollback. With
+/// `lock_branch_ref`, the hook also blocks the reset. Returns the stash entry
+/// the saved state points at.
+fn fixup_rollback_with_unrestorable_stash(lock_branch_ref: bool) -> (tempfile::TempDir, String) {
     let (dir, repo) = setup_repo();
     let main_id = repo.revparse_single("main").unwrap().id();
     let main_commit = repo.find_commit(main_id).unwrap();
@@ -3961,12 +4008,14 @@ fn test_commit_fixup_failed_rollback_keeps_the_unrestored_stash_in_state() {
     fs::write(dir.path().join("a2.txt"), "unstaged a2").unwrap();
     run_ok("git", &["config", "rebase.autostash", "false"], dir.path());
 
-    // Refuse the rebase after making both rollback steps fail: an edit to the
-    // stashed file blocks the stash from applying, and a held lock on the
-    // branch ref blocks the reset.
+    let lock = if lock_branch_ref {
+        "touch \"$(git rev-parse --git-dir)/refs/heads/feature-a.lock\"\n"
+    } else {
+        ""
+    };
     fs::write(
         dir.path().join(".git/hooks/pre-rebase"),
-        "#!/bin/sh\nprintf 'hook edit' > a2.txt\ntouch \"$(git rev-parse --git-dir)/refs/heads/feature-a.lock\"\nexit 1\n",
+        format!("#!/bin/sh\nprintf 'hook edit' > a2.txt\n{lock}exit 1\n"),
     )
     .unwrap();
     run_ok("chmod", &["+x", ".git/hooks/pre-rebase"], dir.path());
@@ -3983,22 +4032,23 @@ fn test_commit_fixup_failed_rollback_keeps_the_unrestored_stash_in_state() {
     assert!(!output.status.success(), "the fold should have failed");
     assert!(
         stderr.contains("run 'kin abort'"),
-        "expected the rollback failure to point at kin abort, got:\n{stderr}"
+        "expected the failure to point at kin abort, got:\n{stderr}"
     );
+    fs::remove_file(dir.path().join(".git/hooks/pre-rebase")).unwrap();
+    if lock_branch_ref {
+        fs::remove_file(dir.path().join(".git/refs/heads/feature-a.lock")).unwrap();
+    }
 
     let state: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(dir.path().join(".git/kindra_rebase_state.json"))
-            .expect("the unfinished rollback must keep its state"),
+            .expect("the state must stay until the set-aside changes are back"),
     )
     .unwrap();
     let stash_ref = state["stash_ref"]
         .as_str()
-        .unwrap_or_else(|| panic!("state lost the stash reference: {state}"));
-    let stashes = git_stdout(dir.path(), &["stash", "list", "--format=%H %gs"]);
-    assert!(
-        stashes.lines().any(|line| line.contains(stash_ref)),
-        "state points at {stash_ref}, which is not in the stash list:\n{stashes}"
-    );
+        .unwrap_or_else(|| panic!("state lost the stash reference: {state}"))
+        .to_string();
+    (dir, stash_ref)
 }
 
 /// A fold that git refuses before starting must not leave the saved state
@@ -4133,6 +4183,7 @@ fn check_fixup_with_dependents_pre_start_failure(
 }
 
 #[test]
+#[cfg(unix)]
 fn test_commit_fixup_on_other_branch_unwinds_pre_start_rebase_failure() {
     // Folding into a commit above HEAD takes the checkout path. When git refuses
     // the fold before starting, the user must end up back on their own branch

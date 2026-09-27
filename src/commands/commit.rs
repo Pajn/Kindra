@@ -1624,12 +1624,21 @@ fn unwind_unstarted_rebase(
             .and_then(|()| checkout_branch(&caller_branch))
             .map(|()| restore_set_aside(state)),
     };
-    match unwound.and_then(|restored| clear_state(repo).map(|()| restored)) {
+    // Until the set-aside changes are back, keep the state so `kin abort` can
+    // still restore them.
+    match unwound.and_then(|restored| {
+        if restored {
+            clear_state(repo)
+        } else {
+            save_state(repo, state)
+        }
+        .map(|()| restored)
+    }) {
         Ok(true) => anyhow!(
             "{err:#} The commit was rolled back and your changes were restored as they were."
         ),
         Ok(false) => anyhow!(
-            "{err:#} The commit was rolled back, but your changes could not all be restored; see the warning above for where they are."
+            "{err:#} The commit was rolled back, but your set-aside changes could not be restored (see the warning above). Clear the way, then run 'kin abort' to restore them."
         ),
         Err(unwind_err) => {
             let _ = save_state(repo, state);
