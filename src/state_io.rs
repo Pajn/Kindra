@@ -162,6 +162,17 @@ pub struct RepoLock {
 impl RepoLock {
     /// Acquire the repository lock, failing fast if another `kin` process holds it.
     pub fn acquire(repo: &Repository) -> Result<Self> {
+        Self::try_acquire(repo)?.ok_or_else(|| {
+            anyhow!(
+                "Another 'kin' process is operating on this repository. Wait for it to finish and try again. \
+                 If you are sure no other 'kin' process is running, remove '{}'.",
+                lock_path(repo).display()
+            )
+        })
+    }
+
+    /// Acquire the repository lock, or `None` if another `kin` process holds it.
+    pub fn try_acquire(repo: &Repository) -> Result<Option<Self>> {
         let path = lock_path(repo);
         let file = OpenOptions::new()
             .read(true)
@@ -172,13 +183,9 @@ impl RepoLock {
             .with_context(|| format!("Failed to open Kindra lock file '{}'", path.display()))?;
 
         match file.try_lock_exclusive() {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => Ok(Some(Self { _file: file })),
             // Only genuine lock contention means another process holds the lock.
-            Err(err) if err.kind() == fs2::lock_contended_error().kind() => Err(anyhow!(
-                "Another 'kin' process is operating on this repository. Wait for it to finish and try again. \
-                 If you are sure no other 'kin' process is running, remove '{}'.",
-                path.display()
-            )),
+            Err(err) if err.kind() == fs2::lock_contended_error().kind() => Ok(None),
             // Anything else (unsupported locking, permissions, I/O) is a real error
             // and must be surfaced rather than disguised as contention.
             Err(err) => Err(anyhow::Error::from(err).context(format!(

@@ -161,6 +161,9 @@ fn pr_create_or_update(
     gh::check_gh().context("GitHub CLI check failed")?;
 
     let repo = crate::open_repo()?;
+    // A paused operation has rewritten only part of the stack; publishing
+    // now would push (or merge) a half-rebased stack.
+    crate::operation_state::ensure_idle_now(&repo, crate::operation_state::Allow::PUBLISH)?;
 
     // A single `gh pr list` snapshot serves scope filtering, the flatten-need
     // check, and per-branch processing — instead of ~4 `gh pr view` subprocesses
@@ -557,6 +560,9 @@ fn pr_flatten() -> Result<()> {
     gh::check_gh().context("GitHub CLI check failed")?;
 
     let repo = crate::open_repo()?;
+    // A paused operation has rewritten only part of the stack; publishing
+    // now would push (or merge) a half-rebased stack.
+    crate::operation_state::ensure_idle_now(&repo, crate::operation_state::Allow::PUBLISH)?;
     let (upstream_name, branches_with_upstream) = discover_stack_branches_with_upstream(&repo)?;
 
     if branches_with_upstream.is_empty() {

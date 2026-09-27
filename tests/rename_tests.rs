@@ -342,3 +342,29 @@ fn rename_respects_repository_lock_across_worktrees() {
         .assert()
         .success();
 }
+
+#[test]
+fn rename_refuses_during_native_rebase() {
+    let dir = setup_repo();
+    // A conflicting `git rebase --update-refs` of feature-b also plans to move
+    // feature-a when it finishes, so renaming feature-a now would strand it.
+    run_ok("git", &["switch", "-q", "-c", "other", "main"], dir.path());
+    std::fs::write(dir.path().join("feature-b.txt"), "other").unwrap();
+    run_ok("git", &["add", "feature-b.txt"], dir.path());
+    run_ok("git", &["commit", "-q", "-m", "other"], dir.path());
+    run_ok("git", &["switch", "-q", "feature-b"], dir.path());
+    let rebase = common::git_command(dir.path())
+        .args(["rebase", "--update-refs", "other"])
+        .output()
+        .unwrap();
+    assert!(!rebase.status.success(), "rebase was expected to conflict");
+
+    common::kin_cmd()
+        .current_dir(dir.path())
+        .args(["rename", "feature-a", "renamed"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("git rebase --continue"));
+    assert!(common::branch_exists(dir.path(), "feature-a"));
+    assert!(!common::branch_exists(dir.path(), "renamed"));
+}

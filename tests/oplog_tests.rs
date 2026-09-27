@@ -315,7 +315,7 @@ fn reflog_refuses_when_operation_in_progress() {
         .arg("reflog")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("operation is in progress"));
+        .stderr(predicate::str::contains("operation is already in progress"));
 
     // The pending snapshot is untouched (not consumed into a bogus entry).
     assert!(
@@ -706,4 +706,36 @@ fn abort_with_divergent_state_finalizes_oplog_for_recovery() {
         "abort on divergent state must finalize (not discard) the oplog. Got:\n{}",
         stdout
     );
+}
+
+#[test]
+fn undo_redo_and_reflog_refuse_during_a_native_merge_even_with_force() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    setup_stack_with_advanced_main(root);
+    kin_cmd().current_dir(root).arg("sync").assert().success();
+    common::stop_native_operation(root, common::NativeStop::Merge, true);
+
+    for args in [
+        vec!["undo", "--force"],
+        vec!["redo", "--force"],
+        vec!["reflog"],
+    ] {
+        kin_cmd()
+            .current_dir(root)
+            .args(&args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("git merge --continue"));
+        assert_eq!(
+            Repository::open(root).unwrap().state(),
+            git2::RepositoryState::Merge,
+            "{args:?}"
+        );
+    }
+    let staged = common::git_command(root)
+        .args(["show", &format!(":{}", common::NATIVE_CONFLICT_FILE)])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&staged.stdout), "resolved\n");
 }

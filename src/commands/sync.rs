@@ -1,7 +1,6 @@
 use crate::commands::find_upstream;
 use crate::rebase_utils::{
-    Operation, RebaseState, checkout_branch, clear_state, git_rebase_in_progress,
-    passively_reconcile_rebase_state, save_state,
+    Operation, RebaseState, checkout_branch, clear_state, git_rebase_in_progress, save_state,
 };
 use crate::stack::{
     collect_merged_local_branches, find_sync_boundary, get_stack_branches_from_merge_base,
@@ -35,21 +34,12 @@ pub struct SyncArgs {
 pub fn sync(args: &SyncArgs) -> Result<()> {
     let repo = crate::open_repo()?;
 
-    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+    let lock = crate::state_io::RepoLock::acquire(&repo)?;
+    crate::operation_state::ensure_idle(&repo, &lock, crate::operation_state::Allow::NOTHING)?;
     crate::overrides::with_planned(&repo, false, || sync_locked(&repo, args))
 }
 
 fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
-    if passively_reconcile_rebase_state(repo)?
-        || crate::commands::run::run_state_exists(repo)
-        || crate::commands::checkout::hydration_in_progress(repo)
-    {
-        return Err(anyhow!(
-            "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
-        ));
-    }
-    ensure_no_native_git_operation(repo)?;
-
     let head = repo.head()?;
     let head_id = head.peel_to_commit()?.id();
     let current_branch_name = if !repo.head_detached()? {
@@ -459,21 +449,6 @@ fn ensure_sync_rebase_completed(repo: &git2::Repository, state: &RebaseState) ->
         state.original_branch,
         state.target_branch
     ))
-}
-
-pub(crate) fn ensure_no_native_git_operation(repo: &git2::Repository) -> Result<()> {
-    let git_dir = repo.path();
-    let rebase_in_progress = git_rebase_in_progress(repo);
-    let merge_in_progress = git_dir.join("MERGE_HEAD").exists();
-    let cherry_pick_in_progress = git_dir.join("CHERRY_PICK_HEAD").exists();
-
-    if rebase_in_progress || merge_in_progress || cherry_pick_in_progress {
-        return Err(anyhow!(
-            "A native git operation is in progress. Resolve it first with 'git rebase --continue'/'git rebase --abort', 'git merge --abort', or 'git cherry-pick --continue'/'git cherry-pick --abort'. If this came from a Kindra-managed rebase, use 'kin continue' or 'kin abort'."
-        ));
-    }
-
-    Ok(())
 }
 
 fn resolve_sync_onto(

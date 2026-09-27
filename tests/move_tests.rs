@@ -2542,3 +2542,308 @@ fn move_onto_descendant_allows_merge_before_subtree() {
     assert_eq!(repo.state(), git2::RepositoryState::Clean);
     assert!(!repo.path().join("kindra_rebase_state.json").exists());
 }
+
+/// Kindra's autostash follows `rebase.autostash`; set it in the test repository
+/// so the outcome never depends on the developer's global Git config.
+fn set_repo_autostash(cwd: &Path, enabled: bool) {
+    run_ok(
+        "git",
+        &[
+            "config",
+            "rebase.autostash",
+            if enabled { "true" } else { "false" },
+        ],
+        cwd,
+    );
+}
+
+fn git_path_exists(cwd: &Path, name: &str) -> bool {
+    Repository::open(cwd).unwrap().path().join(name).exists()
+}
+
+#[test]
+fn move_refuses_resolved_native_merge_and_cherry_pick_with_autostash() {
+    for (op, head_file, hint) in [
+        (
+            common::NativeStop::Merge,
+            "MERGE_HEAD",
+            "git merge --continue",
+        ),
+        (
+            common::NativeStop::CherryPick,
+            "CHERRY_PICK_HEAD",
+            "git cherry-pick --continue",
+        ),
+    ] {
+        let dir = common::setup_repo();
+        set_repo_autostash(dir.path(), true);
+        common::stop_native_operation(dir.path(), op, true);
+
+        kin_cmd()
+            .args(["move", "--onto", "main"])
+            .current_dir(dir.path())
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(hint));
+
+        // The resolution is still staged and Git can still finish the operation.
+        assert!(
+            git_path_exists(dir.path(), head_file),
+            "{op:?}: {head_file} lost"
+        );
+        let staged = common::git_command(dir.path())
+            .args(["show", &format!(":{}", common::NATIVE_CONFLICT_FILE)])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&staged.stdout), "resolved\n");
+        common::assert_no_kindra_operation(dir.path());
+    }
+}
+
+#[test]
+fn move_refused_by_unresolved_native_merge_leaves_no_operation_behind() {
+    let dir = common::setup_repo();
+    set_repo_autostash(dir.path(), true);
+    common::stop_native_operation(dir.path(), common::NativeStop::Merge, false);
+
+    kin_cmd()
+        .args(["move", "--onto", "main"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("git merge --abort"));
+
+    common::assert_no_kindra_operation(dir.path());
+    let status = kin_cmd()
+        .arg("status")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(status.status.success());
+    assert!(stdout.contains("No Kindra operation active."), "{stdout}");
+    assert!(!stdout.contains("Move in progress"), "{stdout}");
+}
+
+#[test]
+fn move_refuses_during_native_bisect() {
+    let dir = common::setup_repo();
+    common::start_native_bisect(dir.path(), "feature-b", "main");
+    run_ok("git", &["checkout", "-q", "feature-b"], dir.path());
+
+    kin_cmd()
+        .args(["move", "--onto", "main"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("git bisect reset"));
+    common::assert_no_kindra_operation(dir.path());
+}
+
+/// A move paused on a conflict, whose rebase the user then aborted with Git.
+fn paused_move_without_native_rebase() -> (tempfile::TempDir, Repository) {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let base_id = make_commit(&repo, "refs/heads/main", "file.txt", "base", "initial", &[]);
+    let base = repo.find_commit(base_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/target",
+        "file.txt",
+        "target content",
+        "target commit",
+        &[&base],
+    );
+    make_commit(
+        &repo,
+        "refs/heads/feature",
+        "file.txt",
+        "feature content",
+        "feature commit",
+        &[&base],
+    );
+    run_ok("git", &["checkout", "-q", "-f", "feature"], dir.path());
+    kin_cmd()
+        .args(["move", "--onto", "target"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Resolve conflicts"));
+    run_ok("git", &["rebase", "--abort"], dir.path());
+    let reopened = Repository::open(dir.path()).unwrap();
+    (dir, reopened)
+}
+
+/// Stop `git am` applying target's commit onto the current branch, without
+/// committing anything.
+fn stop_git_am_on_target_patch(cwd: &Path) {
+    let patch = common::git_command(cwd)
+        .args(["format-patch", "-1", "--stdout", "target"])
+        .output()
+        .unwrap();
+    assert!(patch.status.success());
+    let patch_file = tempfile::NamedTempFile::new().unwrap();
+    fs::write(patch_file.path(), &patch.stdout).unwrap();
+    let am = common::git_command(cwd)
+        .args(["am", patch_file.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!am.status.success(), "git am was expected to stop");
+    assert_eq!(
+        Repository::open(cwd).unwrap().state(),
+        git2::RepositoryState::ApplyMailbox
+    );
+}
+
+#[test]
+fn continue_during_git_am_advises_git_am_instead_of_retrying_a_rebase() {
+    let (dir, repo) = paused_move_without_native_rebase();
+    stop_git_am_on_target_patch(dir.path());
+
+    let output = kin_cmd()
+        .arg("continue")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("git am --continue"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("git rebase --continue failed"),
+        "stderr: {stderr}"
+    );
+    // Neither the paused move nor the am was disturbed.
+    assert!(repo.path().join("kindra_rebase_state.json").exists());
+    assert_eq!(repo.state(), git2::RepositoryState::ApplyMailbox);
+
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("git am --abort"));
+    assert!(repo.path().join("kindra_rebase_state.json").exists());
+    assert_eq!(repo.state(), git2::RepositoryState::ApplyMailbox);
+
+    // Once the am is gone, the paused move can be aborted as usual.
+    run_ok("git", &["am", "--abort"], dir.path());
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(!repo.path().join("kindra_rebase_state.json").exists());
+}
+
+#[test]
+fn continue_and_abort_name_git_am_when_only_am_is_in_progress() {
+    let (dir, repo) = paused_move_without_native_rebase();
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    stop_git_am_on_target_patch(dir.path());
+
+    for command in ["continue", "abort"] {
+        let output = kin_cmd()
+            .arg(command)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            text.contains(&format!("git am --{command}")),
+            "{command}: {text}"
+        );
+        assert!(!text.contains("git rebase"), "{command}: {text}");
+        assert_eq!(repo.state(), git2::RepositoryState::ApplyMailbox);
+    }
+}
+
+/// `main` with `feature-a` -> `feature-b` stacked on it, and `other` changing
+/// feature-b's file so rebasing feature-b onto it conflicts. The main
+/// worktree is on feature-a; the linked worktree (`<returned dir>/linked`) is
+/// on feature-b.
+fn stack_with_linked_worktree() -> (tempfile::TempDir, tempfile::TempDir, Repository) {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let base_id = make_commit(&repo, "refs/heads/main", "file.txt", "base", "initial", &[]);
+    let base = repo.find_commit(base_id).unwrap();
+    let a_id = make_commit(&repo, "refs/heads/feature-a", "a.txt", "a", "a", &[&base]);
+    let a = repo.find_commit(a_id).unwrap();
+    make_commit(&repo, "refs/heads/feature-b", "b.txt", "b", "b", &[&a]);
+    make_commit(
+        &repo,
+        "refs/heads/other",
+        "b.txt",
+        "other",
+        "other",
+        &[&base],
+    );
+    run_ok("git", &["checkout", "-q", "-f", "feature-a"], dir.path());
+
+    let linked = tempdir().unwrap();
+    let linked_path = linked.path().join("linked");
+    run_ok(
+        "git",
+        &[
+            "worktree",
+            "add",
+            linked_path.to_str().unwrap(),
+            "feature-b",
+        ],
+        dir.path(),
+    );
+    let reopened = Repository::open(dir.path()).unwrap();
+    (dir, linked, reopened)
+}
+
+#[test]
+fn move_refuses_branch_being_rebased_or_bisected_in_another_worktree() {
+    for activity in ["rebased", "bisected"] {
+        let (dir, linked, repo) = stack_with_linked_worktree();
+        let linked_path = linked.path().join("linked");
+        if activity == "rebased" {
+            let rebase = common::git_command(&linked_path)
+                .args(["rebase", "other"])
+                .output()
+                .unwrap();
+            assert!(!rebase.status.success(), "rebase was expected to conflict");
+        } else {
+            common::start_native_bisect(&linked_path, "feature-b", "main");
+        }
+        // Git lists the linked worktree as detached while it works.
+        let list = common::git_command(dir.path())
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&list.stdout).contains("refs/heads/feature-b"));
+
+        let tips = |repo: &Repository| -> Vec<Oid> {
+            ["feature-a", "feature-b"]
+                .iter()
+                .map(|name| repo.revparse_single(name).unwrap().id())
+                .collect()
+        };
+        let tips_before = tips(&repo);
+        kin_cmd()
+            .args(["move", "--onto", "other"])
+            .current_dir(dir.path())
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(format!(
+                "feature-b is being {activity} in"
+            )));
+        assert_eq!(
+            tips_before,
+            tips(&repo),
+            "{activity}: branches were rewritten"
+        );
+        common::assert_no_kindra_operation(dir.path());
+    }
+}

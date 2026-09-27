@@ -1,5 +1,4 @@
 use crate::commands::find_upstream;
-use crate::rebase_utils::passively_reconcile_rebase_state;
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
 use git2::{BranchType, Repository};
@@ -41,15 +40,14 @@ fn current_branch_name(repo: &Repository) -> Result<String> {
 }
 
 fn rename_branch(repo: &Repository, old_name: &str, new_name: &str) -> Result<()> {
-    let _lock = crate::state_io::RepoLock::acquire(repo)?;
-    if passively_reconcile_rebase_state(repo)?
-        || crate::commands::run::run_state_exists(repo)
-        || crate::commands::checkout::hydration_in_progress(repo)
-    {
-        return Err(anyhow!(
-            "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
-        ));
-    }
+    let lock = crate::state_io::RepoLock::acquire(repo)?;
+    // A native rebase may be about to update this branch (its own or, with
+    // --update-refs, one it carries along), so a rename would strand it.
+    crate::operation_state::ensure_idle(
+        repo,
+        &lock,
+        crate::operation_state::Allow::OVERRIDE_RECOVERY,
+    )?;
 
     // Verify the branch exists before the same-name short-circuit, so
     // `kin rename ghost ghost` reports "not found" instead of a false success.

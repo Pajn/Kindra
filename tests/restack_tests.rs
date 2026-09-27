@@ -3068,3 +3068,21 @@ fn restack_rejects_checked_out_child_before_saving_state() {
     assert_eq!(common::current_branch(dir.path()), "feature-a");
     assert_no_rebase_in_progress(dir.path());
 }
+
+#[test]
+fn restack_refuses_during_native_revert() {
+    let dir = common::setup_repo();
+    common::stop_native_operation(dir.path(), common::NativeStop::Revert, false);
+
+    kin_cmd()
+        .arg("restack")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("git revert --abort"));
+    assert_eq!(
+        Repository::open(dir.path()).unwrap().state(),
+        git2::RepositoryState::Revert
+    );
+    common::assert_no_kindra_operation(dir.path());
+}

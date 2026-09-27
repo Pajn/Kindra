@@ -1441,3 +1441,64 @@ fn force_flag_does_not_bypass_the_base_branch_guard() {
         main_before,
     );
 }
+
+/// A paused operation has rewritten only part of the stack, so pushing now
+/// would publish a half-rebased stack.
+#[test]
+fn push_refuses_while_a_kindra_operation_is_paused() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let main_id = make_commit(&repo, "refs/heads/main", "main.txt", "m", "main", &[]);
+    let main_commit = repo.find_commit(main_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature",
+        "f.txt",
+        "f",
+        "feature",
+        &[&main_commit],
+    );
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+    let remote_dir = tempdir().unwrap();
+    run_ok("git", &["init", "--bare"], remote_dir.path());
+    run_ok(
+        "git",
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    let feature_before = remote_tip(remote_dir.path(), "refs/heads/feature");
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature",
+        "f2.txt",
+        "f2",
+        "half-rebased",
+        &[&head],
+    );
+    common::write_paused_operation(&repo, "feature");
+
+    kin_cmd()
+        .arg("push")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("already in progress"))
+        .stderr(predicates::str::contains("kin continue"));
+    assert_eq!(
+        remote_tip(remote_dir.path(), "refs/heads/feature"),
+        feature_before
+    );
+}

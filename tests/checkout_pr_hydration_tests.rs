@@ -819,3 +819,32 @@ fn checkout_identifies_scp_and_ssh_remote_urls() {
         );
     }
 }
+
+#[test]
+fn checkout_refuses_during_native_revert_and_bisect() {
+    for bisect in [false, true] {
+        let dir = common::setup_repo();
+        if bisect {
+            common::start_native_bisect(dir.path(), "feature-b", "main");
+        } else {
+            common::stop_native_operation(dir.path(), common::NativeStop::Revert, true);
+        }
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let state = repo.state();
+        let head = repo.head().unwrap().target();
+
+        kin_cmd()
+            .args(["co", "feature-a"])
+            .current_dir(dir.path())
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(if bisect {
+                "git bisect reset"
+            } else {
+                "git revert --continue"
+            }));
+        assert_eq!(repo.state(), state);
+        assert_eq!(repo.head().unwrap().target(), head);
+        assert!(!dir.path().join(".git/kindra_checkout_state.json").exists());
+    }
+}

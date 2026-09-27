@@ -2,9 +2,8 @@ use crate::commands::{find_upstream, resolve_rebase_autostash};
 use crate::rebase_utils::{
     RebaseState, StashApplyOutcome, apply_stash, apply_stash_with_outcome, check_worktrees,
     checkout_branch, clear_state, drop_stash, git_rebase_in_progress, local_branch_tips_in_range,
-    passively_reconcile_rebase_state, record_branch_tips_in_range, restore_set_aside_changes,
-    restore_stashed_changes, run_rebase_loop, save_state, stash_push_changes,
-    try_restore_set_aside_changes,
+    record_branch_tips_in_range, restore_set_aside_changes, restore_stashed_changes,
+    run_rebase_loop, save_state, stash_push_changes, try_restore_set_aside_changes,
 };
 use crate::stack::{
     StackBranch, StackCommit, build_parent_maps, collect_descendants, collect_descendants_of_id,
@@ -18,21 +17,54 @@ use std::process::Command;
 
 pub fn commit(args: &[String]) -> Result<()> {
     let repo = crate::open_repo()?;
-    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
-    crate::overrides::with_planned(&repo, false, || commit_locked(&repo, args))
+    let lock = crate::state_io::RepoLock::acquire(&repo)?;
+    let active =
+        crate::operation_state::ensure_idle(&repo, &lock, crate::operation_state::Allow::COMMIT)?;
+    let parsed = parse_commit_args(args)?;
+    ensure_commit_can_finish(&repo, active.native, &parsed)?;
+    crate::overrides::with_planned_during(&repo, false, active.native, || {
+        commit_locked(&repo, parsed)
+    })
 }
 
-fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
-    if passively_reconcile_rebase_state(repo)?
-        || crate::commands::run::run_state_exists(repo)
-        || crate::commands::checkout::hydration_in_progress(repo)
-    {
+/// `kin commit` may make the final commit of a resolved native merge (a merge
+/// commit) or single-commit cherry-pick, exactly as `git commit` would, and
+/// then restack dependents. Anything else would rewrite or switch branches
+/// underneath the native operation, so it is refused before any state exists.
+fn ensure_commit_can_finish(
+    repo: &Repository,
+    native: crate::operation_state::NativeOperation,
+    parsed: &ParsedCommitArgs,
+) -> Result<()> {
+    if native == crate::operation_state::NativeOperation::None {
+        return Ok(());
+    }
+    let advice = native.advice();
+    if repo.index()?.has_conflicts() {
         return Err(anyhow!(
-            "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
+            "{advice} It has unmerged paths: resolve and stage them, then run 'kin commit' to finish it."
         ));
     }
+    if repo.state() == git2::RepositoryState::CherryPickSequence {
+        return Err(anyhow!(
+            "{advice} 'kin commit' finishes only a single-commit cherry-pick."
+        ));
+    }
+    let rewrites = parsed.on_target.is_some()
+        || parsed.interactive
+        || parsed.fixup_target.is_some()
+        || parsed.new_branch.is_some()
+        || forwards_non_resolution_commit_flag(&parsed.git_commit_args)
+        || has_forwarded_pathspec(&parsed.git_commit_args);
+    if rewrites {
+        return Err(anyhow!(
+            "{advice} 'kin commit' can also finish it, but only by committing the staged resolution on the current branch (without --on, --fixup, --interactive, --new-branch, --amend, --all, --patch, --dry-run or pathspecs)."
+        ));
+    }
+    Ok(())
+}
 
-    let mut parsed = parse_commit_args(args)?;
+fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Result<()> {
     let head = match repo.head() {
         Ok(head) => head,
         Err(err) if err.code() == git2::ErrorCode::UnbornBranch => {
@@ -1525,6 +1557,45 @@ fn has_forwarded_pathspec(args: &[String]) -> bool {
     false
 }
 
+/// Whether the forwarded `git commit` arguments amend, commit anything other
+/// than exactly what is staged, or commit nothing at all (`--dry-run`). Short flags may be bundled (`-am`); a bundle
+/// ends at the first short option that takes a value.
+fn forwards_non_resolution_commit_flag(args: &[String]) -> bool {
+    let mut expects_value_for_option = false;
+    for arg in args {
+        if expects_value_for_option {
+            expects_value_for_option = false;
+            continue;
+        }
+        if arg == "--" {
+            return false;
+        }
+        if matches!(
+            arg.as_str(),
+            "--amend" | "--all" | "--patch" | "--only" | "--include" | "--dry-run"
+        ) {
+            return true;
+        }
+        if let Some(bundle) = arg.strip_prefix('-').filter(|rest| !rest.starts_with('-')) {
+            for (index, flag) in bundle.char_indices() {
+                if matches!(flag, 'a' | 'p' | 'o' | 'i') {
+                    return true;
+                }
+                if matches!(flag, 'm' | 'C' | 'c' | 'F' | 'S' | 't' | 'u') {
+                    // The rest of the bundle is this option's value; a bare
+                    // option takes the next argument instead.
+                    expects_value_for_option =
+                        index + flag.len_utf8() == bundle.len() && option_takes_value(arg);
+                    break;
+                }
+            }
+            continue;
+        }
+        expects_value_for_option = option_takes_value(arg);
+    }
+    false
+}
+
 fn option_takes_value(arg: &str) -> bool {
     if arg.starts_with("--message=")
         || arg.starts_with("--reuse-message=")
@@ -1888,6 +1959,25 @@ fn select_commit_interactive(commits: &[StackCommit]) -> Result<StackCommit> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn non_resolution_commit_flags_are_detected_in_bundles_but_not_in_values() {
+        let detects = |args: &[&str]| {
+            forwards_non_resolution_commit_flag(
+                &args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert!(detects(&["-a", "-m", "msg"]));
+        assert!(detects(&["--all"]));
+        assert!(detects(&["-am", "msg"]));
+        assert!(detects(&["-vp"]));
+        assert!(detects(&["--amend", "--no-edit"]));
+        assert!(!detects(&["-m", "-p"]));
+        assert!(!detects(&["-mall"]));
+        assert!(!detects(&["--message", "--all"]));
+        assert!(!detects(&["-s", "-m", "msg"]));
+        assert!(!detects(&["--", "-a"]));
+    }
+
     use super::*;
 
     fn args(list: &[&str]) -> Vec<String> {

@@ -11,6 +11,7 @@ pub mod config;
 pub mod editor;
 pub mod gh;
 pub mod interaction;
+pub(crate) mod operation_state;
 pub mod oplog;
 pub mod overrides;
 pub mod rebase_todo;

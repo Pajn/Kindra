@@ -300,12 +300,12 @@ pub fn discard(repo: &Repository) -> Result<()> {
 /// Revert the most recent recorded operation.
 pub fn undo(force: bool) -> Result<()> {
     let repo = crate::open_repo()?;
-    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+    let lock = crate::state_io::RepoLock::acquire(&repo)?;
+    ensure_no_operation_in_progress(&repo, &lock, crate::operation_state::Allow::NOTHING)?;
     crate::overrides::with_planned(&repo, false, || undo_locked(&repo, force))
 }
 
 fn undo_locked(repo: &git2::Repository, force: bool) -> Result<()> {
-    ensure_no_operation_in_progress(repo)?;
     finalize_inner(repo)?;
 
     let mut log = load_log(repo)?;
@@ -327,12 +327,12 @@ fn undo_locked(repo: &git2::Repository, force: bool) -> Result<()> {
 /// Reapply the most recently undone operation.
 pub fn redo(force: bool) -> Result<()> {
     let repo = crate::open_repo()?;
-    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+    let lock = crate::state_io::RepoLock::acquire(&repo)?;
+    ensure_no_operation_in_progress(&repo, &lock, crate::operation_state::Allow::NOTHING)?;
     crate::overrides::with_planned(&repo, false, || redo_locked(&repo, force))
 }
 
 fn redo_locked(repo: &git2::Repository, force: bool) -> Result<()> {
-    ensure_no_operation_in_progress(repo)?;
     finalize_inner(repo)?;
 
     let mut log = load_log(repo)?;
@@ -353,12 +353,16 @@ fn redo_locked(repo: &git2::Repository, force: bool) -> Result<()> {
 /// Print recent operations, newest first, marking the current position.
 pub fn reflog() -> Result<()> {
     let repo = crate::open_repo()?;
-    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+    let lock = crate::state_io::RepoLock::acquire(&repo)?;
     // Guard before finalizing, exactly like undo/redo: finalizing while an
     // operation is mid-flight (e.g. a sync paused on a conflict) would snapshot
     // the half-applied state as a bogus entry and delete the pending marker,
     // corrupting the log.
-    ensure_no_operation_in_progress(&repo)?;
+    ensure_no_operation_in_progress(
+        &repo,
+        &lock,
+        crate::operation_state::Allow::OVERRIDE_RECOVERY,
+    )?;
     finalize_inner(&repo)?;
 
     let log = load_log(&repo)?;
@@ -722,25 +726,24 @@ fn summarize(op: &str, changes: &BTreeMap<String, Change>) -> String {
 // Repository state helpers.
 // ---------------------------------------------------------------------------
 
-/// True when a Kindra-managed operation (or a raw git rebase) is mid-flight, so
-/// its saved state — and any pending undo snapshot — must survive for the
-/// resuming `kin continue` / `kin abort` process rather than being settled now.
+/// True when a Kindra operation (or the native rebase it stopped in) is
+/// mid-flight, so its saved state — and any pending undo snapshot — must
+/// survive for the resuming `kin continue` / `kin abort` process rather than
+/// being settled now.
 fn operation_in_progress(repo: &Repository) -> bool {
-    crate::rebase_utils::state_path(repo).exists()
-        || crate::commands::run::run_state_exists(repo)
-        || crate::commands::checkout::hydration_in_progress(repo)
+    crate::operation_state::kindra_operation(repo) != crate::operation_state::KindraOperation::None
         || crate::rebase_utils::git_rebase_in_progress(repo)
 }
 
-/// Reject undo/redo while a rebase/split/run operation is mid-flight, since its
-/// half-applied refs are not a coherent state to move away from.
-fn ensure_no_operation_in_progress(repo: &Repository) -> Result<()> {
-    if operation_in_progress(repo) {
-        return Err(anyhow!(
-            "A Kindra operation is in progress. Finish it with 'kin continue' or 'kin abort' first."
-        ));
-    }
-    Ok(())
+/// The gate for undo, redo and reflog. A paused operation's half-applied refs
+/// are not a coherent state to move away from or record, and moving branches
+/// under a native Git operation would destroy its state.
+fn ensure_no_operation_in_progress(
+    repo: &Repository,
+    lock: &crate::state_io::RepoLock,
+    allow: crate::operation_state::Allow,
+) -> Result<()> {
+    crate::operation_state::ensure_idle(repo, lock, allow).map(drop)
 }
 
 fn git(args: &[&str]) -> Result<()> {

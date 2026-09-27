@@ -1,5 +1,4 @@
 use crate::commands::find_upstream;
-use crate::rebase_utils::passively_reconcile_rebase_state;
 use crate::stack::{
     get_stack_branches_from_merge_base, resolve_merge_base, sort_branches_topologically,
 };
@@ -81,20 +80,12 @@ pub(crate) struct RunState {
 
 pub fn run(args: &RunArgs) -> Result<()> {
     let repo = crate::open_repo()?;
-    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+    let lock = crate::state_io::RepoLock::acquire(&repo)?;
+    crate::operation_state::ensure_idle(&repo, &lock, crate::operation_state::Allow::NOTHING)?;
     crate::overrides::with_planned(&repo, false, || run_locked(&repo, args))
 }
 
 fn run_locked(repo: &git2::Repository, args: &RunArgs) -> Result<()> {
-    if passively_reconcile_rebase_state(repo)?
-        || run_state_exists(repo)
-        || crate::commands::checkout::hydration_in_progress(repo)
-    {
-        return Err(anyhow!(
-            "A Kindra operation is already in progress. Use 'kin continue' or 'kin abort'."
-        ));
-    }
-
     let upstream_name = find_upstream(repo)?.ok_or_else(|| {
         anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
     })?;
@@ -194,11 +185,7 @@ pub(crate) fn abort_run(repo: &Repository) -> Result<()> {
 }
 
 pub(crate) fn run_state_path(repo: &Repository) -> PathBuf {
-    repo.path().join("kindra_run_state.json")
-}
-
-pub(crate) fn run_state_exists(repo: &Repository) -> bool {
-    run_state_path(repo).exists()
+    crate::operation_state::PersistedOperation::Run.path(repo)
 }
 
 pub(crate) fn load_run_state(repo: &Repository) -> Result<RunState> {

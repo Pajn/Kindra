@@ -1,7 +1,5 @@
 use crate::commands::{prompt_multi_select, resolve_restack_history_limit};
-use crate::rebase_utils::{
-    Operation, RebaseState, passively_reconcile_rebase_state, run_rebase_loop,
-};
+use crate::rebase_utils::{Operation, RebaseState, run_rebase_loop};
 use anyhow::{Result, anyhow};
 use clap::Args;
 use git2::{BranchType, Commit, Oid, Repository};
@@ -25,20 +23,12 @@ pub struct RestackArgs {
 
 pub fn restack(args: &RestackArgs) -> Result<()> {
     let repo = crate::open_repo()?;
-    let _lock = crate::state_io::RepoLock::acquire(&repo)?;
+    let lock = crate::state_io::RepoLock::acquire(&repo)?;
+    crate::operation_state::ensure_idle(&repo, &lock, crate::operation_state::Allow::NOTHING)?;
     crate::overrides::with_planned(&repo, false, || restack_locked(&repo, args))
 }
 
 fn restack_locked(repo: &git2::Repository, args: &RestackArgs) -> Result<()> {
-    if passively_reconcile_rebase_state(repo)?
-        || crate::commands::run::run_state_exists(repo)
-        || crate::commands::checkout::hydration_in_progress(repo)
-    {
-        return Err(anyhow!(
-            "A Kindra-managed operation is already in progress. Use 'kin continue' or 'kin abort'."
-        ));
-    }
-
     let head = repo.head()?;
     let current_branch_name = head
         .shorthand()

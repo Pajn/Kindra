@@ -971,3 +971,27 @@ fn test_absorb_fork_from_linked_worktree() {
     assert_eq!(repo.find_reference(&anchor).unwrap().target(), Some(fork));
     assert!(!linked.path().join("kindra_rebase_state.json").exists());
 }
+
+#[test]
+fn absorb_refuses_resolved_native_merge_and_keeps_the_resolution_staged() {
+    let dir = common::setup_repo();
+    common::stop_native_operation(dir.path(), common::NativeStop::Merge, true);
+    let repo = Repository::open(dir.path()).unwrap();
+    let head = repo.head().unwrap().target().unwrap();
+
+    kin_cmd()
+        .arg("absorb")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("git merge --continue"));
+
+    assert_eq!(repo.state(), git2::RepositoryState::Merge);
+    assert_eq!(repo.head().unwrap().target().unwrap(), head);
+    let staged = common::git_command(dir.path())
+        .args(["show", &format!(":{}", common::NATIVE_CONFLICT_FILE)])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&staged.stdout), "resolved\n");
+    common::assert_no_kindra_operation(dir.path());
+}

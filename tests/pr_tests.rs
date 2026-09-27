@@ -7481,3 +7481,78 @@ fn pr_created_url_is_clickable_only_in_a_terminal() {
         }
     }
 }
+
+/// `kin pr`, `kin pr flatten` and `kin pr merge` publish the local stack, so
+/// they must refuse while a paused operation has rewritten only part of it —
+/// and `pr merge` must refuse before it merges anything on GitHub.
+#[test]
+fn pr_commands_refuse_while_a_kindra_operation_is_paused() {
+    let (dir, repo) = setup_simple_stack();
+    let remote_dir = dir.path().join("remote.git");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    run_ok("git", &["init", "--bare"], &remote_dir);
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "feature"], dir.path());
+    common::write_paused_operation(&repo, "feature");
+
+    let gh_mock = dir.path().join("gh");
+    std::fs::write(
+        &gh_mock,
+        r#"#!/bin/bash
+printf "%s\n" "$*" >> "$MOCK_GH_LOG"
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"headRefName":"feature","number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[],"baseRefName":"main"}]'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
+    echo '{"number":42,"title":"Feature title","body":"Feature body","url":"https://github.com/test/repo/pull/42","state":"OPEN","labels":[],"reviewRequests":[],"baseRefName":"main"}'
+    exit 0
+fi
+if [[ "$1" == "api" ]] && [[ "$2" == "graphql" ]]; then
+    echo '{"data":{"repository":{"pr0":{"reviewThreads":{"nodes":[]},"reviewRequests":{"nodes":[]},"latestReviews":{"nodes":[{"state":"APPROVED","author":{"login":"alice"}}]},"headRefOid":"deadbeef42","reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}}}}}'
+    exit 0
+fi
+exit 0
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
+    let gh_log = dir.path().join("gh.log");
+
+    for args in [vec!["pr", "merge"], vec!["pr"], vec!["pr", "flatten"]] {
+        kin_cmd()
+            .args(&args)
+            .current_dir(dir.path())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("MOCK_GH_LOG", &gh_log)
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("already in progress"));
+        let log = fs::read_to_string(&gh_log).unwrap_or_default();
+        for publishing in ["pr merge", "pr create", "pr edit"] {
+            assert!(
+                !log.lines().any(|line| line.starts_with(publishing)),
+                "{args:?} ran 'gh {publishing}':\n{log}"
+            );
+        }
+    }
+}

@@ -46,6 +46,9 @@ fn base_push_allowed(repo: &Repository, branch: &str, explicit: &[String]) -> bo
 
 pub fn push(args: &PushArgs) -> Result<()> {
     let repo = crate::open_repo()?;
+    // A paused operation has rewritten only part of the stack; publishing
+    // now would push (or merge) a half-rebased stack.
+    crate::operation_state::ensure_idle_now(&repo, crate::operation_state::Allow::PUBLISH)?;
 
     let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
         anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
