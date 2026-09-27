@@ -81,6 +81,7 @@ fn write_commit_rebase_state_fixture(repo: &Repository, stash_ref: &str) {
         carry_stash_ref: None,
         preserve_content_on_abort: false,
         suppress_editor: false,
+        abort_only: false,
         unstage_on_restore: false,
         autostash: false,
         cleanup_merged_branches: Vec::new(),
@@ -3943,6 +3944,25 @@ fn test_commit_fixup_failed_rollback_keeps_the_unrestored_stash_in_state() {
         stashes.lines().any(|line| line.contains(&stash_ref)),
         "state points at {stash_ref}, which is not in the stash list:\n{stashes}"
     );
+    assert_continue_refuses_rollback_state(dir.path());
+}
+
+/// A rolled-back commit has nothing left to continue: `kin continue` must
+/// refuse and leave the state for `kin abort`.
+fn assert_continue_refuses_rollback_state(dir: &Path) {
+    let head_before = git_stdout(dir, &["rev-parse", "HEAD"]);
+    let output = kin_cmd().arg("continue").current_dir(dir).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "continue should refuse a rolled-back commit, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("kin abort"),
+        "continue should point at kin abort, got:\n{stderr}"
+    );
+    assert_eq!(git_stdout(dir, &["rev-parse", "HEAD"]), head_before);
+    assert!(dir.join(".git/kindra_rebase_state.json").exists());
 }
 
 /// If the rollback itself succeeds but the set-aside changes cannot be put
@@ -3960,6 +3980,7 @@ fn test_commit_fixup_rollback_keeps_state_until_set_aside_changes_are_restored()
 
     // Clear the edit that blocked the restore, then let abort finish it.
     run_ok("git", &["checkout", "--", "a2.txt"], dir.path());
+    assert_continue_refuses_rollback_state(dir.path());
     kin_cmd()
         .arg("abort")
         .current_dir(dir.path())

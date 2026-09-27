@@ -79,6 +79,10 @@ pub struct RebaseState {
     /// commit-message editor).
     #[serde(default)]
     pub suppress_editor: bool,
+    /// Set when the operation was already rolled back but could not finish
+    /// restoring the working tree: only `kin abort` may complete it.
+    #[serde(default)]
+    pub abort_only: bool,
     /// Whether to run `git reset` when returning to the original branch.
     #[serde(default)]
     pub unstage_on_restore: bool,

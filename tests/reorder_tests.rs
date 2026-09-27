@@ -557,6 +557,7 @@ fn reorder_abort_restores_extra_local_refs_moved_by_update_refs() {
         carry_stash_ref: None,
         preserve_content_on_abort: false,
         suppress_editor: false,
+        abort_only: false,
         unstage_on_restore: false,
         autostash: false,
         cleanup_merged_branches: Vec::new(),

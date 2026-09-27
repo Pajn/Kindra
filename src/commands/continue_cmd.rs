@@ -23,6 +23,11 @@ fn continue_cmd_locked(repo: &git2::Repository) -> Result<()> {
         }
         return crate::commands::checkout::continue_hydration(repo);
     }
+    if crate::rebase_utils::load_state(repo).is_ok_and(|state| state.abort_only) {
+        return Err(anyhow!(
+            "The saved operation was already rolled back and only needs its set-aside changes restored. Run 'kin abort' to finish it."
+        ));
+    }
     let rebase_state = reconcile_saved_rebase_state(repo, ReconcileMode::Continue)?;
     let has_rebase_state = rebase_state.is_some();
     let has_run_state = crate::commands::run::run_state_exists(repo);

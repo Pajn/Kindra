@@ -1262,6 +1262,7 @@ fn status_blocks_and_preserves_state_when_active_git_rebase_mismatches_kindra_st
         carry_stash_ref: None,
         preserve_content_on_abort: false,
         suppress_editor: false,
+        abort_only: false,
         unstage_on_restore: false,
         autostash: false,
         cleanup_merged_branches: vec!["feature-b".to_string()],

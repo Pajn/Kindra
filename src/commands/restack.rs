@@ -181,6 +181,7 @@ fn restack_locked(repo: &git2::Repository, args: &RestackArgs) -> Result<()> {
         carry_stash_ref: None,
         preserve_content_on_abort: false,
         suppress_editor: false,
+        abort_only: false,
         unstage_on_restore: false,
         autostash,
         cleanup_merged_branches: Vec::new(),

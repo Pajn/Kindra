@@ -405,6 +405,7 @@ fn commit_locked(repo: &git2::Repository, args: &[String]) -> Result<()> {
             // rather than drop it with the commit.
             preserve_content_on_abort: moving_onto_ancestor,
             suppress_editor: false,
+            abort_only: false,
             unstage_on_restore: switching_branches,
             autostash,
             cleanup_merged_branches: Vec::new(),
@@ -880,6 +881,7 @@ fn commit_on_new_branch(
         carry_stash_ref: None,
         preserve_content_on_abort: false,
         suppress_editor: false,
+        abort_only: false,
         unstage_on_restore: false,
         autostash,
         cleanup_merged_branches: Vec::new(),
@@ -1626,6 +1628,9 @@ fn unwind_unstarted_rebase(
     };
     // Until the set-aside changes are back, keep the state so `kin abort` can
     // still restore them.
+    // Anything saved from here on describes a rolled-back commit, so there is
+    // nothing for `kin continue` to resume.
+    state.abort_only = true;
     match unwound.and_then(|restored| {
         if restored {
             clear_state(repo)
