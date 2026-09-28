@@ -25,7 +25,7 @@
       {
         "kind": "UnstagedOnly",
         "oid": "<kin-commit-on set-aside stash>",
-        "restore": "Plain",
+        "restore": "UnstagedDelta",
         "stash": "<kin-commit-on set-aside>"
       }
     ],

@@ -157,6 +157,16 @@ impl RebaseState {
     }
 }
 
+impl set_aside::Journal for RebaseState {
+    fn set_asides(&mut self) -> &mut SetAsides {
+        &mut self.set_asides
+    }
+
+    fn save(&self, repo: &Repository) -> Result<()> {
+        save_state(repo, self)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReconcileMode {
     Continue,
@@ -1009,7 +1019,7 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         }
         state.autostash = false;
         if let Err(err) = save_state(repo, &state) {
-            set_aside::restore_or_warn(state.set_asides.take_changes());
+            set_aside::unwind(repo, &mut state.set_asides);
             return Err(err);
         }
     }
@@ -1106,7 +1116,7 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         )
     })?;
 
-    restore_state_stash(repo, &mut state)?;
+    set_aside::restore_all(repo, &mut state, set_aside::Phase::Completion)?;
 
     if state.unstage_on_restore {
         unstage_all()?;
@@ -1194,38 +1204,6 @@ fn parse_git_semver(version_output: &str) -> Option<(u64, u64, u64)> {
     Some((numbers[0], numbers[1], numbers[2]))
 }
 
-/// Restore saved changes after returning to the caller, retaining recovery
-/// state on errors and avoiding a second stash apply after conflicts.
-pub fn restore_state_stash(repo: &Repository, state: &mut RebaseState) -> Result<()> {
-    if let Some(changes) = state.set_asides.changes().cloned() {
-        println!("Restoring set-aside changes...");
-        match set_aside::restore(&changes)? {
-            set_aside::Outcome::Applied => {
-                state.set_asides.take_changes();
-                save_state(repo, state)?;
-                if let Err(err) = set_aside::drop_entry(&changes) {
-                    eprintln!("Warning: {}", err);
-                }
-            }
-            set_aside::Outcome::ConflictsLeftInTree => {
-                // The changes are in the tree as conflict markers; a later
-                // `kin continue` must not apply the stash a second time, so
-                // drop it from the state but keep the entry as a backup. Keep
-                // the saved state itself: the operation stays resumable
-                // (`kin continue` finishes its bookkeeping) and abortable
-                // (`kin abort` rolls the branches back).
-                state.set_asides.take_changes();
-                save_state(repo, state)?;
-                return Err(anyhow!(
-                    "Restoring the set-aside changes hit conflicts; resolve the conflict markers in the working tree, then run 'kin continue' to finish (or 'kin abort' to roll the operation back). The original changes are also preserved in stash entry '{}'.",
-                    changes.stash
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{JOURNAL_VERSION, Operation, RebaseState, Replay, parse_git_semver, parse_state};
@@ -1269,12 +1247,12 @@ mod tests {
                 "carry_stash_ref":"kin-commit-on-index-1-3"}}"#
         ))
         .unwrap();
-        let carry = state.set_asides.take_carry().unwrap();
+        let carry = state.set_asides.pop().unwrap();
         assert_eq!(
             (carry.kind, carry.restore, carry.stash.as_str()),
             (Kind::Carry, Restore::WithIndex, "kin-commit-on-index-1-3")
         );
-        let changes = state.set_asides.take_changes().unwrap();
+        let changes = state.set_asides.pop().unwrap();
         assert_eq!(
             (changes.kind, changes.restore, changes.stash.as_str()),
             (Kind::WholeTree, Restore::WithIndex, "kin-absorb-1-2")

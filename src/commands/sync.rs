@@ -218,7 +218,7 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
             state.autostash = false;
         }
         if let Err(err) = save_state(repo, &state) {
-            crate::set_aside::restore_or_warn(state.set_asides.take_changes());
+            crate::set_aside::unwind(repo, &mut state.set_asides);
             return Err(err);
         }
 
@@ -443,7 +443,7 @@ pub(crate) fn finish_sync_after_rebase(
     if let Some(caller) = &state.caller_branch {
         checkout_branch(caller)?;
     }
-    crate::rebase_utils::restore_state_stash(repo, &mut state)?;
+    crate::set_aside::restore_all(repo, &mut state, crate::set_aside::Phase::Completion)?;
     clear_state(repo)?;
 
     let checkout_fallback = state
@@ -841,7 +841,7 @@ fn sync_tree(
     }
     state.autostash = false;
     if let Err(err) = save_state(repo, &state) {
-        crate::set_aside::restore_or_warn(state.set_asides.take_changes());
+        crate::set_aside::unwind(repo, &mut state.set_asides);
         return Err(err);
     }
     crate::rebase_utils::run_rebase_loop(repo, state)

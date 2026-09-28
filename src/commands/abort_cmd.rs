@@ -1,9 +1,8 @@
 use crate::operation_state::{KindraOperation, NativeOperation};
 use crate::rebase_utils::{
-    checkout_branch, git_rebase_in_progress, load_state, owned_tip_state_matches, save_state,
-    unstage_all,
+    checkout_branch, git_rebase_in_progress, load_state, owned_tip_state_matches, unstage_all,
 };
-use crate::set_aside::{self, Outcome};
+use crate::set_aside::{self, Phase};
 use anyhow::{Result, anyhow};
 use git2::Oid;
 use std::collections::HashMap;
@@ -129,7 +128,7 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
                 // below then moves the ref out from underneath, so the
                 // discarded content reappears as staged changes.
                 checkout_branch(&parsed_state.original_branch)?;
-                apply_abort_stash(repo, &mut parsed_state)?;
+                set_aside::restore_all(repo, &mut parsed_state, Phase::Abort)?;
                 restore_original_branch_tips(&parsed_state.original_tip_map)?;
                 if restore_branch != parsed_state.original_branch {
                     checkout_branch(&restore_branch)?;
@@ -137,7 +136,7 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
             } else {
                 restore_original_branch_tips(&parsed_state.original_tip_map)?;
                 checkout_branch(&restore_branch)?;
-                apply_abort_stash(repo, &mut parsed_state)?;
+                set_aside::restore_all(repo, &mut parsed_state, Phase::Abort)?;
             }
 
             if parsed_state.unstage_on_restore {
@@ -225,74 +224,6 @@ impl Drop for AbortOplogSettle<'_> {
             SettleAction::Finalize => crate::oplog::finalize(self.repo),
         };
     }
-}
-
-/// Restore the state's set-asides (if any), newest first, each as its record
-/// says, and settle them in the saved state. A conflicted apply keeps the
-/// entry as a backup and warns instead of failing the abort.
-fn apply_abort_stash(
-    repo: &git2::Repository,
-    parsed_state: &mut crate::rebase_utils::RebaseState,
-) -> Result<()> {
-    apply_abort_carry_stash(repo, parsed_state)?;
-    let Some(changes) = parsed_state.set_asides.changes().cloned() else {
-        return Ok(());
-    };
-    match set_aside::restore(&changes)? {
-        Outcome::Applied => {
-            parsed_state.set_asides.take_changes();
-            save_state(repo, parsed_state)?;
-            if let Err(err) = set_aside::drop_entry(&changes) {
-                eprintln!("Warning: {}", err);
-            }
-        }
-        Outcome::ConflictsLeftInTree => {
-            // The changes are in the tree as conflict markers; do not reapply,
-            // keep the entry as a backup.
-            parsed_state.set_asides.take_changes();
-            save_state(repo, parsed_state)?;
-            eprintln!(
-                "Warning: restoring the set-aside changes left conflicts in the working tree; the stash entry '{}' was preserved as a backup.",
-                changes.stash
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Restore the staged changes `kin commit --on` was carrying across a branch
-/// switch when it was interrupted mid-carry.
-///
-/// The carry is a handful of git commands long and clears its set-aside on every
-/// path out of it, so one here means the process died inside that window.
-/// The entry was taken on the branch this abort has just returned to, so it
-/// applies cleanly there; it goes back *before* the operation's own stash, whose
-/// snapshot also contains this content and would otherwise deliver it unstaged.
-fn apply_abort_carry_stash(
-    repo: &git2::Repository,
-    parsed_state: &mut crate::rebase_utils::RebaseState,
-) -> Result<()> {
-    let Some(carry) = parsed_state.set_asides.carry().cloned() else {
-        return Ok(());
-    };
-    match set_aside::restore(&carry)? {
-        Outcome::Applied => {
-            parsed_state.set_asides.take_carry();
-            save_state(repo, parsed_state)?;
-            if let Err(err) = set_aside::drop_entry(&carry) {
-                eprintln!("Warning: {}", err);
-            }
-        }
-        Outcome::ConflictsLeftInTree => {
-            parsed_state.set_asides.take_carry();
-            save_state(repo, parsed_state)?;
-            eprintln!(
-                "Warning: restoring the staged changes left conflicts in the working tree; the stash entry '{}' was preserved as a backup.",
-                carry.stash
-            );
-        }
-    }
-    Ok(())
 }
 
 fn restore_original_branch_tips(original_tip_map: &HashMap<String, String>) -> Result<()> {

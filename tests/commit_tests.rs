@@ -1868,6 +1868,64 @@ fn test_commit_on_other_stack_default_just_commits() {
     assert_no_staged_changes(dir.path());
 }
 
+/// Committing onto a branch of another stack takes the staged changes away
+/// from the caller: they land on the target, and the caller gets back only
+/// what was unstaged. The unstaged changes were set aside with the staged ones
+/// still in the tree, so restoring that whole snapshot would leave the
+/// committed content behind on the caller as a modification.
+#[test]
+fn test_commit_on_other_stack_leaves_only_the_unstaged_changes_on_the_caller() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let root_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
+    let root = repo.find_commit(root_id).unwrap();
+    let s1a_id = make_commit(&repo, "refs/heads/s1-a", "s1.txt", "s1-a", "s1-a", &[&root]);
+    let s1a = repo.find_commit(s1a_id).unwrap();
+    make_commit(&repo, "refs/heads/s2-a", "s2.txt", "s2-a", "s2-a", &[&root]);
+    repo.set_head("refs/heads/s1-a").unwrap();
+    repo.checkout_tree(
+        s1a.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+
+    // Staged: an edit to a tracked file and a new file, both for `s2-a`.
+    stage(dir.path(), "root.txt", "root, edited on s2-a");
+    stage(dir.path(), "cross.txt", "cross stack commit");
+    // Unstaged: an edit that stays on the caller.
+    fs::write(dir.path().join("s1.txt"), "s1-a, unstaged").unwrap();
+
+    kin_commit(dir.path())
+        .args(["--on", "s2-a", "-m", "cross stack commit"])
+        .assert()
+        .success();
+
+    assert_eq!(current_branch(dir.path()), "s1-a");
+    assert_eq!(
+        git_stdout(dir.path(), &["show", "s2-a:root.txt"]),
+        "root, edited on s2-a"
+    );
+    assert_eq!(
+        git_stdout(dir.path(), &["show", "s2-a:cross.txt"]),
+        "cross stack commit"
+    );
+    // Only the unstaged edit came back; the committed content did not.
+    assert_eq!(
+        git_stdout(
+            dir.path(),
+            &["status", "--porcelain", "--untracked-files=all"]
+        ),
+        " M s1.txt\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("s1.txt")).unwrap(),
+        "s1-a, unstaged"
+    );
+    assert_eq!(git_stdout(dir.path(), &["stash", "list"]), "");
+    assert!(!rebase_state_file(dir.path()).exists());
+}
+
 #[test]
 fn test_commit_on_conflict_and_continue_restores_original_context() {
     let (dir, repo) = setup_repo();
@@ -2230,6 +2288,79 @@ fn test_commit_on_ancestor_moves_commit_without_switching_branches() {
     );
     assert!(!rebase_state_file(repo_path).exists());
     assert_eq!(git_stdout(repo_path, &["stash", "list"]).trim(), "");
+}
+
+/// Restoring the set-aside changes when the move onto an ancestor finishes
+/// completes the operation the same way `kin continue` does: a conflicted
+/// restore leaves the changes in the tree as conflict markers, keeps the
+/// stash entry as a backup and the operation resumable, and a later
+/// `kin continue` finishes without applying the entry a second time.
+#[test]
+#[cfg(unix)]
+fn test_commit_on_ancestor_conflicted_restore_finishes_with_continue() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    repo_init(repo_path);
+    setup_diverged_line_stack(repo_path);
+
+    edit_line(repo_path, 20, "20-staged");
+    run_ok("git", &["add", "f.txt"], repo_path);
+    edit_line(repo_path, 35, "35-unstaged");
+    // Once the move has rewritten `upper`, commit an edit to the line the
+    // set-aside change touches, so restoring it conflicts.
+    let hook = repo_path.join(".git/hooks/post-rewrite");
+    fs::write(
+        &hook,
+        "#!/bin/sh\n[ \"$1\" = rebase ] || exit 0\n\
+         sed 's/^35$/35-hook/' f.txt > f.tmp && mv f.tmp f.txt\n\
+         git commit -qam 'hook edit' </dev/null\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = kin_cmd()
+        .current_dir(repo_path)
+        .args(["commit", "--on", "lower", "-m", "onto lower"])
+        .output()
+        .unwrap();
+    fs::remove_file(&hook).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("hit conflicts") && stderr.contains("kin continue"),
+        "{stderr}"
+    );
+    assert_eq!(file_line(repo_path, "lower", 20), "20-staged");
+    let backup = git_stdout(repo_path, &["stash", "list"]);
+    assert_eq!(backup.lines().count(), 1, "the entry is kept as a backup");
+    // The changes are in the tree, so the journal no longer records them.
+    assert!(journal_set_asides(repo_path).is_empty());
+
+    write_numbered_file(
+        repo_path,
+        &[
+            (5, "5-lower"),
+            (20, "20-staged"),
+            (30, "30-upper"),
+            (35, "35-resolved"),
+        ],
+    );
+    run_ok("git", &["add", "f.txt"], repo_path);
+    kin_cmd()
+        .current_dir(repo_path)
+        .arg("continue")
+        .assert()
+        .success();
+
+    assert!(!rebase_state_file(repo_path).exists());
+    assert_eq!(current_branch(repo_path), "upper");
+    let content = fs::read_to_string(repo_path.join("f.txt")).unwrap();
+    assert!(
+        content.contains("35-resolved") && !content.contains("<<<<<<<"),
+        "{content}"
+    );
+    assert_eq!(git_stdout(repo_path, &["stash", "list"]), backup);
 }
 
 /// The replay rewrites everything between the target and HEAD, and the rebase
@@ -5545,12 +5676,13 @@ fn test_continue_recovers_from_failed_pick_commit_during_fold() {
 /// from under the user.
 ///
 /// `--amend` puts this on the branch-switching path, where the unstaged edit is
-/// set aside *before* the commit, so restoring it afterwards has to contend with
-/// what landed in between. (A plain `--on` an ancestor branch never switches and
-/// sets the edit aside after committing, so the same overlap resolves quietly —
-/// `test_commit_on_ancestor_keeps_an_overlapping_unstaged_edit` covers that.)
+/// set aside *before* the commit. Only what was unstaged comes back, so its
+/// overlap with the committed line alone resolves quietly; a hook edits the
+/// same line while `upper` is restacked, which the restore cannot resolve.
 #[test]
+#[cfg(unix)]
 fn test_commit_on_conflicted_stash_restore_stays_resumable() {
+    use std::os::unix::fs::PermissionsExt;
     let dir = tempdir().unwrap();
     let repo_path = dir.path();
     let repo = repo_init(repo_path);
@@ -5583,11 +5715,20 @@ fn test_commit_on_conflicted_stash_restore_stays_resumable() {
     );
 
     // Stage a change destined for 'lower', with an overlapping unstaged edit
-    // that gets set aside. After the commit lands and 'upper' is restacked,
-    // restoring the set-aside edit conflicts with the committed line.
+    // that gets set aside. Once 'upper' is restacked onto the commit, a hook
+    // edits the same line there, so restoring the set-aside edit conflicts.
     fs::write(repo_path.join("f.txt"), "from-commit\nline2\n").unwrap();
     run_ok("git", &["add", "f.txt"], repo_path);
     fs::write(repo_path.join("f.txt"), "unstaged-edit\nline2\n").unwrap();
+    let hook = repo_path.join(".git/hooks/post-rewrite");
+    fs::write(
+        &hook,
+        "#!/bin/sh\n[ \"$1\" = rebase ] || exit 0\n\
+         printf 'hook-edit\\nline2\\n' > f.txt\n\
+         git commit -qam 'hook edit' </dev/null\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
 
     let mut cmd = kin_cmd();
     let output = cmd
@@ -5602,6 +5743,7 @@ fn test_commit_on_conflicted_stash_restore_stays_resumable() {
         ])
         .output()
         .unwrap();
+    fs::remove_file(&hook).unwrap();
     assert!(
         !output.status.success(),
         "the conflicted stash restore must surface as an error\nstdout:\n{}\nstderr:\n{}",

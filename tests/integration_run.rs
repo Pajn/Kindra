@@ -316,6 +316,74 @@ fn run_autostash_restored_after_continue_on_failure_run() {
     );
 }
 
+/// A run keeps no journal to resume, so when its set-aside changes come back
+/// conflicted they are in the tree as conflict markers: the warning must say
+/// so and name the backup entry, not advise applying the stash again.
+#[test]
+fn run_autostash_conflicted_restore_names_the_backup() {
+    let dir = setup_run_repo();
+    fs::write(dir.path().join("base.txt"), "dirty").unwrap();
+
+    let output = kin_cmd()
+        .arg("run")
+        .arg("--command")
+        .arg(
+            "[ \"$KINDRA_BRANCH\" = feature-b ] || exit 0; \
+             echo committed > base.txt && git commit -qam 'run edit'",
+        )
+        .arg("--autostash")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let backup = git_stdout(dir.path(), &["stash", "list", "--format=%gs"]);
+    let backup = backup.split_once(": ").map_or(backup.as_str(), |(_, m)| m);
+    assert!(
+        stderr.contains(&format!(
+            "Warning: restoring the set-aside changes left conflicts in the working tree; the stash entry '{backup}' was preserved as a backup."
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("git stash pop"), "{stderr}");
+    assert!(
+        fs::read_to_string(dir.path().join("base.txt"))
+            .unwrap()
+            .contains("<<<<<<<")
+    );
+    assert!(!state_file(dir.path(), StateFile::Run).exists());
+}
+
+/// When the set-aside changes cannot be applied at all, the run still ends
+/// without a journal, so the warning spells out how to recover the entry.
+#[test]
+fn run_autostash_unrestorable_changes_come_with_recovery_steps() {
+    let dir = setup_run_repo();
+    fs::write(dir.path().join("base.txt"), "dirty").unwrap();
+
+    let output = kin_cmd()
+        .arg("run")
+        .arg("--command")
+        .arg("[ \"$KINDRA_BRANCH\" = feature-b ] || exit 0; echo in the way > base.txt")
+        .arg("--autostash")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let entry = git_stdout(dir.path(), &["stash", "list", "--format=%gs"]);
+    let entry = entry.split_once(": ").map_or(entry.as_str(), |(_, m)| m);
+    assert!(
+        stderr.contains(&format!(
+            "Warning: could not restore the set-aside changes: Failed to apply stashed changes from '{entry}'. They are still saved on the stash stack, labeled `{entry}`. Recover them manually: locate it with `git stash list`, then `git stash apply <ref>` (and `git stash drop <ref>` once applied)."
+        )),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("base.txt")).unwrap(),
+        "in the way\n"
+    );
+    assert!(!state_file(dir.path(), StateFile::Run).exists());
+}
+
 /// `setup_run_repo`'s stack plus a branch forking off `feature-a`, so HEAD's line
 /// of descent (`feature-a`, `feature-b`) is a strict subset of the component.
 /// HEAD is left on `feature-b`, from which `feature-c` is invisible by default.

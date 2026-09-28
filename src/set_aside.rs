@@ -7,6 +7,11 @@
 //! the entry and the stash commit, so the entry is found again even after
 //! other stashes were pushed on top of it, and says how the paused
 //! operation's completion and abort restore it.
+//!
+//! How a restore that does not go cleanly is handled follows the [`Phase`] of
+//! the operation's lifecycle it happens in, not the command:
+//! [`restore_all`] applies that policy to a journal's set-asides and
+//! [`restore`] to a single one.
 
 use anyhow::{Result, anyhow};
 use git2::Repository;
@@ -36,6 +41,12 @@ pub enum Restore {
     /// to a plain apply, with a warning, only when the attempt left the tree
     /// untouched.
     WithIndex,
+    /// Completion brings back only what was unstaged when the changes were
+    /// set aside: the difference between the entry's index and its working
+    /// tree, applied plainly. For unstaged-only set-asides, whose entry also
+    /// holds the staged changes the operation commits. Abort, which undoes
+    /// that commit, applies the whole entry plainly instead.
+    UnstagedDelta,
 }
 
 /// One set-aside, as a journal records it.
@@ -81,28 +92,25 @@ impl SetAsides {
         self.0.push(set_aside);
     }
 
+    /// The set-aside restored next.
+    pub fn newest(&self) -> Option<&SetAside> {
+        self.0.last()
+    }
+
+    /// Remove and return [`SetAsides::newest`].
+    pub fn pop(&mut self) -> Option<SetAside> {
+        self.0.pop()
+    }
+
     /// The operation's own set-aside: the whole tree or the unstaged changes.
     pub fn changes(&self) -> Option<&SetAside> {
         self.0.iter().rev().find(|s| s.kind != Kind::Carry)
     }
 
-    /// Remove and return [`SetAsides::changes`].
-    pub fn take_changes(&mut self) -> Option<SetAside> {
-        self.take(|kind| kind != Kind::Carry)
-    }
-
-    /// The staged changes being carried across a branch switch.
-    pub fn carry(&self) -> Option<&SetAside> {
-        self.0.iter().rev().find(|s| s.kind == Kind::Carry)
-    }
-
-    /// Remove and return [`SetAsides::carry`].
+    /// Remove and return the staged changes being carried across a branch
+    /// switch.
     pub fn take_carry(&mut self) -> Option<SetAside> {
-        self.take(|kind| kind == Kind::Carry)
-    }
-
-    fn take(&mut self, matches: impl Fn(Kind) -> bool) -> Option<SetAside> {
-        let index = self.0.iter().rposition(|s| matches(s.kind))?;
+        let index = self.0.iter().rposition(|s| s.kind == Kind::Carry)?;
         Some(self.0.remove(index))
     }
 
@@ -144,15 +152,47 @@ impl SetAsides {
     }
 }
 
-/// How an apply that did not fail ended.
+/// Where in an operation's lifecycle a set-aside is restored. The phase, not
+/// the command, decides what happens when the restore does not go cleanly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Phase {
+    /// The operation finished its work and restores what it set aside. A
+    /// conflicted restore leaves the conflict markers in the tree and keeps
+    /// the operation resumable and abortable; a restore that cannot apply
+    /// keeps the record and fails, naming the stash entry.
+    Completion,
+    /// `kin abort` rolled the operation back. A conflicted restore warns; one
+    /// that cannot apply fails and keeps the journal.
+    Abort,
+    /// A command that could not start or finish rolls itself back. Restoring
+    /// is best-effort, with the staged state: any problem is a warning that
+    /// names the stash entry, and the record stays in the journal (if there
+    /// is one) until the changes are back.
+    Unwind,
+    /// A command that keeps no resumable journal (`kin run`, `kin split`)
+    /// restores its set-aside when it ends. Any problem is a warning that
+    /// names the stash entry and how to recover it.
+    NonResumable,
+}
+
+/// How restoring one set-aside ended.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Outcome {
-    /// The stash applied cleanly (staged state restored when requested).
-    Applied,
-    /// The apply merged the stash into the working tree but hit conflicts:
-    /// the changes ARE in the tree as conflict markers, so the stash must not
-    /// be applied again, but the entry should be preserved as a backup.
-    ConflictsLeftInTree,
+    /// The changes are back and the entry was dropped.
+    Restored,
+    /// The changes are in the tree as conflict markers, so the entry must not
+    /// be applied again; it is kept as a backup.
+    ConflictsLeft { backup: String },
+    /// The changes are not back, and the entry still holds them. `reason`
+    /// says why and names the entry.
+    NotRestored { reason: String },
+}
+
+/// A saved record of an operation that holds set-asides.
+pub trait Journal {
+    fn set_asides(&mut self) -> &mut SetAsides;
+    /// Persist the journal after one of its set-asides settled.
+    fn save(&self, repo: &Repository) -> Result<()>;
 }
 
 /// A stash message no other set-aside has: `name`, the process id and a
@@ -208,8 +248,8 @@ pub fn take_tracked(
 /// the operation. `name` names the entry. Returns `None` when there was
 /// nothing to set aside.
 ///
-/// Completion and abort restore unstaged-only changes plainly, and the whole
-/// tree or a carry with their staged state.
+/// Completion restores only what was unstaged of unstaged-only changes, and the
+/// whole tree or a carry with their staged state.
 pub fn take(repo: &Repository, kind: Kind, name: &str) -> Result<Option<SetAside>> {
     let message = stash_message(name)?;
     let mut cmd = Command::new("git");
@@ -236,7 +276,7 @@ pub fn take(repo: &Repository, kind: Kind, name: &str) -> Result<Option<SetAside
     }
 
     let restore = match kind {
-        Kind::UnstagedOnly => Restore::Plain,
+        Kind::UnstagedOnly => Restore::UnstagedDelta,
         Kind::WholeTree | Kind::Carry => Restore::WithIndex,
     };
     // `git stash push` exits 0 without creating an entry when there is nothing
@@ -267,123 +307,293 @@ pub fn from_message(kind: Kind, stash: String, restore: Restore) -> SetAside {
     }
 }
 
-/// Restore `set_aside` as the journal says ([`SetAside::restore`]). The entry
-/// is kept; drop it with [`drop_entry`] once the outcome is settled.
-pub fn restore(set_aside: &SetAside) -> Result<Outcome> {
-    apply_with_outcome(set_aside, set_aside.restore == Restore::WithIndex)
+/// Restore `journal`'s set-asides newest first, as `phase` dictates.
+///
+/// A set-aside leaves the journal once its changes are back in the tree,
+/// cleanly or as conflict markers, and Completion and Abort save the journal
+/// each time; Unwind and NonResumable never save it. Restoring stops at the
+/// first set-aside that does not come back cleanly (Abort alone goes on past
+/// conflicts): an older one could overlap it (the carry of `kin commit --on`
+/// is also part of its unstaged changes' entry).
+///
+/// Returns the first outcome that was not [`Outcome::Restored`], or
+/// `Restored`. Completion fails on any such outcome, and Abort when a
+/// set-aside could not be applied; the other phases only warn.
+pub fn restore_all(repo: &Repository, journal: &mut impl Journal, phase: Phase) -> Result<Outcome> {
+    let saves = matches!(phase, Phase::Completion | Phase::Abort);
+    if phase == Phase::Completion && journal.set_asides().newest().is_some() {
+        println!("Restoring set-aside changes...");
+    }
+    let mut conflicted = None;
+    while let Some(set_aside) = journal.set_asides().newest().cloned() {
+        let outcome = restore(repo, &set_aside, phase);
+        if !matches!(outcome, Outcome::NotRestored { .. }) {
+            journal.set_asides().pop();
+            if saves {
+                journal.save(repo)?;
+            }
+        }
+        match (&outcome, phase) {
+            (Outcome::Restored, _) => continue,
+            (Outcome::ConflictsLeft { backup }, Phase::Completion) => {
+                return Err(anyhow!(
+                    "Restoring {} hit conflicts; resolve the conflict markers in the working tree, then run 'kin continue' to finish (or 'kin abort' to roll the operation back). The original changes are also preserved in stash entry '{backup}'.",
+                    set_aside.what()
+                ));
+            }
+            (Outcome::NotRestored { reason }, Phase::Completion) => {
+                return Err(anyhow!(
+                    "{reason} Once that is resolved, run 'kin continue' to restore them, or 'kin abort' to roll the operation back."
+                ));
+            }
+            (Outcome::NotRestored { reason }, Phase::Abort) => {
+                return Err(anyhow!(
+                    "{reason} Once that is resolved, run 'kin abort' again to restore them."
+                ));
+            }
+            // Abort leaves nothing behind to restore the rest later, so it
+            // still tries them: one that cannot apply over the conflicts
+            // fails the abort and keeps the journal.
+            (Outcome::ConflictsLeft { .. }, Phase::Abort) => conflicted = Some(outcome),
+            _ => return Ok(outcome),
+        }
+    }
+    Ok(conflicted.unwrap_or(Outcome::Restored))
 }
 
-/// Apply `set_aside` plainly (its changes come back unstaged), failing on any
-/// conflict. The entry is kept.
-pub fn apply(set_aside: &SetAside) -> Result<()> {
-    let resolved_ref = resolve(set_aside)?;
-    let status = Command::new("git")
-        .arg("stash")
-        .arg("apply")
-        .arg(&resolved_ref)
-        .status()?;
-    if !status.success() {
+/// Restore every set-aside in `set_asides` while unwinding a command,
+/// newest first, whether or not a journal records them: [`restore_all`] in
+/// [`Phase::Unwind`], which never saves and never fails.
+pub fn unwind(repo: &Repository, set_asides: &mut SetAsides) -> Outcome {
+    struct Unsaved<'a>(&'a mut SetAsides);
+    impl Journal for Unsaved<'_> {
+        fn set_asides(&mut self) -> &mut SetAsides {
+            self.0
+        }
+        fn save(&self, _: &Repository) -> Result<()> {
+            Ok(())
+        }
+    }
+    restore_all(repo, &mut Unsaved(set_asides), Phase::Unwind).unwrap_or_else(|err| {
+        Outcome::NotRestored {
+            reason: format!("{err:#}"),
+        }
+    })
+}
+
+/// Restore one set-aside in `phase` and drop its entry once the changes are
+/// back cleanly. The phase picks how it is applied (the record's
+/// [`Restore`], except that Unwind always tries to bring the staged state
+/// back and Abort applies an unstaged-only entry whole) and, in Abort, Unwind
+/// and NonResumable, prints the warning for an outcome that is not clean.
+/// Completion, and Abort's failure, are reported by the caller.
+pub fn restore(repo: &Repository, set_aside: &SetAside, phase: Phase) -> Outcome {
+    let how = match (phase, set_aside.restore) {
+        (Phase::Unwind, _) => Restore::WithIndex,
+        (Phase::Abort, Restore::UnstagedDelta) => Restore::Plain,
+        (_, restore) => restore,
+    };
+    let outcome = attempt(repo, set_aside, how).unwrap_or_else(|err| Outcome::NotRestored {
+        reason: format!("{err:#}"),
+    });
+    let what = set_aside.what();
+    match (&outcome, phase) {
+        (Outcome::Restored, _)
+        | (_, Phase::Completion)
+        | (Outcome::NotRestored { .. }, Phase::Abort) => {}
+        (Outcome::ConflictsLeft { backup }, _) => eprintln!(
+            "Warning: restoring {what} left conflicts in the working tree; the stash entry '{backup}' was preserved as a backup."
+        ),
+        (Outcome::NotRestored { reason }, Phase::Unwind) => eprintln!(
+            "Warning: could not restore {what}; they remain in stash entry '{}'. {reason}",
+            set_aside.stash
+        ),
+        (Outcome::NotRestored { reason }, Phase::NonResumable) => eprintln!(
+            "Warning: could not restore {what}: {reason} They are still saved on the stash stack, labeled `{}`. Recover them manually: locate it with `git stash list`, then `git stash apply <ref>` (and `git stash drop <ref>` once applied).",
+            set_aside.stash
+        ),
+    }
+    outcome
+}
+
+impl SetAside {
+    /// What the set-aside holds, for messages.
+    fn what(&self) -> &'static str {
+        match self.kind {
+            Kind::Carry => "the staged changes",
+            Kind::WholeTree | Kind::UnstagedOnly => "the set-aside changes",
+        }
+    }
+}
+
+/// Apply `set_aside` as `how` says, and drop its entry once it applied
+/// cleanly. An error means the changes are not back.
+fn attempt(repo: &Repository, set_aside: &SetAside, how: Restore) -> Result<Outcome> {
+    let reference = resolve(set_aside)?;
+    // Derive revisions from the stash commit's id: `stash@{N}` names whichever
+    // entry is at N when each Git command runs.
+    let commit = git_output(&["rev-parse", "--verify", &reference])?;
+    // Git applies the tracked changes before it restores the untracked files,
+    // so an untracked file already in the way leaves a half-applied entry that
+    // a retry would apply twice. Refuse before touching anything instead.
+    let in_the_way = untracked_in_the_way(repo, &commit)?;
+    if !in_the_way.is_empty() {
+        return Ok(Outcome::NotRestored {
+            reason: format!(
+                "Stash entry '{}' would restore untracked files that already exist in the working tree ({}), so nothing was restored. Move them out of the way first.",
+                set_aside.stash,
+                in_the_way.join(", ")
+            ),
+        });
+    }
+    let outcome = match how {
+        Restore::Plain => apply(&reference, false, set_aside)?,
+        Restore::WithIndex => apply_with_index(&reference, set_aside)?,
+        Restore::UnstagedDelta => apply(&unstaged_delta(&commit)?, false, set_aside)?,
+    };
+    if outcome == Outcome::Restored
+        && let Err(err) = drop_entry(set_aside)
+    {
+        eprintln!("Warning: {err}");
+    }
+    Ok(outcome)
+}
+
+/// Apply a stash with its recorded index state (`--index`) so previously
+/// staged hunks come back staged. Distinguishes a conflicted merge (stash
+/// content delivered as conflict markers — retrying would double-apply) from
+/// an apply that failed before touching the tree.
+fn apply_with_index(reference: &str, set_aside: &SetAside) -> Result<Outcome> {
+    let before = status_porcelain()?;
+    if let Some(outcome) = try_apply(reference, true, set_aside)? {
+        return Ok(outcome);
+    }
+    // `--index` failures come in shapes: the working-tree merge ran and left
+    // conflict markers (handled above: retrying any apply would stack the
+    // stash on top of itself), a partial application without conflicts, or a
+    // refusal before touching anything. Only a provably untouched tree can
+    // safely fall back to a plain apply.
+    if status_porcelain()? != before {
         return Err(anyhow!(
-            "Failed to apply stashed changes from '{}'. Resolve conflicts and run 'kin continue' or 'kin abort'.",
+            "git stash apply --index failed after partially applying stash '{}'. The stash entry is preserved; clean up the partial application and restore it manually with 'git stash apply --index'.",
             set_aside.stash
         ));
     }
-    Ok(())
+    eprintln!(
+        "Warning: could not restore the staged state of the set-aside changes; restoring them unstaged."
+    );
+    apply(reference, false, set_aside)
 }
 
-/// Apply `set_aside` plainly and drop it, best-effort and silently. Used on
-/// error paths where no saved state will restore it later, so the user's
-/// changes aren't stranded in the stash list; a failed apply keeps the entry.
-pub fn restore_quietly(set_aside: Option<SetAside>) {
-    let Some(set_aside) = set_aside else {
-        return;
-    };
-    if apply(&set_aside).is_ok() {
-        let _ = drop_entry(&set_aside);
-    }
+/// `git stash apply [--index] <reference>`, failing unless it applied cleanly
+/// or left conflicts.
+fn apply(reference: &str, index: bool, set_aside: &SetAside) -> Result<Outcome> {
+    try_apply(reference, index, set_aside)?.ok_or_else(|| {
+        anyhow!(
+            "Failed to apply stashed changes from '{}'.",
+            set_aside.stash
+        )
+    })
 }
 
-/// Best-effort restore of `set_aside` with its staged state on an error path,
-/// whatever its record says. Drops the entry only on a clean apply; a
-/// conflicted or failed apply keeps it and warns where the changes are.
-/// Returns whether the changes came back cleanly (or there were none).
-pub fn restore_or_warn(set_aside: Option<SetAside>) -> bool {
-    let Some(set_aside) = set_aside else {
-        return true;
-    };
-    match apply_with_outcome(&set_aside, true) {
-        Ok(Outcome::Applied) => {
-            let _ = drop_entry(&set_aside);
-            true
-        }
-        Ok(Outcome::ConflictsLeftInTree) => {
-            eprintln!(
-                "Warning: restoring the set-aside changes left conflicts in the working tree; the stash entry '{}' was preserved as a backup.",
-                set_aside.stash
-            );
-            false
-        }
-        Err(_) => {
-            eprintln!(
-                "Warning: could not restore the set-aside changes; they remain in stash entry '{}'.",
-                set_aside.stash
-            );
-            false
-        }
+/// `git stash apply [--index] <reference>`: `None` when it failed without
+/// leaving conflicts.
+fn try_apply(reference: &str, index: bool, set_aside: &SetAside) -> Result<Option<Outcome>> {
+    let mut git = Command::new("git");
+    git.arg("stash").arg("apply");
+    if index {
+        git.arg("--index");
     }
-}
-
-/// Apply a stash, optionally restoring its recorded index state (`--index`) so
-/// previously staged hunks come back staged. Distinguishes a conflicted merge
-/// (stash content delivered as conflict markers — retrying would double-apply)
-/// from an apply that failed before touching the tree.
-fn apply_with_outcome(set_aside: &SetAside, restore_index: bool) -> Result<Outcome> {
-    let resolved_ref = resolve(set_aside)?;
-    if restore_index {
-        let before = status_porcelain()?;
-        let status = Command::new("git")
-            .arg("stash")
-            .arg("apply")
-            .arg("--index")
-            .arg(&resolved_ref)
-            .status()?;
-        if status.success() {
-            return Ok(Outcome::Applied);
-        }
-        // `--index` failures come in shapes: the working-tree merge ran and
-        // left conflict markers (retrying any apply would stack the stash on
-        // top of itself), a partial application without conflicts (e.g.
-        // untracked files restored before the failure), or a refusal before
-        // touching anything. Only a provably untouched tree can safely fall
-        // back to a plain apply.
-        if crate::rebase_utils::unmerged_paths_exist()? {
-            return Ok(Outcome::ConflictsLeftInTree);
-        }
-        if status_porcelain()? != before {
-            return Err(anyhow!(
-                "git stash apply --index failed after partially applying stash '{}'. The stash entry is preserved; clean up the partial application and restore it manually with 'git stash apply --index'.",
-                set_aside.stash
-            ));
-        }
-        eprintln!(
-            "Warning: could not restore the staged state of the set-aside changes; restoring them unstaged."
-        );
-    }
-    let status = Command::new("git")
-        .arg("stash")
-        .arg("apply")
-        .arg(&resolved_ref)
-        .status()?;
-    if status.success() {
-        return Ok(Outcome::Applied);
+    if git.arg(reference).status()?.success() {
+        return Ok(Some(Outcome::Restored));
     }
     if crate::rebase_utils::unmerged_paths_exist()? {
-        return Ok(Outcome::ConflictsLeftInTree);
+        return Ok(Some(Outcome::ConflictsLeft {
+            backup: set_aside.stash.clone(),
+        }));
     }
-    Err(anyhow!(
-        "Failed to apply stashed changes from '{}'. Resolve conflicts and run 'kin continue' or 'kin abort'.",
-        set_aside.stash
-    ))
+    Ok(None)
+}
+
+/// A stash-shaped commit holding only what was unstaged in the stash at
+/// `stash` (a commit id): its base is the stash's index, and its own index is that same
+/// state, so a plain apply merges in the index-to-worktree difference (and
+/// the untracked files) and nothing that was staged.
+fn unstaged_delta(stash: &str) -> Result<String> {
+    let index = format!("{stash}^2");
+    let base = git_output(&[
+        "commit-tree",
+        &format!("{index}^{{tree}}"),
+        "-p",
+        &index,
+        "-m",
+        "kin: set-aside index",
+    ])?;
+    let mut args = vec![
+        "commit-tree".to_string(),
+        format!("{stash}^{{tree}}"),
+        "-p".to_string(),
+        index,
+        "-p".to_string(),
+        base,
+    ];
+    if let Some(untracked) = untracked_commit(stash)? {
+        args.extend(["-p".to_string(), untracked]);
+    }
+    args.extend([
+        "-m".to_string(),
+        "kin: set-aside unstaged changes".to_string(),
+    ]);
+    git_output(&args.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// The commit holding the stash's untracked files, if it has any.
+fn untracked_commit(stash: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--quiet", "--verify"])
+        .arg(format!("{stash}^3"))
+        .output()?;
+    Ok(output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string()))
+}
+
+/// The stash's untracked files that already exist in the working tree.
+fn untracked_in_the_way(repo: &Repository, stash: &str) -> Result<Vec<String>> {
+    let Some(untracked) = untracked_commit(stash)? else {
+        return Ok(Vec::new());
+    };
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| anyhow!("Cannot restore set-aside changes in a bare repository."))?;
+    let output = Command::new("git")
+        .args(["ls-tree", "-r", "-z", "--name-only", &untracked])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Failed to list the untracked files of the set-aside changes."
+        ));
+    }
+    Ok(output
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .filter(|path| workdir.join(path).symlink_metadata().is_ok())
+        .collect())
+}
+
+fn git_output(args: &[&str]) -> Result<String> {
+    let output = Command::new("git").args(args).output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git {} failed: {}",
+            args.first().copied().unwrap_or_default(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// Machine-readable snapshot of the working tree and index state, for
@@ -399,7 +609,7 @@ fn status_porcelain() -> Result<Vec<u8>> {
 }
 
 /// Drop `set_aside`'s stash entry.
-pub fn drop_entry(set_aside: &SetAside) -> Result<()> {
+fn drop_entry(set_aside: &SetAside) -> Result<()> {
     let resolved_ref = resolve(set_aside)?;
     let status = Command::new("git")
         .arg("stash")
@@ -527,16 +737,16 @@ mod tests {
                 Restore::Plain
             ))
         );
-        assert_eq!(set_asides.0.last(), set_asides.carry());
+        assert_eq!(set_asides.newest().map(|s| s.kind), Some(Kind::Carry));
         assert_eq!(
-            set_asides.take_carry(),
+            set_asides.pop(),
             Some(set_aside(
                 Kind::Carry,
                 "kin-commit-on-index-1-3",
                 Restore::WithIndex
             ))
         );
-        assert!(set_asides.take_changes().is_some());
+        assert_eq!(set_asides.pop().map(|s| s.kind), Some(Kind::UnstagedOnly));
         assert!(set_asides.is_empty());
     }
 

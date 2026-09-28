@@ -431,38 +431,23 @@ fn apply_split(
         if let Err(rollback_err) = head_snapshot.restore(repo) {
             eprintln!("Warning: rollback of HEAD was incomplete: {rollback_err:#}");
         }
-        restore_split_autostash(set_aside);
+        restore_split_autostash(repo, set_aside);
         // The undo guard in `split` finalizes on return: if rollback fully
         // restored the pre-split refs it records nothing; if it was incomplete,
         // the residual changes become an undoable entry.
         return Err(err.context("kin split was aborted and rolled back"));
     }
 
-    restore_split_autostash(set_aside);
+    restore_split_autostash(repo, set_aside);
     Ok(())
 }
 
-/// Pop the autostash taken by [`apply_split`] back onto the current HEAD. On
-/// conflict it is left on the stash stack (with a warning) rather than lost.
-fn restore_split_autostash(set_aside: Option<crate::set_aside::SetAside>) {
-    let Some(set_aside) = set_aside else {
-        return;
-    };
-    let stash_ref = &set_aside.stash;
-    if crate::set_aside::apply(&set_aside).is_err() {
-        // `split` is not resumable, so the generic apply guidance ("run kin
-        // continue / kin abort") doesn't apply here. Point the user straight at
-        // the stash instead.
-        eprintln!(
-            "Warning: could not reapply your autostashed working-tree changes. They are \
-             still saved on the stash stack, labeled `{stash_ref}`. Recover them manually: \
-             locate it with `git stash list`, then `git stash apply <ref>` (and \
-             `git stash drop <ref>` once applied)."
-        );
-        return;
-    }
-    if let Err(err) = crate::set_aside::drop_entry(&set_aside) {
-        eprintln!("Warning: {err}");
+/// Restore the autostash taken by [`apply_split`] onto the current HEAD.
+/// `split` is not resumable, so a restore that does not go cleanly keeps the
+/// entry and points the user straight at it.
+fn restore_split_autostash(repo: &Repository, set_aside: Option<crate::set_aside::SetAside>) {
+    if let Some(set_aside) = set_aside {
+        crate::set_aside::restore(repo, &set_aside, crate::set_aside::Phase::NonResumable);
     }
 }
 

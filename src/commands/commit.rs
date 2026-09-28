@@ -3,7 +3,7 @@ use crate::rebase_utils::{
     RebaseState, check_worktrees, checkout_branch, clear_state, git_rebase_in_progress,
     local_branch_tips_in_range, record_branch_tips_in_range, run_rebase_loop, save_state,
 };
-use crate::set_aside::{self, SetAside};
+use crate::set_aside::{self, Outcome, Phase, SetAside};
 use crate::stack::{
     StackBranch, StackCommit, build_parent_maps, collect_descendants, collect_descendants_of_id,
     collect_sub_stack_from_id, enumerate_fixup_commits, enumerate_stack_commits,
@@ -482,7 +482,7 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
         if pre_commit_state_required && let Err(err) = save_state(repo, &state) {
             // Persisting failed, so no later `kin continue`/`abort` knows about
             // the stash; pop it back rather than stranding the user's changes.
-            set_aside::restore_quietly(state.set_asides.take_changes());
+            set_aside::unwind(repo, &mut state.set_asides);
             return Err(err);
         }
 
@@ -581,7 +581,7 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
                 &mut state.original_tip_map,
             )?;
             if let Err(err) = save_state(repo, &state) {
-                set_aside::restore_quietly(state.set_asides.take_changes());
+                set_aside::unwind(repo, &mut state.set_asides);
                 return Err(err.context(
                     "The commit was created on this branch but the move could not be started; it is still at HEAD.",
                 ));
@@ -649,7 +649,7 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
             }
 
             if move_state_required {
-                restore_autostash(repo, &mut state)?;
+                set_aside::restore_all(repo, &mut state, Phase::Completion)?;
                 clear_state(repo)?;
                 return Ok(());
             }
@@ -686,7 +686,7 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
                 if let Err(err) = save_state(repo, &state) {
                     // Persisting failed; pop the stash back rather than leaving
                     // the user's unstaged changes stranded.
-                    set_aside::restore_quietly(state.set_asides.take_changes());
+                    set_aside::unwind(repo, &mut state.set_asides);
                     return Err(err);
                 }
             }
@@ -752,7 +752,7 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
             }
 
             if autosquash_state_required {
-                restore_autostash(repo, &mut state)?;
+                set_aside::restore_all(repo, &mut state, Phase::Completion)?;
                 clear_state(repo)?;
             }
         }
@@ -947,7 +947,7 @@ fn commit_on_new_branch(
         .set_asides
         .extend(stash_non_staged_changes(repo).with_context(|| inserted_note.clone())?);
     if let Err(err) = save_state(repo, &state) {
-        set_aside::restore_quietly(state.set_asides.take_changes());
+        set_aside::unwind(repo, &mut state.set_asides);
         return Err(err.context(inserted_note));
     }
 
@@ -1658,27 +1658,6 @@ fn option_takes_value(arg: &str) -> bool {
     )
 }
 
-/// Reapply the changes set aside in `state` (if any), drop the entry, and only
-/// then clear the set-aside and `in_progress_branch` and persist.
-///
-/// The ordering matters: the apply runs *before* the saved state stops
-/// referencing the stash. If it fails, the on-disk state still points at the
-/// stash, so `kin abort` can recover the user's changes instead of orphaning
-/// them. `save_state` already persists the set-aside before the autosquash
-/// rebase, so no state is lost on the failure path.
-fn restore_autostash(repo: &Repository, state: &mut RebaseState) -> Result<()> {
-    let Some(changes) = state.set_asides.changes().cloned() else {
-        return Ok(());
-    };
-    set_aside::apply(&changes)?;
-    if let Err(err) = set_aside::drop_entry(&changes) {
-        eprintln!("Warning: {}", err);
-    }
-    state.set_asides.take_changes();
-    state.in_progress_branch = None;
-    save_state(repo, state)
-}
-
 /// Undo the commit of a fixup or `--on` move whose rebase git refused before
 /// starting (e.g. a rejecting `pre-rebase` hook, or unstaged changes without
 /// autostash).
@@ -1698,45 +1677,41 @@ fn unwind_unstarted_rebase(
     let target = target_old_head_id.to_string();
     // The state keeps naming the stash until its changes are back, so a
     // rollback that stops partway still leaves `kin abort` able to find them.
-    let restore_set_aside = |state: &mut RebaseState| {
-        let restored = set_aside::restore_or_warn(state.set_asides.changes().cloned());
-        if restored {
-            state.set_asides.take_changes();
-        }
-        restored
-    };
     let unwound = match state.caller_branch.clone() {
         // In place: the set-aside stash (if any) is based on the new commit, so
         // it goes back first; the soft reset then returns the commit's content
         // to the index.
         None => {
-            let restored = restore_set_aside(state);
-            run_git(&["reset", "--soft", &target]).map(|()| restored)
+            let outcome = set_aside::unwind(repo, &mut state.set_asides);
+            run_git(&["reset", "--soft", &target]).map(|()| outcome)
         }
         // Checkout path: the stash taken on the caller branch before the switch
         // holds the staged changes as well as the non-staged ones, so the fixup
         // commit can be dropped outright and the stash applied back on its base.
         Some(caller_branch) => run_git(&["reset", "--hard", &target])
             .and_then(|()| checkout_branch(&caller_branch))
-            .map(|()| restore_set_aside(state)),
+            .map(|()| set_aside::unwind(repo, &mut state.set_asides)),
     };
     // Until the set-aside changes are back, keep the state so `kin abort` can
     // still restore them.
     // Anything saved from here on describes a rolled-back commit, so there is
     // nothing for `kin continue` to resume.
     state.abort_only = true;
-    match unwound.and_then(|restored| {
-        if restored {
+    match unwound.and_then(|outcome| {
+        if state.set_asides.is_empty() {
             clear_state(repo)
         } else {
             save_state(repo, state)
         }
-        .map(|()| restored)
+        .map(|()| outcome)
     }) {
-        Ok(true) => anyhow!(
+        Ok(Outcome::Restored) => anyhow!(
             "{err:#} The commit was rolled back and your changes were restored as they were."
         ),
-        Ok(false) => anyhow!(
+        Ok(Outcome::ConflictsLeft { .. }) => anyhow!(
+            "{err:#} The commit was rolled back, but restoring your set-aside changes left conflicts in the working tree (see the warning above)."
+        ),
+        Ok(Outcome::NotRestored { .. }) => anyhow!(
             "{err:#} The commit was rolled back, but your set-aside changes could not be restored (see the warning above). Clear the way, then run 'kin abort' to restore them."
         ),
         Err(unwind_err) => {
@@ -1809,7 +1784,8 @@ fn carry_staged_changes_onto(
 
     state.set_asides.push(carry_stash.clone());
     if let Err(err) = save_state(repo, state) {
-        set_aside::restore_or_warn(state.set_asides.take_carry());
+        state.set_asides.take_carry();
+        set_aside::restore(repo, &carry_stash, Phase::Unwind);
         return Err(err);
     }
 
@@ -1817,7 +1793,10 @@ fn carry_staged_changes_onto(
         // Nothing moved, so put the staged content back on the branch it was
         // taken from and leave the rest of the state for `kin abort`. Nothing
         // was committed either, so there is nothing for `kin continue` to do.
-        if set_aside::restore_or_warn(Some(carry_stash)) {
+        if !matches!(
+            set_aside::restore(repo, &carry_stash, Phase::Unwind),
+            Outcome::NotRestored { .. }
+        ) {
             state.set_asides.take_carry();
         }
         state.abort_only = true;
@@ -1827,16 +1806,12 @@ fn carry_staged_changes_onto(
         ));
     }
 
-    match set_aside::restore(&carry_stash) {
-        Ok(set_aside::Outcome::Applied) => {
+    match set_aside::restore(repo, &carry_stash, Phase::Completion) {
+        Outcome::Restored => {
             state.set_asides.take_carry();
-            save_state(repo, state)?;
-            if let Err(err) = set_aside::drop_entry(&carry_stash) {
-                eprintln!("Warning: {}", err);
-            }
-            Ok(())
+            save_state(repo, state)
         }
-        Ok(set_aside::Outcome::ConflictsLeftInTree) => {
+        Outcome::ConflictsLeft { .. } => {
             // A real conflict between the staged change and the target branch —
             // the one case a switch genuinely cannot carry. The stash entry still
             // holds the change, so discard the conflicted merge and unwind the
@@ -1846,86 +1821,46 @@ fn carry_staged_changes_onto(
             //
             // Each set-aside stays in the state until it is back, and the state
             // is cleared only once all of them are; otherwise it is kept, with
-            // nothing left to continue, so `kin abort` restores the rest.
-            let unwound = unwind_carry_to_caller(state, &carry_stash, &caller_branch).and_then(
-                |()| {
-                    let Some(changes) = state.set_asides.changes().cloned() else {
-                        return Ok(());
-                    };
-                    let outcome = set_aside::restore(&changes)?;
-                    // Conflict markers mean the changes are in the tree: they
-                    // must not be applied again, so the record goes either way.
-                    state.set_asides.take_changes();
-                    match outcome {
-                        set_aside::Outcome::Applied => {
-                            if let Err(err) = set_aside::drop_entry(&changes) {
-                                eprintln!("Warning: {}", err);
-                            }
-                            Ok(())
-                        }
-                        set_aside::Outcome::ConflictsLeftInTree => Err(anyhow!(
-                            "restoring them left conflicts in the working tree; the stash entry '{}' was preserved as a backup",
-                            changes.stash
-                        )),
-                    }
-                },
-            );
+            // nothing left to continue, so `kin abort` restores the rest. The
+            // carry is newest, so it goes back first, onto the branch it was
+            // taken on.
+            let unwound = discard_conflicted_carry(&caller_branch)
+                .map(|()| set_aside::unwind(repo, &mut state.set_asides));
             let err = anyhow!(
                 "The staged changes conflict with '{}', so committing them there would leave conflicts to resolve. Restack this branch onto '{}' first, or move the overlapping changes by hand.",
                 target_branch,
                 target_branch
             );
-            match unwound {
-                Ok(()) => {
+            let unwind_err = match unwound {
+                Ok(Outcome::Restored) => {
                     clear_state(repo)?;
-                    Err(err)
+                    return Err(err);
                 }
-                Err(unwind_err) => {
-                    state.abort_only = true;
-                    save_state(repo, state)?;
-                    Err(err.context(format!(
-                        "Additionally, restoring the changes on '{caller_branch}' did not complete ({unwind_err:#}). Clear the way, then run 'kin abort' to restore them."
-                    )))
-                }
-            }
+                Ok(_) => anyhow!("see the warning above"),
+                Err(unwind_err) => unwind_err,
+            };
+            state.abort_only = true;
+            save_state(repo, state)?;
+            Err(err.context(format!(
+                "Additionally, restoring the changes on '{caller_branch}' did not complete ({unwind_err:#}). Clear the way, then run 'kin abort' to restore them."
+            )))
         }
-        Err(err) => Err(err.context(
+        Outcome::NotRestored { reason } => Err(anyhow!(reason).context(
             "Failed to move the staged changes onto the target branch. Use 'kin abort' to restore original state.",
         )),
     }
 }
 
-/// Undo a conflicted carry: drop the conflicted merge from the tree, return to
-/// `caller_branch`, and re-apply `carry_stash` there — its base, so it applies
-/// cleanly. The carry leaves `state` once it is back in the tree, and its entry
-/// is dropped only once it applied cleanly (a conflicted apply keeps it as a
-/// backup, as `kin abort` does).
-fn unwind_carry_to_caller(
-    state: &mut RebaseState,
-    carry_stash: &SetAside,
-    caller_branch: &str,
-) -> Result<()> {
+/// Drop a conflicted carry from the tree and return to `caller_branch`, where
+/// the carry applies cleanly again.
+fn discard_conflicted_carry(caller_branch: &str) -> Result<()> {
     let status = Command::new("git").args(["reset", "--hard"]).status()?;
     if !status.success() {
         return Err(anyhow!(
             "Failed to discard the conflicted changes from the working tree."
         ));
     }
-    checkout_branch(caller_branch)?;
-    let outcome = set_aside::restore(carry_stash)?;
-    state.set_asides.take_carry();
-    match outcome {
-        set_aside::Outcome::Applied => {
-            if let Err(err) = set_aside::drop_entry(carry_stash) {
-                eprintln!("Warning: {}", err);
-            }
-            Ok(())
-        }
-        set_aside::Outcome::ConflictsLeftInTree => Err(anyhow!(
-            "restoring them left conflicts in the working tree; the stash entry '{}' was preserved as a backup",
-            carry_stash.stash
-        )),
-    }
+    checkout_branch(caller_branch)
 }
 
 fn stash_non_staged_changes(repo: &Repository) -> Result<Option<SetAside>> {
