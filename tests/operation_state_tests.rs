@@ -572,12 +572,22 @@ fn paused_reorder() -> Paused {
     repo.switch("feature-a");
     let edited = repo.path().join(".git/edited-reorder.txt");
     fs::write(&edited, "branch feature-b parent main\nbranch feature-a\n").unwrap();
-    let editor = repo.path().join(".git/reorder-editor.sh");
-    fs::write(
-        &editor,
-        format!("#!/bin/sh\ncp \"{}\" \"$1\"\n", edited.display()),
-    )
-    .unwrap();
+    // kin runs the editor through `sh -c` on Unix and `cmd /C` on Windows.
+    let (editor, script) = if cfg!(windows) {
+        (
+            repo.path().join(".git/reorder-editor.cmd"),
+            format!(
+                "@echo off\r\ncopy /Y \"{}\" \"%~1\" >NUL\r\n",
+                edited.display()
+            ),
+        )
+    } else {
+        (
+            repo.path().join(".git/reorder-editor.sh"),
+            format!("#!/bin/sh\ncp \"{}\" \"$1\"\n", edited.display()),
+        )
+    };
+    fs::write(&editor, script).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -897,7 +907,7 @@ fn assert_legacy_replay_continues(
     fixture: &str,
     ends_on: &str,
     stacked: &[(&str, &str)],
-) {
+) -> Paused {
     let paused = paused_with_legacy(scenario, fixture);
     paused.continue_to_completion();
     assert_eq!(paused.repo.current_branch(), ends_on);
@@ -908,6 +918,7 @@ fn assert_legacy_replay_continues(
         );
     }
     assert_eq!(paused.repo.porcelain(), "");
+    paused
 }
 
 /// Kindra 0.1.0 recorded no `owned_tip_map`. Without it, `kin abort` cannot
@@ -1032,12 +1043,14 @@ fn legacy_reorder_0_2_2_aborts() {
 
 #[test]
 fn legacy_reorder_0_2_2_continues() {
-    assert_legacy_replay_continues(
+    let paused = assert_legacy_replay_continues(
         paused_reorder,
         "reorder@0.2.2",
         "feature-a",
         &[("main", "feature-b"), ("feature-b", "feature-a")],
     );
+    // The reorder puts feature-b directly on main, not just somewhere above it.
+    assert_eq!(paused.repo.rev("feature-b^"), paused.repo.rev("main"));
 }
 
 #[test]
@@ -1047,12 +1060,14 @@ fn legacy_reorder_1_1_0_aborts() {
 
 #[test]
 fn legacy_reorder_1_1_0_continues() {
-    assert_legacy_replay_continues(
+    let paused = assert_legacy_replay_continues(
         paused_reorder,
         "reorder@1.1.0",
         "feature-a",
         &[("main", "feature-b"), ("feature-b", "feature-a")],
     );
+    // The reorder puts feature-b directly on main, not just somewhere above it.
+    assert_eq!(paused.repo.rev("feature-b^"), paused.repo.rev("main"));
 }
 
 #[test]
