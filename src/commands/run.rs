@@ -150,7 +150,9 @@ fn run_locked(repo: &git2::Repository, args: &RunArgs) -> Result<()> {
         plan.checkout(branch.id);
     }
     crate::overrides::prepare(repo, &plan)?;
-    let stash_ref = crate::rebase_utils::take_autostash(repo, autostash)?;
+    let stash_ref =
+        crate::set_aside::take_tracked(repo, autostash, crate::set_aside::Restore::Plain)?
+            .map(|set_aside| set_aside.stash);
 
     let mut run_state = RunState {
         target_branches: stack_branches.into_iter().map(|b| b.name).collect(),
@@ -212,7 +214,13 @@ fn restore_run_stash(run_state: &mut RunState) {
     let Some(stash_ref) = run_state.stash_ref.take() else {
         return;
     };
-    if let Err(err) = crate::rebase_utils::apply_stash(&stash_ref) {
+    // The run state records only the stash message.
+    let set_aside = crate::set_aside::from_message(
+        crate::set_aside::Kind::WholeTree,
+        stash_ref.clone(),
+        crate::set_aside::Restore::Plain,
+    );
+    if let Err(err) = crate::set_aside::apply(&set_aside) {
         // `run` is a reporter, not a resumable operation, so callers clear the
         // run-state file after this returns — keeping the ref in the (dropped)
         // state would lose it. Surface an actionable message instead, so the
@@ -224,7 +232,7 @@ fn restore_run_stash(run_state: &mut RunState) {
         );
         return;
     }
-    if let Err(err) = crate::rebase_utils::drop_stash(&stash_ref) {
+    if let Err(err) = crate::set_aside::drop_entry(&set_aside) {
         eprintln!("Warning: {err}");
     }
 }

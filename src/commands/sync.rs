@@ -181,9 +181,7 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
             original_commit_count_map: HashMap::new(),
             original_tip_map: HashMap::from([(top_branch.clone(), top_branch_tip.to_string())]),
             owned_tip_map: HashMap::new(),
-            stash_ref: None,
-            stash_apply_index: false,
-            carry_stash_ref: None,
+            set_asides: Default::default(),
             preserve_content_on_abort: false,
             suppress_editor: false,
             abort_only: false,
@@ -199,12 +197,17 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
         // Keep these changes in Kindra's state until we return to the caller,
         // including across rebase conflicts and aborts.
         if state.caller_branch.is_some() {
-            state.stash_ref = crate::rebase_utils::take_autostash(repo, autostash)?;
-            state.stash_apply_index = true;
+            if let Some(taken) = crate::set_aside::take_tracked(
+                repo,
+                autostash,
+                crate::set_aside::Restore::WithIndex,
+            )? {
+                state.set_asides.push(taken);
+            }
             state.autostash = false;
         }
         if let Err(err) = save_state(repo, &state) {
-            crate::rebase_utils::restore_set_aside_changes(state.stash_ref.take());
+            crate::set_aside::restore_or_warn(state.set_asides.take_changes());
             return Err(err);
         }
 
@@ -281,9 +284,7 @@ fn sync_upstream_branch(
             original_commit_count_map: HashMap::new(),
             original_tip_map: HashMap::from([(upstream_name.to_string(), upstream_id.to_string())]),
             owned_tip_map: HashMap::new(),
-            stash_ref: None,
-            stash_apply_index: false,
-            carry_stash_ref: None,
+            set_asides: Default::default(),
             preserve_content_on_abort: false,
             suppress_editor: false,
             abort_only: false,
@@ -565,9 +566,7 @@ fn sync_tree(
             .map(|b| (b.name.clone(), b.id.to_string()))
             .collect(),
         owned_tip_map: HashMap::new(),
-        stash_ref: None,
-        stash_apply_index: false,
-        carry_stash_ref: None,
+        set_asides: Default::default(),
         preserve_content_on_abort: false,
         suppress_editor: false,
         abort_only: false,
@@ -576,11 +575,14 @@ fn sync_tree(
         cleanup_merged_branches: merged,
         cleanup_checkout_fallback: Some(local_upstream.to_string()),
     };
-    state.stash_ref = crate::rebase_utils::take_autostash(repo, autostash)?;
-    state.stash_apply_index = true;
+    if let Some(taken) =
+        crate::set_aside::take_tracked(repo, autostash, crate::set_aside::Restore::WithIndex)?
+    {
+        state.set_asides.push(taken);
+    }
     state.autostash = false;
     if let Err(err) = save_state(repo, &state) {
-        crate::rebase_utils::restore_set_aside_changes(state.stash_ref.take());
+        crate::set_aside::restore_or_warn(state.set_asides.take_changes());
         return Err(err);
     }
     crate::rebase_utils::run_rebase_loop(repo, state)

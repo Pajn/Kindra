@@ -1,9 +1,9 @@
 use crate::commands::find_upstream;
 use crate::rebase_utils::{
     RebaseState, check_worktrees, clear_state, ensure_git_supports_update_refs,
-    git_rebase_in_progress, local_branch_tips_in_range, restore_set_aside_changes, run_rebase_loop,
-    save_state, stash_push_changes,
+    git_rebase_in_progress, local_branch_tips_in_range, run_rebase_loop, save_state,
 };
+use crate::set_aside::{self, SetAside};
 use crate::stack::{collect_descendants, get_stack_branches_from_merge_base};
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
@@ -271,11 +271,9 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         original_commit_count_map: HashMap::new(),
         original_tip_map,
         owned_tip_map: HashMap::new(),
-        stash_ref: None,
-        // The stash below is a full stash (no --keep-index), so restoring it
-        // with --index brings unabsorbable staged hunks back *staged*.
-        stash_apply_index: true,
-        carry_stash_ref: None,
+        // Set below to a whole-tree set-aside (no --keep-index), whose
+        // restore with --index brings unabsorbable staged hunks back *staged*.
+        set_asides: Default::default(),
         // The absorbed changes live only in the fixup/folded commits; if `kin
         // abort` discards that history, it must first let the worktree keep
         // the content so it reappears as staged changes instead of being lost.
@@ -296,24 +294,27 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
     // left (unabsorbable hunks, unstaged edits, untracked files) must be set
     // aside for the rebases below. Stash it all and restore at the end via the
     // saved state, so `kin continue`/`abort` recover it after a conflict stop.
-    state.stash_ref = match stash_push_changes(&repo, false, "kin-absorb") {
-        Ok(stash_ref) => {
-            if stash_ref.is_some() {
-                println!(
-                    "Set aside remaining changes; they will be restored when the operation completes."
-                );
-            }
-            stash_ref
+    match set_aside::take(&repo, set_aside::Kind::WholeTree, "kin-absorb") {
+        Ok(Some(taken)) => {
+            println!(
+                "Set aside remaining changes; they will be restored when the operation completes."
+            );
+            state.set_asides.push(taken);
         }
+        Ok(None) => {}
         Err(err) => {
             return Err(rollback_fixups(head_before, None, err));
         }
-    };
+    }
     if let Err(err) = save_state(&repo, &state) {
         // Persisting failed, so no later `kin continue`/`abort` knows about the
         // stash; roll the fixups back and pop it rather than stranding the
         // user's changes.
-        return Err(rollback_fixups(head_before, state.stash_ref.take(), err));
+        return Err(rollback_fixups(
+            head_before,
+            state.set_asides.take_changes(),
+            err,
+        ));
     }
 
     // Fold the fixup commits. `--update-refs` moves every branch tip inside the
@@ -364,7 +365,11 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         // restack dependents onto the raw fixup commits. Roll the fixups back
         // and restore the set-aside changes instead.
         let _ = clear_state(&repo);
-        return Err(rollback_fixups(head_before, state.stash_ref.take(), err));
+        return Err(rollback_fixups(
+            head_before,
+            state.set_asides.take_changes(),
+            err,
+        ));
     }
 
     // Restack dependents; also restores the stash, clears the saved state, and
@@ -380,10 +385,10 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
 /// itself fails, that is surfaced on the returned error instead of guessing.
 fn rollback_fixups(
     head_before: Oid,
-    stash_ref: Option<String>,
+    changes: Option<SetAside>,
     err: anyhow::Error,
 ) -> anyhow::Error {
-    restore_set_aside_changes(stash_ref);
+    set_aside::restore_or_warn(changes);
     let reset_ok = matches!(
         Command::new("git")
             .args(["reset", "--soft", &head_before.to_string()])

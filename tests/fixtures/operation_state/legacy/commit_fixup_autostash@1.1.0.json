@@ -1,0 +1,27 @@
+{
+  "autostash": true,
+  "caller_branch": null,
+  "carry_stash_ref": null,
+  "cleanup_checkout_fallback": null,
+  "cleanup_merged_branches": [],
+  "in_progress_branch": "feature-a",
+  "new_base_map": {},
+  "operation": "Commit",
+  "original_branch": "feature-a",
+  "original_commit_count_map": {},
+  "original_tip_map": {
+    "feature-a": "<feature-a@before>"
+  },
+  "owned_tip_map": {
+    "feature-a": "<feature-a@paused>"
+  },
+  "parent_id_map": {},
+  "parent_name_map": {},
+  "preserve_content_on_abort": false,
+  "remaining_branches": [],
+  "stash_apply_index": false,
+  "stash_ref": "<kin-commit-on set-aside>",
+  "suppress_editor": false,
+  "target_branch": "feature-a",
+  "unstage_on_restore": false
+}

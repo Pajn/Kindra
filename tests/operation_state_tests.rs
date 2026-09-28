@@ -18,7 +18,8 @@
 //! - `<commit: subject>`: any other commit, by its subject (`#2`, `#3`, ...
 //!   tell apart distinct commits with the same subject);
 //! - `<kin-... set-aside>`: a set-aside stash entry, whose name carries a
-//!   process id and a timestamp;
+//!   process id and a timestamp, and `<kin-... set-aside stash>` its stash
+//!   commit;
 //! - `<absorb-namespace>`: the per-operation part of absorb's anchor refs.
 //!
 //! JSON objects are compared with their keys sorted, so the order in which a
@@ -50,7 +51,10 @@
 //!   `suppress_editor` (absorb);
 //! - 1.0.0 and 1.1.0: adds `carry_stash_ref`; tree sync first ships;
 //! - after 1.1.0: adds `abort_only` and `replay`; restack and absorb save
-//!   their own `operation` labels instead of `Move` and `Commit`.
+//!   their own `operation` labels instead of `Move` and `Commit`; records
+//!   `stash_ref`, `stash_apply_index` and `carry_stash_ref` as `set_asides`;
+//!   and saves the journal inside a `{"version": 1, "journal": {...}}`
+//!   envelope. A flat journal (no `version`) is converted when it is loaded.
 
 mod common;
 
@@ -272,6 +276,15 @@ impl Labels {
                 .ok()
                 .filter(|output| output.status.success())
                 .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+            // A stash commit's subject is `On <branch>: <message>`.
+            let set_aside = subject
+                .as_deref()
+                .and_then(|subject| subject.split_once(": "))
+                .and_then(|(_, message)| SET_ASIDE.captures(message))
+                .map(|caps| caps[1].to_string());
+            if let Some(set_aside) = set_aside {
+                return self.name(oid, &format!("{set_aside} set-aside stash"));
+            }
             match subject {
                 Some(subject) => self.name(oid, &format!("commit: {subject}")),
                 None => self.name(oid, "unknown object"),
@@ -690,6 +703,16 @@ fn paused_commit_on_ancestor() -> Paused {
 /// `kin commit --fixup <a1>` on feature-a, whose later commit a2 changes the
 /// line the fixup changes.
 fn paused_commit_fixup() -> Paused {
+    paused_commit_fixup_with(&[])
+}
+
+/// [`paused_commit_fixup`] with `--autostash`, which the journal records
+/// alongside the unstaged changes it has already set aside.
+fn paused_commit_fixup_autostash() -> Paused {
+    paused_commit_fixup_with(&["--autostash"])
+}
+
+fn paused_commit_fixup_with(extra_args: &[&str]) -> Paused {
     let repo = Repo::new();
     repo.branch("feature-a");
     repo.commit("shared.txt", "a1\n", "a1");
@@ -697,7 +720,9 @@ fn paused_commit_fixup() -> Paused {
     repo.commit("shared.txt", "a2\n", "a2");
     repo.stage("shared.txt", "fix\n");
     repo.write("unstaged.txt", "unstaged\n");
-    Paused::start(repo, &["commit", "--fixup", &a1])
+    let mut args = vec!["commit", "--fixup", &a1];
+    args.extend_from_slice(extra_args);
+    Paused::start(repo, &args)
 }
 
 /// `kin commit -b inserted --insert` on feature-a, whose restack of feature-b
@@ -829,6 +854,15 @@ fn commit_fixup_journal_and_status() {
 }
 
 #[test]
+fn commit_fixup_autostash_journal_and_status() {
+    let mut paused = paused_commit_fixup_autostash();
+    paused.assert_golden("commit_fixup_autostash");
+    paused.assert_status(&format!(
+        "Commit in progress on feature-a\nRemaining branches: \n{NATIVE_REBASE}"
+    ));
+}
+
+#[test]
 fn commit_insert_journal_and_status() {
     let mut paused = paused_commit_insert();
     paused.assert_golden("commit_insert");
@@ -871,6 +905,21 @@ fn journal_lives_in_the_worktree_git_directory() {
     assert!(!StateFile::Checkout.in_git_dir(&git_dir).exists());
 }
 
+/// The journal is saved inside a `{version, journal}` envelope with nothing
+/// else at the top level, so Kindra 1.1 and earlier, which require
+/// `operation`, `original_branch`, `target_branch`, `remaining_branches` and
+/// `in_progress_branch` there, refuse the file instead of misreading it.
+#[test]
+fn journal_is_saved_in_an_envelope_older_kindra_cannot_parse() {
+    let paused = paused_commit_fixup();
+    let saved = paused.repo.state_json();
+    let mut keys: Vec<_> = saved.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["journal", "version"]);
+    assert_eq!(saved["version"], Value::from(1));
+    assert!(saved["journal"]["operation"].is_string());
+}
+
 /// The `operation` label only names the command that paused: how the paused
 /// rebase is resumed and finished comes from `replay`. A linear sync whose
 /// label says otherwise still finishes as a sync, deleting the merged branches
@@ -880,8 +929,8 @@ fn replay_not_the_label_decides_how_a_paused_sync_finishes() {
     let paused = paused_sync_linear();
     paused.repo.git(&["branch", "stale", "main"]);
     let mut journal = paused.repo.state_json();
-    journal["operation"] = Value::from("Move");
-    journal["cleanup_merged_branches"] = serde_json::json!(["stale"]);
+    journal["journal"]["operation"] = Value::from("Move");
+    journal["journal"]["cleanup_merged_branches"] = serde_json::json!(["stale"]);
     fs::write(
         paused.repo.state_path(),
         serde_json::to_string_pretty(&journal).unwrap(),
@@ -905,7 +954,7 @@ fn replay_not_the_label_decides_how_a_paused_sync_finishes() {
 fn journal_from_a_newer_kindra_is_refused_with_advice() {
     let paused = paused_move();
     let mut journal = paused.repo.state_json();
-    journal["operation"] = Value::from("FromTheFuture");
+    journal["journal"]["operation"] = Value::from("FromTheFuture");
     let saved = serde_json::to_string_pretty(&journal).unwrap();
     fs::write(paused.repo.state_path(), &saved).unwrap();
 
@@ -922,6 +971,36 @@ fn journal_from_a_newer_kindra_is_refused_with_advice() {
     let cleared = paused.repo.kin(&["abort", "--clear-state"]);
     assert!(cleared.status.success(), "{}", describe(&cleared));
     assert!(!paused.repo.state_path().exists());
+}
+
+/// A journal saved in a format newer than this Kindra reads is refused with
+/// advice and left as it is until `kin abort --clear-state` discards it, even
+/// when every field it has would parse.
+#[test]
+fn journal_with_a_newer_version_is_refused_with_advice() {
+    let paused = paused_commit_fixup();
+    let mut journal = paused.repo.state_json();
+    assert_eq!(journal["version"], Value::from(1));
+    journal["version"] = Value::from(2);
+    let saved = serde_json::to_string_pretty(&journal).unwrap();
+    fs::write(paused.repo.state_path(), &saved).unwrap();
+
+    for command in ["status", "continue", "abort"] {
+        let output = paused.repo.kin(&[command]);
+        assert!(!output.status.success(), "{}", describe(&output));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("newer version of kin"), "{stderr}");
+        assert!(stderr.contains("journal version 2"), "{stderr}");
+        assert!(stderr.contains("kin abort --clear-state"), "{stderr}");
+        assert_eq!(fs::read_to_string(paused.repo.state_path()).unwrap(), saved);
+        assert!(paused.repo.rebase_in_progress());
+    }
+
+    let set_aside = paused.repo.stash_list();
+    let cleared = paused.repo.kin(&["abort", "--clear-state"]);
+    assert!(cleared.status.success(), "{}", describe(&cleared));
+    assert!(!paused.repo.state_path().exists());
+    assert_eq!(paused.repo.stash_list(), set_aside);
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,6 +1400,25 @@ fn legacy_commit_fixup_1_1_0_aborts() {
     assert_legacy_commit_aborts(
         paused_commit_fixup,
         "commit_fixup@1.1.0",
+        &format!("Commit in progress on feature-a\nRemaining branches: \n{NATIVE_REBASE}"),
+        AbortOutcome {
+            tips: &[
+                ("feature-a", "<feature-a@before>"),
+                ("main", "<main@before>"),
+            ],
+            ends_on: "feature-a",
+            porcelain: "M  shared.txt\n?? unstaged.txt\n",
+        },
+    );
+}
+
+/// Kindra 1.1 saved `autostash` alongside the unstaged changes a fixup had
+/// already set aside; it still means the same and the set-aside comes back.
+#[test]
+fn legacy_commit_fixup_autostash_1_1_0_aborts() {
+    assert_legacy_commit_aborts(
+        paused_commit_fixup_autostash,
+        "commit_fixup_autostash@1.1.0",
         &format!("Commit in progress on feature-a\nRemaining branches: \n{NATIVE_REBASE}"),
         AbortOutcome {
             tips: &[

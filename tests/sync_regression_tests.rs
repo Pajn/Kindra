@@ -772,7 +772,7 @@ fn check_sync_autostash_conflict_recovery(abort: bool) {
         .stderr(predicate::str::contains("Resolve conflicts"));
     let repo = Repository::open(dir.path()).unwrap();
     let state = kindra::rebase_utils::load_state(&repo).unwrap();
-    assert!(state.stash_ref.is_some());
+    assert!(state.set_asides.changes().is_some());
     if !abort {
         fs::write(dir.path().join("shared.txt"), "lower\n").unwrap();
         run_ok("git", &["add", "shared.txt"], dir.path());
@@ -812,7 +812,8 @@ fn sync_autostash_can_abort_after_tip_checkout_is_blocked() {
     assert!(
         kindra::rebase_utils::load_state(&repo)
             .unwrap()
-            .stash_ref
+            .set_asides
+            .changes()
             .is_some()
     );
     kin_cmd()
@@ -861,7 +862,10 @@ fn sync_no_delete_stash_conflict_preserves_state_until_resolved() {
     assert!(repo.index().unwrap().has_conflicts());
     assert_eq!(repo.head().unwrap().shorthand(), Some("lower"));
     let state = kindra::rebase_utils::load_state(&repo).unwrap();
-    assert!(state.stash_ref.is_none(), "stash must not be applied twice");
+    assert!(
+        state.set_asides.is_empty(),
+        "stash must not be applied twice"
+    );
     assert!(state.cleanup_merged_branches.is_empty());
     let state_path = rebase_state_file(dir.path());
     kin_cmd()

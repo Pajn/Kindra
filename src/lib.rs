@@ -18,6 +18,7 @@ pub mod overrides;
 pub mod rebase_todo;
 pub mod rebase_utils;
 pub mod repository;
+pub mod set_aside;
 pub mod stack;
 pub(crate) mod state_io;
 pub mod trunk;

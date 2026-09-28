@@ -403,12 +403,13 @@ fn apply_split(
     touched.extend(delete_names.iter().cloned());
     // Snapshot the refs and HEAD first (both read-only). Only then set aside
     // uncommitted changes, so a failure while snapshotting can't strand the
-    // autostash — `take_autostash` is the last fallible step before the mutations
+    // autostash — `set_aside::take_tracked` is the last fallible step before the mutations
     // that `restore_split_autostash` pairs with. The stash is restored below onto
     // the final HEAD (on success) or the rolled-back HEAD (on failure).
     let snapshot = snapshot_branches(repo, &touched)?;
     let head_snapshot = HeadSnapshot::capture(repo)?;
-    let stash_ref = crate::rebase_utils::take_autostash(repo, autostash)?;
+    let set_aside =
+        crate::set_aside::take_tracked(repo, autostash, crate::set_aside::Restore::Plain)?;
 
     // 3. Perform the ref mutations, rolling back on any error.
     let result = apply_split_mutations(
@@ -430,25 +431,26 @@ fn apply_split(
         if let Err(rollback_err) = head_snapshot.restore(repo) {
             eprintln!("Warning: rollback of HEAD was incomplete: {rollback_err:#}");
         }
-        restore_split_autostash(stash_ref);
+        restore_split_autostash(set_aside);
         // The undo guard in `split` finalizes on return: if rollback fully
         // restored the pre-split refs it records nothing; if it was incomplete,
         // the residual changes become an undoable entry.
         return Err(err.context("kin split was aborted and rolled back"));
     }
 
-    restore_split_autostash(stash_ref);
+    restore_split_autostash(set_aside);
     Ok(())
 }
 
 /// Pop the autostash taken by [`apply_split`] back onto the current HEAD. On
 /// conflict it is left on the stash stack (with a warning) rather than lost.
-fn restore_split_autostash(stash_ref: Option<String>) {
-    let Some(stash_ref) = stash_ref else {
+fn restore_split_autostash(set_aside: Option<crate::set_aside::SetAside>) {
+    let Some(set_aside) = set_aside else {
         return;
     };
-    if crate::rebase_utils::apply_stash(&stash_ref).is_err() {
-        // `split` is not resumable, so the generic apply_stash guidance ("run kin
+    let stash_ref = &set_aside.stash;
+    if crate::set_aside::apply(&set_aside).is_err() {
+        // `split` is not resumable, so the generic apply guidance ("run kin
         // continue / kin abort") doesn't apply here. Point the user straight at
         // the stash instead.
         eprintln!(
@@ -459,7 +461,7 @@ fn restore_split_autostash(stash_ref: Option<String>) {
         );
         return;
     }
-    if let Err(err) = crate::rebase_utils::drop_stash(&stash_ref) {
+    if let Err(err) = crate::set_aside::drop_entry(&set_aside) {
         eprintln!("Warning: {err}");
     }
 }

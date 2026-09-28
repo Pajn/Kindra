@@ -6,6 +6,7 @@ use common::{
 };
 use git2::{BranchType, Repository};
 use kindra::rebase_utils::{Operation, RebaseState, load_state, save_state};
+use kindra::set_aside::{Kind, Restore, SetAside};
 use predicates::prelude::*;
 use std::collections::HashMap;
 use std::fs;
@@ -1226,7 +1227,13 @@ fn status_blocks_and_preserves_state_when_active_git_rebase_mismatches_kindra_st
         parent_id_map: HashMap::from([("feature-a".to_string(), base_id.to_string())]),
         original_tip_map: HashMap::from([("feature-a".to_string(), a_id.to_string())]),
         owned_tip_map: HashMap::from([("feature-a".to_string(), a_id.to_string())]),
-        stash_ref: Some("stash@{0}".to_string()),
+        set_asides: vec![SetAside {
+            kind: Kind::UnstagedOnly,
+            stash: "stash@{0}".to_string(),
+            oid: None,
+            restore: Restore::Plain,
+        }]
+        .into(),
         cleanup_merged_branches: vec!["feature-b".to_string()],
         cleanup_checkout_fallback: Some("main".to_string()),
         ..rebase_state(Operation::Sync, "feature-a", "main")
@@ -1254,7 +1261,10 @@ fn status_blocks_and_preserves_state_when_active_git_rebase_mismatches_kindra_st
 
     let preserved = load_state(&repo).unwrap();
     assert_eq!(preserved.in_progress_branch.as_deref(), Some("feature-a"));
-    assert_eq!(preserved.stash_ref.as_deref(), Some("stash@{0}"));
+    assert_eq!(
+        preserved.set_asides.changes().map(|s| s.stash.as_str()),
+        Some("stash@{0}")
+    );
     assert_eq!(preserved.cleanup_merged_branches, vec!["feature-b"]);
 }
 

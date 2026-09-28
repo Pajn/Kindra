@@ -1,8 +1,9 @@
 use crate::operation_state::{KindraOperation, NativeOperation};
 use crate::rebase_utils::{
-    StashApplyOutcome, checkout_branch, drop_stash, git_rebase_in_progress, load_state,
-    owned_tip_state_matches, save_state, unstage_all,
+    checkout_branch, git_rebase_in_progress, load_state, owned_tip_state_matches, save_state,
+    unstage_all,
 };
+use crate::set_aside::{self, Outcome};
 use anyhow::{Result, anyhow};
 use git2::Oid;
 use std::collections::HashMap;
@@ -160,10 +161,10 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
         if kindra_owns_current_state {
             println!("Operation aborted (state cleared).");
         } else if git_rebase_active {
-            if let Some(stash_ref) = parsed_state.stash_ref.clone() {
+            if let Some(changes) = parsed_state.set_asides.changes() {
                 println!(
                     "Kindra state cleared without touching the active git rebase because the repository no longer matches Kindra's saved state. Saved stash '{}' was left untouched for manual recovery.",
-                    stash_ref
+                    changes.stash
                 );
             } else {
                 println!(
@@ -171,10 +172,10 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
                 );
             }
         } else {
-            if let Some(stash_ref) = parsed_state.stash_ref.clone() {
+            if let Some(changes) = parsed_state.set_asides.changes() {
                 println!(
                     "Kindra state cleared without restoring refs because the repository no longer matches Kindra's saved state. Saved stash '{}' was left untouched for manual recovery.",
-                    stash_ref
+                    changes.stash
                 );
             } else {
                 println!(
@@ -226,33 +227,33 @@ impl Drop for AbortOplogSettle<'_> {
     }
 }
 
-/// Apply the state's stash (if any), honoring `stash_apply_index`, and settle
-/// it in the saved state. A conflicted apply keeps the entry as a backup and
-/// warns instead of failing the abort.
+/// Restore the state's set-asides (if any), newest first, each as its record
+/// says, and settle them in the saved state. A conflicted apply keeps the
+/// entry as a backup and warns instead of failing the abort.
 fn apply_abort_stash(
     repo: &git2::Repository,
     parsed_state: &mut crate::rebase_utils::RebaseState,
 ) -> Result<()> {
     apply_abort_carry_stash(repo, parsed_state)?;
-    let Some(stash_ref) = parsed_state.stash_ref.clone() else {
+    let Some(changes) = parsed_state.set_asides.changes().cloned() else {
         return Ok(());
     };
-    match crate::rebase_utils::apply_state_stash(parsed_state, &stash_ref)? {
-        StashApplyOutcome::Applied => {
-            parsed_state.stash_ref = None;
+    match set_aside::restore(&changes)? {
+        Outcome::Applied => {
+            parsed_state.set_asides.take_changes();
             save_state(repo, parsed_state)?;
-            if let Err(err) = drop_stash(&stash_ref) {
+            if let Err(err) = set_aside::drop_entry(&changes) {
                 eprintln!("Warning: {}", err);
             }
         }
-        StashApplyOutcome::ConflictsLeftInTree => {
+        Outcome::ConflictsLeftInTree => {
             // The changes are in the tree as conflict markers; do not reapply,
             // keep the entry as a backup.
-            parsed_state.stash_ref = None;
+            parsed_state.set_asides.take_changes();
             save_state(repo, parsed_state)?;
             eprintln!(
                 "Warning: restoring the set-aside changes left conflicts in the working tree; the stash entry '{}' was preserved as a backup.",
-                stash_ref
+                changes.stash
             );
         }
     }
@@ -262,8 +263,8 @@ fn apply_abort_stash(
 /// Restore the staged changes `kin commit --on` was carrying across a branch
 /// switch when it was interrupted mid-carry.
 ///
-/// The carry is a handful of git commands long and clears this field on every
-/// path out of it, so a value here means the process died inside that window.
+/// The carry is a handful of git commands long and clears its set-aside on every
+/// path out of it, so one here means the process died inside that window.
 /// The entry was taken on the branch this abort has just returned to, so it
 /// applies cleanly there; it goes back *before* the operation's own stash, whose
 /// snapshot also contains this content and would otherwise deliver it unstaged.
@@ -271,23 +272,23 @@ fn apply_abort_carry_stash(
     repo: &git2::Repository,
     parsed_state: &mut crate::rebase_utils::RebaseState,
 ) -> Result<()> {
-    let Some(carry_stash) = parsed_state.carry_stash_ref.clone() else {
+    let Some(carry) = parsed_state.set_asides.carry().cloned() else {
         return Ok(());
     };
-    match crate::rebase_utils::apply_stash_with_outcome(&carry_stash, true)? {
-        StashApplyOutcome::Applied => {
-            parsed_state.carry_stash_ref = None;
+    match set_aside::restore(&carry)? {
+        Outcome::Applied => {
+            parsed_state.set_asides.take_carry();
             save_state(repo, parsed_state)?;
-            if let Err(err) = drop_stash(&carry_stash) {
+            if let Err(err) = set_aside::drop_entry(&carry) {
                 eprintln!("Warning: {}", err);
             }
         }
-        StashApplyOutcome::ConflictsLeftInTree => {
-            parsed_state.carry_stash_ref = None;
+        Outcome::ConflictsLeftInTree => {
+            parsed_state.set_asides.take_carry();
             save_state(repo, parsed_state)?;
             eprintln!(
                 "Warning: restoring the staged changes left conflicts in the working tree; the stash entry '{}' was preserved as a backup.",
-                carry_stash
+                carry.stash
             );
         }
     }

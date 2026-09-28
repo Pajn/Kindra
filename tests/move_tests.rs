@@ -1916,7 +1916,7 @@ fn test_move_repo_config_enables_autostash_and_persists_in_state() {
 
     let state = kindra::rebase_utils::load_state(&repo).unwrap();
     assert!(
-        state.stash_ref.is_some(),
+        state.set_asides.changes().is_some(),
         "operation must own the autostash"
     );
     assert!(
@@ -1971,7 +1971,7 @@ fn test_move_repo_config_enables_autostash_in_linked_worktree() {
     );
     let state = kindra::rebase_utils::load_state(&linked).unwrap();
     assert!(
-        state.stash_ref.is_some(),
+        state.set_asides.changes().is_some(),
         "operation must own the autostash"
     );
 }
@@ -2046,12 +2046,11 @@ exec {} "$@"
     // Verify state file exists and still contains the branch in remaining_branches
     let state_path = rebase_state_file(dir.path());
     assert!(state_path.exists(), "State file should exist");
-    let state_content = fs::read_to_string(&state_path).unwrap();
-
-    assert!(
-        state_content.contains("\"remaining_branches\": [\n    \"feature\"\n  ]"),
-        "State should still contain 'feature' in remaining_branches but got: {}",
-        state_content
+    let state = kindra::rebase_utils::load_state(&Repository::open(dir.path()).unwrap()).unwrap();
+    assert_eq!(
+        state.remaining_branches,
+        ["feature"],
+        "State should still contain 'feature' in remaining_branches"
     );
 
     // Remove the failure trigger

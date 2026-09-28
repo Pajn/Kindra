@@ -5,6 +5,7 @@ use common::{
 };
 use git2::Repository;
 use kindra::rebase_utils::{Operation, RebaseState, save_state};
+use kindra::set_aside::{Kind, Restore, SetAside};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -65,7 +66,13 @@ fn write_commit_rebase_state_fixture(repo: &Repository, stash_ref: &str) {
         .to_string();
     let state = RebaseState {
         owned_tip_map: HashMap::from([("main".to_string(), main_tip)]),
-        stash_ref: Some(stash_ref.to_string()),
+        set_asides: vec![SetAside {
+            kind: Kind::UnstagedOnly,
+            stash: stash_ref.to_string(),
+            oid: None,
+            restore: Restore::Plain,
+        }]
+        .into(),
         ..rebase_state(Operation::Commit, "main", "main")
     };
 
@@ -1289,6 +1296,72 @@ fn test_abort_refuses_legacy_state_without_owned_tip_map_and_keeps_its_stash() {
         !state_path.exists(),
         "State file should be cleared by --clear-state"
     );
+}
+
+/// `kin commit --on feature` interrupted mid-carry: the staged changes are in
+/// the carry set-aside, the tree is clean, HEAD is still on the caller and the
+/// target has no dependents to restack. Nothing else in the journal says work
+/// is pending, yet the carried changes exist only in the stash, so a gated
+/// command's passive reconcile must keep the journal and `kin abort` must put
+/// the changes back staged.
+///
+/// Kindra also records `unstage_on_restore` for every `--on`; it is cleared
+/// here so the test shows the carry keeps the journal on its own.
+#[test]
+fn test_passive_reconcile_keeps_a_journal_with_a_live_carry() {
+    let (dir, repo) = setup_repo();
+    run_ok(
+        "git",
+        &["checkout", "-q", "-b", "caller", "main"],
+        dir.path(),
+    );
+    fs::write(dir.path().join("carried.txt"), "carried\n").unwrap();
+    run_ok("git", &["add", "carried.txt"], dir.path());
+    let message = "kin-commit-on-index-1-1";
+    run_ok("git", &["stash", "push", "-m", message], dir.path());
+    assert_eq!(git_stdout(dir.path(), &["status", "--porcelain"]), "");
+
+    let tip = |branch: &str| repo.revparse_single(branch).unwrap().id().to_string();
+    let state = RebaseState {
+        caller_branch: Some("caller".to_string()),
+        original_tip_map: HashMap::from([
+            ("feature".to_string(), tip("feature")),
+            ("caller".to_string(), tip("caller")),
+        ]),
+        set_asides: vec![SetAside {
+            kind: Kind::Carry,
+            stash: message.to_string(),
+            oid: None,
+            restore: Restore::WithIndex,
+        }]
+        .into(),
+        ..rebase_state(Operation::Commit, "feature", "feature")
+    };
+    save_state(&repo, &state).unwrap();
+    let state_path = rebase_state_file(dir.path());
+
+    kin_cmd()
+        .arg("status")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(
+        state_path.exists(),
+        "status's passive reconcile discarded the journal of a live carry"
+    );
+
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(current_branch(dir.path()), "caller");
+    assert_eq!(
+        git_stdout(dir.path(), &["status", "--porcelain"]),
+        "A  carried.txt\n"
+    );
+    assert_eq!(git_stdout(dir.path(), &["stash", "list"]), "");
+    assert!(!state_path.exists());
 }
 
 #[test]
@@ -4055,7 +4128,7 @@ fn fixup_rollback_with_unrestorable_stash(lock_branch_ref: bool) -> (tempfile::T
             .expect("the state must stay until the set-aside changes are back"),
     )
     .unwrap();
-    let stash_ref = state["stash_ref"]
+    let stash_ref = state["journal"]["set_asides"][0]["stash"]
         .as_str()
         .unwrap_or_else(|| panic!("state lost the stash reference: {state}"))
         .to_string();
@@ -6057,7 +6130,7 @@ fn check_commit_autostash_on_parent(recovery: Option<bool>) {
         cmd.assert().failure();
         let state = kindra::rebase_utils::load_state(&repo).unwrap();
         assert!(
-            state.stash_ref.is_some(),
+            state.set_asides.changes().is_some(),
             "Kindra must own the caller's stash"
         );
         if !abort {
@@ -6110,7 +6183,7 @@ fn test_failed_unmerged_inspection_preserves_completed_state() {
     let (dir, repo) = setup_repo();
     write_commit_rebase_state_fixture(&repo, "unused");
     let mut state = kindra::rebase_utils::load_state(&repo).unwrap();
-    state.stash_ref = None;
+    state.set_asides = Default::default();
     save_state(&repo, &state).unwrap();
     let state_path = StateFile::Rebase.in_git_dir(repo.path());
     let saved = fs::read(&state_path).unwrap();
