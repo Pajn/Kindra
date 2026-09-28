@@ -997,6 +997,147 @@ fn first_parent_chain_descending_from(
     Ok(chain)
 }
 
+/// A local branch that took another local branch's commits with a merge
+/// instead of being rebased onto them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergedBranch {
+    /// The branch holding the merge commit.
+    pub merger: String,
+    /// The branch whose commits the merge brought in.
+    pub merged: String,
+    /// Whether `merged`'s tip is among the merged commits, rather than `merged`
+    /// having gone on after the merge.
+    pub merged_tip_replayed: bool,
+    /// Whether other branches are stacked on `merger`.
+    pub merger_has_descendants: bool,
+}
+
+/// Finds a merge of another branch in the commits a `git rebase --update-refs`
+/// of `base..head` replays (`base` excluded; `None` replays all of `head`).
+///
+/// Such a rebase drops the merge and replays the merged commits in line with
+/// the merging branch's own, so their order mixes the two branches:
+/// `--update-refs` then moves the merged branch to its replayed tip, on top of
+/// commits of the branch that merged it, and a merged branch that went on
+/// after the merge ends up with its commits copied into the other. A merge
+/// whose merged side `base` or `onto` already reaches brings in nothing that is
+/// replayed; this is what keeps a merged parent that is already integrated
+/// upstream, or a merge of the trunk, out of it.
+pub fn find_merged_branch_in_replay(
+    repo: &Repository,
+    base: Option<Oid>,
+    head: Oid,
+    onto: Option<Oid>,
+) -> Result<Option<MergedBranch>> {
+    let reaches = |from: Option<Oid>, id: Oid| -> Result<bool> {
+        Ok(match from {
+            Some(from) => from == id || repo.graph_descendant_of(from, id)?,
+            None => false,
+        })
+    };
+    let mut walk = repo.revwalk()?;
+    walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
+    walk.push(head)?;
+    if let Some(base) = base {
+        walk.hide(base)?;
+    }
+    // Only loaded once a merge is found, which most replays never contain.
+    let mut branches: Option<Vec<(String, Oid)>> = None;
+    for merge in walk {
+        let merge = merge?;
+        let commit = repo.find_commit(merge)?;
+        for merged_side in commit.parent_ids().skip(1) {
+            if reaches(base, merged_side)? || reaches(onto, merged_side)? {
+                continue;
+            }
+            let branches = match &mut branches {
+                Some(branches) => branches,
+                None => branches.insert(local_branch_tips(repo)?),
+            };
+            // The branch whose commits the merge brought in: preferably one whose
+            // tip is among them (the nearest to the merge), otherwise the nearest
+            // one that went on from them.
+            let mut replayed: Option<(&str, Oid)> = None;
+            let mut went_on: Option<(&str, Oid)> = None;
+            for (name, tip) in branches.iter() {
+                let tip = *tip;
+                if tip == merge
+                    || repo.graph_descendant_of(tip, merge)?
+                    || reaches(base, tip)?
+                    || reaches(onto, tip)?
+                {
+                    continue;
+                }
+                if tip == merged_side || repo.graph_descendant_of(merged_side, tip)? {
+                    if match replayed {
+                        None => true,
+                        Some((_, best)) => repo.graph_descendant_of(tip, best)?,
+                    } {
+                        replayed = Some((name, tip));
+                    }
+                } else if repo.graph_descendant_of(tip, merged_side)?
+                    && match went_on {
+                        None => true,
+                        Some((_, best)) => repo.graph_descendant_of(best, tip)?,
+                    }
+                {
+                    went_on = Some((name, tip));
+                }
+            }
+            let Some((merged, _)) = replayed.or(went_on) else {
+                continue;
+            };
+            // The branch holding the merge: the nearest one at or above it.
+            let mut merger: Option<(&str, Oid)> = None;
+            for (name, tip) in branches.iter() {
+                let tip = *tip;
+                let holds_merge = tip == merge || repo.graph_descendant_of(tip, merge)?;
+                let replayed_tip = tip == head || repo.graph_descendant_of(head, tip)?;
+                if holds_merge
+                    && replayed_tip
+                    && match merger {
+                        None => true,
+                        Some((_, best)) => repo.graph_descendant_of(best, tip)?,
+                    }
+                {
+                    merger = Some((name, tip));
+                }
+            }
+            let (merger, merger_tip) = match merger {
+                Some((name, tip)) => (name.to_string(), tip),
+                None => (merge.to_string(), merge),
+            };
+            let mut merger_has_descendants = false;
+            for (_, tip) in branches.iter() {
+                if repo.graph_descendant_of(*tip, merger_tip)? {
+                    merger_has_descendants = true;
+                    break;
+                }
+            }
+            return Ok(Some(MergedBranch {
+                merger,
+                merged: merged.to_string(),
+                merged_tip_replayed: replayed.is_some(),
+                merger_has_descendants,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Every local branch and its tip, sorted by name.
+fn local_branch_tips(repo: &Repository) -> Result<Vec<(String, Oid)>> {
+    let mut tips = Vec::new();
+    for branch in repo.branches(Some(git2::BranchType::Local))? {
+        let (branch, _) = branch?;
+        if let (Some(tip), Ok(Some(name))) = (branch.get().target(), branch.name()) {
+            tips.push((name.to_string(), tip));
+        }
+    }
+    tips.sort();
+    Ok(tips)
+}
+
 pub fn collect_merged_local_branches(
     repo: &Repository,
     target_ref_name: &str,

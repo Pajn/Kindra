@@ -1,6 +1,9 @@
 mod common;
 
-use common::{kin_cmd, make_commit, make_commit_at, rebase_state_file, repo_init, run_ok};
+use common::{
+    commit_on, kin_cmd, make_commit, make_commit_at, merge_into, rebase_state_file, repo_init,
+    run_ok,
+};
 use git2::{BranchType, Repository};
 use predicates::prelude::*;
 use std::fs;
@@ -1244,4 +1247,196 @@ fn first_parent_chain_follows_the_graph_when_commit_dates_are_skewed() {
 
     let chain = kindra::stack::collect_first_parent_chain(&repo, base_id, tip.id()).unwrap();
     assert_eq!(chain, expected);
+}
+
+/// The commit subjects `branch` has on top of `main`, oldest first.
+fn subjects_above_main(repo: &Repository, branch: &str) -> Vec<String> {
+    let mut walk = repo.revwalk().unwrap();
+    walk.push_ref(&format!("refs/heads/{branch}")).unwrap();
+    walk.hide_ref("refs/heads/main").unwrap();
+    walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)
+        .unwrap();
+    walk.map(|id| {
+        repo.find_commit(id.unwrap())
+            .unwrap()
+            .summary()
+            .unwrap()
+            .to_string()
+    })
+    .collect()
+}
+
+/// `main <- parent <- child`, where `child` took `parent`'s second commit with
+/// `git merge` instead of a rebase and `main` has moved on. Leaves HEAD on
+/// `child`.
+fn stack_with_child_that_merged_its_parent(root: &std::path::Path) -> Repository {
+    let repo = repo_init(root);
+    make_commit(&repo, "refs/heads/main", "base.txt", "base\n", "base", &[]);
+    run_ok("git", &["checkout", "-b", "parent"], root);
+    commit_on(root, "parent", "parent0.txt", "p0");
+    run_ok("git", &["checkout", "-b", "child"], root);
+    commit_on(root, "child", "child.txt", "c0");
+    commit_on(root, "parent", "parent1.txt", "p1");
+    merge_into(root, "child", "parent");
+    commit_on(root, "child", "child.txt", "c1");
+    commit_on(root, "main", "main.txt", "m1");
+    run_ok("git", &["checkout", "child"], root);
+    repo
+}
+
+/// Sync refuses, naming both branches and the ways out, and leaves the
+/// repository exactly as it was.
+fn assert_sync_refused(root: &std::path::Path, merger: &str, merged: &str, advice: &[&str]) {
+    let before = common::repository_snapshot(root);
+    let mut assert = kin_cmd()
+        .arg("sync")
+        .current_dir(root)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "{merger} merged {merged} instead of rebasing onto it"
+        )))
+        .stderr(predicate::str::contains(format!(
+            "git rebase {merged} {merger}"
+        )))
+        .stderr(predicate::str::contains(format!(
+            "or merge {merged} upstream before syncing"
+        )));
+    for advice in advice {
+        assert = assert.stderr(predicate::str::contains(*advice));
+    }
+    assert_eq!(common::repository_snapshot(root), before);
+}
+
+/// Replaying a stack flattens a merge of the parent into the child, and
+/// `--update-refs` then moves the parent to its replayed commit, which sits on
+/// top of child commits. Sync refuses before changing anything instead.
+#[test]
+fn sync_refuses_a_child_that_merged_its_unmerged_parent() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = stack_with_child_that_merged_its_parent(root);
+
+    assert_sync_refused(
+        root,
+        "child",
+        "parent",
+        &["move parent onto child's commits"],
+    );
+    assert_eq!(
+        subjects_above_main(&repo, "parent"),
+        ["parent p0", "parent p1"]
+    );
+}
+
+/// The parent went on after the child merged it: its tip is not in the range
+/// sync replays, but the commits the child merged are, so the child would end
+/// up with its own copies of them.
+#[test]
+fn sync_refuses_a_child_that_merged_its_parent_before_the_parent_moved_on() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let _repo = stack_with_child_that_merged_its_parent(root);
+    commit_on(root, "parent", "parent2.txt", "p2");
+    run_ok("git", &["checkout", "child"], root);
+
+    assert_sync_refused(
+        root,
+        "child",
+        "parent",
+        &["copy parent's commits into child"],
+    );
+}
+
+/// The merge sits in the middle of `main <- a <- b <- c`: sync from the top
+/// names the branch that merged, not the one being synced from.
+#[test]
+fn sync_refuses_a_merge_of_the_parent_in_an_intermediate_branch() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = repo_init(root);
+    make_commit(&repo, "refs/heads/main", "base.txt", "base\n", "base", &[]);
+    run_ok("git", &["checkout", "-b", "a"], root);
+    commit_on(root, "a", "a0.txt", "a0");
+    run_ok("git", &["checkout", "-b", "b"], root);
+    commit_on(root, "b", "b.txt", "b0");
+    commit_on(root, "a", "a1.txt", "a1");
+    merge_into(root, "b", "a");
+    commit_on(root, "b", "b.txt", "b1");
+    run_ok("git", &["checkout", "-b", "c"], root);
+    commit_on(root, "c", "c.txt", "c0");
+    commit_on(root, "main", "main.txt", "m1");
+    run_ok("git", &["checkout", "c"], root);
+
+    assert_sync_refused(
+        root,
+        "b",
+        "a",
+        &["move a onto b's commits", "then run kin restack on b"],
+    );
+    assert_eq!(subjects_above_main(&repo, "a"), ["a a0", "a a1"]);
+}
+
+/// A branching stack syncs one branch at a time, each from its parent's tip,
+/// so the child's replay never contains the parent's commits: the merge is
+/// dropped and the child lands on the synced parent.
+#[test]
+fn sync_tree_rebases_a_child_that_merged_its_parent_onto_the_synced_parent() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = stack_with_child_that_merged_its_parent(root);
+    run_ok("git", &["checkout", "-b", "sibling", "parent"], root);
+    commit_on(root, "sibling", "sibling.txt", "s0");
+    run_ok("git", &["checkout", "child"], root);
+
+    kin_cmd().arg("sync").current_dir(root).assert().success();
+
+    let parent = repo.revparse_single("parent").unwrap().id();
+    let main = repo.revparse_single("main").unwrap().id();
+    assert!(repo.graph_descendant_of(parent, main).unwrap());
+    assert_eq!(
+        subjects_above_main(&repo, "parent"),
+        ["parent p0", "parent p1"]
+    );
+    let child = repo
+        .find_commit(repo.revparse_single("child").unwrap().id())
+        .unwrap();
+    assert_eq!(child.parent_count(), 1);
+    assert_eq!(child.parent(0).unwrap().parent_id(0).unwrap(), parent);
+    assert_eq!(
+        subjects_above_main(&repo, "child"),
+        ["parent p0", "parent p1", "child c0", "child c1"]
+    );
+    assert_eq!(
+        subjects_above_main(&repo, "sibling"),
+        ["parent p0", "parent p1", "sibling s0"]
+    );
+}
+
+/// A merge of the trunk into a stack branch brings in nothing sync replays
+/// onto the trunk, so it is not refused.
+#[test]
+fn sync_replays_a_branch_that_merged_the_trunk() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = repo_init(root);
+    make_commit(&repo, "refs/heads/main", "base.txt", "base\n", "base", &[]);
+    run_ok("git", &["checkout", "-b", "parent"], root);
+    commit_on(root, "parent", "parent.txt", "p0");
+    run_ok("git", &["checkout", "-b", "child"], root);
+    commit_on(root, "child", "child.txt", "c0");
+    commit_on(root, "main", "main.txt", "m1");
+    merge_into(root, "child", "main");
+    commit_on(root, "child", "child.txt", "c1");
+    commit_on(root, "main", "main.txt", "m2");
+    run_ok("git", &["checkout", "child"], root);
+
+    kin_cmd().arg("sync").current_dir(root).assert().success();
+
+    let main = repo.revparse_single("main").unwrap().id();
+    let parent = repo.revparse_single("parent").unwrap().id();
+    let child = repo.revparse_single("child").unwrap().id();
+    assert!(repo.graph_descendant_of(parent, main).unwrap());
+    assert!(repo.graph_descendant_of(child, parent).unwrap());
+    assert_eq!(subjects_above_main(&repo, "parent"), ["parent p0"]);
 }

@@ -622,6 +622,55 @@ pub fn assert_no_kindra_operation(cwd: &Path) {
     }
 }
 
+/// Check out `branch` and commit `content` to `file` on it, with the subject
+/// `<branch> <content>`.
+#[allow(dead_code)]
+pub fn commit_on(root: &Path, branch: &str, file: &str, content: &str) {
+    run_ok("git", &["checkout", branch], root);
+    fs::write(root.join(file), content).unwrap();
+    run_ok("git", &["add", file], root);
+    run_ok(
+        "git",
+        &["commit", "-m", &format!("{branch} {content}")],
+        root,
+    );
+}
+
+/// Merge `merged` into `branch` with a merge commit, as `git merge` does when a
+/// branch takes its parent's new commits instead of being rebased onto them.
+#[allow(dead_code)]
+pub fn merge_into(root: &Path, branch: &str, merged: &str) {
+    run_ok("git", &["checkout", branch], root);
+    run_ok("git", &["merge", "--no-ff", "--no-edit", merged], root);
+}
+
+/// Everything a refused command must leave as it was in the worktree at `cwd`:
+/// every ref (branches, stashes, Kindra's own), what HEAD names, the working
+/// tree and index, and the Kindra files in the Git directory (operation state
+/// and the undo log) other than the repository lock.
+#[allow(dead_code)]
+pub fn repository_snapshot(cwd: &Path) -> String {
+    let git = |args: &[&str]| {
+        let output = git_command(cwd).args(args).output().unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let repo = Repository::open(cwd).unwrap();
+    let mut kindra_files = fs::read_dir(repo.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        // Every command takes the lock, refused or not.
+        .filter(|name| name.starts_with("kindra") && name != "kindra.lock")
+        .collect::<Vec<_>>();
+    kindra_files.sort();
+    format!(
+        "refs:\n{}HEAD: {}status:\n{}kindra files: {kindra_files:?}",
+        git(&["for-each-ref", "--format=%(refname) %(objectname)"]),
+        git(&["symbolic-ref", "-q", "HEAD"]),
+        git(&["status", "--porcelain=v1", "--untracked-files=all"]),
+    )
+}
+
 /// A file Kindra persists an operation's progress in, inside a worktree's Git
 /// directory. The names are part of the on-disk format, so tests spell them
 /// out here once instead of borrowing them from the crate: renaming one in the
