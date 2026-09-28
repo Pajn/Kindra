@@ -1,4 +1,5 @@
 use crate::commands::find_upstream;
+use crate::set_aside::SetAside;
 use crate::stack::{
     get_stack_branches_from_merge_base, resolve_merge_base, sort_branches_topologically,
 };
@@ -72,8 +73,16 @@ pub(crate) struct RunState {
     pub failed_branches: Vec<String>,
     #[serde(default)]
     pub last_error: Option<String>,
-    /// Autostash ref set aside for the duration of the run; restored (applied +
-    /// dropped) on any terminal exit — success, failure, or `kin abort`.
+    /// The changes set aside for the duration of the run; restored (applied +
+    /// dropped) on any terminal exit — success, failure, or `kin abort`. The
+    /// record names the stash commit, so the run's own entry is restored even
+    /// when another has the same message.
+    #[serde(default)]
+    pub stash: Option<SetAside>,
+    /// The message of [`RunState::stash`]'s entry. The run state has no format
+    /// version, and Kindra 1.1 and earlier read only this field, so it is still
+    /// written: without it, such a `kin abort` would clear the state and leave
+    /// the stash entry behind. It is read only when `stash` is absent.
     #[serde(default)]
     pub stash_ref: Option<String>,
 }
@@ -150,9 +159,7 @@ fn run_locked(repo: &git2::Repository, args: &RunArgs) -> Result<()> {
         plan.checkout(branch.id);
     }
     crate::overrides::prepare(repo, &plan)?;
-    let stash_ref =
-        crate::set_aside::take_tracked(repo, autostash, crate::set_aside::Restore::Plain)?
-            .map(|set_aside| set_aside.stash);
+    let stash = crate::set_aside::take_tracked(repo, autostash, crate::set_aside::Restore::Plain)?;
 
     let mut run_state = RunState {
         target_branches: stack_branches.into_iter().map(|b| b.name).collect(),
@@ -165,7 +172,8 @@ fn run_locked(repo: &git2::Repository, args: &RunArgs) -> Result<()> {
         status: RunStatus::InProgress,
         failed_branches: Vec::new(),
         last_error: None,
-        stash_ref,
+        stash_ref: stash.as_ref().map(|set_aside| set_aside.stash.clone()),
+        stash,
     };
     // If persisting fails, nothing downstream knows to restore the autostash, so
     // pop it back now rather than stranding the user's uncommitted changes.
@@ -211,15 +219,20 @@ fn persist_run_state(repo: &Repository, run_state: &RunState) -> Result<()> {
 /// (A run is not resumable: leftover state after a failed checkout-restore is
 /// recovered by `kin abort`, not `kin continue`.)
 fn restore_run_stash(run_state: &mut RunState) {
-    let Some(stash_ref) = run_state.stash_ref.take() else {
+    let stash_ref = run_state.stash_ref.take();
+    // Run state saved by Kindra 1.1 or earlier records only the stash message.
+    let Some(set_aside) = run_state.stash.take().or_else(|| {
+        stash_ref.map(|stash| {
+            crate::set_aside::from_message(
+                crate::set_aside::Kind::WholeTree,
+                stash,
+                crate::set_aside::Restore::Plain,
+            )
+        })
+    }) else {
         return;
     };
-    // The run state records only the stash message.
-    let set_aside = crate::set_aside::from_message(
-        crate::set_aside::Kind::WholeTree,
-        stash_ref.clone(),
-        crate::set_aside::Restore::Plain,
-    );
+    let stash_ref = &set_aside.stash;
     if let Err(err) = crate::set_aside::apply(&set_aside) {
         // `run` is a reporter, not a resumable operation, so callers clear the
         // run-state file after this returns — keeping the ref in the (dropped)

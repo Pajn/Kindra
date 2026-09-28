@@ -2752,6 +2752,207 @@ fn test_commit_on_sibling_conflict_unwinds_to_the_original_context() {
     assert_no_rebase_in_progress(repo_path);
 }
 
+/// Install a `post-checkout` hook running `script` whenever `branch` has just
+/// been checked out (not on file checkouts, which `git stash --keep-index`
+/// makes). Git exits with the hook's status, so a failing hook makes the
+/// checkout report failure.
+#[cfg(unix)]
+fn install_post_checkout_hook(dir: &Path, branch: &str, script: &str) {
+    let hook = dir.join(".git/hooks/post-checkout");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nif [ \"$3\" = 1 ] && [ \"$(git rev-parse --abbrev-ref HEAD)\" = {branch} ]; then\n{script}\nfi\nexit 0\n"
+        ),
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", ".git/hooks/post-checkout"], dir);
+}
+
+/// The set-asides the saved journal records, as `(kind, stash message)`.
+fn journal_set_asides(dir: &Path) -> Vec<(String, String)> {
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(rebase_state_file(dir)).expect("the journal must be kept"),
+    )
+    .unwrap();
+    state["journal"]["set_asides"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|s| {
+            (
+                s["kind"].as_str().unwrap().to_string(),
+                s["stash"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Each set-aside the journal records is still in the stash list.
+fn assert_journal_names_live_stashes(dir: &Path) {
+    let stashes = git_stdout(dir, &["stash", "list", "--format=%gs"]);
+    for (_, stash) in journal_set_asides(dir) {
+        assert!(
+            stashes.lines().any(|line| line.ends_with(&stash)),
+            "the journal names {stash}, which is not in the stash list:\n{stashes}"
+        );
+    }
+}
+
+/// A `--on` switch whose checkout fails puts the carried staged changes back.
+/// When that restore fails too, the journal must keep recording the carry so
+/// `kin abort` restores it, rather than leave its stash entry unrecorded.
+#[test]
+#[cfg(unix)]
+fn test_commit_on_failed_checkout_keeps_the_unrestored_carry_in_state() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    repo_init(repo_path);
+    setup_diverged_line_stack(repo_path);
+    run_ok("git", &["checkout", "-b", "other", "main"], repo_path);
+    edit_line(repo_path, 10, "10-other");
+    run_ok("git", &["commit", "-am", "other edit"], repo_path);
+    run_ok("git", &["checkout", "upper"], repo_path);
+
+    edit_line(repo_path, 20, "20-staged");
+    run_ok("git", &["add", "f.txt"], repo_path);
+    edit_line(repo_path, 35, "35-unstaged");
+    // The checkout of `other` fails, and the held index lock keeps the carry
+    // from being applied again.
+    install_post_checkout_hook(
+        repo_path,
+        "other",
+        "touch \"$(git rev-parse --git-dir)/index.lock\"\nexit 1",
+    );
+
+    kin_cmd()
+        .current_dir(repo_path)
+        .args(["commit", "--on", "other", "-m", "should not land"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("kin abort"));
+    fs::remove_file(repo_path.join(".git/hooks/post-checkout")).unwrap();
+    fs::remove_file(repo_path.join(".git/index.lock")).unwrap();
+
+    let kinds: Vec<String> = journal_set_asides(repo_path)
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect();
+    assert_eq!(kinds, ["UnstagedOnly", "Carry"]);
+    assert_journal_names_live_stashes(repo_path);
+    assert_continue_refuses_rollback_state(repo_path);
+
+    kin_cmd()
+        .arg("abort")
+        .current_dir(repo_path)
+        .assert()
+        .success();
+    assert_eq!(current_branch(repo_path), "upper");
+    let content = fs::read_to_string(repo_path.join("f.txt")).unwrap();
+    assert!(content.contains("20-staged") && content.contains("35-unstaged"));
+    assert_eq!(git_stdout(repo_path, &["stash", "list"]).trim(), "");
+    assert!(!rebase_state_file(repo_path).exists());
+}
+
+/// Stage a line `other` also changed, so carrying it there conflicts and the
+/// switch unwinds back to `upper`, with an untracked file set aside.
+/// `hook_script` runs once the unwind is back on `upper`. Returns the error.
+#[cfg(unix)]
+fn commit_on_conflict_with_blocked_unwind(dir: &Path, hook_script: &str) -> String {
+    repo_init(dir);
+    setup_diverged_line_stack(dir);
+    run_ok("git", &["checkout", "-b", "other", "main"], dir);
+    edit_line(dir, 30, "30-other");
+    run_ok("git", &["commit", "-am", "other edit"], dir);
+    run_ok("git", &["checkout", "upper"], dir);
+
+    edit_line(dir, 30, "30-staged");
+    run_ok("git", &["add", "f.txt"], dir);
+    fs::write(dir.join("untracked.txt"), "untracked").unwrap();
+    install_post_checkout_hook(dir, "upper", hook_script);
+
+    let output = kin_cmd()
+        .current_dir(dir)
+        .args(["commit", "--on", "other", "-m", "should not land"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(!output.status.success(), "the carry should conflict");
+    assert!(stderr.contains("conflict with 'other'"), "{stderr}");
+    fs::remove_file(dir.join(".git/hooks/post-checkout")).unwrap();
+    stderr
+}
+
+/// After an unwound switch, `kin abort` brings back the staged line and the
+/// untracked file, leaving nothing set aside.
+fn assert_abort_restores_the_unwound_commit(dir: &Path) {
+    kin_cmd().arg("abort").current_dir(dir).assert().success();
+    assert_eq!(current_branch(dir), "upper");
+    assert!(
+        fs::read_to_string(dir.join("f.txt"))
+            .unwrap()
+            .contains("30-staged")
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("untracked.txt")).unwrap(),
+        "untracked"
+    );
+    assert_eq!(git_stdout(dir, &["stash", "list"]).trim(), "");
+    assert!(!rebase_state_file(dir).exists());
+}
+
+/// Once the unwound commit's staged changes are back, the other set-aside
+/// changes follow. If they cannot be restored, the journal must stay and keep
+/// recording them for `kin abort`, rather than be cleared with their stash
+/// entry unrecorded.
+#[test]
+#[cfg(unix)]
+fn test_commit_on_conflict_unwind_keeps_state_until_set_aside_changes_are_restored() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    // A file in the way of the set-aside untracked file blocks its restore.
+    let stderr = commit_on_conflict_with_blocked_unwind(repo_path, "printf hook > untracked.txt");
+    assert!(stderr.contains("kin abort"), "{stderr}");
+
+    assert_eq!(current_branch(repo_path), "upper");
+    assert!(git_stdout(repo_path, &["diff", "--cached"]).contains("30-staged"));
+    let kinds: Vec<String> = journal_set_asides(repo_path)
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect();
+    assert_eq!(kinds, ["UnstagedOnly"]);
+    assert_journal_names_live_stashes(repo_path);
+    assert_continue_refuses_rollback_state(repo_path);
+
+    fs::remove_file(repo_path.join("untracked.txt")).unwrap();
+    assert_abort_restores_the_unwound_commit(repo_path);
+}
+
+/// If returning the conflicted carry to its own branch fails, the journal must
+/// still record the carry, so `kin abort` restores it along with the other
+/// set-aside changes.
+#[test]
+#[cfg(unix)]
+fn test_commit_on_failed_carry_unwind_keeps_the_carry_in_state() {
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    // An edit to `f.txt` blocks the carry itself.
+    let stderr = commit_on_conflict_with_blocked_unwind(repo_path, "printf hook > f.txt");
+    assert!(stderr.contains("kin abort"), "{stderr}");
+
+    let kinds: Vec<String> = journal_set_asides(repo_path)
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect();
+    assert_eq!(kinds, ["UnstagedOnly", "Carry"]);
+    assert_journal_names_live_stashes(repo_path);
+    assert_continue_refuses_rollback_state(repo_path);
+
+    run_ok("git", &["checkout", "--", "f.txt"], repo_path);
+    assert_abort_restores_the_unwound_commit(repo_path);
+}
+
 #[test]
 fn test_commit_on_branch_amend() {
     let (dir, repo) = setup_repo();

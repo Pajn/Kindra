@@ -3,7 +3,7 @@ use crate::rebase_utils::{
     RebaseState, check_worktrees, clear_state, ensure_git_supports_update_refs,
     git_rebase_in_progress, local_branch_tips_in_range, run_rebase_loop, save_state,
 };
-use crate::set_aside::{self, SetAside};
+use crate::set_aside;
 use crate::stack::{collect_descendants, get_stack_branches_from_merge_base};
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
@@ -209,7 +209,7 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         // them back so a partial absorb doesn't linger at HEAD.
         let repo = crate::open_repo()?;
         if repo.revparse_single("HEAD")?.id() != head_before {
-            return Err(rollback_fixups(head_before, None, err));
+            return Err(rollback_fixups(head_before, err));
         }
         return Err(err);
     }
@@ -303,18 +303,15 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         }
         Ok(None) => {}
         Err(err) => {
-            return Err(rollback_fixups(head_before, None, err));
+            return Err(rollback_fixups(head_before, err));
         }
     }
     if let Err(err) = save_state(&repo, &state) {
         // Persisting failed, so no later `kin continue`/`abort` knows about the
         // stash; roll the fixups back and pop it rather than stranding the
         // user's changes.
-        return Err(rollback_fixups(
-            head_before,
-            state.set_asides.take_changes(),
-            err,
-        ));
+        set_aside::restore_or_warn(state.set_asides.take_changes());
+        return Err(rollback_fixups(head_before, err));
     }
 
     // Fold the fixup commits. `--update-refs` moves every branch tip inside the
@@ -341,13 +338,10 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         .status();
     let failure = match status {
         Ok(status) if status.success() => None,
-        Ok(_) => Some(anyhow!(
-            "git rebase --autosquash failed before starting. The absorb was rolled back."
-        )),
-        Err(err) => Some(
-            anyhow::Error::from(err)
-                .context("failed to run git rebase --autosquash. The absorb was rolled back."),
-        ),
+        Ok(_) => Some(anyhow!("git rebase --autosquash failed before starting.")),
+        Err(err) => {
+            Some(anyhow::Error::from(err).context("failed to run git rebase --autosquash."))
+        }
     };
     if let Some(err) = failure {
         if git_rebase_in_progress(&repo) {
@@ -364,12 +358,31 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         // leaving the saved state behind would only invite `kin continue` to
         // restack dependents onto the raw fixup commits. Roll the fixups back
         // and restore the set-aside changes instead.
-        let _ = clear_state(&repo);
-        return Err(rollback_fixups(
-            head_before,
-            state.set_asides.take_changes(),
-            err,
-        ));
+        //
+        // The set-aside goes back before the fixups come off, onto the tip it
+        // was taken from. If it cannot, the fixups stay and so does the state,
+        // still naming it and with nothing left to continue: `kin abort` then
+        // restores the changes and takes the fixups off the same way.
+        if set_aside::restore_or_warn(state.set_asides.changes().cloned()) {
+            state.set_asides.take_changes();
+            let _ = clear_state(&repo);
+            return Err(rollback_fixups(
+                head_before,
+                anyhow!("{err:#} The absorb was rolled back."),
+            ));
+        }
+        state.abort_only = true;
+        return Err(match save_state(&repo, &state) {
+            Ok(()) => anyhow!(
+                "{err:#} Your set-aside changes could not be restored (see the warning above), so the absorb was not rolled back. Clear the way, then run 'kin abort' to roll it back and restore them."
+            ),
+            Err(save_err) => rollback_fixups(
+                head_before,
+                anyhow!(
+                    "{err:#} The absorb was rolled back, but your set-aside changes could not be restored (see the warning above) and saving the state failed ({save_err:#}); they remain in the stash list ('git stash list')."
+                ),
+            ),
+        });
     }
 
     // Restack dependents; also restores the stash, clears the saved state, and
@@ -377,18 +390,14 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
     run_rebase_loop(&repo, state)
 }
 
-/// Error-path rollback: pop the set-aside stash back (its base is the current
-/// fixup tip, so it applies cleanly and its staged hunks come back staged),
-/// then soft-reset the fixup commits off HEAD — the index and working tree
-/// keep everything, so the absorbed content returns to the index and the
-/// failure leaves the repository as it was before the absorb. If the reset
-/// itself fails, that is surfaced on the returned error instead of guessing.
-fn rollback_fixups(
-    head_before: Oid,
-    changes: Option<SetAside>,
-    err: anyhow::Error,
-) -> anyhow::Error {
-    set_aside::restore_or_warn(changes);
+/// Error-path rollback, once the set-aside stash has been popped back (its
+/// base is the current fixup tip, so it applies cleanly and its staged hunks
+/// come back staged): soft-reset the fixup commits off HEAD — the index and
+/// working tree keep everything, so the absorbed content returns to the index
+/// and the failure leaves the repository as it was before the absorb. If the
+/// reset itself fails, that is surfaced on the returned error instead of
+/// guessing.
+fn rollback_fixups(head_before: Oid, err: anyhow::Error) -> anyhow::Error {
     let reset_ok = matches!(
         Command::new("git")
             .args(["reset", "--soft", &head_before.to_string()])

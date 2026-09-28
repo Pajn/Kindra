@@ -1763,7 +1763,9 @@ fn head_commit_id() -> Result<Oid> {
 ///
 /// The carry stash is recorded in the saved state while it is live, and every
 /// path out of here clears it again: on success by dropping it, on failure by
-/// putting it back where it applies cleanly (the branch it was taken on).
+/// putting it back where it applies cleanly (the branch it was taken on). A
+/// set-aside leaves the saved state only once its changes are back, so a
+/// restore that fails leaves it recorded for `kin abort`.
 fn carry_staged_changes_onto(
     repo: &Repository,
     state: &mut RebaseState,
@@ -1793,8 +1795,12 @@ fn carry_staged_changes_onto(
 
     if let Err(err) = checkout_branch(target_branch) {
         // Nothing moved, so put the staged content back on the branch it was
-        // taken from and leave the rest of the state for `kin abort`.
-        set_aside::restore_or_warn(state.set_asides.take_carry());
+        // taken from and leave the rest of the state for `kin abort`. Nothing
+        // was committed either, so there is nothing for `kin continue` to do.
+        if set_aside::restore_or_warn(Some(carry_stash)) {
+            state.set_asides.take_carry();
+        }
+        state.abort_only = true;
         save_state(repo, state)?;
         return Err(err.context(
             "Failed to checkout target branch. Use 'kin abort' to restore original state.",
@@ -1817,23 +1823,48 @@ fn carry_staged_changes_onto(
             // whole operation: the user is left where they started, on their own
             // branch with their changes as they were, rather than mid-merge on a
             // branch they didn't ask to be on.
-            state.set_asides.take_carry();
-            let unwound = unwind_carry_to_caller(&carry_stash, &caller_branch)
-                .and_then(|()| {
-                    set_aside::restore_quietly(state.set_asides.take_changes());
-                    clear_state(repo)
-                });
+            //
+            // Each set-aside stays in the state until it is back, and the state
+            // is cleared only once all of them are; otherwise it is kept, with
+            // nothing left to continue, so `kin abort` restores the rest.
+            let unwound = unwind_carry_to_caller(state, &carry_stash, &caller_branch).and_then(
+                |()| {
+                    let Some(changes) = state.set_asides.changes().cloned() else {
+                        return Ok(());
+                    };
+                    let outcome = set_aside::restore(&changes)?;
+                    // Conflict markers mean the changes are in the tree: they
+                    // must not be applied again, so the record goes either way.
+                    state.set_asides.take_changes();
+                    match outcome {
+                        set_aside::Outcome::Applied => {
+                            if let Err(err) = set_aside::drop_entry(&changes) {
+                                eprintln!("Warning: {}", err);
+                            }
+                            Ok(())
+                        }
+                        set_aside::Outcome::ConflictsLeftInTree => Err(anyhow!(
+                            "restoring them left conflicts in the working tree; the stash entry '{}' was preserved as a backup",
+                            changes.stash
+                        )),
+                    }
+                },
+            );
             let err = anyhow!(
                 "The staged changes conflict with '{}', so committing them there would leave conflicts to resolve. Restack this branch onto '{}' first, or move the overlapping changes by hand.",
                 target_branch,
                 target_branch
             );
             match unwound {
-                Ok(()) => Err(err),
+                Ok(()) => {
+                    clear_state(repo)?;
+                    Err(err)
+                }
                 Err(unwind_err) => {
+                    state.abort_only = true;
                     save_state(repo, state)?;
                     Err(err.context(format!(
-                        "Additionally, restoring the changes on '{caller_branch}' did not complete ({unwind_err}); they are preserved in stash entries listed by 'git stash list'."
+                        "Additionally, restoring the changes on '{caller_branch}' did not complete ({unwind_err:#}). Clear the way, then run 'kin abort' to restore them."
                     )))
                 }
             }
@@ -1846,8 +1877,14 @@ fn carry_staged_changes_onto(
 
 /// Undo a conflicted carry: drop the conflicted merge from the tree, return to
 /// `caller_branch`, and re-apply `carry_stash` there — its base, so it applies
-/// cleanly. The entry is dropped only once it is back in the tree.
-fn unwind_carry_to_caller(carry_stash: &SetAside, caller_branch: &str) -> Result<()> {
+/// cleanly. The carry leaves `state` once it is back in the tree, and its entry
+/// is dropped only once it applied cleanly (a conflicted apply keeps it as a
+/// backup, as `kin abort` does).
+fn unwind_carry_to_caller(
+    state: &mut RebaseState,
+    carry_stash: &SetAside,
+    caller_branch: &str,
+) -> Result<()> {
     let status = Command::new("git").args(["reset", "--hard"]).status()?;
     if !status.success() {
         return Err(anyhow!(
@@ -1855,16 +1892,19 @@ fn unwind_carry_to_caller(carry_stash: &SetAside, caller_branch: &str) -> Result
         ));
     }
     checkout_branch(caller_branch)?;
-    match set_aside::restore(carry_stash)? {
+    let outcome = set_aside::restore(carry_stash)?;
+    state.set_asides.take_carry();
+    match outcome {
         set_aside::Outcome::Applied => {
             if let Err(err) = set_aside::drop_entry(carry_stash) {
                 eprintln!("Warning: {}", err);
             }
             Ok(())
         }
-        set_aside::Outcome::ConflictsLeftInTree => {
-            Err(anyhow!("restoring them left conflicts in the working tree"))
-        }
+        set_aside::Outcome::ConflictsLeftInTree => Err(anyhow!(
+            "restoring them left conflicts in the working tree; the stash entry '{}' was preserved as a backup",
+            carry_stash.stash
+        )),
     }
 }
 

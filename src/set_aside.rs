@@ -256,8 +256,8 @@ fn recorded(kind: Kind, message: String, restore: Restore) -> Result<Option<SetA
     }))
 }
 
-/// A set-aside that only a stash message records, such as the one `kin run`
-/// saves in its state.
+/// A set-aside that only a stash message records, such as the one in run
+/// state saved by Kindra 1.1 or earlier.
 pub fn from_message(kind: Kind, stash: String, restore: Restore) -> SetAside {
     SetAside {
         kind,
