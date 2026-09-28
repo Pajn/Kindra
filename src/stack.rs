@@ -291,7 +291,7 @@ impl SyncScanCache {
 
         // A lineage runs from the merge base up, so a branch below it can
         // never be in one, whichever tip is being asked about.
-        let above_merge_base = local_branches_by_ancestry(repo, "--contains", merge_base)?;
+        let above_merge_base = local_branches_by_ancestry(repo, &[("--contains", merge_base)])?;
         let mut candidates = Vec::new();
         for res in repo.branches(Some(git2::BranchType::Local))? {
             let (branch, _) = res?;
@@ -661,6 +661,12 @@ pub fn collect_stack_component(
 ) -> Result<Vec<StackBranch>> {
     let local_branches = repo.branches(Some(git2::BranchType::Local))?;
     let mut candidates = Vec::new();
+    // At or above the merge base and not yet in upstream, for every branch in
+    // one query.
+    let unmerged_above_merge_base = local_branches_by_ancestry(
+        repo,
+        &[("--contains", merge_base), ("--no-merged", upstream_id)],
+    )?;
 
     for branch_result in local_branches {
         let (branch, _) = branch_result?;
@@ -675,10 +681,7 @@ pub fn collect_stack_component(
             continue;
         };
 
-        let is_descendant_of_merge_base =
-            repo.graph_descendant_of(id, merge_base)? || id == merge_base;
-        let is_on_upstream = repo.graph_descendant_of(upstream_id, id)? || upstream_id == id;
-        if is_descendant_of_merge_base && !is_on_upstream {
+        if unmerged_above_merge_base.contains(name) {
             candidates.push(StackBranch {
                 name: name.to_string(),
                 id,
@@ -1194,7 +1197,7 @@ pub fn collect_merged_local_branches(
     // Branches here share ranges and path sets, so the memoised lookups pay off
     // across the loop even though the per-stack answers are not reused.
     let mut cache = SyncScanCache::default();
-    let tips_in_target = local_branches_by_ancestry(repo, "--merged", target_id)?;
+    let tips_in_target = local_branches_by_ancestry(repo, &[("--merged", target_id)])?;
     let mut unmerged_by_graph = Vec::new();
     for (name, branch_id) in branches {
         if tips_in_target.contains(&name) {
@@ -1221,25 +1224,31 @@ pub fn collect_merged_local_branches(
     Ok(merged_branches)
 }
 
-/// Local branches related to `commit` by `filter`: `--merged` for tips that
-/// `commit` contains, `--contains` for tips that contain `commit`. One query
-/// answers for every branch, and git reads the commit-graph, split chains
-/// included, where libgit2 would walk the commits behind each branch in turn.
+/// Local branches whose tips pass every `(filter, commit)` pair: `--merged`
+/// for tips that `commit` contains, `--no-merged` for tips it does not, and
+/// `--contains` for tips that contain `commit`. Git ORs repeats of one kind,
+/// so pass each kind at most once. One query answers for every branch, and
+/// git reads the commit-graph, split chains included, where libgit2 would
+/// walk the commits behind each branch in turn.
 fn local_branches_by_ancestry(
     repo: &Repository,
-    filter: &str,
-    commit: Oid,
+    filters: &[(&str, Oid)],
 ) -> Result<HashSet<String>> {
-    let output = Command::new("git")
-        .arg("for-each-ref")
-        .arg(format!("{filter}={commit}"))
+    let mut command = Command::new("git");
+    command.arg("for-each-ref");
+    for (filter, commit) in filters {
+        command.arg(format!("{filter}={commit}"));
+    }
+    let output = command
         .arg("--format=%(refname)")
         .arg("refs/heads/")
         .current_dir(repo_root(repo)?)
         .output()?;
     if !output.status.success() {
+        let filters: Vec<String> = filters.iter().map(|(f, c)| format!("{f}={c}")).collect();
         return Err(anyhow!(
-            "git for-each-ref {filter} failed while relating local branches to {commit}."
+            "git for-each-ref {} failed while relating local branches.",
+            filters.join(" ")
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout)
@@ -2454,6 +2463,11 @@ pub fn get_stack_branches(
     // Find the merge base of HEAD and upstream.
     // Any branch that is a descendant of this merge base and NOT on upstream is part of the stack.
     let merge_base = repo.merge_base(head_id, upstream_id)?;
+    let unmerged_above_merge_base = local_branches_by_ancestry(
+        repo,
+        &[("--contains", merge_base), ("--no-merged", upstream_id)],
+    )?;
+    let lineage = HeadLineage::new(repo, head_id, upstream_id)?;
 
     for res in local_branches {
         let (branch, _) = res?;
@@ -2469,7 +2483,7 @@ pub fn get_stack_branches(
             continue;
         }
 
-        if is_stack_member(repo, id, merge_base, upstream_id, head_id)? {
+        if unmerged_above_merge_base.contains(name) && lineage.contains(name, id) {
             branches.push(StackBranch {
                 name: name.to_string(),
                 id,
@@ -2478,6 +2492,61 @@ pub fn get_stack_branches(
     }
 
     Ok(branches)
+}
+
+/// The local branches on HEAD's lineage that upstream does not contain yet:
+/// those whose tips are in HEAD's private history, and those whose tips
+/// contain HEAD. Each part is answered for every branch at once, so the cost
+/// follows the private history and not the number of local branches times
+/// the depth of the history they fork from.
+struct HeadLineage {
+    /// Commits reachable from HEAD but not from upstream. Empty when upstream
+    /// already contains HEAD.
+    private: HashSet<Oid>,
+    /// Branches whose tips contain HEAD and are not in upstream.
+    above_head: HashSet<String>,
+}
+
+impl HeadLineage {
+    fn new(repo: &Repository, head_id: Oid, upstream_id: Oid) -> Result<Self> {
+        // Walk from HEAD backward, stopping at upstream. Cost is O(stack_depth),
+        // not O(full repo history). TOPOLOGICAL sort avoids the timestamp-ordering
+        // pitfall where libgit2 would otherwise eagerly process upstream's recent
+        // commits before the (potentially older) stack commits.
+        let mut private = HashSet::new();
+        let mut walk = repo.revwalk()?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
+        walk.push(head_id)?;
+        walk.hide(upstream_id)?;
+        for id in walk {
+            private.insert(id?);
+        }
+        let above_head = local_branches_by_ancestry(
+            repo,
+            &[("--contains", head_id), ("--no-merged", upstream_id)],
+        )?;
+        Ok(Self {
+            private,
+            above_head,
+        })
+    }
+
+    /// Whether upstream already contains HEAD, leaving it no private history.
+    fn head_is_on_upstream(&self) -> bool {
+        self.private.is_empty()
+    }
+
+    fn is_private(&self, id: Oid) -> bool {
+        self.private.contains(&id)
+    }
+
+    fn is_above_head(&self, name: &str) -> bool {
+        self.above_head.contains(name)
+    }
+
+    fn contains(&self, name: &str, id: Oid) -> bool {
+        self.is_private(id) || self.is_above_head(name)
+    }
 }
 
 /// Enumerates stack commits for interactive selection.
@@ -2732,6 +2801,16 @@ pub fn get_stack_branches_for_head(
     get_stack_branches_from_merge_base(repo, merge_base, head_id, upstream_id, upstream_name)
 }
 
+/// The branches on HEAD's lineage that upstream does not contain: first those
+/// whose tips are in HEAD's private history, then those stacked above HEAD,
+/// each group in local branch order. `merge_base` is the merge base of HEAD
+/// and upstream; when upstream already contains HEAD, a branch above HEAD
+/// must also descend from it.
+///
+/// Every local branch is related to HEAD by one walk of the private history
+/// and one `git for-each-ref` query, never by a graph walk per branch: on a
+/// long history with many branches forked from old points, per-branch walks
+/// cost branches × history depth.
 pub fn get_stack_branches_from_merge_base(
     repo: &Repository,
     merge_base: Oid,
@@ -2739,27 +2818,24 @@ pub fn get_stack_branches_from_merge_base(
     upstream_id: Oid,
     upstream_name: &str,
 ) -> Result<Vec<StackBranch>> {
-    // Walk from HEAD backward, stopping at upstream. This builds a set of all commits
-    // reachable from HEAD but NOT from upstream — the entire "private stack" range.
-    // Cost is O(stack_depth), not O(full repo history), making this fast even in huge repos.
-    // TOPOLOGICAL sort avoids the timestamp-ordering pitfall where libgit2 would otherwise
-    // eagerly process upstream's recent commits before the (potentially older) stack commits.
-    let mut ancestor_set = HashSet::new();
-    {
-        let mut walk = repo.revwalk()?;
-        walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
-        walk.push(head_id)?;
-        walk.hide(upstream_id)?;
-        for id_res in walk {
-            ancestor_set.insert(id_res?);
-        }
-    }
+    let lineage = HeadLineage::new(repo, head_id, upstream_id)?;
 
-    let local_branches = repo.branches(Some(git2::BranchType::Local))?;
+    // With HEAD on upstream (e.g. committing on a branch just created there),
+    // only branches above HEAD can be in the stack, and they must start at or
+    // above the merge base. Callers pass the merge base of HEAD and upstream,
+    // which is then HEAD itself and adds nothing to ask.
+    let above_merge_base = if lineage.head_is_on_upstream() && merge_base != head_id {
+        Some(local_branches_by_ancestry(
+            repo,
+            &[("--contains", merge_base)],
+        )?)
+    } else {
+        None
+    };
+
     let mut branches = Vec::new();
-    let mut candidates_above = Vec::new();
-
-    for res in local_branches {
+    let mut above_head = Vec::new();
+    for res in repo.branches(Some(git2::BranchType::Local))? {
         let (branch, _) = res?;
         let name = match branch.name()? {
             Some(n) => n.to_string(),
@@ -2773,101 +2849,19 @@ pub fn get_stack_branches_from_merge_base(
             None => continue,
         };
 
-        if ancestor_set.contains(&id) {
-            // Tip is in the private stack range (ancestor of HEAD, not merged into upstream).
+        if lineage.is_private(id) {
             branches.push(StackBranch { name, id });
-        } else {
-            // Could be above HEAD in the stack, or completely unrelated.
-            candidates_above.push((name, id));
+        } else if lineage.is_above_head(&name)
+            && above_merge_base
+                .as_ref()
+                .is_none_or(|above| above.contains(&name))
+        {
+            above_head.push(StackBranch { name, id });
         }
     }
-
-    // ancestor_set is empty when HEAD is ON upstream (head_id == upstream_id or HEAD is
-    // already merged). This is a rare case (e.g., committing directly on main). Fall back
-    // to the original per-branch check which is correct for small test repos.
-    let head_is_on_upstream = ancestor_set.is_empty();
-
-    // Pre-compute HEAD's commit timestamp for the candidates_above pre-filter below.
-    // A branch can only be "above HEAD" (i.e., HEAD reachable from branch_tip) if the
-    // branch tip was committed at the same time as or after HEAD. This O(1) check
-    // eliminates the expensive per-branch revwalk for the vast majority of noise branches
-    // (old feature branches whose tips predate HEAD). Only computed when needed.
-    let head_time = if head_is_on_upstream {
-        0 // unused in the fallback path
-    } else {
-        repo.find_commit(head_id)?.time().seconds()
-    };
-
-    for (name, id) in candidates_above {
-        let in_stack = if head_is_on_upstream {
-            is_stack_member(repo, id, merge_base, upstream_id, head_id)?
-        } else {
-            // Fast pre-filter: a branch committed strictly before HEAD cannot be above it.
-            // Loading one commit object is O(1) — far cheaper than creating a revwalk in
-            // repos with many pack files (e.g. 825 packs × 25 ms/walk = 2.4 s for 96 noise
-            // branches; with this filter, old branches are skipped in ~30 µs each).
-            //
-            // Fallback: Git timestamps are not strictly monotonic (e.g., clock skew,
-            // rebase). If tip_time < head_time, we perform a definitive O(1) graph
-            // check via graph_descendant_of to avoid false negatives.
-            // We also must ensure the branch is not already merged into upstream.
-            let tip_time = repo.find_commit(id)?.time().seconds();
-            if tip_time < head_time {
-                repo.graph_descendant_of(id, head_id)?
-                    && !(repo.graph_descendant_of(upstream_id, id)? || upstream_id == id)
-            } else {
-                // Walk from this candidate backward (bounded by upstream) and check if
-                // head_id appears in its ancestry. If so, the candidate is above HEAD in
-                // the stack. TOPOLOGICAL sort ensures we traverse only the candidate's own
-                // commits without being side-tracked by upstream's recent history.
-                let mut walk = repo.revwalk()?;
-                walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
-                walk.push(id)?;
-                walk.hide(upstream_id)?;
-                let mut found = false;
-                for commit_res in walk {
-                    if commit_res? == head_id {
-                        found = true;
-                        break;
-                    }
-                }
-                found
-            }
-        };
-
-        if in_stack {
-            branches.push(StackBranch { name, id });
-        }
-    }
+    branches.extend(above_head);
 
     Ok(branches)
-}
-
-fn is_stack_member(
-    repo: &Repository,
-    id: Oid,
-    merge_base: Oid,
-    upstream_id: Oid,
-    head_id: Oid,
-) -> Result<bool> {
-    // Is it reachable from the merge base?
-    let is_descendant_of_merge_base = repo.graph_descendant_of(id, merge_base)? || id == merge_base;
-    if !is_descendant_of_merge_base {
-        return Ok(false);
-    }
-
-    // AND it must NOT be reachable from upstream (i.e. not yet merged/on main).
-    let is_on_upstream = repo.graph_descendant_of(upstream_id, id)? || upstream_id == id;
-    if is_on_upstream {
-        return Ok(false);
-    }
-
-    // AND it must be on the same lineage as HEAD (ancestor or descendant)
-    let is_on_head_lineage = repo.graph_descendant_of(id, head_id)?
-        || repo.graph_descendant_of(head_id, id)?
-        || id == head_id;
-
-    Ok(is_on_head_lineage)
 }
 
 pub fn get_immediate_successors(
