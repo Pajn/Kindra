@@ -437,7 +437,10 @@ pub fn find_sync_boundary_cached(
         branch_cutoff = branch.id;
     }
 
-    let first_parent_chain = collect_first_parent_chain(repo, branch_cutoff, top_id)?;
+    // Each candidate prefix is compared by its change relative to the cutoff,
+    // which only commits descending from the cutoff have. A branch that merged
+    // its parent reaches the cutoff through a merge, not its first parent.
+    let first_parent_chain = first_parent_chain_descending_from(repo, branch_cutoff, top_id)?;
     let prefix_touched_paths = first_parent_chain
         .iter()
         .map(|&commit_id| cache.touched_paths(repo, branch_cutoff, commit_id))
@@ -540,20 +543,18 @@ pub fn find_sync_boundary_cached(
         });
     }
 
-    let first_commit = first_parent_chain[first_unmerged_idx];
-    let first = repo.find_commit(first_commit)?;
-    if first.parent_count() == 0 {
-        return Err(anyhow!(
-            "Cannot sync from root commit {} without a parent base.",
-            first_commit
-        ));
-    }
+    // Rebasing from the cutoff, not the first commit's first parent, keeps the
+    // branch's own commits below a merge of its parent in the replay.
+    let old_base = match first_unmerged_idx.checked_sub(1) {
+        Some(last_merged) => first_parent_chain[last_merged],
+        None => branch_cutoff,
+    };
 
     let mut merged_branches = merged_branches.into_iter().collect::<Vec<_>>();
     merged_branches.sort();
 
     Ok(SyncBoundary {
-        old_base: Some(first.parent_id(0)?),
+        old_base: Some(old_base),
         merged_branches,
     })
 }
@@ -909,28 +910,90 @@ fn topologically_sort_edited_graph(
     Ok(sorted)
 }
 
+/// The commits on `tip`'s first-parent history from `ancestor_exclusive` (not
+/// included) up to `tip`, oldest first. Fails when `ancestor_exclusive` is not
+/// on that history, for example when the branch merged its parent instead of
+/// being rebased onto it.
 pub fn collect_first_parent_chain(
     repo: &Repository,
     ancestor_exclusive: Oid,
     tip: Oid,
 ) -> Result<Vec<Oid>> {
-    let mut chain = Vec::new();
-    let mut current = tip;
-
-    while current != ancestor_exclusive {
-        chain.push(current);
-        let commit = repo.find_commit(current)?;
-        if commit.parent_count() == 0 {
-            return Err(anyhow!(
-                "Failed to walk first-parent history from {} to merge-base {}.",
-                tip,
-                ancestor_exclusive
-            ));
-        }
-        current = commit.parent_id(0)?;
+    if tip == ancestor_exclusive {
+        return Ok(Vec::new());
     }
+    let chain = first_parent_commits_above(repo, ancestor_exclusive, tip)?;
+    let joins_ancestor = match chain.first() {
+        Some(&oldest) => repo.find_commit(oldest)?.parent_ids().next() == Some(ancestor_exclusive),
+        None => false,
+    };
+    if joins_ancestor {
+        return Ok(chain);
+    }
+    if repo.graph_descendant_of(tip, ancestor_exclusive)? {
+        return Err(anyhow!(
+            "{} is not on the first-parent history of {}; the branch probably merged its parent instead of rebasing onto it.",
+            ancestor_exclusive,
+            tip
+        ));
+    }
+    Err(anyhow!(
+        "{} is not an ancestor of {}.",
+        ancestor_exclusive,
+        tip
+    ))
+}
 
+/// The commits on `tip`'s first-parent history that `ancestor` does not
+/// reach, oldest first. The walk stops where the first-parent history meets
+/// `ancestor`'s history, so it never runs to the root of a related history.
+fn first_parent_commits_above(repo: &Repository, ancestor: Oid, tip: Oid) -> Result<Vec<Oid>> {
+    let mut walk = repo.revwalk()?;
+    // Topological, so skewed commit dates cannot reorder the chain.
+    walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
+    walk.simplify_first_parent()?;
+    walk.push(tip)?;
+    walk.hide(ancestor)?;
+    let mut chain = walk.collect::<std::result::Result<Vec<_>, _>>()?;
     chain.reverse();
+    Ok(chain)
+}
+
+/// The commits on `tip`'s first-parent history that descend from `ancestor`,
+/// oldest first. This is [`collect_first_parent_chain`] when `ancestor` is on
+/// that history. When the branch merged `ancestor` instead, the chain starts at
+/// the first-parent commit that brought it in (a merge): the commits below it
+/// have no change relative to `ancestor` of their own to compare, and rebasing
+/// from `ancestor` replays them anyway.
+fn first_parent_chain_descending_from(
+    repo: &Repository,
+    ancestor: Oid,
+    tip: Oid,
+) -> Result<Vec<Oid>> {
+    if tip == ancestor {
+        return Ok(Vec::new());
+    }
+    let mut chain = first_parent_commits_above(repo, ancestor, tip)?;
+    if let Some(&oldest) = chain.first()
+        && repo.find_commit(oldest)?.parent_ids().next() == Some(ancestor)
+    {
+        return Ok(chain);
+    }
+    // Descending from `ancestor` is monotone along a first-parent history, so
+    // the first descendant can be found by bisection.
+    let (mut low, mut high) = (0, chain.len());
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if repo.graph_descendant_of(chain[mid], ancestor)? {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    if low == chain.len() {
+        return Err(anyhow!("{} is not an ancestor of {}.", ancestor, tip));
+    }
+    chain.drain(..low);
     Ok(chain)
 }
 
