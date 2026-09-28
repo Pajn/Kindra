@@ -1234,7 +1234,7 @@ fn local_branches_by_ancestry(
     repo: &Repository,
     filters: &[(&str, Oid)],
 ) -> Result<HashSet<String>> {
-    let mut command = Command::new("git");
+    let mut command = crate::repository::git_command(repo);
     command.arg("for-each-ref");
     for (filter, commit) in filters {
         command.arg(format!("{filter}={commit}"));
@@ -1242,7 +1242,6 @@ fn local_branches_by_ancestry(
     let output = command
         .arg("--format=%(refname)")
         .arg("refs/heads/")
-        .current_dir(repo_root(repo)?)
         .output()?;
     if !output.status.success() {
         let filters: Vec<String> = filters.iter().map(|(f, c)| format!("{f}={c}")).collect();

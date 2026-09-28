@@ -172,6 +172,47 @@ fn test_tree_simple_stack() {
     );
 }
 
+/// Git exports `GIT_DIR` to hooks, and wrappers set it too. Kindra reads the
+/// repository it discovered from the working directory, so the git queries
+/// behind stack discovery must read that same repository, not the one
+/// `GIT_DIR` names. HEAD on the trunk tip takes discovery through those queries.
+/// The other repository is a clone, so it has the same commits but only `main`
+/// as a local branch: reading it finds no stack rather than failing.
+#[test]
+fn test_tree_reads_the_discovered_repository_when_git_dir_names_another() {
+    let (dir, _repo) = setup_simple_stack();
+    let other = tempdir().unwrap();
+    common::run_ok(
+        "git",
+        &[
+            "clone",
+            "--quiet",
+            dir.path().to_str().unwrap(),
+            other.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+
+    let output = kin_cmd()
+        .arg("tree")
+        .current_dir(dir.path())
+        .env("GIT_DIR", other.path().join(".git"))
+        .output()
+        .expect("Failed to execute kin tree");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "kin tree failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for branch in ["feature-a", "feature-b"] {
+        assert!(
+            stdout.contains(branch),
+            "Missing {branch} with GIT_DIR naming another repository:\n{stdout}"
+        );
+    }
+}
+
 /// A fork's siblings remain visible from either tip, even without a named parent.
 #[test]
 fn test_tree_shows_full_stack_from_every_branch() {
