@@ -16,7 +16,7 @@
 //! With the O(stack_depth) algorithm, it completes in <20ms.
 
 mod common;
-use common::repo_init;
+use common::{kin_cmd, push_remote_commit, repo_init, run_ok};
 use git2::{Repository, Signature};
 use kindra::stack::{
     StackBranch, get_full_stack_branches_for_head, get_stack_branches_from_merge_base,
@@ -548,4 +548,79 @@ fn sync_boundary_after_a_merged_parent_stops_at_the_fork() {
     let boundary = kindra::stack::find_sync_boundary(&repo, "child", "main", &branches).unwrap();
     assert_eq!(boundary.old_base, Some(parent_tip));
     assert_eq!(boundary.merged_branches, vec!["parent".to_string()]);
+}
+
+/// `kin sync` against a remote with many branches must ask the server about
+/// the trunk and the stack's own remote branches alone. Reading what the server advertises, rather than timing the
+/// fetch, keeps this deterministic: on a large remote the advertisement and
+/// negotiation of every ref is where a full fetch spends its time.
+#[test]
+fn sync_requests_only_the_trunk_and_stack_from_a_remote_with_many_branches() {
+    const REMOTE_BRANCHES: usize = 200;
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let remote = tempdir().unwrap();
+    run_ok(
+        "git",
+        &["init", "--bare", "--initial-branch=main"],
+        remote.path(),
+    );
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        dir.path(),
+    );
+    let base = append_commits(&repo, "refs/heads/main", 1);
+    branch_with_content_commits(&repo, "feature", base, 1);
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature"],
+        dir.path(),
+    );
+    // Without `-u`: tracking is set per local branch, and `main` must keep
+    // tracking `origin/main`.
+    let mut push: Vec<String> = ["push", "origin", "main:refs/tags/v1"]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+    push.extend((0..REMOTE_BRANCHES).map(|i| format!("main:refs/heads/unrelated-{i}")));
+    let push: Vec<&str> = push.iter().map(String::as_str).collect();
+    run_ok("git", &push, dir.path());
+    run_ok("git", &["checkout", "-f", "feature"], dir.path());
+    let trunk = push_remote_commit(remote.path(), "main", "trunk.txt");
+
+    let trace = dir.path().join(".git").join("packet-trace");
+    kin_cmd()
+        .arg("sync")
+        .current_dir(dir.path())
+        .env("GIT_TRACE_PACKET", &trace)
+        // Protocol v2 lets the client name the refs it wants advertised. It is
+        // Git's default, pinned so the assertion does not depend on it.
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "protocol.version")
+        .env("GIT_CONFIG_VALUE_0", "2")
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(repo.revparse_single("origin/main").unwrap().id(), trunk);
+    let trace = std::fs::read_to_string(&trace).unwrap();
+    // The client logs each advertised ref as `fetch< <oid> <refname>[ ...]`.
+    let mut advertised: Vec<&str> = trace
+        .lines()
+        .filter_map(|line| line.split_once("fetch< ").map(|(_, packet)| packet))
+        .filter_map(|packet| {
+            let (oid, rest) = packet.split_once(' ')?;
+            (matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| rest.split(' ').next().unwrap_or(rest))
+        })
+        .collect();
+    advertised.sort_unstable();
+    advertised.dedup();
+    assert_eq!(
+        advertised,
+        ["refs/heads/feature", "refs/heads/main"],
+        "sync should have the remote advertise only the trunk and the stack \
+         ({REMOTE_BRANCHES} unrelated branches and a tag exist):\n{trace}"
+    );
 }

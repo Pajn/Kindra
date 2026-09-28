@@ -3382,3 +3382,324 @@ fn sync_names_the_native_operation_it_refuses_to_run_during() {
         common::assert_no_kindra_operation(dir.path());
     }
 }
+
+/// A repository whose `main` tracks a bare remote that also carries
+/// `unrelated`, a branch no local branch tracks. Everything is fetched, so each
+/// remote-tracking ref starts out current. Returns the repository directory and
+/// the remote.
+fn remote_backed_repo() -> (TempDir, TempDir) {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let remote = tempdir().unwrap();
+    run_ok(
+        "git",
+        &["init", "--bare", "--initial-branch=main"],
+        remote.path(),
+    );
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        dir.path(),
+    );
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "base.txt",
+        "base",
+        "base commit",
+        &[],
+    );
+    run_ok("git", &["push", "-u", "origin", "main"], dir.path());
+    common::push_remote_commit(remote.path(), "unrelated", "unrelated-0.txt");
+    run_ok("git", &["fetch", "origin"], dir.path());
+    (dir, remote)
+}
+
+fn tip(repo: &Repository, rev: &str) -> git2::Oid {
+    repo.revparse_single(rev)
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+}
+
+#[test]
+fn sync_fetches_the_trunk_but_leaves_unrelated_remote_branches_alone() {
+    let (dir, remote) = remote_backed_repo();
+    let repo = Repository::open(dir.path()).unwrap();
+    let base = repo.find_commit(tip(&repo, "main")).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feature a",
+        &[&base],
+    );
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    let unrelated_before = tip(&repo, "origin/unrelated");
+
+    let trunk = common::push_remote_commit(remote.path(), "main", "trunk-1.txt");
+    let unrelated = common::push_remote_commit(remote.path(), "unrelated", "unrelated-1.txt");
+
+    kin_cmd()
+        .arg("sync")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(tip(&repo, "origin/main"), trunk, "trunk must be fetched");
+    let feature = repo.find_commit(tip(&repo, "feature-a")).unwrap();
+    assert_eq!(feature.parent_id(0).unwrap(), trunk);
+    assert_ne!(unrelated_before, unrelated);
+    assert_eq!(
+        tip(&repo, "origin/unrelated"),
+        unrelated_before,
+        "sync must not fetch remote branches it does not use"
+    );
+}
+
+#[test]
+fn sync_on_the_trunk_fetches_only_the_trunk() {
+    let (dir, remote) = remote_backed_repo();
+    let repo = Repository::open(dir.path()).unwrap();
+    let unrelated_before = tip(&repo, "origin/unrelated");
+
+    let trunk = common::push_remote_commit(remote.path(), "main", "trunk-1.txt");
+    common::push_remote_commit(remote.path(), "unrelated", "unrelated-1.txt");
+
+    kin_cmd()
+        .arg("sync")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(tip(&repo, "main"), trunk);
+    assert_eq!(tip(&repo, "origin/unrelated"), unrelated_before);
+}
+
+#[test]
+fn sync_tree_cleans_up_a_squash_merged_root_whose_remote_branch_was_deleted() {
+    let (dir, remote) = remote_backed_repo();
+    let repo = Repository::open(dir.path()).unwrap();
+    let base = repo.find_commit(tip(&repo, "main")).unwrap();
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feature a",
+        &[&base],
+    );
+    let a = repo.find_commit(a_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "feature b",
+        &[&a],
+    );
+    make_commit(
+        &repo,
+        "refs/heads/feature-c",
+        "c.txt",
+        "c",
+        "feature c",
+        &[&a],
+    );
+    run_ok("git", &["push", "-u", "origin", "feature-a"], dir.path());
+    run_ok("git", &["checkout", "-f", "feature-b"], dir.path());
+
+    // The PR for feature-a is squash-merged and its branch deleted on the remote.
+    let other = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote.path().to_str().unwrap(),
+            other.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["merge", "--squash", "origin/feature-a"],
+        other.path(),
+    );
+    run_ok("git", &["commit", "-m", "feature a (#1)"], other.path());
+    run_ok("git", &["push", "origin", "main"], other.path());
+    run_ok(
+        "git",
+        &["push", "origin", "--delete", "feature-a"],
+        other.path(),
+    );
+    let trunk = common::remote_tip(remote.path(), "refs/heads/main");
+
+    kin_cmd()
+        .arg("sync")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(tip(&repo, "origin/main"), trunk);
+    assert!(
+        repo.find_branch("feature-a", BranchType::Local).is_err(),
+        "the squash-merged root should be deleted"
+    );
+    for branch in ["feature-b", "feature-c"] {
+        let commit = repo.find_commit(tip(&repo, branch)).unwrap();
+        assert_eq!(commit.parent_id(0).unwrap(), trunk, "{branch}");
+    }
+}
+
+#[test]
+fn sync_falls_back_to_a_full_fetch_when_the_trunk_is_gone_from_the_remote() {
+    let (dir, remote) = remote_backed_repo();
+    let repo = Repository::open(dir.path()).unwrap();
+    let base = repo.find_commit(tip(&repo, "main")).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feature a",
+        &[&base],
+    );
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    let unrelated = common::push_remote_commit(remote.path(), "unrelated", "unrelated-1.txt");
+    run_ok("git", &["branch", "-m", "main", "old-main"], remote.path());
+
+    kin_cmd()
+        .arg("sync")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    // The whole remote was fetched, and the trunk's ref kept its last value.
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(tip(&repo, "origin/unrelated"), unrelated);
+    assert_eq!(tip(&repo, "origin/main"), base.id());
+}
+
+#[test]
+fn sync_refreshes_the_remote_branches_of_the_stack_it_syncs() {
+    let (dir, remote) = remote_backed_repo();
+    let repo = Repository::open(dir.path()).unwrap();
+    let base = repo.find_commit(tip(&repo, "main")).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feature a",
+        &[&base],
+    );
+    run_ok("git", &["push", "-u", "origin", "feature-a"], dir.path());
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    // A remote branch whose name extends the stack branch's is still unrelated.
+    common::push_remote_commit(remote.path(), "feature-a-followup", "followup-0.txt");
+    run_ok("git", &["fetch", "origin"], dir.path());
+    let unrelated_before = tip(&repo, "origin/unrelated");
+    let followup_before = tip(&repo, "origin/feature-a-followup");
+
+    let trunk = common::push_remote_commit(remote.path(), "main", "trunk-1.txt");
+    let teammate = common::push_remote_commit(remote.path(), "feature-a", "teammate.txt");
+    common::push_remote_commit(remote.path(), "unrelated", "unrelated-1.txt");
+    common::push_remote_commit(remote.path(), "feature-a-followup", "followup-1.txt");
+
+    kin_cmd()
+        .arg("sync")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(tip(&repo, "origin/main"), trunk);
+    assert_eq!(
+        tip(&repo, "origin/feature-a"),
+        teammate,
+        "the stack branch's remote-tracking ref should be refreshed"
+    );
+    assert_eq!(tip(&repo, "origin/unrelated"), unrelated_before);
+    assert_eq!(tip(&repo, "origin/feature-a-followup"), followup_before);
+    // Only the undo snapshot may remain in Kindra's namespace.
+    let leftovers: Vec<String> = repo
+        .references_glob("refs/kindra/*")
+        .unwrap()
+        .filter_map(|r| r.unwrap().name().map(str::to_string))
+        .filter(|name| !name.starts_with("refs/kindra/undo/"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "sync must not leave temporary refs behind: {leftovers:?}"
+    );
+}
+
+#[test]
+fn sync_skips_stack_branches_deleted_on_the_remote() {
+    let (dir, remote) = remote_backed_repo();
+    let repo = Repository::open(dir.path()).unwrap();
+    let base = repo.find_commit(tip(&repo, "main")).unwrap();
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feature a",
+        &[&base],
+    );
+    let a = repo.find_commit(a_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "feature b",
+        &[&a],
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "feature-a", "feature-b"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "-f", "feature-b"], dir.path());
+
+    let other = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote.path().to_str().unwrap(),
+            other.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "origin", "--delete", "feature-a"],
+        other.path(),
+    );
+    let teammate = common::push_remote_commit(remote.path(), "feature-b", "teammate.txt");
+    let trunk = common::push_remote_commit(remote.path(), "main", "trunk-1.txt");
+
+    kin_cmd()
+        .arg("sync")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(tip(&repo, "origin/main"), trunk);
+    assert_eq!(tip(&repo, "origin/feature-b"), teammate);
+    assert_eq!(
+        tip(&repo, "origin/feature-a"),
+        a_id,
+        "a remote-tracking ref is never pruned by sync"
+    );
+    let a_after = repo.find_commit(tip(&repo, "feature-a")).unwrap();
+    assert_eq!(a_after.parent_id(0).unwrap(), trunk);
+}

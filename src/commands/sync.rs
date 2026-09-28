@@ -11,7 +11,7 @@ use anyhow::{Result, anyhow};
 use clap::Args;
 use git2::BranchType;
 use std::collections::HashMap;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Args, Default)]
 pub struct SyncArgs {
@@ -64,7 +64,26 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
     })?;
     let local_upstream = upstream_name.clone();
     let (rebase_onto_name, fetch_remote) = resolve_sync_onto(repo, &upstream_name)?;
-    fetch_sync_remote(fetch_remote.as_deref())?;
+    if let Some(remote) = fetch_remote.as_deref() {
+        // The stack is discovered again after the fetch, against the fetched
+        // trunk. This earlier pass, against the trunk as last fetched, only
+        // picks the remote branches to refresh in the same fetch; a branch it
+        // misses or adds costs a stale or an extra remote-tracking ref, never a
+        // wrong rebase.
+        let stack = if current_branch_name.as_deref() == Some(&upstream_name) {
+            Vec::new()
+        } else {
+            discover_stack(
+                repo,
+                head_id,
+                current_branch_name.as_deref(),
+                &rebase_onto_name,
+            )
+            .map(|(_, stack)| stack)
+            .unwrap_or_default()
+        };
+        fetch_sync_remote(repo, remote, &rebase_onto_name, &stack)?;
+    }
 
     // Snapshot for undo only after the preflight (upstream discovery, remote
     // fetch) has succeeded, so a failed preflight never leaves a stale pending
@@ -77,31 +96,12 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
         return sync_upstream_branch(repo, args, &upstream_name, &rebase_onto_name);
     }
 
-    let upstream_obj = repo.revparse_single(&rebase_onto_name)?;
-    let upstream_id = upstream_obj.id();
-    let merge_base = resolve_merge_base(repo, upstream_id, head_id)?;
-    let stack_branches = get_stack_branches_from_merge_base(
+    let (merge_base, stack_branches) = discover_stack(
         repo,
-        merge_base,
         head_id,
-        upstream_id,
+        current_branch_name.as_deref(),
         &rebase_onto_name,
     )?;
-
-    // Include cousins connected through private ancestor branches, even from a leaf.
-    let stack_branches = if let Some(current) = current_branch_name.as_deref()
-        && stack_branches.iter().any(|b| b.name == current)
-    {
-        crate::stack::collect_stack_component(
-            repo,
-            current,
-            merge_base,
-            upstream_id,
-            &rebase_onto_name,
-        )?
-    } else {
-        stack_branches
-    };
     let distinct_tips: std::collections::HashSet<_> = get_stack_tips(repo, &stack_branches)?
         .iter()
         .map(|name| repo.revparse_single(name).map(|o| o.id()))
@@ -474,6 +474,30 @@ fn ensure_sync_rebase_completed(repo: &git2::Repository, state: &RebaseState) ->
     ))
 }
 
+/// The branches sync rebases, with their merge base with the trunk `onto`: the
+/// stack between the trunk and HEAD, widened to the connected component when
+/// HEAD is one of its branches, so cousins joined through private ancestor
+/// branches are included even from a leaf.
+fn discover_stack(
+    repo: &git2::Repository,
+    head_id: git2::Oid,
+    current_branch: Option<&str>,
+    onto: &str,
+) -> Result<(git2::Oid, Vec<crate::stack::StackBranch>)> {
+    let upstream_id = repo.revparse_single(onto)?.id();
+    let merge_base = resolve_merge_base(repo, upstream_id, head_id)?;
+    let stack_branches =
+        get_stack_branches_from_merge_base(repo, merge_base, head_id, upstream_id, onto)?;
+    let stack_branches = if let Some(current) = current_branch
+        && stack_branches.iter().any(|b| b.name == current)
+    {
+        crate::stack::collect_stack_component(repo, current, merge_base, upstream_id, onto)?
+    } else {
+        stack_branches
+    };
+    Ok((merge_base, stack_branches))
+}
+
 fn resolve_sync_onto(
     repo: &git2::Repository,
     upstream_name: &str,
@@ -512,10 +536,53 @@ fn resolve_sync_onto(
     Ok((upstream_name.to_string(), None))
 }
 
-fn fetch_sync_remote(remote_name: Option<&str>) -> Result<()> {
-    let Some(remote_name) = remote_name else {
-        return Ok(());
-    };
+/// Where the targeted fetch lands stack branches' remote branches before sync
+/// copies the ones it asked for into their remote-tracking refs. Nothing
+/// outside [`targeted_fetch`] reads it, and it is empty before and after.
+const SYNC_FETCH_REF_PREFIX: &str = "refs/kindra/sync-fetch/";
+
+/// A remote ref and the remote-tracking ref the remote's fetch refspec maps
+/// it to.
+struct TrackedRef {
+    source: String,
+    tracking: String,
+    force: bool,
+}
+
+/// Refresh, from `remote_name`, the trunk's remote-tracking ref `onto` and the
+/// remote-tracking refs of the `stack` branches that track that remote.
+///
+/// The trunk's ref is the only remote state sync itself reads: the rebase goes
+/// onto it, and merged or squash-merged branches are detected by comparing
+/// their content with it. The stack branches' refs are refreshed so that
+/// `kin tree` and `kin push` compare against the remote as it is after the
+/// sync. Nothing else is fetched: no other remote branches and no tags. On a
+/// remote with thousands of branches, advertising and negotiating every ref
+/// is most of what a full fetch costs.
+///
+/// The refs come from the remote's own fetch refspecs (for the default
+/// layout, `+refs/heads/main:refs/remotes/origin/main`), and everything is
+/// fetched in one `git fetch`, so one round trip; see [`targeted_fetch`] for
+/// how a stack branch deleted on the remote is skipped.
+///
+/// The full `git fetch <remote>` remains the fallback when the targeted fetch
+/// cannot be built safely (no fetch refspec of the remote maps to `onto`, or
+/// the remote has negative refspecs whose exclusions this does not evaluate)
+/// and when it fails, for instance because the trunk no longer exists on the
+/// remote; the full fetch then behaves as sync always has, keeping the ref's
+/// last-fetched value.
+fn fetch_sync_remote(
+    repo: &git2::Repository,
+    remote_name: &str,
+    onto: &str,
+    stack: &[crate::stack::StackBranch],
+) -> Result<()> {
+    if let Some(trunk) = trunk_tracked_ref(repo, remote_name, onto) {
+        let branches = stack_tracked_refs(repo, remote_name, &trunk.tracking, stack);
+        if targeted_fetch(repo, remote_name, &trunk, &branches)? {
+            return Ok(());
+        }
+    }
 
     let status = Command::new("git").arg("fetch").arg(remote_name).status()?;
     if !status.success() {
@@ -526,6 +593,212 @@ fn fetch_sync_remote(remote_name: Option<&str>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Fetch `trunk` and `branches` from `remote_name` in one `git fetch`,
+/// returning whether it succeeded.
+///
+/// Git fails the whole fetch when a ref named exactly on the command line is
+/// missing on the remote, which is normal for a stack branch whose pull
+/// request was merged and its branch deleted. A pattern refspec is allowed to
+/// match nothing, so each branch is fetched as the pattern `<source>*`, whose
+/// advertisement is limited to refs starting with that name. The pattern can
+/// also match longer names, so it lands in [`SYNC_FETCH_REF_PREFIX`], and only
+/// the exact match is copied into the remote-tracking ref. `--refmap=` stops
+/// Git from also updating remote-tracking refs for those longer names. A
+/// missing branch simply leaves its remote-tracking ref as it was: nothing is
+/// pruned. The trunk is named exactly, so its absence fails the fetch.
+fn targeted_fetch(
+    repo: &git2::Repository,
+    remote_name: &str,
+    trunk: &TrackedRef,
+    branches: &[TrackedRef],
+) -> Result<bool> {
+    let force = |r: &TrackedRef| if r.force { "+" } else { "" };
+    let mut refspecs = vec![format!(
+        "{}{}:{}",
+        force(trunk),
+        trunk.source,
+        trunk.tracking
+    )];
+    refspecs.extend(
+        branches
+            .iter()
+            .enumerate()
+            .map(|(i, b)| format!("+{}*:{SYNC_FETCH_REF_PREFIX}{i}/ref*", b.source)),
+    );
+    let before: Vec<_> = std::iter::once(trunk)
+        .chain(branches)
+        .map(|r| ref_target(repo, &r.tracking))
+        .collect();
+
+    clear_sync_fetch_refs(repo)?;
+    // Capture stderr so a failure the full fetch recovers from is not reported
+    // as an error.
+    let output = Command::new("git")
+        .args(["fetch", "--quiet", "--no-tags", "--refmap=", remote_name])
+        .args(&refspecs)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !output.status.success() {
+        clear_sync_fetch_refs(repo)?;
+        return Ok(false);
+    }
+
+    let copied = copy_fetched_branches(repo, remote_name, branches);
+    clear_sync_fetch_refs(repo)?;
+    copied?;
+
+    for (r, old) in std::iter::once(trunk).chain(branches).zip(before) {
+        let new = ref_target(repo, &r.tracking);
+        if new == old {
+            continue;
+        }
+        let short = r
+            .tracking
+            .strip_prefix("refs/remotes/")
+            .unwrap_or(&r.tracking);
+        match (old, new) {
+            (Some(old), Some(new)) => println!(
+                "Fetched {short}: {}..{}",
+                &old.to_string()[..7],
+                &new.to_string()[..7]
+            ),
+            (None, Some(new)) => println!("Fetched {short}: {}", &new.to_string()[..7]),
+            _ => {}
+        }
+    }
+    Ok(true)
+}
+
+/// Copy the exact match of each branch's pattern fetch into its
+/// remote-tracking ref, honouring whether the remote's refspec forces updates.
+fn copy_fetched_branches(
+    repo: &git2::Repository,
+    remote_name: &str,
+    branches: &[TrackedRef],
+) -> Result<()> {
+    for (i, branch) in branches.iter().enumerate() {
+        let Some(new) = ref_target(repo, &format!("{SYNC_FETCH_REF_PREFIX}{i}/ref")) else {
+            continue;
+        };
+        let old = ref_target(repo, &branch.tracking);
+        if old == Some(new) {
+            continue;
+        }
+        if let Some(old) = old
+            && !branch.force
+            && !repo.graph_descendant_of(new, old)?
+        {
+            println!(
+                "Warning: not updating {}: the remote branch was not fast-forwarded.",
+                branch.tracking
+            );
+            continue;
+        }
+        repo.reference(
+            &branch.tracking,
+            new,
+            true,
+            &format!("kin sync: fetch {remote_name} {}", branch.source),
+        )?;
+    }
+    Ok(())
+}
+
+fn ref_target(repo: &git2::Repository, name: &str) -> Option<git2::Oid> {
+    repo.find_reference(name).ok().and_then(|r| r.target())
+}
+
+fn clear_sync_fetch_refs(repo: &git2::Repository) -> Result<()> {
+    for reference in repo.references_glob(&format!("{SYNC_FETCH_REF_PREFIX}*"))? {
+        reference?.delete()?;
+    }
+    Ok(())
+}
+
+/// The remote ref behind the trunk's remote-tracking ref `onto`, found by
+/// running `remote_name`'s fetch refspecs in reverse so a custom layout is
+/// respected. `None` when it cannot be derived safely.
+fn trunk_tracked_ref(repo: &git2::Repository, remote_name: &str, onto: &str) -> Option<TrackedRef> {
+    let tracking = repo
+        .find_branch(onto, BranchType::Remote)
+        .ok()?
+        .get()
+        .name()?
+        .to_string();
+    let remote = repo.find_remote(remote_name).ok()?;
+    let mut found = None;
+    for spec in remote.refspecs() {
+        if spec.direction() != git2::Direction::Fetch {
+            continue;
+        }
+        if spec.str()?.starts_with('^') {
+            return None;
+        }
+        if found.is_none() && spec.dst_matches(&tracking) {
+            let source = spec.rtransform(&tracking).ok()?.as_str()?.to_string();
+            found = Some(TrackedRef {
+                source,
+                tracking: tracking.clone(),
+                force: spec.is_force(),
+            });
+        }
+    }
+    found
+}
+
+/// For each `stack` branch whose configured upstream is on `remote_name`, the
+/// remote ref it tracks (`branch.<name>.merge`) and the remote-tracking ref the
+/// remote's fetch refspecs map it to. The trunk's ref and duplicates are left
+/// out, as are branches tracking another remote or a ref no refspec maps.
+fn stack_tracked_refs(
+    repo: &git2::Repository,
+    remote_name: &str,
+    trunk_tracking: &str,
+    stack: &[crate::stack::StackBranch],
+) -> Vec<TrackedRef> {
+    let Ok(remote) = repo.find_remote(remote_name) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::from([trunk_tracking.to_string()]);
+    let mut refs = Vec::new();
+    for branch in stack {
+        let local = format!("refs/heads/{}", branch.name);
+        let tracks_remote = repo
+            .branch_upstream_remote(&local)
+            .ok()
+            .is_some_and(|name| name.as_str() == Some(remote_name));
+        if !tracks_remote {
+            continue;
+        }
+        let Some(source) = repo
+            .branch_upstream_merge(&local)
+            .ok()
+            .and_then(|buf| buf.as_str().map(str::to_string))
+        else {
+            continue;
+        };
+        let mapped = remote.refspecs().find_map(|spec| {
+            if spec.direction() != git2::Direction::Fetch || !spec.src_matches(&source) {
+                return None;
+            }
+            let tracking = spec.transform(&source).ok()?.as_str()?.to_string();
+            Some((tracking, spec.is_force()))
+        });
+        if let Some((tracking, force)) = mapped
+            && seen.insert(tracking.clone())
+        {
+            refs.push(TrackedRef {
+                source,
+                tracking,
+                force,
+            });
+        }
+    }
+    refs
 }
 
 fn sync_tree(
