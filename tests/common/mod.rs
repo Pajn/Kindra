@@ -471,6 +471,48 @@ pub fn remote_tip(remote_dir: &std::path::Path, refname: &str) -> git2::Oid {
         .unwrap()
 }
 
+/// Commit `file` to `branch` on the bare `remote_dir` from a throwaway clone and
+/// push it, fetching into no other repository, so a local clone's
+/// remote-tracking ref for `branch` goes stale. The branch starts from the
+/// remote's `main` when it does not exist there yet. Returns the new remote tip.
+#[allow(dead_code)]
+pub fn push_remote_commit(remote_dir: &Path, branch: &str, file: &str) -> git2::Oid {
+    let other = tempfile::tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote_dir.to_str().unwrap(),
+            other.path().to_str().unwrap(),
+        ],
+        remote_dir,
+    );
+    let refname = format!("refs/heads/{branch}");
+    let exists = Repository::open(remote_dir)
+        .unwrap()
+        .find_reference(&refname)
+        .is_ok();
+    let start = if exists {
+        format!("origin/{branch}")
+    } else {
+        "origin/main".to_string()
+    };
+    run_ok("git", &["checkout", "-B", branch, &start], other.path());
+    fs::write(other.path().join(file), file).unwrap();
+    run_ok("git", &["add", file], other.path());
+    run_ok(
+        "git",
+        &["commit", "-m", &format!("add {file}")],
+        other.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "origin", &format!("HEAD:{refname}")],
+        other.path(),
+    );
+    remote_tip(remote_dir, &refname)
+}
+
 /// Add a linked worktree for `branch` in a fresh temp directory outside the
 /// repository. Returns the temp dir (keep it alive for the test) and the
 /// worktree's path.
