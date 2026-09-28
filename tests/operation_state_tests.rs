@@ -921,12 +921,12 @@ fn assert_legacy_replay_continues(
     paused
 }
 
-/// Kindra 0.1.0 recorded no `owned_tip_map`. Without it, `kin abort` cannot
-/// prove the repository is still as the operation left it, so it only
-/// discards the journal: the native rebase stays in progress and no branch
-/// is restored. This pins that behaviour; it does not restore anything, which
-/// falls short of the ADR 0001 promise that such operations can be aborted.
-fn assert_legacy_without_owned_tips_only_clears_journal(
+/// Kindra 0.1.0 recorded no `owned_tip_map`, so `kin abort` cannot prove the
+/// repository is still as the operation left it. It refuses, leaves the
+/// journal, the native rebase and every branch as they are, and says how to
+/// finish: continue it, or clear Kindra's record and abort the rebase with
+/// Git. ADR 0001 promises abort only for journals from 0.2.0 on.
+fn assert_legacy_without_owned_tips_refuses_abort(
     scenario: fn() -> Paused,
     fixture: &str,
     status: &str,
@@ -934,11 +934,18 @@ fn assert_legacy_without_owned_tips_only_clears_journal(
     let paused = paused_with_legacy(scenario, fixture);
     paused.assert_status(status);
     let paused_tips = paused.repo.tips();
-    let output = paused.abort();
-    assert_eq!(
-        stdout(&output),
-        "Kindra state cleared without touching the active git rebase because the repository no longer matches Kindra's saved state.\n"
-    );
+
+    let output = paused.repo.kin(&["abort"]);
+    assert!(!output.status.success(), "{}", describe(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("kin continue"), "{stderr}");
+    assert!(stderr.contains("kin abort --clear-state"), "{stderr}");
+    assert!(paused.repo.state_path().exists());
+    assert!(paused.repo.rebase_in_progress());
+    assert_eq!(paused.repo.tips(), paused_tips);
+
+    let cleared = paused.repo.kin(&["abort", "--clear-state"]);
+    assert!(cleared.status.success(), "{}", describe(&cleared));
     assert!(!paused.repo.state_path().exists());
     assert!(paused.repo.rebase_in_progress());
     assert_eq!(paused.repo.tips(), paused_tips);
@@ -977,8 +984,8 @@ fn sync_tree_status() -> String {
 }
 
 #[test]
-fn legacy_move_0_1_0_abort_only_clears_journal() {
-    assert_legacy_without_owned_tips_only_clears_journal(paused_move, "move@0.1.0", &move_status());
+fn legacy_move_0_1_0_abort_refuses_and_explains() {
+    assert_legacy_without_owned_tips_refuses_abort(paused_move, "move@0.1.0", &move_status());
 }
 
 #[test]
@@ -1071,8 +1078,8 @@ fn legacy_reorder_1_1_0_continues() {
 }
 
 #[test]
-fn legacy_sync_linear_0_1_0_abort_only_clears_journal() {
-    assert_legacy_without_owned_tips_only_clears_journal(
+fn legacy_sync_linear_0_1_0_abort_refuses_and_explains() {
+    assert_legacy_without_owned_tips_refuses_abort(
         paused_sync_linear,
         "sync_linear@0.1.0",
         &sync_linear_status(),
@@ -1219,8 +1226,8 @@ const COMMIT_RESTACK_ABORTED: AbortOutcome = AbortOutcome {
 };
 
 #[test]
-fn legacy_commit_restack_0_1_0_abort_only_clears_journal() {
-    assert_legacy_without_owned_tips_only_clears_journal(
+fn legacy_commit_restack_0_1_0_abort_refuses_and_explains() {
+    assert_legacy_without_owned_tips_refuses_abort(
         paused_commit_restack,
         "commit_restack@0.1.0",
         &format!(

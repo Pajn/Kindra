@@ -1234,7 +1234,7 @@ fn test_abort_preserves_stash_when_owned_tip_map_mismatches() {
 }
 
 #[test]
-fn test_abort_preserves_stash_for_legacy_state_without_owned_tip_map() {
+fn test_abort_refuses_legacy_state_without_owned_tip_map_and_keeps_its_stash() {
     let (dir, _repo) = setup_repo();
 
     run_ok("git", &["checkout", "-f", "main"], dir.path());
@@ -1263,12 +1263,21 @@ fn test_abort_preserves_stash_for_legacy_state_without_owned_tip_map() {
     )
     .unwrap();
 
+    // Without an owned_tip_map, abort cannot prove what it would undo: it
+    // refuses and leaves the state and the stash alone.
     kin_cmd()
         .arg("abort")
         .current_dir(dir.path())
         .assert()
-        .success()
-        .stdout(predicates::str::contains("kin-commit-on-1-1"));
+        .failure()
+        .stderr(predicates::str::contains("kin abort --clear-state"));
+    assert!(state_path.exists(), "abort must keep the state it refused");
+
+    kin_cmd()
+        .args(["abort", "--clear-state"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
 
     let stash_list = git_stdout(dir.path(), &["stash", "list"]);
     assert!(
@@ -1278,7 +1287,7 @@ fn test_abort_preserves_stash_for_legacy_state_without_owned_tip_map() {
     );
     assert!(
         !state_path.exists(),
-        "State file should be cleared after abort"
+        "State file should be cleared by --clear-state"
     );
 }
 

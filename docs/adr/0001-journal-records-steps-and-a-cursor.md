@@ -7,5 +7,5 @@ An operation's journal stores the list of steps it will perform and the position
 ## Consequences
 
 - The journal is versioned from its first release, so later format changes can be detected rather than guessed.
-- A paused operation recorded by Kindra 1.1 or earlier stays usable after an upgrade. Operations built only from branch replays (move, restack, reorder and sync) are read by a legacy adapter and can be continued. Every other recorded operation can at least be aborted.
+- A paused operation recorded by Kindra 1.1 or earlier stays usable after an upgrade. Operations built only from branch replays (move, restack, reorder and sync) are read by a legacy adapter and can be continued. Every other operation recorded by 0.2.0 or later can at least be aborted. Kindra 0.1.0 did not record which branches an operation owns, so `kin abort` cannot prove what it would undo; for those it refuses and points to `kin continue` or `kin abort --clear-state`.
 - Inferring progress from the graph was rejected because it can only describe branch replays. It would keep the autosquash and move-onto-ancestor rebases, and their separate recovery paths, outside the shared executor.

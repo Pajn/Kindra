@@ -94,6 +94,14 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
 
     if matches!(kindra, KindraOperation::Rebase(_)) {
         let mut parsed_state = load_state(repo)?;
+        // Kindra before 0.2.0 saved no record of which branch tips it owns, so
+        // nothing proves the repository is still as the operation left it.
+        // Leave everything as it is rather than clear the state or restore refs.
+        if parsed_state.owned_tip_map.is_empty() {
+            return Err(anyhow!(
+                "This operation was saved by an older Kindra that did not record which branches it owns, so 'kin abort' cannot undo it safely. Run 'kin continue' to finish it, or 'kin abort --clear-state' to discard Kindra's record and then undo the rest with Git (for example 'git rebase --abort')."
+            ));
+        }
         let git_rebase_active = git_rebase_in_progress(repo);
         let kindra_owns_current_state = owned_tip_state_matches(repo, &parsed_state)?;
 
