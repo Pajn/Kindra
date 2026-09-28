@@ -1,6 +1,6 @@
 #![cfg(unix)]
 mod common;
-use common::{git_command, kin_cmd, repo_init, run_ok};
+use common::{git_command, kin_cmd, rebase_state_file, repo_init, run_ok};
 use std::{fs, path::Path};
 use tempfile::{TempDir, tempdir};
 
@@ -1368,7 +1368,7 @@ fn planned_operation_refuses_staged_override_changes_before_saving_state() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("staged"));
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
     assert_eq!(git(dir.path(), &["show", ":AGENTS.md"]), "local override\n");
 }
 #[test]

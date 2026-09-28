@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{current_branch, kin_cmd, repo_init, run_ok};
+use common::{StateFile, current_branch, kin_cmd, repo_init, run_ok, state_file};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -596,7 +596,7 @@ fn checkout_checkpoints_partial_hydration_and_continues() {
         .failure();
     assert!(local_branch_exists(dir.path(), "parent"));
     assert!(!local_branch_exists(dir.path(), "child"));
-    let path = dir.path().join(".git/kindra_checkout_state.json");
+    let path = state_file(dir.path(), StateFile::Checkout);
     let state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(state["branch"], "child");
@@ -652,7 +652,7 @@ fn checkout_abort_clears_partial_hydration_without_deleting_local_work() {
         .env("PATH", mocked_path(dir.path()))
         .assert()
         .failure();
-    let path = dir.path().join(".git/kindra_checkout_state.json");
+    let path = state_file(dir.path(), StateFile::Checkout);
     assert!(path.exists());
     kin_cmd()
         .arg("abort")
@@ -706,7 +706,7 @@ fn interrupted_hydration_keeps_overrides_applied_until_it_checks_out() {
             "overlay\n"
         );
         assert!(!overlay_state.exists());
-        assert!(!dir.path().join(".git/kindra_checkout_state.json").exists());
+        assert!(!state_file(dir.path(), StateFile::Checkout).exists());
     }
 }
 
@@ -722,7 +722,7 @@ fn checkout_continue_retries_uncheckpointed_creation_without_overwriting_edits()
             .env("PATH", mocked_path(dir.path()))
             .assert()
             .failure();
-        let path = dir.path().join(".git/kindra_checkout_state.json");
+        let path = state_file(dir.path(), StateFile::Checkout);
         let mut state: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         // Simulate a crash after creating parent but before its checkpoint.
@@ -777,14 +777,14 @@ fn checkout_recovery_preserves_native_git_operation() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("native git operation"));
-    assert!(dir.path().join(".git/kindra_checkout_state.json").exists());
+    assert!(state_file(dir.path(), StateFile::Checkout).exists());
     kin_cmd()
         .arg("abort")
         .current_dir(dir.path())
         .assert()
         .success();
     assert!(merge_head.exists());
-    assert!(!dir.path().join(".git/kindra_checkout_state.json").exists());
+    assert!(!state_file(dir.path(), StateFile::Checkout).exists());
 }
 
 #[test]
@@ -845,6 +845,6 @@ fn checkout_refuses_during_native_revert_and_bisect() {
             }));
         assert_eq!(repo.state(), state);
         assert_eq!(repo.head().unwrap().target(), head);
-        assert!(!dir.path().join(".git/kindra_checkout_state.json").exists());
+        assert!(!state_file(dir.path(), StateFile::Checkout).exists());
     }
 }

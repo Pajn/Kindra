@@ -1,17 +1,13 @@
 mod common;
 
-use common::{kin_cmd, repo_init};
+use common::{StateFile, kin_cmd, repo_init};
 use predicates::prelude::*;
 use std::fs;
 use tempfile::tempdir;
 
 #[test]
 fn status_reports_overlapping_operations_before_reading_or_reconciling_them() {
-    let states = [
-        "kindra_checkout_state.json",
-        "kindra_rebase_state.json",
-        "kindra_run_state.json",
-    ];
+    let states = [StateFile::Checkout, StateFile::Rebase, StateFile::Run];
     for selected in [
         [true, true, false],
         [true, false, true],
@@ -20,10 +16,10 @@ fn status_reports_overlapping_operations_before_reading_or_reconciling_them() {
     ] {
         let dir = tempdir().unwrap();
         let repo = repo_init(dir.path());
-        for (name, present) in states.iter().zip(selected) {
+        for (file, present) in states.iter().zip(selected) {
             if present {
                 // Overlap must be reported even if a saved state is malformed.
-                fs::write(repo.path().join(name), "{}").unwrap();
+                fs::write(file.in_git_dir(repo.path()), "{}").unwrap();
             }
         }
         kin_cmd()
@@ -36,9 +32,12 @@ fn status_reports_overlapping_operations_before_reading_or_reconciling_them() {
             ))
             .stdout(predicate::str::contains("Checkout hydration in progress").not())
             .stdout(predicate::str::contains("Run 'kin continue' to resume").not());
-        for (name, present) in states.iter().zip(selected) {
+        for (file, present) in states.iter().zip(selected) {
             if present {
-                assert_eq!(fs::read_to_string(repo.path().join(name)).unwrap(), "{}");
+                assert_eq!(
+                    fs::read_to_string(file.in_git_dir(repo.path())).unwrap(),
+                    "{}"
+                );
             }
         }
     }
@@ -48,12 +47,12 @@ fn status_reports_overlapping_operations_before_reading_or_reconciling_them() {
 fn status_preserves_single_operation_messages() {
     let cases = [
         (
-            "kindra_checkout_state.json",
+            StateFile::Checkout,
             "{}",
             "Checkout hydration in progress. Run 'kin continue' to resume or 'kin abort' to stop.",
         ),
         (
-            "kindra_run_state.json",
+            StateFile::Run,
             r#"{
             "target_branches":["feature"], "current_index":0,
             "args":{"command":"true", "continue_on_failure":false},
@@ -62,7 +61,7 @@ fn status_preserves_single_operation_messages() {
             "Run in progress: 0 of 1 branch(es) processed\nNext branch: feature",
         ),
         (
-            "kindra_rebase_state.json",
+            StateFile::Rebase,
             r#"{
             "operation":"Reorder", "original_branch":"feature", "target_branch":"main",
             "remaining_branches":[], "in_progress_branch":"feature"
@@ -73,7 +72,7 @@ fn status_preserves_single_operation_messages() {
     for (file, state, expected) in cases {
         let dir = tempdir().unwrap();
         let repo = repo_init(dir.path());
-        fs::write(repo.path().join(file), state).unwrap();
+        fs::write(file.in_git_dir(repo.path()), state).unwrap();
         kin_cmd()
             .arg("status")
             .current_dir(dir.path())
@@ -89,8 +88,8 @@ fn overlapping_operations_point_status_continue_and_abort_at_clear_state() {
     let dir = tempdir().unwrap();
     let repo = repo_init(dir.path());
     common::make_commit(&repo, "refs/heads/main", "file.txt", "base", "base", &[]);
-    for name in ["kindra_rebase_state.json", "kindra_run_state.json"] {
-        fs::write(repo.path().join(name), "{}").unwrap();
+    for file in [StateFile::Rebase, StateFile::Run] {
+        fs::write(file.in_git_dir(repo.path()), "{}").unwrap();
     }
     for command in ["status", "continue", "abort"] {
         let output = kin_cmd()
@@ -165,7 +164,7 @@ fn status_reports_busy_and_reconciles_nothing_while_another_kin_holds_the_lock()
     use fs2::FileExt;
     let dir = tempdir().unwrap();
     let repo = move_completed_with_git(dir.path());
-    let state_path = repo.path().join("kindra_rebase_state.json");
+    let state_path = StateFile::Rebase.in_git_dir(repo.path());
     let saved = fs::read(&state_path).unwrap();
 
     let lock = fs::OpenOptions::new()

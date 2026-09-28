@@ -600,7 +600,7 @@ pub fn start_native_bisect(cwd: &Path, bad: &str, good: &str) {
 #[allow(dead_code)]
 pub fn write_paused_operation(repo: &Repository, branch: &str) {
     fs::write(
-        repo.path().join("kindra_rebase_state.json"),
+        StateFile::Rebase.in_git_dir(repo.path()),
         format!(
             r#"{{"operation":"Reorder","original_branch":"{branch}","target_branch":"main",
             "remaining_branches":[],"in_progress_branch":"{branch}"}}"#
@@ -613,16 +613,99 @@ pub fn write_paused_operation(repo: &Repository, branch: &str) {
 #[allow(dead_code)]
 pub fn assert_no_kindra_operation(cwd: &Path) {
     let repo = Repository::open(cwd).unwrap();
-    for name in [
-        "kindra_rebase_state.json",
-        "kindra_run_state.json",
-        "kindra_checkout_state.json",
-    ] {
+    for file in StateFile::ALL {
+        let name = file.file_name();
         assert!(
-            !repo.path().join(name).exists(),
+            !file.in_git_dir(repo.path()).exists(),
             "{name} was persisted by a refused command"
         );
     }
+}
+
+/// A file Kindra persists an operation's progress in, inside a worktree's Git
+/// directory. The names are part of the on-disk format, so tests spell them
+/// out here once instead of borrowing them from the crate: renaming one in the
+/// implementation then fails tests rather than silently orphaning operations
+/// paused by an older Kindra.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateFile {
+    /// Every operation driven by the rebase loop (move, restack, reorder,
+    /// sync, commit, absorb).
+    Rebase,
+    /// An interrupted `kin run`.
+    Run,
+    /// Checkout hydration.
+    Checkout,
+}
+
+#[allow(dead_code)]
+impl StateFile {
+    pub const ALL: [Self; 3] = [Self::Rebase, Self::Run, Self::Checkout];
+
+    pub fn file_name(self) -> &'static str {
+        match self {
+            Self::Rebase => "kindra_rebase_state.json",
+            Self::Run => "kindra_run_state.json",
+            Self::Checkout => "kindra_checkout_state.json",
+        }
+    }
+
+    /// This state file inside the Git directory `git_dir` (`repo.path()`).
+    pub fn in_git_dir(self, git_dir: &Path) -> PathBuf {
+        git_dir.join(self.file_name())
+    }
+}
+
+/// Where the worktree checked out at `worktree` keeps `file`: inside its own
+/// Git directory, which for a linked worktree is not `<worktree>/.git`.
+#[allow(dead_code)]
+pub fn state_file(worktree: &Path, file: StateFile) -> PathBuf {
+    let repo = Repository::open(worktree).unwrap();
+    file.in_git_dir(repo.path())
+}
+
+/// Where the worktree at `worktree` keeps the state of a rebase-based
+/// operation.
+#[allow(dead_code)]
+pub fn rebase_state_file(worktree: &Path) -> PathBuf {
+    state_file(worktree, StateFile::Rebase)
+}
+
+/// The smallest rebase state Kindra accepts: only the fields without a serde
+/// default. Every other field takes the value an older Kindra that never wrote
+/// it leaves behind.
+#[allow(dead_code)]
+pub const MINIMAL_REBASE_STATE_JSON: &str = r#"{
+  "operation": "Move",
+  "original_branch": "",
+  "target_branch": "",
+  "remaining_branches": [],
+  "in_progress_branch": null
+}"#;
+
+/// A `RebaseState` for tests, deserialized from [`MINIMAL_REBASE_STATE_JSON`]
+/// so tests keep compiling when the state gains a field. Set the fields a test
+/// cares about with struct update syntax:
+///
+/// ```ignore
+/// let state = RebaseState {
+///     owned_tip_map: HashMap::from([("main".to_string(), tip.to_string())]),
+///     ..rebase_state(Operation::Commit, "main", "main")
+/// };
+/// ```
+#[allow(dead_code)]
+pub fn rebase_state(
+    operation: kindra::rebase_utils::Operation,
+    original_branch: &str,
+    target_branch: &str,
+) -> kindra::rebase_utils::RebaseState {
+    let mut state: kindra::rebase_utils::RebaseState =
+        serde_json::from_str(MINIMAL_REBASE_STATE_JSON).unwrap();
+    state.operation = operation;
+    state.original_branch = original_branch.to_string();
+    state.target_branch = target_branch.to_string();
+    state
 }
 
 /// A shell snippet for a mock (`gh`) or Git hook that pauses the `kin`

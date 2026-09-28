@@ -1,9 +1,8 @@
 mod common;
 
-use common::{kin_cmd, make_commit, repo_init};
+use common::{kin_cmd, make_commit, rebase_state, rebase_state_file, repo_init};
 use git2::{Repository, Signature};
 use kindra::rebase_utils::{Operation, RebaseState, save_state};
-use std::collections::HashMap;
 use std::fs;
 use tempfile::tempdir;
 
@@ -692,7 +691,7 @@ mv "$file.tmp" "$file"
         .stderr(predicates::str::contains("must follow a commit line"));
 
     // Verify state file does NOT exist
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
 }
 
 #[test]
@@ -712,28 +711,9 @@ fn test_split_refuses_when_kindra_operation_in_progress() {
     // reconciliation cannot prove the branch is done, so the state is treated as
     // active and any mutating command must refuse.
     let state = RebaseState {
-        operation: Operation::Move,
-        original_branch: "feature-b".to_string(),
-        target_branch: "main".to_string(),
-        caller_branch: None,
         remaining_branches: vec!["feature-b".to_string()],
         in_progress_branch: Some("feature-b".to_string()),
-        parent_id_map: HashMap::new(),
-        parent_name_map: HashMap::new(),
-        new_base_map: HashMap::new(),
-        original_commit_count_map: HashMap::new(),
-        original_tip_map: HashMap::new(),
-        owned_tip_map: HashMap::new(),
-        stash_ref: None,
-        stash_apply_index: false,
-        carry_stash_ref: None,
-        preserve_content_on_abort: false,
-        suppress_editor: false,
-        abort_only: false,
-        unstage_on_restore: false,
-        autostash: false,
-        cleanup_merged_branches: Vec::new(),
-        cleanup_checkout_fallback: None,
+        ..rebase_state(Operation::Move, "feature-b", "main")
     };
     save_state(&repo, &state).unwrap();
 
@@ -758,7 +738,7 @@ fn test_split_refuses_when_kindra_operation_in_progress() {
         .stderr(predicates::str::contains("already in progress"));
 
     // The interrupted operation's state is untouched and no branches were changed.
-    assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(rebase_state_file(dir.path()).exists());
     assert!(
         repo.find_branch("feature-b", git2::BranchType::Local)
             .is_ok()
@@ -972,7 +952,7 @@ fn test_split_refuses_dirty_working_tree_by_default() {
         fs::read_to_string(dir.path().join("file.txt")).unwrap(),
         "dirty"
     );
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
 }
 
 #[test]
@@ -1148,7 +1128,7 @@ perl -i -pe 's/(commit 2)/$1\nbranch feature-x/' "$file"
         fs::read_to_string(dir.path().join("file.txt")).unwrap(),
         "dirty"
     );
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
 }
 
 /// A bare `branch` row (no name) is auto-named by slugifying the commit it sits

@@ -1,6 +1,6 @@
 mod common;
 
-use common::{kin_cmd, repo_init, run_ok};
+use common::{StateFile, kin_cmd, rebase_state, rebase_state_file, repo_init, run_ok};
 use git2::{BranchType, Repository};
 use kindra::rebase_utils::{Operation, RebaseState};
 use predicates::prelude::*;
@@ -305,7 +305,7 @@ fn reflog_refuses_when_operation_in_progress() {
 
     // Simulate an operation in progress plus a pending oplog snapshot.
     let git_dir = root.join(".git");
-    fs::write(git_dir.join("kindra_run_state.json"), "{}").unwrap();
+    fs::write(StateFile::Run.in_git_dir(&git_dir), "{}").unwrap();
     let pending = git_dir.join("kindra_oplog_pending.json");
     fs::write(&pending, "pending-snapshot").unwrap();
 
@@ -664,34 +664,14 @@ fn abort_with_divergent_state_finalizes_oplog_for_recovery() {
     // the real `RebaseState` type so the fixture tracks the schema instead of a
     // hand-copied JSON snapshot.
     let state = RebaseState {
-        operation: Operation::Commit,
-        original_branch: "main".to_string(),
-        target_branch: "main".to_string(),
         owned_tip_map: HashMap::from([(
             "main".to_string(),
             "0000000000000000000000000000000000000000".to_string(),
         )]),
-        caller_branch: None,
-        remaining_branches: Vec::new(),
-        in_progress_branch: None,
-        parent_id_map: HashMap::new(),
-        parent_name_map: HashMap::new(),
-        new_base_map: HashMap::new(),
-        original_commit_count_map: HashMap::new(),
-        original_tip_map: HashMap::new(),
-        stash_ref: None,
-        stash_apply_index: false,
-        carry_stash_ref: None,
-        preserve_content_on_abort: false,
-        suppress_editor: false,
-        abort_only: false,
-        unstage_on_restore: false,
-        autostash: false,
-        cleanup_merged_branches: Vec::new(),
-        cleanup_checkout_fallback: None,
+        ..rebase_state(Operation::Commit, "main", "main")
     };
     fs::write(
-        root.join(".git/kindra_rebase_state.json"),
+        rebase_state_file(root),
         serde_json::to_string_pretty(&state).unwrap(),
     )
     .unwrap();

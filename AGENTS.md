@@ -4,6 +4,7 @@
 - **Mandatory Integration Tests**: Every new feature or subcommand must include a corresponding integration test in the `tests/` directory.
 - **Bug Regression Tests**: Any identified bug or edge case (e.g., panics, incorrect state) MUST be reproduced with a permanent test case before the fix is applied. Do not use temporary "repro" filenames; integrate them into the relevant test suite
 - **Conflict Handling**: Commands that perform complex Git operations (like `move` or `split`) must be tested against rebase conflicts and incomplete states.
+- **Operation State**: `tests/operation_state_tests.rs` pins the journal each operation saves when it pauses (golden files in `tests/fixtures/operation_state/golden/`, regenerated with `KIN_UPDATE_GOLDEN=1 cargo test --test operation_state_tests`; review the diff) and how journals written by released versions behave (`legacy/`, frozen — never regenerate them). In tests, name state files through `common::StateFile`/`rebase_state_file` and build `RebaseState` values with `common::rebase_state` and struct update syntax, not full literals.
 
 ### Linting & Formatting
 - **Clippy**: Code must be Clippy-clean across all targets and features. Always run:

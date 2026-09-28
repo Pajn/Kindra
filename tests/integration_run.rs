@@ -1,6 +1,6 @@
 mod common;
 
-use common::{current_branch, kin_cmd, repo_init, run_ok};
+use common::{StateFile, current_branch, kin_cmd, repo_init, run_ok, state_file};
 use predicates::str::contains;
 use std::fs;
 use std::path::Path;
@@ -69,7 +69,7 @@ fn run_happy_path_traverses_stack() {
 
     assert_eq!(read_lines(&log_path), vec!["feature-a", "feature-b"]);
     assert_eq!(current_branch(dir.path()), "feature-b");
-    assert!(!dir.path().join(".git/kindra_run_state.json").exists());
+    assert!(!state_file(dir.path(), StateFile::Run).exists());
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn run_continue_on_failure_processes_later_branches() {
     assert_eq!(current_branch(dir.path()), "feature-b");
     // run is a reporter: a failed command reports via the exit code and leaves
     // no blocking state behind.
-    assert!(!dir.path().join(".git/kindra_run_state.json").exists());
+    assert!(!state_file(dir.path(), StateFile::Run).exists());
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn run_failure_restores_original_checkout() {
 
     assert_eq!(read_lines(&log_path), vec!["feature-a"]);
     assert_eq!(current_branch(dir.path()), "feature-b");
-    assert!(!dir.path().join(".git/kindra_run_state.json").exists());
+    assert!(!state_file(dir.path(), StateFile::Run).exists());
 }
 
 #[test]
@@ -136,7 +136,7 @@ fn run_failure_restores_original_detached_head() {
 #[test]
 fn run_failed_command_is_terminal_and_does_not_block() {
     let dir = setup_run_repo();
-    let state_path = dir.path().join(".git/kindra_run_state.json");
+    let state_path = state_file(dir.path(), StateFile::Run);
 
     // A failing command reports via a non-zero exit code...
     kin_cmd()
@@ -199,7 +199,7 @@ fn run_refuses_dirty_working_tree_by_default() {
         "dirty"
     );
     assert_eq!(current_branch(dir.path()), "feature-b");
-    assert!(!dir.path().join(".git/kindra_run_state.json").exists());
+    assert!(!state_file(dir.path(), StateFile::Run).exists());
 }
 
 #[test]
@@ -209,7 +209,7 @@ fn continue_rejects_leftover_run_state() {
     // A leftover run-state file means a `kin run` was interrupted before it could
     // restore the working tree. `kin run` is not resumable, so `kin continue`
     // cannot resolve it and must say so, pointing the user at `kin abort`.
-    fs::write(dir.path().join(".git/kindra_run_state.json"), "{}").unwrap();
+    fs::write(state_file(dir.path(), StateFile::Run), "{}").unwrap();
 
     kin_cmd()
         .arg("continue")
@@ -252,13 +252,13 @@ fn run_autostash_sets_aside_changes_and_restores_them() {
         fs::read_to_string(dir.path().join("base.txt")).unwrap(),
         "dirty"
     );
-    assert!(!dir.path().join(".git/kindra_run_state.json").exists());
+    assert!(!state_file(dir.path(), StateFile::Run).exists());
 }
 
 #[test]
 fn run_autostash_restored_on_failure() {
     let dir = setup_run_repo();
-    let state_path = dir.path().join(".git/kindra_run_state.json");
+    let state_path = state_file(dir.path(), StateFile::Run);
 
     // Dirty a tracked file, then run a command that fails on the first branch.
     fs::write(dir.path().join("base.txt"), "dirty").unwrap();
@@ -290,7 +290,7 @@ fn run_autostash_restored_after_continue_on_failure_run() {
     // exact case that used to strand the user's work pending a `kin continue`
     // that could never restore it.
     let dir = setup_run_repo();
-    let state_path = dir.path().join(".git/kindra_run_state.json");
+    let state_path = state_file(dir.path(), StateFile::Run);
 
     fs::write(dir.path().join("base.txt"), "dirty").unwrap();
 

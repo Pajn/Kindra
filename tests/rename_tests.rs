@@ -1,6 +1,6 @@
 mod common;
 
-use common::{current_branch, kin_cmd, run_ok, setup_repo};
+use common::{StateFile, current_branch, kin_cmd, run_ok, setup_repo, state_file};
 use std::process::Command;
 
 fn branch_exists(cwd: &std::path::Path, name: &str) -> bool {
@@ -240,7 +240,7 @@ fn rename_detached_head_single_arg_errors() {
 #[test]
 fn rename_refuses_when_operation_in_progress() {
     let dir = setup_repo();
-    std::fs::write(dir.path().join(".git/kindra_run_state.json"), "{}").unwrap();
+    std::fs::write(state_file(dir.path(), StateFile::Run), "{}").unwrap();
     kin_cmd()
         .current_dir(dir.path())
         .args(["rename", "feature-a", "feature-a-renamed"])

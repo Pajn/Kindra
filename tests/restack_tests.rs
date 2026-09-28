@@ -16,8 +16,8 @@ fn find_floating_base(
 
 mod common;
 use common::{
-    apply_global_config_env, assert_no_rebase_in_progress, kin_cmd, make_commit, repo_init, run_ok,
-    test_global_config_dir,
+    StateFile, apply_global_config_env, assert_no_rebase_in_progress, kin_cmd, make_commit,
+    rebase_state_file, repo_init, run_ok, state_file, test_global_config_dir,
 };
 
 #[test]
@@ -325,7 +325,7 @@ fn test_restack_refuses_dirty_working_tree_before_pick_prompt() {
         std::fs::read_to_string(repo_path.join("a.txt")).unwrap(),
         "dirty"
     );
-    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(repo_path).exists());
     assert_no_rebase_in_progress(repo_path);
 }
 
@@ -3016,7 +3016,7 @@ fn restack_blocked_by_stale_run_state() {
 
     // An unresolved `kin run` left persisted run state behind.
     std::fs::write(
-        dir.path().join(".git/kindra_run_state.json"),
+        state_file(dir.path(), StateFile::Run),
         r#"{"target_branches":["main"],"current_index":0,"args":{"command":"false","continue_on_failure":false},"original_branch":"main","original_head_id":"0000000000000000000000000000000000000000","status":"failed"}"#,
     )
     .unwrap();
@@ -3037,7 +3037,7 @@ fn restack_blocked_by_stale_run_state() {
         "expected an in-progress state-gate error, got:\n{}",
         stderr
     );
-    assert!(dir.path().join(".git/kindra_run_state.json").exists());
+    assert!(state_file(dir.path(), StateFile::Run).exists());
 }
 
 #[test]
@@ -3063,7 +3063,7 @@ fn restack_rejects_checked_out_child_before_saving_state() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("feature-b is checked out in"));
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
     assert_eq!(repo.revparse_single("feature-b").unwrap().id(), original);
     assert_eq!(common::current_branch(dir.path()), "feature-a");
     assert_no_rebase_in_progress(dir.path());

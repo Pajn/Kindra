@@ -1,0 +1,31 @@
+{
+  "autostash": false,
+  "caller_branch": null,
+  "carry_stash_ref": null,
+  "cleanup_checkout_fallback": "main",
+  "cleanup_merged_branches": [],
+  "in_progress_branch": "main",
+  "new_base_map": {},
+  "operation": "Sync",
+  "original_branch": "main",
+  "original_commit_count_map": {},
+  "original_tip_map": {
+    "main": "<main@before>"
+  },
+  "owned_tip_map": {
+    "main": "<main@before>"
+  },
+  "parent_id_map": {
+    "main": "<commit: base>"
+  },
+  "parent_name_map": {},
+  "preserve_content_on_abort": false,
+  "remaining_branches": [
+    "main"
+  ],
+  "stash_apply_index": false,
+  "stash_ref": null,
+  "suppress_editor": false,
+  "target_branch": "origin/main",
+  "unstage_on_restore": false
+}
