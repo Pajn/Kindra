@@ -551,8 +551,9 @@ fn sync_boundary_after_a_merged_parent_stops_at_the_fork() {
 }
 
 /// `kin sync` against a remote with many branches must ask the server about
-/// the trunk and the stack's own remote branches alone. Reading what the server advertises, rather than timing the
-/// fetch, keeps this deterministic: on a large remote the advertisement and
+/// the trunk and the stack's own remote branches alone, and download nothing
+/// else. Reading what the server advertises, rather than timing the fetch,
+/// keeps this deterministic: on a large remote the advertisement and
 /// negotiation of every ref is where a full fetch spends its time.
 #[test]
 fn sync_requests_only_the_trunk_and_stack_from_a_remote_with_many_branches() {
@@ -588,6 +589,31 @@ fn sync_requests_only_the_trunk_and_stack_from_a_remote_with_many_branches() {
     run_ok("git", &push, dir.path());
     run_ok("git", &["checkout", "-f", "feature"], dir.path());
     let trunk = push_remote_commit(remote.path(), "main", "trunk.txt");
+    // Branches whose names extend the stack branch's are unrelated too. Each
+    // gets a commit only the remote has, so downloading it is detectable.
+    let prefixed: Vec<git2::Oid> = {
+        let remote_repo = Repository::open(remote.path()).unwrap();
+        let sig = Signature::now("perf", "perf@test.com").unwrap();
+        let parent = remote_repo.find_commit(trunk).unwrap();
+        (0..REMOTE_BRANCHES)
+            .map(|i| {
+                let mut tree = remote_repo.treebuilder(None).unwrap();
+                let blob = remote_repo.blob(format!("feature-{i}").as_bytes()).unwrap();
+                tree.insert("prefixed.txt", blob, 0o100644).unwrap();
+                let tree = remote_repo.find_tree(tree.write().unwrap()).unwrap();
+                remote_repo
+                    .commit(
+                        Some(&format!("refs/heads/feature-{i}")),
+                        &sig,
+                        &sig,
+                        &format!("feature-{i}"),
+                        &tree,
+                        &[&parent],
+                    )
+                    .unwrap()
+            })
+            .collect()
+    };
 
     let trace = dir.path().join(".git").join("packet-trace");
     kin_cmd()
@@ -617,10 +643,29 @@ fn sync_requests_only_the_trunk_and_stack_from_a_remote_with_many_branches() {
         .collect();
     advertised.sort_unstable();
     advertised.dedup();
-    assert_eq!(
-        advertised,
-        ["refs/heads/feature", "refs/heads/main"],
+    // Protocol v2 advertises by prefix, so the remote also lists the branches
+    // whose names extend a requested one; they must not be downloaded.
+    let unexpected: Vec<&&str> = advertised
+        .iter()
+        .filter(|name| {
+            !["refs/heads/main", "refs/heads/feature"]
+                .iter()
+                .any(|p| name.starts_with(p))
+        })
+        .collect();
+    assert!(
+        unexpected.is_empty()
+            && advertised.contains(&"refs/heads/main")
+            && advertised.contains(&"refs/heads/feature"),
         "sync should have the remote advertise only the trunk and the stack \
-         ({REMOTE_BRANCHES} unrelated branches and a tag exist):\n{trace}"
+         ({REMOTE_BRANCHES} unrelated branches and a tag exist), got {unexpected:?}"
+    );
+    let downloaded = prefixed
+        .iter()
+        .filter(|oid| repo.find_commit(**oid).is_ok())
+        .count();
+    assert_eq!(
+        downloaded, 0,
+        "sync downloaded commits of {downloaded} branches that only share the stack branch's name prefix"
     );
 }

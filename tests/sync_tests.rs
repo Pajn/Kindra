@@ -3415,6 +3415,15 @@ fn remote_backed_repo() -> (TempDir, TempDir) {
     (dir, remote)
 }
 
+/// How many `git fetch` commands a `GIT_TRACE` log records.
+fn fetch_count(trace: &std::path::Path) -> usize {
+    fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("trace: built-in: git fetch"))
+        .count()
+}
+
 fn tip(repo: &Repository, rev: &str) -> git2::Oid {
     repo.revparse_single(rev)
         .unwrap()
@@ -3615,6 +3624,7 @@ fn sync_refreshes_the_stack_even_when_the_stale_trunk_shares_no_history() {
         .unwrap();
     let trunk = common::push_remote_commit(remote.path(), "main", "trunk-1.txt");
     let teammate = common::push_remote_commit(remote.path(), "feature-a", "teammate.txt");
+    let unrelated = common::push_remote_commit(remote.path(), "unrelated", "unrelated-1.txt");
 
     kin_cmd()
         .arg("sync")
@@ -3628,6 +3638,11 @@ fn sync_refreshes_the_stack_even_when_the_stale_trunk_shares_no_history() {
         tip(&repo, "origin/feature-a"),
         teammate,
         "the stack branch's remote-tracking ref should be refreshed"
+    );
+    assert_eq!(
+        tip(&repo, "origin/unrelated"),
+        unrelated,
+        "without a stack to target, sync should fetch the whole remote"
     );
 }
 
@@ -3655,7 +3670,8 @@ fn sync_refreshes_the_remote_branches_of_the_stack_it_syncs() {
     let trunk = common::push_remote_commit(remote.path(), "main", "trunk-1.txt");
     let teammate = common::push_remote_commit(remote.path(), "feature-a", "teammate.txt");
     common::push_remote_commit(remote.path(), "unrelated", "unrelated-1.txt");
-    common::push_remote_commit(remote.path(), "feature-a-followup", "followup-1.txt");
+    let followup =
+        common::push_remote_commit(remote.path(), "feature-a-followup", "followup-1.txt");
 
     kin_cmd()
         .arg("sync")
@@ -3672,16 +3688,9 @@ fn sync_refreshes_the_remote_branches_of_the_stack_it_syncs() {
     );
     assert_eq!(tip(&repo, "origin/unrelated"), unrelated_before);
     assert_eq!(tip(&repo, "origin/feature-a-followup"), followup_before);
-    // Only the undo snapshot may remain in Kindra's namespace.
-    let leftovers: Vec<String> = repo
-        .references_glob("refs/kindra/*")
-        .unwrap()
-        .filter_map(|r| r.unwrap().name().map(str::to_string))
-        .filter(|name| !name.starts_with("refs/kindra/undo/"))
-        .collect();
     assert!(
-        leftovers.is_empty(),
-        "sync must not leave temporary refs behind: {leftovers:?}"
+        repo.find_commit(followup).is_err(),
+        "a remote branch that only shares the stack branch's name prefix must not be downloaded"
     );
 }
 
@@ -3731,16 +3740,30 @@ fn sync_skips_stack_branches_deleted_on_the_remote() {
     );
     let teammate = common::push_remote_commit(remote.path(), "feature-b", "teammate.txt");
     let trunk = common::push_remote_commit(remote.path(), "main", "trunk-1.txt");
+    let unrelated_before = tip(&repo, "origin/unrelated");
+    common::push_remote_commit(remote.path(), "unrelated", "unrelated-1.txt");
 
+    let trace = dir.path().join(".git").join("kin-trace");
     kin_cmd()
         .arg("sync")
+        .env("GIT_TRACE", &trace)
         .current_dir(dir.path())
         .assert()
         .success();
 
+    assert_eq!(
+        fetch_count(&trace),
+        2,
+        "one targeted fetch and one retry without the deleted branch"
+    );
     let repo = Repository::open(dir.path()).unwrap();
     assert_eq!(tip(&repo, "origin/main"), trunk);
     assert_eq!(tip(&repo, "origin/feature-b"), teammate);
+    assert_eq!(
+        tip(&repo, "origin/unrelated"),
+        unrelated_before,
+        "the retry is targeted too, not a full fetch"
+    );
     assert_eq!(
         tip(&repo, "origin/feature-a"),
         a_id,
@@ -3748,4 +3771,68 @@ fn sync_skips_stack_branches_deleted_on_the_remote() {
     );
     let a_after = repo.find_commit(tip(&repo, "feature-a")).unwrap();
     assert_eq!(a_after.parent_id(0).unwrap(), trunk);
+}
+
+#[test]
+fn sync_skips_every_stack_branch_deleted_on_the_remote() {
+    let (dir, remote) = remote_backed_repo();
+    let repo = Repository::open(dir.path()).unwrap();
+    let mut parent = repo.find_commit(tip(&repo, "main")).unwrap();
+    for name in ["feature-a", "feature-b", "feature-c"] {
+        let id = make_commit(
+            &repo,
+            &format!("refs/heads/{name}"),
+            &format!("{name}.txt"),
+            name,
+            name,
+            &[&parent],
+        );
+        parent = repo.find_commit(id).unwrap();
+    }
+    run_ok(
+        "git",
+        &[
+            "push",
+            "-u",
+            "origin",
+            "feature-a",
+            "feature-b",
+            "feature-c",
+        ],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "-f", "feature-c"], dir.path());
+    let other = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote.path().to_str().unwrap(),
+            other.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "origin", "--delete", "feature-a", "feature-b"],
+        other.path(),
+    );
+    let teammate = common::push_remote_commit(remote.path(), "feature-c", "teammate.txt");
+    let unrelated_before = tip(&repo, "origin/unrelated");
+    common::push_remote_commit(remote.path(), "unrelated", "unrelated-1.txt");
+
+    let trace = dir.path().join(".git").join("kin-trace");
+    kin_cmd()
+        .arg("sync")
+        .env("GIT_TRACE", &trace)
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    // Git names only the first missing ref before it gives up, so each
+    // deleted branch costs one retry.
+    assert_eq!(fetch_count(&trace), 3);
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(tip(&repo, "origin/feature-c"), teammate);
+    assert_eq!(tip(&repo, "origin/unrelated"), unrelated_before);
 }

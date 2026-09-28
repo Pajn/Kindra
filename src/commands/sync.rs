@@ -10,7 +10,7 @@ use crate::stack::{
 use anyhow::{Result, anyhow};
 use clap::Args;
 use git2::BranchType;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
 
 #[derive(Args, Default)]
@@ -537,17 +537,21 @@ fn resolve_sync_onto(
     Ok((upstream_name.to_string(), None))
 }
 
-/// Where the targeted fetch lands stack branches' remote branches before sync
-/// copies the ones it asked for into their remote-tracking refs. Nothing
-/// outside [`targeted_fetch`] reads it, and it is empty before and after.
-const SYNC_FETCH_REF_PREFIX: &str = "refs/kindra/sync-fetch/";
-
 /// A remote ref and the remote-tracking ref the remote's fetch refspec maps
 /// it to.
 struct TrackedRef {
     source: String,
     tracking: String,
     force: bool,
+}
+
+impl TrackedRef {
+    /// The command-line refspec that fetches exactly this ref, forcing the
+    /// update only when the remote's configured refspec does.
+    fn refspec(&self) -> String {
+        let force = if self.force { "+" } else { "" };
+        format!("{force}{}:{}", self.source, self.tracking)
+    }
 }
 
 /// Refresh, from `remote_name`, the trunk's remote-tracking ref `onto` and the
@@ -562,16 +566,17 @@ struct TrackedRef {
 /// is most of what a full fetch costs.
 ///
 /// The refs come from the remote's own fetch refspecs (for the default
-/// layout, `+refs/heads/main:refs/remotes/origin/main`), and everything is
-/// fetched in one `git fetch`, so one round trip; see [`targeted_fetch`] for
-/// how a stack branch deleted on the remote is skipped.
+/// layout, `+refs/heads/main:refs/remotes/origin/main`) and are fetched
+/// together in one `git fetch`; see [`targeted_fetch`] for how a stack branch
+/// deleted on the remote is skipped.
 ///
 /// The full `git fetch <remote>` remains the fallback when the targeted fetch
-/// cannot be built safely (no fetch refspec of the remote maps to `onto`, or
-/// the remote has negative refspecs whose exclusions this does not evaluate)
-/// and when it fails, for instance because the trunk no longer exists on the
-/// remote; the full fetch then behaves as sync always has, keeping the ref's
-/// last-fetched value.
+/// cannot be built safely (the stack could not be found before fetching, no
+/// fetch refspec of the remote maps to `onto`, or the remote has negative
+/// refspecs whose exclusions this does not evaluate) and when it fails for any
+/// reason other than a missing stack branch, for instance because the trunk no
+/// longer exists on the remote. The full fetch then behaves as sync always
+/// has, keeping the ref's last-fetched value.
 fn fetch_sync_remote(
     repo: &git2::Repository,
     remote_name: &str,
@@ -582,7 +587,7 @@ fn fetch_sync_remote(
         && let Some(trunk) = trunk_tracked_ref(repo, remote_name, onto)
     {
         let branches = stack_tracked_refs(repo, remote_name, &trunk.tracking, stack);
-        if targeted_fetch(repo, remote_name, &trunk, &branches)? {
+        if targeted_fetch(repo, remote_name, &trunk, branches)? {
             return Ok(());
         }
     }
@@ -598,128 +603,96 @@ fn fetch_sync_remote(
     Ok(())
 }
 
-/// Fetch `trunk` and `branches` from `remote_name` in one `git fetch`,
+/// Fetch `trunk` and `branches` from `remote_name` with exact refspecs,
 /// returning whether it succeeded.
 ///
-/// Git fails the whole fetch when a ref named exactly on the command line is
-/// missing on the remote, which is normal for a stack branch whose pull
-/// request was merged and its branch deleted. A pattern refspec is allowed to
-/// match nothing, so each branch is fetched as the pattern `<source>*`, whose
-/// advertisement is limited to refs starting with that name. The pattern can
-/// also match longer names, so it lands in [`SYNC_FETCH_REF_PREFIX`], and only
-/// the exact match is copied into the remote-tracking ref. `--refmap=` stops
-/// Git from also updating remote-tracking refs for those longer names. A
-/// missing branch simply leaves its remote-tracking ref as it was: nothing is
-/// pruned. The trunk is named exactly, so its absence fails the fetch.
+/// Git fails the whole fetch when a ref named on the command line is missing
+/// on the remote, which is normal for a stack branch whose pull request was
+/// merged and its branch deleted. It names the first missing ref and stops,
+/// so the fetch is retried without each stack branch it reports, one retry
+/// per deleted branch. The branch's remote-tracking ref is left as it was:
+/// nothing is pruned. A missing trunk, or any other failure, returns `false`
+/// so the caller falls back to the full fetch.
+///
+/// The fetch runs quietly with its stderr captured, so a failure the retry or
+/// the full fetch recovers from is not reported; the refs it updated are
+/// summarised instead. It runs in the C locale so the missing-ref message can
+/// be recognised.
 fn targeted_fetch(
     repo: &git2::Repository,
     remote_name: &str,
     trunk: &TrackedRef,
-    branches: &[TrackedRef],
+    mut branches: Vec<TrackedRef>,
 ) -> Result<bool> {
-    let force = |r: &TrackedRef| if r.force { "+" } else { "" };
-    let mut refspecs = vec![format!(
-        "{}{}:{}",
-        force(trunk),
-        trunk.source,
-        trunk.tracking
-    )];
-    refspecs.extend(
-        branches
-            .iter()
-            .enumerate()
-            .map(|(i, b)| format!("+{}*:{SYNC_FETCH_REF_PREFIX}{i}/ref*", b.source)),
-    );
-    let before: Vec<_> = std::iter::once(trunk)
-        .chain(branches)
-        .map(|r| ref_target(repo, &r.tracking))
+    let before: HashMap<String, Option<git2::Oid>> = std::iter::once(trunk)
+        .chain(&branches)
+        .map(|r| (r.tracking.clone(), ref_target(repo, &r.tracking)))
         .collect();
 
-    clear_sync_fetch_refs(repo)?;
-    // Capture stderr so a failure the full fetch recovers from is not reported
-    // as an error.
-    let output = Command::new("git")
-        .args(["fetch", "--quiet", "--no-tags", "--refmap=", remote_name])
-        .args(&refspecs)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()?;
-    if !output.status.success() {
-        clear_sync_fetch_refs(repo)?;
-        return Ok(false);
+    loop {
+        let output = Command::new("git")
+            .args(["fetch", "--quiet", "--no-tags", remote_name])
+            .args(
+                std::iter::once(trunk)
+                    .chain(&branches)
+                    .map(TrackedRef::refspec),
+            )
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()?;
+        if output.status.success() {
+            break;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Only stack branches are ever dropped: a missing trunk leaves this
+        // empty, and so does any other failure.
+        let missing = missing_remote_refs(&stderr, &branches);
+        if missing.is_empty() {
+            return Ok(false);
+        }
+        branches.retain(|branch| !missing.contains(&branch.source));
     }
 
-    let copied = copy_fetched_branches(repo, remote_name, branches);
-    clear_sync_fetch_refs(repo)?;
-    copied?;
-
-    for (r, old) in std::iter::once(trunk).chain(branches).zip(before) {
-        let new = ref_target(repo, &r.tracking);
-        if new == old {
+    for r in std::iter::once(trunk).chain(&branches) {
+        let old = before.get(&r.tracking).copied().flatten();
+        let Some(new) = ref_target(repo, &r.tracking) else {
+            continue;
+        };
+        if old == Some(new) {
             continue;
         }
         let short = r
             .tracking
             .strip_prefix("refs/remotes/")
             .unwrap_or(&r.tracking);
-        match (old, new) {
-            (Some(old), Some(new)) => println!(
-                "Fetched {short}: {}..{}",
-                &old.to_string()[..7],
-                &new.to_string()[..7]
-            ),
-            (None, Some(new)) => println!("Fetched {short}: {}", &new.to_string()[..7]),
-            _ => {}
+        let new = &new.to_string()[..7];
+        match old {
+            Some(old) => println!("Fetched {short}: {}..{new}", &old.to_string()[..7]),
+            None => println!("Fetched {short}: {new}"),
         }
     }
     Ok(true)
 }
 
-/// Copy the exact match of each branch's pattern fetch into its
-/// remote-tracking ref, honouring whether the remote's refspec forces updates.
-fn copy_fetched_branches(
-    repo: &git2::Repository,
-    remote_name: &str,
-    branches: &[TrackedRef],
-) -> Result<()> {
-    for (i, branch) in branches.iter().enumerate() {
-        let Some(new) = ref_target(repo, &format!("{SYNC_FETCH_REF_PREFIX}{i}/ref")) else {
-            continue;
-        };
-        let old = ref_target(repo, &branch.tracking);
-        if old == Some(new) {
-            continue;
-        }
-        if let Some(old) = old
-            && !branch.force
-            && !repo.graph_descendant_of(new, old)?
-        {
-            println!(
-                "Warning: not updating {}: the remote branch was not fast-forwarded.",
-                branch.tracking
-            );
-            continue;
-        }
-        repo.reference(
-            &branch.tracking,
-            new,
-            true,
-            &format!("kin sync: fetch {remote_name} {}", branch.source),
-        )?;
-    }
-    Ok(())
+/// The sources among `branches` that a failed `git fetch` reported missing on
+/// the remote. Git reports each as `couldn't find remote ref <ref>`; the ref
+/// is matched as a whole word on any line mentioning a remote ref, ignoring
+/// surrounding quotes and punctuation, so small wording changes still match.
+fn missing_remote_refs(stderr: &str, branches: &[TrackedRef]) -> HashSet<String> {
+    stderr
+        .lines()
+        .filter(|line| line.contains("remote ref"))
+        .flat_map(str::split_whitespace)
+        .map(|word| word.trim_matches(|c: char| "'\"`:;,.()".contains(c)))
+        .filter(|word| branches.iter().any(|branch| branch.source == *word))
+        .map(str::to_string)
+        .collect()
 }
 
 fn ref_target(repo: &git2::Repository, name: &str) -> Option<git2::Oid> {
     repo.find_reference(name).ok().and_then(|r| r.target())
-}
-
-fn clear_sync_fetch_refs(repo: &git2::Repository) -> Result<()> {
-    for reference in repo.references_glob(&format!("{SYNC_FETCH_REF_PREFIX}*"))? {
-        reference?.delete()?;
-    }
-    Ok(())
 }
 
 /// The remote ref behind the trunk's remote-tracking ref `onto`, found by
