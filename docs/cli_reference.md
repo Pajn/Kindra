@@ -1013,13 +1013,21 @@ main -> [C1] -> (feature-part-1) -> [C2] -> (more-work) -> [C3] -> (my-feature)
 
 ### Status & Control
 
-If a `kin commit`, `kin move`, `kin reorder`, `kin sync`, or `kin restack` operation is interrupted (e.g., due to a merge conflict), both `kin status` and `kin pr status` report the interrupted operation and how to recover:
+If a `kin commit`, `kin absorb`, `kin move`, `kin reorder`, `kin sync`, or `kin restack` operation is interrupted (e.g., due to a merge conflict), both `kin status` and `kin pr status` report the interrupted operation and how to recover:
 
-- **`kin status`**: Shows the current state of the interrupted operation, including which branch is currently being rebased and which ones are remaining.
+- **`kin status`**: Shows the current state of the interrupted operation: the command that paused and the branch it works on, then the branches still to be rebased. For example:
+
+  ```text
+  Restack in progress on feature-a
+  Remaining branches: feature-b
+  ```
+
+  A move or sync names the branch it moves and where to (`Move in progress: feature-a onto other`), a reorder the branch it started from (`Reorder in progress from feature-a`), and a commit or absorb the branch it commits to (`Commit in progress on feature-a`, `Absorb in progress on feature-a`). An operation paused by Kindra 1.1 or earlier reports a restack as a move and an absorb as a commit.
 - **`kin continue`**: Resumes the operation after you've resolved conflicts. It handles the underlying `git rebase --continue` and then proceeds with the remaining branches in the stack.
 - **`kin abort`**: Cancels the current operation and cleans up the state.
 - If there is no saved Kindra state and Git itself is in the middle of a native operation, `kin continue`, `kin abort` and `kin status` name it and the Git command that finishes it (for example `git am --continue` or `git bisect reset`).
 - If more than one operation's state is saved, nothing can resume them: `kin status`, `kin continue` and `kin abort` all point to `kin abort --clear-state`.
+- A paused operation saved by a newer version of `kin` may not be readable. `kin status`, `kin continue` and `kin abort` then refuse and leave it in place: finish it with that version, or run `kin abort --clear-state`.
 - A paused operation saved by Kindra 0.1.0 does not record which branches it owns, so `kin abort` refuses to undo it. Finish it with `kin continue`, or run `kin abort --clear-state` and undo the rest with Git (for example `git rebase --abort`).
 - `kin status` takes the repository lock so the operation it reports is what the next command sees. While another `kin` process holds the lock, it says so and reports the saved state as it is.
 

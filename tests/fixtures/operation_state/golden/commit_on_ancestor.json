@@ -22,9 +22,10 @@
   "parent_name_map": {},
   "preserve_content_on_abort": true,
   "remaining_branches": [],
+  "replay": "Branches",
   "stash_apply_index": false,
   "stash_ref": "<kin-commit-on set-aside>",
   "suppress_editor": false,
-  "target_branch": "feature-b",
+  "target_branch": "feature-a",
   "unstage_on_restore": false
 }

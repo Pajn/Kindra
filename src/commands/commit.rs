@@ -410,8 +410,13 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
 
         let mut state = RebaseState {
             operation: crate::rebase_utils::Operation::Commit,
+            replay: Some(crate::rebase_utils::Replay::Branches),
             original_branch: target_branch.clone(),
-            target_branch: target_branch.clone(),
+            // The branch the commit lands on. Moving onto an ancestor rewrites
+            // the current branch in place, but the commit goes to the ancestor.
+            target_branch: ancestor_on_target
+                .clone()
+                .unwrap_or_else(|| target_branch.clone()),
             caller_branch: if switching_branches {
                 Some(current_branch_name.clone())
             } else {
@@ -896,6 +901,7 @@ fn commit_on_new_branch(
 
     let mut state = RebaseState {
         operation: crate::rebase_utils::Operation::Commit,
+        replay: Some(crate::rebase_utils::Replay::Branches),
         original_branch: branch_name.clone(),
         target_branch: branch_name.clone(),
         // End on the new branch, not the branch we started on.

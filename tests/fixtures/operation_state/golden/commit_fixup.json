@@ -20,6 +20,7 @@
   "parent_name_map": {},
   "preserve_content_on_abort": false,
   "remaining_branches": [],
+  "replay": "Branches",
   "stash_apply_index": false,
   "stash_ref": "<kin-commit-on set-aside>",
   "suppress_editor": false,

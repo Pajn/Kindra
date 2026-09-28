@@ -49,7 +49,8 @@
 //! - 0.2.1 and 0.2.2: adds `stash_apply_index`, `preserve_content_on_abort` and
 //!   `suppress_editor` (absorb);
 //! - 1.0.0 and 1.1.0: adds `carry_stash_ref`; tree sync first ships;
-//! - after 1.1.0: adds `abort_only`.
+//! - after 1.1.0: adds `abort_only` and `replay`; restack and absorb save
+//!   their own `operation` labels instead of `Move` and `Commit`.
 
 mod common;
 
@@ -759,10 +760,8 @@ fn move_journal_and_status() {
 fn restack_journal_and_status() {
     let mut paused = paused_restack();
     paused.assert_golden("restack");
-    // Restack saves a Move journal, so status reports it as a move of the
-    // restacked branch onto itself. Slice S1 is expected to change this.
     paused.assert_status(&format!(
-        "Move in progress: feature-a onto feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"
+        "Restack in progress on feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"
     ));
 }
 
@@ -807,7 +806,7 @@ fn commit_restack_journal_and_status() {
     let mut paused = paused_commit_restack();
     paused.assert_golden("commit_restack");
     paused.assert_status(&format!(
-        "Commit in progress: feature-a onto feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"
+        "Commit in progress on feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"
     ));
 }
 
@@ -816,7 +815,7 @@ fn commit_on_ancestor_journal_and_status() {
     let mut paused = paused_commit_on_ancestor();
     paused.assert_golden("commit_on_ancestor");
     paused.assert_status(&format!(
-        "Commit in progress: feature-b onto feature-b\nRemaining branches: \n{NATIVE_REBASE}"
+        "Commit in progress on feature-a\nRemaining branches: \n{NATIVE_REBASE}"
     ));
 }
 
@@ -825,7 +824,7 @@ fn commit_fixup_journal_and_status() {
     let mut paused = paused_commit_fixup();
     paused.assert_golden("commit_fixup");
     paused.assert_status(&format!(
-        "Commit in progress: feature-a onto feature-a\nRemaining branches: \n{NATIVE_REBASE}"
+        "Commit in progress on feature-a\nRemaining branches: \n{NATIVE_REBASE}"
     ));
 }
 
@@ -834,7 +833,7 @@ fn commit_insert_journal_and_status() {
     let mut paused = paused_commit_insert();
     paused.assert_golden("commit_insert");
     paused.assert_status(&format!(
-        "Commit in progress: inserted onto inserted\nRemaining branches: feature-b\n{NATIVE_REBASE}"
+        "Commit in progress on inserted\nRemaining branches: feature-b\n{NATIVE_REBASE}"
     ));
 }
 
@@ -842,10 +841,8 @@ fn commit_insert_journal_and_status() {
 fn absorb_journal_and_status() {
     let mut paused = paused_absorb();
     paused.assert_golden("absorb");
-    // Absorb saves a Commit journal, so status reports it as a commit. Slice
-    // S1 is expected to change this.
     paused.assert_status(&format!(
-        "Commit in progress: feature-a onto feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"
+        "Absorb in progress on feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"
     ));
 }
 
@@ -859,7 +856,7 @@ fn absorb_unnamed_fork_journal_and_status() {
         "the anchor recorded in new_base_map must exist while paused"
     );
     paused.assert_status(&format!(
-        "Commit in progress: feature-a onto feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"
+        "Absorb in progress on feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"
     ));
 }
 
@@ -872,6 +869,59 @@ fn journal_lives_in_the_worktree_git_directory() {
     assert!(StateFile::Rebase.in_git_dir(&git_dir).exists());
     assert!(!StateFile::Run.in_git_dir(&git_dir).exists());
     assert!(!StateFile::Checkout.in_git_dir(&git_dir).exists());
+}
+
+/// The `operation` label only names the command that paused: how the paused
+/// rebase is resumed and finished comes from `replay`. A linear sync whose
+/// label says otherwise still finishes as a sync, deleting the merged branches
+/// it recorded.
+#[test]
+fn replay_not_the_label_decides_how_a_paused_sync_finishes() {
+    let paused = paused_sync_linear();
+    paused.repo.git(&["branch", "stale", "main"]);
+    let mut journal = paused.repo.state_json();
+    journal["operation"] = Value::from("Move");
+    journal["cleanup_merged_branches"] = serde_json::json!(["stale"]);
+    fs::write(
+        paused.repo.state_path(),
+        serde_json::to_string_pretty(&journal).unwrap(),
+    )
+    .unwrap();
+
+    paused.continue_to_completion();
+    assert!(
+        !paused.repo.tips().contains_key("stale"),
+        "the sync's cleanup did not run"
+    );
+    assert_eq!(paused.repo.current_branch(), "feature-b");
+    assert!(paused.repo.is_ancestor("main", "feature-a"));
+    assert!(paused.repo.is_ancestor("feature-a", "feature-b"));
+}
+
+/// A journal saved by a newer Kindra, naming an operation this one does not
+/// know, is refused with advice rather than a bare parse error, and is left
+/// as it is until `kin abort --clear-state` discards it.
+#[test]
+fn journal_from_a_newer_kindra_is_refused_with_advice() {
+    let paused = paused_move();
+    let mut journal = paused.repo.state_json();
+    journal["operation"] = Value::from("FromTheFuture");
+    let saved = serde_json::to_string_pretty(&journal).unwrap();
+    fs::write(paused.repo.state_path(), &saved).unwrap();
+
+    for command in ["status", "continue", "abort"] {
+        let output = paused.repo.kin(&[command]);
+        assert!(!output.status.success(), "{}", describe(&output));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("newer version of kin"), "{stderr}");
+        assert!(stderr.contains("kin abort --clear-state"), "{stderr}");
+        assert_eq!(fs::read_to_string(paused.repo.state_path()).unwrap(), saved);
+        assert!(paused.repo.rebase_in_progress());
+    }
+
+    let cleared = paused.repo.kin(&["abort", "--clear-state"]);
+    assert!(cleared.status.success(), "{}", describe(&cleared));
+    assert!(!paused.repo.state_path().exists());
 }
 
 // ---------------------------------------------------------------------------
@@ -957,6 +1007,8 @@ fn move_status() -> String {
     )
 }
 
+/// Kindra 1.1 and earlier saved a restack under the `Move` label, so it still
+/// reports as a move of the restacked branch onto itself.
 fn restack_status() -> String {
     format!(
         "Move in progress: feature-a onto feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"
@@ -1230,9 +1282,7 @@ fn legacy_commit_restack_0_1_0_abort_refuses_and_explains() {
     assert_legacy_without_owned_tips_refuses_abort(
         paused_commit_restack,
         "commit_restack@0.1.0",
-        &format!(
-            "Commit in progress: feature-a onto feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"
-        ),
+        &format!("Commit in progress on feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"),
     );
 }
 
@@ -1241,21 +1291,19 @@ fn legacy_commit_restack_1_1_0_aborts() {
     assert_legacy_commit_aborts(
         paused_commit_restack,
         "commit_restack@1.1.0",
-        &format!(
-            "Commit in progress: feature-a onto feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"
-        ),
+        &format!("Commit in progress on feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"),
         COMMIT_RESTACK_ABORTED,
     );
 }
 
+/// Kindra 1.1 recorded the branch rewritten in place, not the ancestor the
+/// commit moves onto, so status names feature-b.
 #[test]
 fn legacy_commit_on_ancestor_1_1_0_aborts() {
     assert_legacy_commit_aborts(
         paused_commit_on_ancestor,
         "commit_on_ancestor@1.1.0",
-        &format!(
-            "Commit in progress: feature-b onto feature-b\nRemaining branches: \n{NATIVE_REBASE}"
-        ),
+        &format!("Commit in progress on feature-b\nRemaining branches: \n{NATIVE_REBASE}"),
         AbortOutcome {
             tips: &[
                 ("feature-a", "<feature-a@before>"),
@@ -1273,9 +1321,7 @@ fn legacy_commit_fixup_1_1_0_aborts() {
     assert_legacy_commit_aborts(
         paused_commit_fixup,
         "commit_fixup@1.1.0",
-        &format!(
-            "Commit in progress: feature-a onto feature-a\nRemaining branches: \n{NATIVE_REBASE}"
-        ),
+        &format!("Commit in progress on feature-a\nRemaining branches: \n{NATIVE_REBASE}"),
         AbortOutcome {
             tips: &[
                 ("feature-a", "<feature-a@before>"),
@@ -1292,9 +1338,7 @@ fn legacy_commit_insert_1_1_0_aborts() {
     assert_legacy_commit_aborts(
         paused_commit_insert,
         "commit_insert@1.1.0",
-        &format!(
-            "Commit in progress: inserted onto inserted\nRemaining branches: feature-b\n{NATIVE_REBASE}"
-        ),
+        &format!("Commit in progress on inserted\nRemaining branches: feature-b\n{NATIVE_REBASE}"),
         AbortOutcome {
             tips: &[
                 ("feature-a", "<feature-a@before>"),
@@ -1308,10 +1352,10 @@ fn legacy_commit_insert_1_1_0_aborts() {
     );
 }
 
+/// Kindra 1.1 and earlier saved an absorb under the `Commit` label, so it still
+/// reports as a commit.
 fn absorb_status() -> String {
-    format!(
-        "Commit in progress: feature-a onto feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"
-    )
+    format!("Commit in progress on feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}")
 }
 
 #[test]

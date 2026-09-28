@@ -9,7 +9,7 @@
   "new_base_map": {
     "feature-b": "refs/kindra/absorb/<absorb-namespace>/<commit: a: add code>"
   },
-  "operation": "Commit",
+  "operation": "Absorb",
   "original_branch": "feature-a",
   "original_commit_count_map": {},
   "original_tip_map": {
@@ -29,6 +29,7 @@
   "remaining_branches": [
     "feature-b"
   ],
+  "replay": "Branches",
   "stash_apply_index": true,
   "stash_ref": null,
   "suppress_editor": true,

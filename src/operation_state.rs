@@ -171,13 +171,7 @@ pub fn kindra_refusal(kindra: &KindraOperation) -> Option<String> {
         KindraOperation::None => None,
         KindraOperation::Rebase(operation) => Some(format!(
             "A Kindra operation is already in progress{}. Use 'kin continue' or 'kin abort'.",
-            match operation {
-                Some(Operation::Move) => " (move or restack)",
-                Some(Operation::Reorder) => " (reorder)",
-                Some(Operation::Sync) => " (sync)",
-                Some(Operation::Commit) => " (commit or absorb)",
-                None => "",
-            }
+            operation.map_or(String::new(), |operation| format!(" ({})", operation.command()))
         )),
         KindraOperation::Hydration => Some(
             "A Kindra operation is already in progress (checkout hydration). Use 'kin continue' or 'kin abort'."
