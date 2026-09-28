@@ -507,13 +507,10 @@ fn apply(reference: &str, index: bool, set_aside: &SetAside) -> Result<Outcome> 
 }
 
 /// `git stash apply [--index] <reference>`: `None` when it failed without
-/// leaving conflicts of its own.
+/// leaving conflicts of its own. Only reached through `attempt`, which refuses
+/// to apply while the index already has unmerged paths, so any conflicts found
+/// after a failed apply are this apply's.
 fn try_apply(reference: &str, index: bool, set_aside: &SetAside) -> Result<Option<Outcome>> {
-    // Conflicts already in the index are not this apply's: Git refuses to
-    // apply over them, so they must not be read as the stash's conflicts.
-    if crate::rebase_utils::unmerged_paths_exist()? {
-        return Ok(None);
-    }
     let mut git = Command::new("git");
     git.arg("stash").arg("apply");
     if index {
