@@ -2,7 +2,10 @@ use git2::Repository;
 use tempfile::TempDir;
 
 mod common;
-use common::{assert_no_rebase_in_progress, kin_cmd, make_commit, repo_init, run_ok};
+use common::{
+    StateFile, assert_no_rebase_in_progress, kin_cmd, make_commit, rebase_state_file, repo_init,
+    run_ok,
+};
 
 /// Build the standard fixture: main, then a stack review -> perf -> docs where
 /// review's first commit introduces `code.txt`. Returns the repo handle.
@@ -423,7 +426,7 @@ fn test_absorb_rolls_back_when_the_fold_fails_before_starting() {
         "untracked"
     );
     assert!(
-        !repo_path.join(".git/kindra_rebase_state.json").exists(),
+        !rebase_state_file(repo_path).exists(),
         "no resumable state may remain after a rollback"
     );
 }
@@ -493,7 +496,7 @@ fn test_absorb_abort_restores_tips_and_absorbed_changes() {
     );
 
     // Bookkeeping: no resumable state, no leftover stash entry.
-    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(repo_path).exists());
     let stashes = std::process::Command::new("git")
         .args(["stash", "list"])
         .current_dir(repo_path)
@@ -683,7 +686,7 @@ fn check_absorb_fork(mode: Option<&str>) {
     }
     assert_eq!(common::current_branch(repo_path), "review");
     assert_no_rebase_in_progress(repo_path);
-    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(repo_path).exists());
     assert_eq!(
         repo.references_glob("refs/kindra/absorb/*")
             .unwrap()
@@ -907,7 +910,7 @@ fn test_absorb_fork_in_another_worktree_is_rejected_before_changes() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(tip(&repo, "review"), before);
-    assert!(!repo_path.join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(repo_path).exists());
     assert_eq!(
         repo.references_glob("refs/kindra/absorb/*")
             .unwrap()
@@ -969,7 +972,7 @@ fn test_absorb_fork_from_linked_worktree() {
         1
     );
     assert_eq!(repo.find_reference(&anchor).unwrap().target(), Some(fork));
-    assert!(!linked.path().join("kindra_rebase_state.json").exists());
+    assert!(!StateFile::Rebase.in_git_dir(linked.path()).exists());
 }
 
 #[test]

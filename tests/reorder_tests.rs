@@ -1,6 +1,9 @@
 mod common;
 
-use common::{git_command, kin_cmd, make_commit, repo_init, run_ok};
+use common::{
+    StateFile, git_command, kin_cmd, make_commit, rebase_state, rebase_state_file, repo_init,
+    run_ok, state_file,
+};
 use git2::{BranchType, Repository};
 use kindra::rebase_utils::{Operation, RebaseState, save_state};
 use std::collections::HashMap;
@@ -479,7 +482,7 @@ fn reorder_conflict_and_abort_restores_original_graph_and_cleans_up() {
     assert_direct_parent_id(&repo, "feature-c", original_parent_feature_c);
     assert_direct_parent_id(&repo, "feature-a", original_parent_feature_a);
     assert_direct_parent_id(&repo, "feature-b", original_parent_feature_b);
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
 }
@@ -534,10 +537,6 @@ fn reorder_abort_restores_extra_local_refs_moved_by_update_refs() {
     let alias_tip_before = branch_tip(&repo, "feature-bookmark");
 
     let mut state = RebaseState {
-        operation: Operation::Reorder,
-        original_branch: "feature-a".to_string(),
-        target_branch: "target".to_string(),
-        caller_branch: None,
         remaining_branches: vec!["feature-a".to_string(), "feature-b".to_string()],
         in_progress_branch: Some("feature-a".to_string()),
         parent_id_map: HashMap::from([
@@ -545,23 +544,11 @@ fn reorder_abort_restores_extra_local_refs_moved_by_update_refs() {
             ("feature-b".to_string(), feature_a_tip_id.to_string()),
         ]),
         parent_name_map: HashMap::from([("feature-b".to_string(), "feature-a".to_string())]),
-        new_base_map: HashMap::new(),
-        original_commit_count_map: HashMap::new(),
         original_tip_map: HashMap::from([
             ("feature-a".to_string(), feature_a_tip_id.to_string()),
             ("feature-b".to_string(), feature_b_tip_id.to_string()),
         ]),
-        owned_tip_map: HashMap::new(),
-        stash_ref: None,
-        stash_apply_index: false,
-        carry_stash_ref: None,
-        preserve_content_on_abort: false,
-        suppress_editor: false,
-        abort_only: false,
-        unstage_on_restore: false,
-        autostash: false,
-        cleanup_merged_branches: Vec::new(),
-        cleanup_checkout_fallback: None,
+        ..rebase_state(Operation::Reorder, "feature-a", "target")
     };
     save_state(&repo, &state).unwrap();
 
@@ -639,7 +626,7 @@ fn reorder_abort_restores_extra_local_refs_moved_by_update_refs() {
 
     let repo = Repository::open(dir.path()).unwrap();
     assert_eq!(branch_tip(&repo, "feature-bookmark"), alias_tip_before);
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
 }
@@ -718,7 +705,7 @@ fn reorder_manual_git_continue_then_abort_clears_state_without_rewinding_refs() 
     assert_eq!(branch_tip(&repo, "feature-a"), feature_a_tip_before_abort);
     assert_eq!(branch_tip(&repo, "feature-b"), feature_b_tip_before_abort);
     assert_eq!(branch_tip(&repo, "feature-c"), feature_c_tip_before_abort);
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
 }
@@ -786,7 +773,7 @@ fn test_reorder_blocked_by_stale_run_state() {
 
     // An interrupted `kin run` left run state behind.
     std::fs::write(
-        dir.path().join(".git/kindra_run_state.json"),
+        state_file(dir.path(), StateFile::Run),
         r#"{"target_branches":["feature"],"current_index":0,"args":{"command":"false","continue_on_failure":false},"original_branch":"feature","original_head_id":"0000000000000000000000000000000000000000","status":"failed"}"#,
     )
     .unwrap();
@@ -798,7 +785,7 @@ fn test_reorder_blocked_by_stale_run_state() {
         .failure()
         .stderr(predicates::str::contains("already in progress"));
 
-    assert!(dir.path().join(".git/kindra_run_state.json").exists());
+    assert!(state_file(dir.path(), StateFile::Run).exists());
 }
 
 /// Path of the reorder draft for a given current branch.

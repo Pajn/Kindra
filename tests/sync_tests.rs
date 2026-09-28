@@ -1,7 +1,8 @@
 mod common;
 
 use common::{
-    apply_global_config_env, kin_cmd, make_commit, repo_init, run_ok, test_global_config_dir,
+    StateFile, apply_global_config_env, kin_cmd, make_commit, rebase_state, rebase_state_file,
+    repo_init, run_ok, state_file, test_global_config_dir,
 };
 use git2::{BranchType, Repository};
 use kindra::rebase_utils::{Operation, RebaseState, load_state, save_state};
@@ -987,7 +988,7 @@ fn sync_reports_rebase_conflict() {
         "Expected git rebase state to remain after conflict"
     );
     assert!(
-        dir.path().join(".git/kindra_rebase_state.json").exists(),
+        rebase_state_file(dir.path()).exists(),
         "Expected kindra state to remain after conflict"
     );
 }
@@ -1047,7 +1048,7 @@ fn sync_no_delete_manual_continue_from_non_tip_branch_preserves_checkout_recover
             predicate::str::contains("rebase").or(predicate::str::contains("Resolve conflicts")),
         );
 
-    let state_path = dir.path().join(".git/kindra_rebase_state.json");
+    let state_path = rebase_state_file(dir.path());
     assert!(state_path.exists());
 
     fs::write(dir.path().join("file.txt"), "resolved").unwrap();
@@ -1158,7 +1159,7 @@ fn sync_abort_restores_original_branch_after_tip_switch_conflict() {
             predicate::str::contains("rebase").or(predicate::str::contains("Resolve conflicts")),
         );
 
-    assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(rebase_state_file(dir.path()).exists());
 
     let repo = Repository::open(dir.path()).unwrap();
     assert_ne!(repo.state(), git2::RepositoryState::Clean);
@@ -1182,7 +1183,7 @@ fn sync_abort_restores_original_branch_after_tip_switch_conflict() {
             .unwrap(),
         old_feature_b
     );
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
 }
@@ -1220,28 +1221,15 @@ fn status_blocks_and_preserves_state_when_active_git_rebase_mismatches_kindra_st
     );
 
     let state = RebaseState {
-        operation: Operation::Sync,
-        original_branch: "feature-a".to_string(),
-        target_branch: "main".to_string(),
-        caller_branch: None,
         remaining_branches: vec!["feature-a".to_string()],
         in_progress_branch: Some("feature-a".to_string()),
         parent_id_map: HashMap::from([("feature-a".to_string(), base_id.to_string())]),
-        parent_name_map: HashMap::new(),
-        new_base_map: HashMap::new(),
-        original_commit_count_map: HashMap::new(),
         original_tip_map: HashMap::from([("feature-a".to_string(), a_id.to_string())]),
         owned_tip_map: HashMap::from([("feature-a".to_string(), a_id.to_string())]),
         stash_ref: Some("stash@{0}".to_string()),
-        stash_apply_index: false,
-        carry_stash_ref: None,
-        preserve_content_on_abort: false,
-        suppress_editor: false,
-        abort_only: false,
-        unstage_on_restore: false,
-        autostash: false,
         cleanup_merged_branches: vec!["feature-b".to_string()],
         cleanup_checkout_fallback: Some("main".to_string()),
+        ..rebase_state(Operation::Sync, "feature-a", "main")
     };
     save_state(&repo, &state).unwrap();
 
@@ -2140,7 +2128,7 @@ fn sync_refuses_dirty_working_tree_with_no_autostash() {
         fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
         "dirty"
     );
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
 }
@@ -2236,7 +2224,7 @@ fn sync_on_main_handles_rebase_conflict_and_preserves_state() {
         "Expected git rebase state to remain after main sync conflict"
     );
     assert!(
-        dir.path().join(".git/kindra_rebase_state.json").exists(),
+        rebase_state_file(dir.path()).exists(),
         "Expected kindra state to remain after main sync conflict"
     );
     assert!(repo.find_branch("feature-a", BranchType::Local).is_ok());
@@ -2312,7 +2300,7 @@ fn sync_on_main_conflict_can_continue_with_gits() {
             predicate::str::contains("rebase").or(predicate::str::contains("Resolve conflicts")),
         );
 
-    assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(rebase_state_file(dir.path()).exists());
 
     fs::write(dir.path().join("shared.txt"), "resolved main").unwrap();
     run_ok("git", &["add", "shared.txt"], dir.path());
@@ -2328,7 +2316,7 @@ fn sync_on_main_conflict_can_continue_with_gits() {
     let repo = Repository::open(dir.path()).unwrap();
     assert_eq!(repo.state(), git2::RepositoryState::Clean);
     assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
 
     let main_tip = repo.find_branch("main", BranchType::Local).unwrap();
     let main_tip = main_tip.get().target().unwrap();
@@ -2398,7 +2386,7 @@ fn sync_on_main_conflict_continue_after_rebase() {
     run_ok("git", &["reset", "--hard", "origin/main"], dir.path());
 
     fs::write(
-        dir.path().join(".git/kindra_rebase_state.json"),
+        rebase_state_file(dir.path()),
         r#"{
   "operation": "Sync",
   "original_branch": "main",
@@ -2421,7 +2409,7 @@ fn sync_on_main_conflict_continue_after_rebase() {
     let repo = Repository::open(dir.path()).unwrap();
     assert_eq!(repo.state(), git2::RepositoryState::Clean);
     assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
 
@@ -2515,7 +2503,7 @@ fn sync_on_main_manual_git_abort_does_not_finalize_or_delete_branches() {
             predicate::str::contains("rebase").or(predicate::str::contains("Resolve conflicts")),
         );
 
-    assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(rebase_state_file(dir.path()).exists());
     run_ok("git", &["rebase", "--abort"], dir.path());
 
     let mut continue_cmd = kin_cmd();
@@ -2528,7 +2516,7 @@ fn sync_on_main_manual_git_abort_does_not_finalize_or_delete_branches() {
 
     let repo = Repository::open(dir.path()).unwrap();
     assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
-    assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(rebase_state_file(dir.path()).exists());
     assert!(repo.find_branch("feature-a", BranchType::Local).is_ok());
 }
 
@@ -3124,7 +3112,7 @@ fn test_sync_blocked_by_stale_run_state() {
 
     // An interrupted `kin run` left run state behind.
     std::fs::write(
-        dir.path().join(".git/kindra_run_state.json"),
+        state_file(dir.path(), StateFile::Run),
         r#"{"target_branches":["feature"],"current_index":0,"args":{"command":"false","continue_on_failure":false},"original_branch":"feature","original_head_id":"0000000000000000000000000000000000000000","status":"failed"}"#,
     )
     .unwrap();
@@ -3136,7 +3124,7 @@ fn test_sync_blocked_by_stale_run_state() {
         .failure()
         .stderr(predicates::str::contains("already in progress"));
 
-    assert!(dir.path().join(".git/kindra_run_state.json").exists());
+    assert!(state_file(dir.path(), StateFile::Run).exists());
 }
 
 /// A top branch whose only commit was cherry-picked onto upstream has nothing

@@ -1,5 +1,7 @@
 mod common;
-use common::{kin_cmd, make_commit, repo_init, run_ok};
+use common::{
+    StateFile, kin_cmd, make_commit, rebase_state, rebase_state_file, repo_init, run_ok, state_file,
+};
 use git2::{Oid, Repository};
 use kindra::rebase_utils::{Operation, RebaseState, save_state};
 use std::collections::HashMap;
@@ -60,28 +62,8 @@ fn setup_repo() -> (tempfile::TempDir, Repository) {
 
 fn write_rebase_state_fixture(repo: &Repository, _state_path: &Path, feature_tip: Oid) {
     let state = RebaseState {
-        operation: Operation::Move,
-        original_branch: "feature".to_string(),
-        target_branch: "target".to_string(),
-        caller_branch: None,
-        remaining_branches: vec![],
-        in_progress_branch: None,
-        parent_id_map: HashMap::new(),
-        parent_name_map: HashMap::new(),
-        new_base_map: HashMap::new(),
-        original_commit_count_map: HashMap::new(),
-        original_tip_map: HashMap::new(),
         owned_tip_map: HashMap::from([("feature".to_string(), feature_tip.to_string())]),
-        stash_ref: None,
-        stash_apply_index: false,
-        carry_stash_ref: None,
-        preserve_content_on_abort: false,
-        suppress_editor: false,
-        abort_only: false,
-        unstage_on_restore: false,
-        autostash: false,
-        cleanup_merged_branches: Vec::new(),
-        cleanup_checkout_fallback: None,
+        ..rebase_state(Operation::Move, "feature", "target")
     };
 
     save_state(repo, &state).unwrap();
@@ -431,7 +413,7 @@ fn test_move_manual_git_continue_then_kin_continue_resumes_next_branch() {
         repo.graph_descendant_of(feature_b_tip, feature_a_tip)
             .unwrap()
     );
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
 }
 
 #[test]
@@ -492,7 +474,7 @@ fn test_move_manual_git_continue_completed_state_clears_on_status() {
         .success()
         .stdout(predicates::str::contains("No Kindra operation active."));
 
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
 
     kin_cmd()
         .arg("move")
@@ -528,28 +510,9 @@ fn test_move_passive_reconcile_keeps_completed_state_with_pending_finalizer() {
     .unwrap();
 
     let state = RebaseState {
-        operation: Operation::Move,
-        original_branch: "feature".to_string(),
-        target_branch: "main".to_string(),
-        caller_branch: None,
-        remaining_branches: Vec::new(),
-        in_progress_branch: None,
-        parent_id_map: HashMap::new(),
-        parent_name_map: HashMap::new(),
-        new_base_map: HashMap::new(),
-        original_commit_count_map: HashMap::new(),
         original_tip_map: HashMap::from([("feature".to_string(), feature_id.to_string())]),
-        owned_tip_map: HashMap::new(),
-        stash_ref: None,
-        stash_apply_index: false,
-        carry_stash_ref: None,
-        preserve_content_on_abort: false,
-        suppress_editor: false,
-        abort_only: false,
         unstage_on_restore: true,
-        autostash: false,
-        cleanup_merged_branches: Vec::new(),
-        cleanup_checkout_fallback: None,
+        ..rebase_state(Operation::Move, "feature", "main")
     };
     save_state(&repo, &state).unwrap();
 
@@ -560,7 +523,7 @@ fn test_move_passive_reconcile_keeps_completed_state_with_pending_finalizer() {
         .success()
         .stdout(predicates::str::contains("Move in progress"));
 
-    assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(rebase_state_file(dir.path()).exists());
 
     kin_cmd()
         .arg("continue")
@@ -568,7 +531,7 @@ fn test_move_passive_reconcile_keeps_completed_state_with_pending_finalizer() {
         .assert()
         .success();
 
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
 }
 
 #[test]
@@ -1271,7 +1234,7 @@ fn descendant_tree_conflict(abort: bool) {
         ] {
             assert_eq!(repo.revparse_single(branch).unwrap().id(), original);
         }
-        assert!(!repo.path().join("kindra_rebase_state.json").exists());
+        assert!(!StateFile::Rebase.in_git_dir(repo.path()).exists());
         assert_eq!(repo.state(), git2::RepositoryState::Clean);
         return;
     }
@@ -1320,7 +1283,7 @@ fn descendant_tree_conflict(abort: bool) {
         .peel_to_commit()
         .unwrap();
     assert_eq!(side.parent_id(0).unwrap(), feature_b_commit.id());
-    assert!(!repo.path().join("kindra_rebase_state.json").exists());
+    assert!(!StateFile::Rebase.in_git_dir(repo.path()).exists());
 }
 
 #[test]
@@ -1431,8 +1394,7 @@ exec "{}" "$@"
         .assert()
         .failure();
 
-    let state_content =
-        fs::read_to_string(dir.path().join(".git/kindra_rebase_state.json")).unwrap();
+    let state_content = fs::read_to_string(rebase_state_file(dir.path())).unwrap();
     assert!(
         state_content.contains("\"in_progress_branch\": null"),
         "Pre-start failure should clear in_progress_branch but got: {state_content}"
@@ -1582,7 +1544,7 @@ fn test_move_abort_preserves_state_on_rebase_abort_failure() {
         .target()
         .unwrap();
 
-    let state_path = dir.path().join(".git/kindra_rebase_state.json");
+    let state_path = rebase_state_file(dir.path());
     write_rebase_state_fixture(&repo, &state_path, feature_tip);
 
     // 2. Manually create a rebase-merge directory to simulate an active rebase
@@ -1663,7 +1625,7 @@ fn test_move_abort_leaves_manual_rebase_when_owned_tip_map_mismatches() {
         "Manual rebase should have failed due to conflict"
     );
 
-    let state_path = dir.path().join(".git/kindra_rebase_state.json");
+    let state_path = rebase_state_file(dir.path());
     fs::write(
         &state_path,
         r#"{
@@ -1829,7 +1791,7 @@ fn test_move_invalid_onto() {
         ));
 
     // Verify no state file was created
-    assert!(!repo.path().join("kindra_rebase_state.json").exists());
+    assert!(!StateFile::Rebase.in_git_dir(repo.path()).exists());
 }
 
 #[test]
@@ -2082,7 +2044,7 @@ exec {} "$@"
         .failure();
 
     // Verify state file exists and still contains the branch in remaining_branches
-    let state_path = dir.path().join(".git/kindra_rebase_state.json");
+    let state_path = rebase_state_file(dir.path());
     assert!(state_path.exists(), "State file should exist");
     let state_content = fs::read_to_string(&state_path).unwrap();
 
@@ -2257,7 +2219,7 @@ fn test_move_abort_cleans_up_rebase_when_state_exists() {
         "rebase should have failed with conflict"
     );
 
-    let state_path = dir.path().join(".git/kindra_rebase_state.json");
+    let state_path = rebase_state_file(dir.path());
     write_rebase_state_fixture(&repo, &state_path, feature_tip);
 
     // Run kin move abort
@@ -2295,7 +2257,7 @@ fn test_move_blocked_by_stale_run_state() {
 
     // An interrupted `kin run` left run state behind (no RepoLock is held).
     std::fs::write(
-        dir.path().join(".git/kindra_run_state.json"),
+        state_file(dir.path(), StateFile::Run),
         r#"{"target_branches":["feature"],"current_index":0,"args":{"command":"false","continue_on_failure":false},"original_branch":"feature","original_head_id":"0000000000000000000000000000000000000000","status":"failed"}"#,
     )
     .unwrap();
@@ -2309,7 +2271,7 @@ fn test_move_blocked_by_stale_run_state() {
         .failure()
         .stderr(predicates::str::contains("already in progress"));
 
-    assert!(dir.path().join(".git/kindra_run_state.json").exists());
+    assert!(state_file(dir.path(), StateFile::Run).exists());
 }
 
 #[test]
@@ -2366,7 +2328,7 @@ fn move_refuses_dirty_working_tree_with_no_autostash() {
         fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
         "dirty"
     );
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
 }
@@ -2404,7 +2366,7 @@ fn assert_parent_edits_restored(dir: &Path) {
         .unwrap();
     assert!(stashes.status.success());
     assert!(stashes.stdout.is_empty());
-    assert!(!dir.join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir).exists());
 }
 
 #[test]
@@ -2540,7 +2502,7 @@ fn move_onto_descendant_allows_merge_before_subtree() {
     assert_eq!(repo.revparse_single("merged-side").unwrap().id(), right_id);
     assert_eq!(repo.head().unwrap().shorthand(), Some("feature-a"));
     assert_eq!(repo.state(), git2::RepositoryState::Clean);
-    assert!(!repo.path().join("kindra_rebase_state.json").exists());
+    assert!(!StateFile::Rebase.in_git_dir(repo.path()).exists());
 }
 
 /// Kindra's autostash follows `rebase.autostash`; set it in the test repository
@@ -2713,7 +2675,7 @@ fn continue_during_git_am_advises_git_am_instead_of_retrying_a_rebase() {
         "stderr: {stderr}"
     );
     // Neither the paused move nor the am was disturbed.
-    assert!(repo.path().join("kindra_rebase_state.json").exists());
+    assert!(StateFile::Rebase.in_git_dir(repo.path()).exists());
     assert_eq!(repo.state(), git2::RepositoryState::ApplyMailbox);
 
     kin_cmd()
@@ -2722,7 +2684,7 @@ fn continue_during_git_am_advises_git_am_instead_of_retrying_a_rebase() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("git am --abort"));
-    assert!(repo.path().join("kindra_rebase_state.json").exists());
+    assert!(StateFile::Rebase.in_git_dir(repo.path()).exists());
     assert_eq!(repo.state(), git2::RepositoryState::ApplyMailbox);
 
     // Once the am is gone, the paused move can be aborted as usual.
@@ -2732,7 +2694,7 @@ fn continue_during_git_am_advises_git_am_instead_of_retrying_a_rebase() {
         .current_dir(dir.path())
         .assert()
         .success();
-    assert!(!repo.path().join("kindra_rebase_state.json").exists());
+    assert!(!StateFile::Rebase.in_git_dir(repo.path()).exists());
 }
 
 #[test]

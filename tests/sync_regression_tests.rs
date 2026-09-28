@@ -1,6 +1,6 @@
 mod common;
 
-use common::{kin_cmd, make_commit, repo_init, run_ok};
+use common::{kin_cmd, make_commit, rebase_state_file, repo_init, run_ok};
 use git2::{BranchType, Repository};
 use predicates::prelude::*;
 use std::fs;
@@ -630,7 +630,7 @@ fn check_sync_checkout(conflict: bool, merged: bool) {
         cmd.assert()
             .failure()
             .stderr(predicate::str::contains("Resolve conflicts"));
-        assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
+        assert!(rebase_state_file(dir.path()).exists());
         fs::write(dir.path().join("shared.txt"), "resolved\n").unwrap();
         run_ok("git", &["add", "shared.txt"], dir.path());
         kin_cmd()
@@ -658,7 +658,7 @@ fn check_sync_checkout(conflict: bool, merged: bool) {
         assert!(repo.graph_descendant_of(lower, main).unwrap());
         assert!(repo.graph_descendant_of(upper, lower).unwrap());
     }
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
 }
 
 #[test]
@@ -747,7 +747,7 @@ fn check_sync_recovery_after_branch_switch(manual_continue: bool) {
     }
     let repo = Repository::open(dir.path()).unwrap();
     assert_eq!(repo.head().unwrap().shorthand(), Some("lower"));
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
 }
 
 #[test]
@@ -792,7 +792,7 @@ fn check_sync_autostash_conflict_recovery(abort: bool) {
             .unwrap()
             .is_index_modified()
     );
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
     assert!(repo.find_reference("refs/stash").is_err());
 }
 
@@ -829,7 +829,7 @@ fn sync_autostash_can_abort_after_tip_checkout_is_blocked() {
         fs::read_to_string(dir.path().join("upper.txt")).unwrap(),
         "untracked\n"
     );
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
     assert!(repo.find_reference("refs/stash").is_err());
 }
 
@@ -863,7 +863,7 @@ fn sync_no_delete_stash_conflict_preserves_state_until_resolved() {
     let state = kindra::rebase_utils::load_state(&repo).unwrap();
     assert!(state.stash_ref.is_none(), "stash must not be applied twice");
     assert!(state.cleanup_merged_branches.is_empty());
-    let state_path = dir.path().join(".git/kindra_rebase_state.json");
+    let state_path = rebase_state_file(dir.path());
     kin_cmd()
         .arg("status")
         .current_dir(dir.path())
@@ -968,7 +968,7 @@ fn check_tree_recovery(abort: bool, manual_abort: bool) {
             .current_dir(dir.path())
             .assert()
             .success();
-        assert!(dir.path().join(".git/kindra_rebase_state.json").exists());
+        assert!(rebase_state_file(dir.path()).exists());
         kin_cmd()
             .arg("continue")
             .current_dir(dir.path())
@@ -1008,7 +1008,7 @@ fn check_tree_recovery(abort: bool, manual_abort: bool) {
             );
         }
     }
-    assert!(!dir.path().join(".git/kindra_rebase_state.json").exists());
+    assert!(!rebase_state_file(dir.path()).exists());
 }
 
 #[test]
