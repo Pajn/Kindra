@@ -6690,3 +6690,88 @@ fn commit_refuses_native_revert() {
     );
     common::assert_no_kindra_operation(dir.path());
 }
+
+/// `main <- base <- parent <- child`, where `child` took `parent`'s second
+/// commit with `git merge` instead of a rebase. Leaves HEAD on `child` with a
+/// change to `parent0.txt` staged.
+fn stack_with_child_that_merged_its_parent() -> (tempfile::TempDir, Repository) {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = repo_init(root);
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "file.txt",
+        "initial",
+        "initial",
+        &[],
+    );
+    run_ok("git", &["checkout", "-b", "base"], root);
+    common::commit_on(root, "base", "base.txt", "b0");
+    run_ok("git", &["checkout", "-b", "parent"], root);
+    common::commit_on(root, "parent", "parent0.txt", "p0");
+    run_ok("git", &["checkout", "-b", "child"], root);
+    common::commit_on(root, "child", "child.txt", "c0");
+    common::commit_on(root, "parent", "parent1.txt", "p1");
+    common::merge_into(root, "child", "parent");
+    common::commit_on(root, "child", "child.txt", "c1");
+    fs::write(root.join("parent0.txt"), "p0 fixed").unwrap();
+    run_ok("git", &["add", "parent0.txt"], root);
+    (dir, repo)
+}
+
+/// Commits that replay the child's history flatten its merge of the parent,
+/// and `--update-refs` would move the parent onto child commits. Kindra
+/// refuses before committing, keeping the staged change staged.
+#[test]
+fn commit_refuses_to_replay_a_branch_that_merged_its_parent() {
+    let (dir, repo) = stack_with_child_that_merged_its_parent();
+    let root = dir.path();
+    let p0 = repo.revparse_single("parent~1").unwrap().id().to_string();
+    for args in [
+        vec!["commit", "--fixup", p0.as_str()],
+        vec!["commit", "--on", "base", "-m", "base fix"],
+    ] {
+        let before = common::repository_snapshot(root);
+        kin_cmd()
+            .args(&args)
+            .current_dir(root)
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(
+                "child merged parent instead of rebasing onto it",
+            ))
+            .stderr(predicates::str::contains("git rebase parent child"));
+        assert_eq!(common::repository_snapshot(root), before, "{args:?}");
+    }
+}
+
+/// Committing onto the merged parent itself replays only the child's own
+/// commits, so the merge is dropped without touching the parent.
+#[test]
+fn commit_on_a_parent_the_child_merged_restacks_the_child() {
+    let (dir, repo) = stack_with_child_that_merged_its_parent();
+    let root = dir.path();
+    let parent_before = repo.revparse_single("parent").unwrap().id();
+
+    kin_cmd()
+        .args(["commit", "--on", "parent", "-m", "parent fix"])
+        .current_dir(root)
+        .assert()
+        .success();
+
+    let parent = repo
+        .find_commit(repo.revparse_single("parent").unwrap().id())
+        .unwrap();
+    assert_eq!(parent.summary(), Some("parent fix"));
+    assert_eq!(parent.parent_id(0).unwrap(), parent_before);
+    let mut walk = repo.revwalk().unwrap();
+    walk.push_ref("refs/heads/child").unwrap();
+    walk.hide(parent.id()).unwrap();
+    let own = walk
+        .map(|id| repo.find_commit(id.unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(own.iter().all(|commit| commit.parent_count() == 1));
+    assert_eq!(own.len(), 2);
+    assert_eq!(current_branch(root), "child");
+}

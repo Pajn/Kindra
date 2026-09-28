@@ -347,6 +347,26 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
         .collect();
         check_worktrees(&in_range, parsed.force)?;
     }
+    // Both in-place rebases replay HEAD's history from below the current
+    // branch, where a merge of another branch would be flattened.
+    let in_place_replay_base = if inline_fixup {
+        Some(autosquash_base(
+            &repo.find_commit(Oid::from_str(&fixup_commit_id)?)?,
+        )?)
+    } else if moving_onto_ancestor {
+        Some(Some(requested_target_old_head_id))
+    } else {
+        None
+    };
+    if let Some(base) = in_place_replay_base {
+        crate::rebase_utils::ensure_replay_keeps_merged_branches(
+            repo,
+            base,
+            head_id,
+            Some(upstream_id),
+            false,
+        )?;
+    }
 
     // The autosquash and move rebases below rewrite branch tips with
     // `--update-refs` (git >= 2.38). Verify support up front, before `git commit`

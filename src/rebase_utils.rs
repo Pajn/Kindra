@@ -905,6 +905,48 @@ pub fn local_branch_tips_in_range(
     Ok(tips)
 }
 
+/// Refuse a `git rebase --update-refs` of `base..head` onto `onto` that would
+/// flatten a merge of another branch (see
+/// [`crate::stack::find_merged_branch_in_replay`]). Commands call this while
+/// planning, before they persist or change anything. `syncing` adds the
+/// alternative of landing the merged branch upstream first, which sync
+/// handles.
+pub fn ensure_replay_keeps_merged_branches(
+    repo: &Repository,
+    base: Option<Oid>,
+    head: Oid,
+    onto: Option<Oid>,
+    syncing: bool,
+) -> Result<()> {
+    let Some(found) = crate::stack::find_merged_branch_in_replay(repo, base, head, onto)? else {
+        return Ok(());
+    };
+    let crate::stack::MergedBranch {
+        merger,
+        merged,
+        merged_tip_replayed,
+        merger_has_descendants,
+    } = found;
+    let consequence = if merged_tip_replayed {
+        format!("move {merged} onto {merger}'s commits")
+    } else {
+        format!("copy {merged}'s commits into {merger}")
+    };
+    let restack = if merger_has_descendants {
+        format!(", then run kin restack on {merger} to bring along the branches stacked on it")
+    } else {
+        String::new()
+    };
+    let upstream = if syncing {
+        format!(", or merge {merged} upstream before syncing")
+    } else {
+        String::new()
+    };
+    Err(anyhow!(
+        "{merger} merged {merged} instead of rebasing onto it, so replaying the stack would {consequence}. Rebase {merger} onto {merged} first (git rebase {merged} {merger}{restack}){upstream}."
+    ))
+}
+
 /// Record, into `original_tip_map`, the pre-rewrite tip of every local branch
 /// whose tip lies inside the range a `--update-refs` rebase over `base..head`
 /// rewrites. Existing entries are preserved. This is what lets `kin abort`

@@ -390,6 +390,14 @@ kin sync [--force] [--no-delete] [--autostash|--no-autostash]
 
 **Conflict handling:** If a sync started by Kindra conflicts, resolve it and run `kin continue`, or abandon it with `kin abort`. If you are in a plain native Git rebase with no saved Kindra state, use `git rebase --continue` or `git rebase --abort`.
 
+**Rebase, don't merge:** Keep a branch up to date with its parent by rebasing onto it, not with `git merge`. The sync rebase drops merge commits and replays the merged commits in line with the branch's own, so `--update-refs` would move the parent onto the child's commits. When a branch in the stack merged a parent that has not landed upstream, `kin sync` refuses before changing anything:
+
+```text
+child merged parent instead of rebasing onto it, so replaying the stack would move parent onto child's commits. Rebase child onto parent first (git rebase parent child), or merge parent upstream before syncing.
+```
+
+Once the parent has landed upstream, including by squash merge, sync replays only the child's own commits and drops the merge. `kin commit --fixup`/`--interactive` into a commit below such a merge, and `kin commit --on` a branch below the merged parent, refuse the same way.
+
 ---
 
 ### `restack`
@@ -441,6 +449,8 @@ autostash = true
 ```
 
 **When to use it:** Use this after you've amended a commit or rebased a branch that has other branches building on top of it. Instead of manually rebasing each dependent branch, `kin restack` will find and fix them for you.
+
+**Rebase, don't merge:** Restack rebases each floating branch with plain `git rebase`, which drops merge commits. Keep stacks rebased rather than merged; see [`sync`](#sync) for what Kindra refuses when they are not.
 
 **ASCII-Art Visualization:**
 

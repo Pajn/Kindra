@@ -141,6 +141,15 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
     let top_branch_tip = repo.revparse_single(&top_branch)?.id();
 
     let boundary = find_sync_boundary(repo, &top_branch, &rebase_onto_name, &stack_branches)?;
+    if let Some(old_base) = boundary.old_base {
+        crate::rebase_utils::ensure_replay_keeps_merged_branches(
+            repo,
+            Some(old_base),
+            top_branch_tip,
+            Some(upstream_id),
+            true,
+        )?;
+    }
 
     let mut merged_branches = if args.no_delete {
         Vec::new()
