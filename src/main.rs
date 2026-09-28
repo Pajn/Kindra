@@ -11,6 +11,7 @@ mod rebase_todo;
 mod rebase_utils;
 mod repository;
 mod runtime;
+mod set_aside;
 mod stack;
 mod state_io;
 mod trunk;

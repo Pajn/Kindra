@@ -530,3 +530,91 @@ fn run_refuses_resolved_native_cherry_pick_with_autostash() {
     );
     common::assert_no_kindra_operation(dir.path());
 }
+
+/// An interrupted run's `kin abort` restores the run's own set-aside, even when
+/// a newer stash entry has the same message: the run records the entry itself,
+/// not only its message.
+#[test]
+#[cfg(unix)]
+fn abort_of_an_interrupted_run_restores_its_own_stash_past_a_same_named_one() {
+    let dir = setup_run_repo();
+    fs::write(dir.path().join("base.txt"), "dirty").unwrap();
+
+    // On the first branch, stash an edit under the run's own stash message,
+    // then kill kin so the run is left interrupted.
+    kin_cmd()
+        .arg("run")
+        .arg("--command")
+        .arg(
+            "msg=$(git stash list -1 --format=%gs | sed 's/^On [^:]*: //'); \
+             echo duplicate > base.txt; git stash push -q -m \"$msg\"; kill -9 $PPID",
+        )
+        .arg("--autostash")
+        .current_dir(dir.path())
+        .assert()
+        .failure();
+    assert!(state_file(dir.path(), StateFile::Run).exists());
+    let messages = git_stdout(dir.path(), &["stash", "list", "--format=%gs"]);
+    let lines: Vec<&str> = messages.lines().collect();
+    assert_eq!(lines.len(), 2, "{messages}");
+    assert_eq!(
+        lines[0].split_once(": ").unwrap().1,
+        lines[1].split_once(": ").unwrap().1
+    );
+
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(current_branch(dir.path()), "feature-b");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("base.txt")).unwrap(),
+        "dirty"
+    );
+    // Only the other entry is left.
+    let left = git_stdout(dir.path(), &["stash", "list", "--format=%H"]);
+    assert_eq!(left.lines().count(), 1, "{left}");
+    assert_eq!(
+        git_stdout(dir.path(), &["show", "stash@{0}:base.txt"]),
+        "duplicate"
+    );
+    assert!(!state_file(dir.path(), StateFile::Run).exists());
+}
+
+/// Run state saved by a Kindra that recorded only the stash message is still
+/// restored by `kin abort`.
+#[test]
+fn abort_restores_the_stash_of_a_run_state_recording_only_its_message() {
+    let dir = setup_run_repo();
+    let head = git_stdout(dir.path(), &["rev-parse", "HEAD"]);
+    fs::write(dir.path().join("base.txt"), "dirty").unwrap();
+    run_ok(
+        "git",
+        &["stash", "push", "-q", "-m", "kin-autostash-1-2"],
+        dir.path(),
+    );
+    fs::write(
+        state_file(dir.path(), StateFile::Run),
+        format!(
+            r#"{{"target_branches":["feature-a","feature-b"],"current_index":0,
+                "args":{{"command":"true","continue_on_failure":false}},
+                "original_branch":"feature-b","original_head_id":"{head}",
+                "status":"in_progress","stash_ref":"kin-autostash-1-2"}}"#
+        ),
+    )
+    .unwrap();
+
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(current_branch(dir.path()), "feature-b");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("base.txt")).unwrap(),
+        "dirty"
+    );
+    assert_eq!(git_stdout(dir.path(), &["stash", "list"]), "");
+    assert!(!state_file(dir.path(), StateFile::Run).exists());
+}

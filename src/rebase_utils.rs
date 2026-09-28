@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::set_aside::{self, SetAsides};
 use crate::stack::collect_first_parent_chain;
 
 /// The command that paused, persisted as `operation`. It is a label for `kin
@@ -110,23 +110,11 @@ pub struct RebaseState {
     /// branch_name -> tip commit id Kindra most recently left behind in a resumable state
     #[serde(default)]
     pub owned_tip_map: HashMap<String, String>,
-    /// Optional stash token created by `kin commit --on` / `kin absorb` to
-    /// preserve files set aside for the operation.
+    /// What the operation set aside and still has to restore, oldest first.
+    /// A journal saved by Kindra 1.1 or earlier recorded these as `stash_ref`,
+    /// `stash_apply_index` and `carry_stash_ref`; loading converts them.
     #[serde(default)]
-    pub stash_ref: Option<String>,
-    /// Whether restoring `stash_ref` should also restore the recorded index
-    /// (staged) state. Only safe for full stashes (no `--keep-index`), whose
-    /// recorded index state was actually removed from the tree.
-    #[serde(default)]
-    pub stash_apply_index: bool,
-    /// Second, short-lived stash token holding the staged content `kin commit
-    /// --on` carries across a branch switch (see `carry_staged_changes_onto`).
-    /// It is set only between the push and the apply that lands it on the target
-    /// branch — every path out of the carry clears it again — so a value found
-    /// here means a run was interrupted mid-carry and `kin abort` has to put
-    /// those staged changes back.
-    #[serde(default)]
-    pub carry_stash_ref: Option<String>,
+    pub set_asides: SetAsides,
     /// Whether `kin abort` must preserve content the operation already
     /// committed (absorb: the fixup/folded commits). When set, abort checks
     /// out the original branch and applies the stash *before* restoring the
@@ -147,7 +135,10 @@ pub struct RebaseState {
     /// Whether to run `git reset` when returning to the original branch.
     #[serde(default)]
     pub unstage_on_restore: bool,
-    /// Whether git rebase should use autostash for this operation.
+    /// Whether the operation may set tracked changes aside: the rebase loop
+    /// sets them aside as a whole tree before its first rebase (and clears
+    /// this), or, when something is already set aside, lets `git rebase`
+    /// autostash.
     #[serde(default)]
     pub autostash: bool,
     /// Branches to clean up after a sync rebase finishes.
@@ -182,7 +173,10 @@ pub fn save_state(repo: &Repository, state: &RebaseState) -> Result<()> {
     merge_persisted_original_tips(repo, &mut persisted_state)?;
     augment_original_tip_map(repo, &mut persisted_state)?;
     persisted_state.owned_tip_map = capture_owned_tip_map(repo, &persisted_state);
-    let json = serde_json::to_string_pretty(&persisted_state)?;
+    let json = serde_json::to_string_pretty(&serde_json::json!({
+        "version": JOURNAL_VERSION,
+        "journal": persisted_state,
+    }))?;
     crate::state_io::write_atomic(&state_path(repo), &json)?;
     Ok(())
 }
@@ -196,18 +190,94 @@ pub fn load_state(repo: &Repository) -> Result<RebaseState> {
     parse_state(&path, &json)
 }
 
-/// Parse a saved journal. One that does not parse, for example because a
-/// newer Kindra saved an operation this one does not know, is reported with
-/// how to get past it.
+/// The format of the journal this Kindra saves.
+///
+/// The file holds `{"version": N, "journal": {...}}`. Kindra 1.1 and earlier
+/// saved the journal's fields at the top level, so they cannot parse this
+/// envelope (it lacks their required fields) and refuse it rather than
+/// misread it. Only `version` is fixed: a later format may shape `journal`
+/// differently.
+///
+/// Bump the version whenever a journal saved by this Kindra would be misread
+/// by an older one: a field whose absence an older release would take as
+/// something else, a field whose meaning changes, or a new value in an
+/// existing field. Every Kindra reads every older format and refuses a newer
+/// one with advice. A file without `version` is a flat journal saved by
+/// Kindra 1.1 or earlier.
+pub const JOURNAL_VERSION: u64 = 1;
+
+/// Parse a saved journal. One saved in a newer format, or that does not parse
+/// (for example because a newer Kindra saved an operation this one does not
+/// know), is reported with how to get past it.
+///
+/// A file with a `version` but no `journal` object is refused as malformed:
+/// no release wrote one, and reading it as a flat journal would guess.
 fn parse_state(path: &Path, json: &str) -> Result<RebaseState> {
-    serde_json::from_str(json).map_err(|err| {
+    let unreadable = |err: &dyn std::fmt::Display| {
         anyhow!(
             "Could not read the paused operation saved in {}: {err}. If a newer version of kin \
              saved it, finish it with that version, or run 'kin abort --clear-state' to discard \
              Kindra's record of it.",
             path.display()
         )
-    })
+    };
+    let mut saved: serde_json::Value =
+        serde_json::from_str(json).map_err(|err| unreadable(&err))?;
+    let journal = match saved.get("version").map(serde_json::Value::as_u64) {
+        None => {
+            convert_legacy_journal(&mut saved).map_err(|err| unreadable(&err))?;
+            saved
+        }
+        Some(Some(version)) if version <= JOURNAL_VERSION => {
+            match saved.get_mut("journal").map(serde_json::Value::take) {
+                Some(journal @ serde_json::Value::Object(_)) => journal,
+                _ => return Err(unreadable(&"it has a version but no journal")),
+            }
+        }
+        Some(_) => {
+            return Err(anyhow!(
+                "The paused operation saved in {} was saved by a newer version of kin (journal \
+                 version {}; this kin reads up to version {JOURNAL_VERSION}). Finish it with that \
+                 version, or run 'kin abort --clear-state' to discard Kindra's record of it.",
+                path.display(),
+                saved["version"]
+            ));
+        }
+    };
+    serde_json::from_value(journal).map_err(|err| unreadable(&err))
+}
+
+/// The set-aside fields of a journal saved by Kindra 1.1 or earlier.
+#[derive(Deserialize)]
+struct LegacySetAsides {
+    #[serde(default)]
+    stash_ref: Option<String>,
+    #[serde(default)]
+    stash_apply_index: bool,
+    #[serde(default)]
+    carry_stash_ref: Option<String>,
+}
+
+/// Rewrite a journal saved without a `version` into today's shape: its
+/// `stash_ref`, `stash_apply_index` and `carry_stash_ref` become `set_asides`.
+/// Every other field it has still means what it meant then.
+fn convert_legacy_journal(journal: &mut serde_json::Value) -> serde_json::Result<()> {
+    let legacy: LegacySetAsides = serde_json::from_value(journal.clone())?;
+    let Some(fields) = journal.as_object_mut() else {
+        return Ok(());
+    };
+    for key in ["stash_ref", "stash_apply_index", "carry_stash_ref"] {
+        fields.remove(key);
+    }
+    let set_asides = SetAsides::from_legacy(
+        legacy.stash_ref,
+        legacy.stash_apply_index,
+        legacy.carry_stash_ref,
+    );
+    if !set_asides.is_empty() {
+        fields.insert("set_asides".to_string(), serde_json::to_value(set_asides)?);
+    }
+    Ok(())
 }
 
 pub fn checkout_branch(branch_name: &str) -> Result<()> {
@@ -604,7 +674,9 @@ fn can_passively_clear_completed_state(repo: &Repository, state: &RebaseState) -
     if unmerged_paths_exist()? {
         return Ok(false);
     }
-    if state.stash_ref.is_some()
+    // Anything still set aside, including staged changes caught mid-carry,
+    // is restored only by finishing or aborting the operation.
+    if !state.set_asides.is_empty()
         || state.unstage_on_restore
         || !state.cleanup_merged_branches.is_empty()
     {
@@ -779,71 +851,6 @@ pub fn ensure_rebase_working_tree(repo: &Repository, autostash: bool) -> Result<
     Ok(())
 }
 
-/// Enforce the clean-or-autostash contract for commands that manage the working
-/// tree themselves rather than via `git rebase`. Returns:
-/// - `Ok(None)` if the tree is clean (nothing stashed),
-/// - `Err(..)` if the tree is dirty and autostash is off,
-/// - `Ok(Some(stash_ref))` if the tree was dirty and autostash stashed it.
-///
-/// Restore the returned ref with [`apply_stash`] + [`drop_stash`].
-pub fn take_autostash(repo: &Repository, autostash: bool) -> Result<Option<String>> {
-    if !working_tree_dirty(repo)? {
-        return Ok(None);
-    }
-    if !autostash {
-        return Err(dirty_working_tree_error());
-    }
-
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let message = format!("kin-autostash-{}-{}", std::process::id(), ts);
-    // Capture (rather than inherit) git's output so the internal
-    // `kin-autostash-…` token doesn't leak onto the user's terminal via git's
-    // "Saved working directory and index state …" confirmation.
-    let output = Command::new("git")
-        .args(["stash", "push", "-m", &message])
-        .output()?;
-    if !output.status.success() {
-        return Err(anyhow!("Failed to autostash working tree changes."));
-    }
-
-    // `git stash push` exits 0 without creating an entry when it refreshes the
-    // index and finds nothing to save ("No local changes to save"). git2's
-    // status can report the tree dirty (e.g. a stat-dirty file whose content
-    // still matches HEAD) when git stash disagrees, so confirm an entry was
-    // actually created before claiming there's something to restore.
-    if find_stash_reference(&message)?.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(message))
-}
-
-pub fn apply_stash(stash_ref: &str) -> Result<()> {
-    let resolved_ref = resolve_stash_reference(stash_ref)?;
-    let status = Command::new("git")
-        .arg("stash")
-        .arg("apply")
-        .arg(&resolved_ref)
-        .status()?;
-    if !status.success() {
-        return Err(anyhow!(
-            "Failed to apply stashed changes from '{}'. Resolve conflicts and run 'kin continue' or 'kin abort'.",
-            stash_ref
-        ));
-    }
-    Ok(())
-}
-
-/// How a stash apply ended when it didn't simply succeed.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum StashApplyOutcome {
-    /// The stash applied cleanly (staged state restored when requested).
-    Applied,
-    /// The apply merged the stash into the working tree but hit conflicts:
-    /// the changes ARE in the tree as conflict markers, so the stash must not
-    /// be applied again, but the entry should be preserved as a backup.
-    ConflictsLeftInTree,
-}
-
 pub fn unmerged_paths_exist() -> Result<bool> {
     let output = Command::new("git")
         .arg("ls-files")
@@ -864,218 +871,6 @@ pub fn has_staged_changes() -> Result<bool> {
         .output()?;
     // Exit code 0 either way; presence of output is the signal.
     Ok(output.status.success() && !output.stdout.is_empty())
-}
-
-/// Machine-readable snapshot of the working tree and index state, for
-/// detecting whether a failed operation touched anything.
-fn status_porcelain() -> Result<Vec<u8>> {
-    let output = Command::new("git")
-        .args(["status", "--porcelain", "-z", "--untracked-files=all"])
-        .output()?;
-    if !output.status.success() {
-        return Err(anyhow!("Failed to read working tree status."));
-    }
-    Ok(output.stdout)
-}
-
-/// Apply a stash, optionally restoring its recorded index state (`--index`) so
-/// previously staged hunks come back staged. Distinguishes a conflicted merge
-/// (stash content delivered as conflict markers — retrying would double-apply)
-/// from an apply that failed before touching the tree.
-pub fn apply_stash_with_outcome(stash_ref: &str, restore_index: bool) -> Result<StashApplyOutcome> {
-    let resolved_ref = resolve_stash_reference(stash_ref)?;
-    if restore_index {
-        let before = status_porcelain()?;
-        let status = Command::new("git")
-            .arg("stash")
-            .arg("apply")
-            .arg("--index")
-            .arg(&resolved_ref)
-            .status()?;
-        if status.success() {
-            return Ok(StashApplyOutcome::Applied);
-        }
-        // `--index` failures come in shapes: the working-tree merge ran and
-        // left conflict markers (retrying any apply would stack the stash on
-        // top of itself), a partial application without conflicts (e.g.
-        // untracked files restored before the failure), or a refusal before
-        // touching anything. Only a provably untouched tree can safely fall
-        // back to a plain apply.
-        if unmerged_paths_exist()? {
-            return Ok(StashApplyOutcome::ConflictsLeftInTree);
-        }
-        if status_porcelain()? != before {
-            return Err(anyhow!(
-                "git stash apply --index failed after partially applying stash '{}'. The stash entry is preserved; clean up the partial application and restore it manually with 'git stash apply --index'.",
-                stash_ref
-            ));
-        }
-        eprintln!(
-            "Warning: could not restore the staged state of the set-aside changes; restoring them unstaged."
-        );
-    }
-    let status = Command::new("git")
-        .arg("stash")
-        .arg("apply")
-        .arg(&resolved_ref)
-        .status()?;
-    if status.success() {
-        return Ok(StashApplyOutcome::Applied);
-    }
-    if unmerged_paths_exist()? {
-        return Ok(StashApplyOutcome::ConflictsLeftInTree);
-    }
-    Err(anyhow!(
-        "Failed to apply stashed changes from '{}'. Resolve conflicts and run 'kin continue' or 'kin abort'.",
-        stash_ref
-    ))
-}
-
-/// Restore `state.stash_ref` honoring `state.stash_apply_index`.
-pub fn apply_state_stash(state: &RebaseState, stash_ref: &str) -> Result<StashApplyOutcome> {
-    apply_stash_with_outcome(stash_ref, state.stash_apply_index)
-}
-
-/// Pop a stash taken by [`stash_push_changes`] back onto the working tree,
-/// best-effort. Used on error paths where no saved state will restore it later,
-/// so the user's changes aren't stranded in the stash list.
-pub fn restore_stashed_changes(stash_ref: Option<String>) {
-    let Some(stash_ref) = stash_ref else {
-        return;
-    };
-    if apply_stash(&stash_ref).is_ok() {
-        let _ = drop_stash(&stash_ref);
-    }
-}
-
-/// Best-effort restore of a *full* stash (taken without `--keep-index`) on an
-/// error path, bringing staged hunks back staged. Drops the stash entry only
-/// on a clean apply; a conflicted or failed apply keeps it and says where the
-/// changes are.
-pub fn restore_set_aside_changes(stash_ref: Option<String>) {
-    try_restore_set_aside_changes(stash_ref);
-}
-
-/// [`restore_set_aside_changes`], returning whether the changes came back
-/// cleanly (or there were none to restore).
-pub fn try_restore_set_aside_changes(stash_ref: Option<String>) -> bool {
-    let Some(stash_ref) = stash_ref else {
-        return true;
-    };
-    match apply_stash_with_outcome(&stash_ref, true) {
-        Ok(StashApplyOutcome::Applied) => {
-            let _ = drop_stash(&stash_ref);
-            true
-        }
-        Ok(StashApplyOutcome::ConflictsLeftInTree) => {
-            eprintln!(
-                "Warning: restoring the set-aside changes left conflicts in the working tree; the stash entry '{}' was preserved as a backup.",
-                stash_ref
-            );
-            false
-        }
-        Err(_) => {
-            eprintln!(
-                "Warning: could not restore the set-aside changes; they remain in stash entry '{}'.",
-                stash_ref
-            );
-            false
-        }
-    }
-}
-
-/// Stash working-tree changes (including untracked files) under a unique
-/// `<prefix>-<pid>-<nanos>` message and return that message as the stash
-/// handle, or `None` when there was nothing to stash. With `keep_index` the
-/// staged changes are kept in place (the `kin commit --on` contract); without
-/// it everything is set aside, in which case restoring with
-/// [`apply_state_stash`] brings staged hunks back staged.
-pub fn stash_push_changes(
-    repo: &Repository,
-    keep_index: bool,
-    message_prefix: &str,
-) -> Result<Option<String>> {
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let message = format!("{}-{}-{}", message_prefix, std::process::id(), ts);
-    let mut cmd = Command::new("git");
-    cmd.arg("stash").arg("push");
-    if keep_index {
-        cmd.arg("--keep-index");
-    }
-    // Capture (rather than inherit) git's output so the internal stash token
-    // doesn't leak onto the user's terminal via git's "Saved working directory
-    // and index state …" confirmation.
-    let output = cmd
-        .arg("--include-untracked")
-        .arg("-m")
-        .arg(&message)
-        // Untracked overlay files stay in place for the operation.
-        .arg("--")
-        .args(crate::overrides::stash_pathspecs(repo)?)
-        .output()?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "Failed to stash working tree changes: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    // `git stash push` exits 0 without creating an entry when there is nothing
-    // to save; confirm an entry was actually created before claiming there's
-    // something to restore.
-    if find_stash_reference(&message)?.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(message))
-}
-
-pub fn drop_stash(stash_ref: &str) -> Result<()> {
-    let resolved_ref = resolve_stash_reference(stash_ref)?;
-    let status = Command::new("git")
-        .arg("stash")
-        .arg("drop")
-        .arg(&resolved_ref)
-        .status()?;
-    if !status.success() {
-        return Err(anyhow!("Failed to drop stash entry '{}'.", stash_ref));
-    }
-    Ok(())
-}
-
-fn resolve_stash_reference(stash_ref: &str) -> Result<String> {
-    if stash_ref.starts_with("stash@{") {
-        return Ok(stash_ref.to_string());
-    }
-
-    find_stash_reference(stash_ref)?
-        .ok_or_else(|| anyhow!("Could not locate stash entry '{}'.", stash_ref))
-}
-
-/// Find the `stash@{N}` reference for a stash created with the given message,
-/// or `None` if no such entry exists.
-fn find_stash_reference(message: &str) -> Result<Option<String>> {
-    let output = Command::new("git")
-        .arg("stash")
-        .arg("list")
-        .arg("--format=%gd%x09%gs")
-        .output()?;
-    if !output.status.success() {
-        return Err(anyhow!("Failed to list stash entries."));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if let Some((reference, subject)) = line.split_once('\t') {
-            let parsed_message = subject
-                .split_once(": ")
-                .map_or_else(|| subject.trim(), |(_, msg)| msg.trim());
-            if parsed_message == message {
-                return Ok(Some(reference.to_string()));
-            }
-        }
-    }
-
-    Ok(None)
 }
 
 /// List every local branch whose tip lies inside the range `base..head`
@@ -1162,12 +957,17 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
     // autostash would restore those edits on a child, where they may conflict
     // even though they apply cleanly on the caller. Own the stash across the
     // entire restack so completion and abort restore it on the saved branch.
-    if !state.remaining_branches.is_empty() && state.autostash && state.stash_ref.is_none() {
-        state.stash_ref = take_autostash(repo, true)?;
-        state.stash_apply_index = true;
+    if !state.remaining_branches.is_empty()
+        && state.autostash
+        && state.set_asides.changes().is_none()
+    {
+        let taken = set_aside::take_tracked(repo, true, set_aside::Restore::WithIndex)?;
+        if let Some(taken) = taken {
+            state.set_asides.push(taken);
+        }
         state.autostash = false;
         if let Err(err) = save_state(repo, &state) {
-            restore_set_aside_changes(state.stash_ref.take());
+            set_aside::restore_or_warn(state.set_asides.take_changes());
             return Err(err);
         }
     }
@@ -1355,28 +1155,28 @@ fn parse_git_semver(version_output: &str) -> Option<(u64, u64, u64)> {
 /// Restore saved changes after returning to the caller, retaining recovery
 /// state on errors and avoiding a second stash apply after conflicts.
 pub fn restore_state_stash(repo: &Repository, state: &mut RebaseState) -> Result<()> {
-    if let Some(stash_ref) = state.stash_ref.clone() {
+    if let Some(changes) = state.set_asides.changes().cloned() {
         println!("Restoring set-aside changes...");
-        match apply_state_stash(state, &stash_ref)? {
-            StashApplyOutcome::Applied => {
-                state.stash_ref = None;
+        match set_aside::restore(&changes)? {
+            set_aside::Outcome::Applied => {
+                state.set_asides.take_changes();
                 save_state(repo, state)?;
-                if let Err(err) = drop_stash(&stash_ref) {
+                if let Err(err) = set_aside::drop_entry(&changes) {
                     eprintln!("Warning: {}", err);
                 }
             }
-            StashApplyOutcome::ConflictsLeftInTree => {
+            set_aside::Outcome::ConflictsLeftInTree => {
                 // The changes are in the tree as conflict markers; a later
                 // `kin continue` must not apply the stash a second time, so
                 // drop it from the state but keep the entry as a backup. Keep
                 // the saved state itself: the operation stays resumable
                 // (`kin continue` finishes its bookkeeping) and abortable
                 // (`kin abort` rolls the branches back).
-                state.stash_ref = None;
+                state.set_asides.take_changes();
                 save_state(repo, state)?;
                 return Err(anyhow!(
                     "Restoring the set-aside changes hit conflicts; resolve the conflict markers in the working tree, then run 'kin continue' to finish (or 'kin abort' to roll the operation back). The original changes are also preserved in stash entry '{}'.",
-                    stash_ref
+                    changes.stash
                 ));
             }
         }
@@ -1386,10 +1186,92 @@ pub fn restore_state_stash(repo: &Repository, state: &mut RebaseState) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{Operation, RebaseState, Replay, parse_git_semver};
+    use super::{JOURNAL_VERSION, Operation, RebaseState, Replay, parse_git_semver, parse_state};
+    use crate::set_aside::{Kind, Restore, SetAside, SetAsides};
+    use std::path::Path;
 
     fn saved(json: &str) -> RebaseState {
         serde_json::from_str(json).unwrap()
+    }
+
+    fn loaded(json: &str) -> anyhow::Result<RebaseState> {
+        parse_state(Path::new("journal.json"), json)
+    }
+
+    const LEGACY_FIELDS: &str = r#""operation":"Commit","original_branch":"a",
+        "target_branch":"a","remaining_branches":[],"in_progress_branch":"a""#;
+
+    #[test]
+    fn a_legacy_journal_with_autostash_keeps_it_and_its_unstaged_changes() {
+        let state = loaded(&format!(
+            r#"{{{LEGACY_FIELDS},"autostash":true,"stash_ref":"kin-commit-on-1-2",
+                "stash_apply_index":false,"carry_stash_ref":null}}"#
+        ))
+        .unwrap();
+        assert!(state.autostash);
+        assert_eq!(
+            state.set_asides,
+            SetAsides::from(vec![SetAside {
+                kind: Kind::UnstagedOnly,
+                stash: "kin-commit-on-1-2".to_string(),
+                oid: None,
+                restore: Restore::Plain,
+            }])
+        );
+    }
+
+    #[test]
+    fn a_legacy_journal_restores_its_carry_before_its_other_changes() {
+        let mut state = loaded(&format!(
+            r#"{{{LEGACY_FIELDS},"stash_ref":"kin-absorb-1-2","stash_apply_index":true,
+                "carry_stash_ref":"kin-commit-on-index-1-3"}}"#
+        ))
+        .unwrap();
+        let carry = state.set_asides.take_carry().unwrap();
+        assert_eq!(
+            (carry.kind, carry.restore, carry.stash.as_str()),
+            (Kind::Carry, Restore::WithIndex, "kin-commit-on-index-1-3")
+        );
+        let changes = state.set_asides.take_changes().unwrap();
+        assert_eq!(
+            (changes.kind, changes.restore, changes.stash.as_str()),
+            (Kind::WholeTree, Restore::WithIndex, "kin-absorb-1-2")
+        );
+        assert!(state.set_asides.is_empty());
+    }
+
+    #[test]
+    fn a_versioned_journal_ignores_fields_it_no_longer_has() {
+        let state = loaded(&format!(
+            r#"{{"version":{JOURNAL_VERSION},"journal":{{{LEGACY_FIELDS},
+                "stash_ref":"kin-commit-on-1-2"}}}}"#
+        ))
+        .unwrap();
+        assert!(state.set_asides.is_empty());
+    }
+
+    #[test]
+    fn a_version_without_a_journal_is_malformed() {
+        let err = loaded(&format!(
+            r#"{{{LEGACY_FIELDS},"version":{JOURNAL_VERSION}}}"#
+        ))
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("it has a version but no journal"), "{err}");
+        assert!(err.contains("kin abort --clear-state"), "{err}");
+    }
+
+    #[test]
+    fn a_journal_with_a_newer_version_is_refused_with_advice() {
+        for version in [format!("{}", JOURNAL_VERSION + 1), r#""2""#.to_string()] {
+            let err = loaded(&format!(r#"{{"version":{version},"journal":{{}}}}"#))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(err.contains("newer version of kin"), "{err}");
+            assert!(err.contains("kin abort --clear-state"), "{err}");
+        }
     }
 
     #[test]

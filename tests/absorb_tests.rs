@@ -431,6 +431,96 @@ fn test_absorb_rolls_back_when_the_fold_fails_before_starting() {
     );
 }
 
+/// When the fold is refused and the set-aside changes cannot be put back, the
+/// rollback must keep the saved state recording them, so `kin abort` restores
+/// them once the way is clear instead of leaving their stash entry unrecorded.
+#[test]
+#[cfg(unix)]
+fn test_absorb_rollback_keeps_state_until_set_aside_changes_are_restored() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = setup_stack(repo_path);
+
+    // The hook refuses the fold and leaves the index locked, so the set-aside
+    // changes cannot be restored.
+    let hook = repo_path.join(".git/hooks/pre-rebase");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\ntouch \"$(git rev-parse --git-dir)/index.lock\"\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    std::fs::write(repo_path.join("code.txt"), "line1 FIXED\nline2\nline3\n").unwrap();
+    run_ok("git", &["add", "code.txt"], repo_path);
+    std::fs::write(repo_path.join("a.txt"), "A staged leftover").unwrap();
+    run_ok("git", &["add", "a.txt"], repo_path);
+    std::fs::write(repo_path.join("untracked.txt"), "untracked").unwrap();
+
+    let tips_before = (tip(&repo, "review"), tip(&repo, "perf"), tip(&repo, "docs"));
+    let output = kin_cmd()
+        .current_dir(repo_path)
+        .arg("absorb")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "rejected fold must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("kin abort"), "{stderr}");
+    std::fs::remove_file(&hook).unwrap();
+
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(rebase_state_file(repo_path))
+            .expect("the state must stay until the set-aside changes are back"),
+    )
+    .unwrap();
+    let stash = state["journal"]["set_asides"][0]["stash"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the state lost the set-aside: {state}"))
+        .to_string();
+    let stashes = git_output(repo_path, &["stash", "list", "--format=%gs"]);
+    assert!(stashes.contains(&stash), "{stash} not in:\n{stashes}");
+    let continued = kin_cmd()
+        .current_dir(repo_path)
+        .arg("continue")
+        .output()
+        .unwrap();
+    assert!(
+        !continued.status.success(),
+        "a rolled-back absorb cannot continue"
+    );
+
+    std::fs::remove_file(repo_path.join(".git/index.lock")).unwrap();
+    kin_cmd()
+        .current_dir(repo_path)
+        .arg("abort")
+        .assert()
+        .success();
+    let tips_after = (tip(&repo, "review"), tip(&repo, "perf"), tip(&repo, "docs"));
+    assert_eq!(tips_before, tips_after);
+    assert_eq!(
+        git_output(repo_path, &["diff", "--cached", "--name-only"]).trim(),
+        "a.txt\ncode.txt"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("untracked.txt")).unwrap(),
+        "untracked"
+    );
+    assert_eq!(git_output(repo_path, &["stash", "list"]).trim(), "");
+    assert!(!rebase_state_file(repo_path).exists());
+}
+
+fn git_output(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?} failed");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
 #[test]
 fn test_absorb_abort_restores_tips_and_absorbed_changes() {
     let temp = TempDir::new().unwrap();
