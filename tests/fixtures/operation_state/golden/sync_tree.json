@@ -35,6 +35,7 @@
     "feature-b",
     "feature-c"
   ],
+  "replay": "SyncTree",
   "stash_apply_index": true,
   "stash_ref": null,
   "suppress_editor": false,

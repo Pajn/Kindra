@@ -28,6 +28,7 @@
   "remaining_branches": [
     "feature-b"
   ],
+  "replay": "Branches",
   "stash_apply_index": false,
   "stash_ref": null,
   "suppress_editor": false,

@@ -258,7 +258,8 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
     );
 
     let mut state = RebaseState {
-        operation: crate::rebase_utils::Operation::Commit,
+        operation: crate::rebase_utils::Operation::Absorb,
+        replay: Some(crate::rebase_utils::Replay::Branches),
         original_branch: current_branch_name.clone(),
         target_branch: current_branch_name.clone(),
         caller_branch: None,

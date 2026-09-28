@@ -1,6 +1,7 @@
 use crate::commands::find_upstream;
 use crate::rebase_utils::{
-    Operation, RebaseState, checkout_branch, clear_state, git_rebase_in_progress, save_state,
+    Operation, RebaseState, Replay, checkout_branch, clear_state, git_rebase_in_progress,
+    save_state,
 };
 use crate::stack::{
     collect_merged_local_branches, find_sync_boundary, get_stack_branches_from_merge_base,
@@ -164,6 +165,7 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
 
         let mut state = RebaseState {
             operation: Operation::Sync,
+            replay: Some(Replay::SyncLinear),
             original_branch: top_branch.clone(),
             target_branch: rebase_onto_name.clone(),
             caller_branch: current_branch_name
@@ -265,6 +267,7 @@ fn sync_upstream_branch(
 
         let state = RebaseState {
             operation: Operation::Sync,
+            replay: Some(Replay::SyncLinear),
             original_branch: upstream_name.to_string(),
             target_branch: rebase_onto_name.to_string(),
             caller_branch: None,
@@ -419,7 +422,7 @@ pub(crate) fn finish_sync_after_rebase(
     repo: &git2::Repository,
     mut state: RebaseState,
 ) -> Result<()> {
-    if state.parent_name_map.is_empty() {
+    if state.replay() == Replay::SyncLinear {
         ensure_sync_rebase_completed(repo, &state)?;
     }
     // The tip drives --update-refs, but the caller should return to the branch
@@ -547,12 +550,12 @@ fn sync_tree(
         crate::commands::resolve_and_check_autostash(repo, args.autostash, args.no_autostash)?;
     let mut state = RebaseState {
         operation: Operation::Sync,
+        replay: Some(Replay::SyncTree),
         original_branch: original.clone(),
         target_branch: upstream.to_string(),
         caller_branch: Some(original.clone()),
         remaining_branches: remaining,
         in_progress_branch: None,
-        // A nonempty parent_name_map marks a tree sync for the shared resumable loop.
         parent_id_map: bases,
         parent_name_map: parents,
         new_base_map: HashMap::new(),

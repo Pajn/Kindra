@@ -1,5 +1,5 @@
 use crate::operation_state::{KindraOperation, NativeOperation};
-use crate::rebase_utils::{Operation, load_state};
+use crate::rebase_utils::{Operation, RebaseState, load_state};
 use anyhow::Result;
 
 pub fn status_cmd() -> Result<()> {
@@ -44,20 +44,7 @@ pub fn status_cmd() -> Result<()> {
         KindraOperation::Run => print_run_status(&repo)?,
         KindraOperation::Rebase(_) => {
             let state = load_state(&repo)?;
-            let op_name = match state.operation {
-                Operation::Move => "Move",
-                Operation::Reorder => "Reorder",
-                Operation::Commit => "Commit",
-                Operation::Sync => "Sync",
-            };
-            if state.operation == Operation::Reorder {
-                println!("{} in progress from {}", op_name, state.original_branch);
-            } else {
-                println!(
-                    "{} in progress: {} onto {}",
-                    op_name, state.original_branch, state.target_branch
-                );
-            }
+            println!("{}", describe_rebase_operation(&state));
             println!(
                 "Remaining branches: {}",
                 state.remaining_branches.join(", ")
@@ -69,6 +56,22 @@ pub fn status_cmd() -> Result<()> {
         println!("{}", active.native.advice());
     }
     Ok(())
+}
+
+/// The first status line for a paused rebase-based operation, named by its
+/// label: a move or sync names the branch it moves and where to; a restack,
+/// commit or absorb names the branch it works on; a reorder, where it started.
+fn describe_rebase_operation(state: &RebaseState) -> String {
+    let original = &state.original_branch;
+    let target = &state.target_branch;
+    match state.operation {
+        Operation::Move => format!("Move in progress: {original} onto {target}"),
+        Operation::Sync => format!("Sync in progress: {original} onto {target}"),
+        Operation::Reorder => format!("Reorder in progress from {original}"),
+        Operation::Restack => format!("Restack in progress on {original}"),
+        Operation::Commit => format!("Commit in progress on {target}"),
+        Operation::Absorb => format!("Absorb in progress on {target}"),
+    }
 }
 
 fn print_run_status(repo: &git2::Repository) -> Result<()> {

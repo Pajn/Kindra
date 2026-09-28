@@ -7,7 +7,7 @@
   "cleanup_merged_branches": [],
   "in_progress_branch": "feature-b",
   "new_base_map": {},
-  "operation": "Move",
+  "operation": "Restack",
   "original_branch": "feature-a",
   "original_commit_count_map": {},
   "original_tip_map": {
@@ -27,6 +27,7 @@
   "remaining_branches": [
     "feature-b"
   ],
+  "replay": "Branches",
   "stash_apply_index": false,
   "stash_ref": null,
   "suppress_editor": false,
