@@ -455,3 +455,97 @@ fn tree_sync_planning_is_proportional_to_stack_not_local_branch_count() {
          {baseline:?} without ({STACK_BRANCHES}-branch stack)"
     );
 }
+
+/// main (`main_commits` commits) with `parent` and `child` forking from its
+/// tip, where `child` merged `parent` instead of rebasing onto it:
+///
+///   main ─┬ parent (1 commit)
+///         └ child (1 commit) ── merge of parent ── child (1 commit)
+///
+/// The root commit's object is then deleted, so any walk that runs past the
+/// fork point to the root fails to read it. Returns the parent and child tips.
+fn child_merged_parent_without_root(
+    dir: &std::path::Path,
+    main_commits: u32,
+) -> (Repository, git2::Oid, git2::Oid) {
+    let repo = repo_init(dir);
+    let root = append_commits(&repo, "refs/heads/main", 1);
+    let fork_point = append_commits(&repo, "refs/heads/main", main_commits - 1);
+    let parent_tip = branch_with_content_commits(&repo, "parent", fork_point, 1);
+    let child_own = branch_with_content_commits(&repo, "child", fork_point, 1);
+
+    let sig = Signature::now("perf", "perf@test.com").unwrap();
+    let child_commit = repo.find_commit(child_own).unwrap();
+    let parent_commit = repo.find_commit(parent_tip).unwrap();
+    let mut index = repo
+        .merge_commits(&child_commit, &parent_commit, None)
+        .unwrap();
+    let tree = repo.find_tree(index.write_tree_to(&repo).unwrap()).unwrap();
+    let merge = repo
+        .commit(
+            Some("refs/heads/child"),
+            &sig,
+            &sig,
+            "Merge branch 'parent' into child",
+            &tree,
+            &[&child_commit, &parent_commit],
+        )
+        .unwrap();
+    let child_tip = branch_with_content_commits(&repo, "child", merge, 1);
+
+    let hex = root.to_string();
+    std::fs::remove_file(dir.join(".git/objects").join(&hex[..2]).join(&hex[2..])).unwrap();
+    let repo = Repository::open(dir).unwrap();
+    assert!(repo.find_commit(root).is_err());
+    (repo, parent_tip, child_tip)
+}
+
+/// Following first parents from a branch that merged its parent never meets
+/// the parent's tip, which sits on a merge's second parent. The walk must stop
+/// where the branch's first-parent history joins the parent's history and name
+/// the situation, not run on to the root of a long trunk.
+#[test]
+fn first_parent_walk_to_a_merged_parent_stops_at_the_fork() {
+    let dir = tempdir().unwrap();
+    let (repo, parent_tip, child_tip) = child_merged_parent_without_root(dir.path(), 2000);
+
+    let err = kindra::stack::collect_first_parent_chain(&repo, parent_tip, child_tip)
+        .expect_err("the parent tip is not on the child's first-parent history");
+    assert!(
+        err.to_string()
+            .contains("the branch probably merged its parent instead of rebasing onto it"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Once the merged parent lands upstream, the sync scan starts from its tip and
+/// must find the child's own commits without walking the trunk's history.
+#[test]
+fn sync_boundary_after_a_merged_parent_stops_at_the_fork() {
+    let dir = tempdir().unwrap();
+    let (repo, parent_tip, child_tip) = child_merged_parent_without_root(dir.path(), 2000);
+    // Squash-merge the parent: one commit on main with the parent's net change.
+    let sig = Signature::now("perf", "perf@test.com").unwrap();
+    let parent = repo.find_commit(parent_tip).unwrap();
+    let main_tip = repo.find_commit(parent.parent_id(0).unwrap()).unwrap();
+    repo.commit(
+        Some("refs/heads/main"),
+        &sig,
+        &sig,
+        "squash: parent (#1)",
+        &parent.tree().unwrap(),
+        &[&main_tip],
+    )
+    .unwrap();
+    let branches = [("parent", parent_tip), ("child", child_tip)]
+        .into_iter()
+        .map(|(name, id)| StackBranch {
+            name: name.to_string(),
+            id,
+        })
+        .collect::<Vec<_>>();
+
+    let boundary = kindra::stack::find_sync_boundary(&repo, "child", "main", &branches).unwrap();
+    assert_eq!(boundary.old_base, Some(parent_tip));
+    assert_eq!(boundary.merged_branches, vec!["parent".to_string()]);
+}

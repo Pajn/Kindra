@@ -1,6 +1,6 @@
 mod common;
 
-use common::{kin_cmd, make_commit, rebase_state_file, repo_init, run_ok};
+use common::{kin_cmd, make_commit, make_commit_at, rebase_state_file, repo_init, run_ok};
 use git2::{BranchType, Repository};
 use predicates::prelude::*;
 use std::fs;
@@ -1131,4 +1131,117 @@ fn sync_tree_cleanup_excludes_branches_retained_by_the_plan() {
             .iter()
             .all(|branch| !plan.merged.contains(branch))
     );
+}
+
+/// A child that took its parent's later commits with `git merge` instead of a
+/// rebase reaches the parent's tip only through a merge's second parent. Once
+/// the parent is squash-merged, sync must still replay exactly the child's own
+/// commits onto the trunk and clean up the parent.
+fn check_sync_after_child_merged_its_parent(merges: usize) {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = repo_init(root);
+    make_commit(&repo, "refs/heads/main", "base.txt", "base\n", "base", &[]);
+    let commit = |branch: &str, file: &str, content: &str| {
+        run_ok("git", &["checkout", branch], root);
+        fs::write(root.join(file), content).unwrap();
+        run_ok("git", &["add", file], root);
+        run_ok(
+            "git",
+            &["commit", "-m", &format!("{branch} {content}")],
+            root,
+        );
+    };
+
+    run_ok("git", &["checkout", "-b", "parent"], root);
+    commit("parent", "parent.txt", "p0");
+    run_ok("git", &["checkout", "-b", "child"], root);
+    commit("child", "child.txt", "c0");
+    for round in 1..=merges {
+        commit("parent", "parent.txt", &format!("p{round}"));
+        run_ok("git", &["checkout", "child"], root);
+        run_ok("git", &["merge", "--no-ff", "--no-edit", "parent"], root);
+        commit("child", "child.txt", &format!("c{round}"));
+    }
+    // The parent's tip is not on the child's first-parent history.
+    let parent_tip = repo.revparse_single("parent").unwrap().id();
+    let mut first_parents = repo.revwalk().unwrap();
+    first_parents.push_ref("refs/heads/child").unwrap();
+    first_parents.simplify_first_parent().unwrap();
+    assert!(first_parents.all(|id| id.unwrap() != parent_tip));
+
+    run_ok("git", &["checkout", "main"], root);
+    run_ok("git", &["merge", "--squash", "parent"], root);
+    run_ok("git", &["commit", "-m", "squash: parent (#1)"], root);
+    let main_tip = repo.revparse_single("main").unwrap().id();
+
+    run_ok("git", &["checkout", "child"], root);
+    kin_cmd().arg("sync").current_dir(root).assert().success();
+
+    let repo = Repository::open(root).unwrap();
+    assert!(repo.find_branch("parent", BranchType::Local).is_err());
+    assert_eq!(repo.head().unwrap().shorthand(), Some("child"));
+    let mut walk = repo.revwalk().unwrap();
+    walk.push_ref("refs/heads/child").unwrap();
+    walk.hide(main_tip).unwrap();
+    walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)
+        .unwrap();
+    let replayed = walk
+        .map(|id| repo.find_commit(id.unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(replayed.iter().all(|commit| commit.parent_count() == 1));
+    assert_eq!(replayed[0].parent_id(0).unwrap(), main_tip);
+    let summaries = replayed
+        .iter()
+        .map(|commit| commit.summary().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let expected = (0..=merges)
+        .map(|round| format!("child c{round}"))
+        .collect::<Vec<_>>();
+    assert_eq!(summaries, expected);
+    assert_eq!(
+        fs::read_to_string(root.join("parent.txt")).unwrap(),
+        format!("p{merges}")
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("child.txt")).unwrap(),
+        format!("c{merges}")
+    );
+}
+
+#[test]
+fn sync_after_child_merged_its_parent_once() {
+    check_sync_after_child_merged_its_parent(1);
+}
+
+#[test]
+fn sync_after_child_merged_its_parent_twice() {
+    check_sync_after_child_merged_its_parent(2);
+}
+
+/// The chain the sync scan walks follows the graph, not commit dates, which
+/// clock skew or rewritten commits can put in any order.
+#[test]
+fn first_parent_chain_follows_the_graph_when_commit_dates_are_skewed() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let base_id = make_commit_at(&repo, "refs/heads/main", "f.txt", "0", "base", &[], 5000);
+    let mut expected = Vec::new();
+    let mut tip = repo.find_commit(base_id).unwrap();
+    for (i, time) in [1000, 4000, 2000, 3000].into_iter().enumerate() {
+        let id = make_commit_at(
+            &repo,
+            "refs/heads/feature",
+            "f.txt",
+            &i.to_string(),
+            &format!("feature {i}"),
+            &[&tip],
+            time,
+        );
+        expected.push(id);
+        tip = repo.find_commit(id).unwrap();
+    }
+
+    let chain = kindra::stack::collect_first_parent_chain(&repo, base_id, tip.id()).unwrap();
+    assert_eq!(chain, expected);
 }
