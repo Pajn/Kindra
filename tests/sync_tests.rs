@@ -3585,6 +3585,52 @@ fn sync_falls_back_to_a_full_fetch_when_the_trunk_is_gone_from_the_remote() {
     assert_eq!(tip(&repo, "origin/main"), base.id());
 }
 
+/// When the stack can't be worked out before fetching (here the trunk as last
+/// fetched shares no history with the branch), sync must not settle for a
+/// trunk-only fetch: the stack branches' remote-tracking refs would stay stale.
+#[test]
+fn sync_refreshes_the_stack_even_when_the_stale_trunk_shares_no_history() {
+    let (dir, remote) = remote_backed_repo();
+    let repo = Repository::open(dir.path()).unwrap();
+    let base = repo.find_commit(tip(&repo, "main")).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feature a",
+        &[&base],
+    );
+    run_ok("git", &["push", "-u", "origin", "feature-a"], dir.path());
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    // The locally known trunk is replaced by an unrelated root commit.
+    let empty_tree = repo
+        .find_tree(repo.treebuilder(None).unwrap().write().unwrap())
+        .unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    let orphan = repo
+        .commit(None, &sig, &sig, "orphan", &empty_tree, &[])
+        .unwrap();
+    repo.reference("refs/remotes/origin/main", orphan, true, "test")
+        .unwrap();
+    let trunk = common::push_remote_commit(remote.path(), "main", "trunk-1.txt");
+    let teammate = common::push_remote_commit(remote.path(), "feature-a", "teammate.txt");
+
+    kin_cmd()
+        .arg("sync")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(tip(&repo, "origin/main"), trunk);
+    assert_eq!(
+        tip(&repo, "origin/feature-a"),
+        teammate,
+        "the stack branch's remote-tracking ref should be refreshed"
+    );
+}
+
 #[test]
 fn sync_refreshes_the_remote_branches_of_the_stack_it_syncs() {
     let (dir, remote) = remote_backed_repo();

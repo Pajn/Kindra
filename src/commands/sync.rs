@@ -69,9 +69,10 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
         // trunk. This earlier pass, against the trunk as last fetched, only
         // picks the remote branches to refresh in the same fetch; a branch it
         // misses or adds costs a stale or an extra remote-tracking ref, never a
-        // wrong rebase.
+        // wrong rebase. If the stack can't be found this early (the trunk as
+        // last fetched may share no history with HEAD), fetch everything.
         let stack = if current_branch_name.as_deref() == Some(&upstream_name) {
-            Vec::new()
+            Some(Vec::new())
         } else {
             discover_stack(
                 repo,
@@ -79,10 +80,10 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
                 current_branch_name.as_deref(),
                 &rebase_onto_name,
             )
+            .ok()
             .map(|(_, stack)| stack)
-            .unwrap_or_default()
         };
-        fetch_sync_remote(repo, remote, &rebase_onto_name, &stack)?;
+        fetch_sync_remote(repo, remote, &rebase_onto_name, stack.as_deref())?;
     }
 
     // Snapshot for undo only after the preflight (upstream discovery, remote
@@ -575,9 +576,11 @@ fn fetch_sync_remote(
     repo: &git2::Repository,
     remote_name: &str,
     onto: &str,
-    stack: &[crate::stack::StackBranch],
+    stack: Option<&[crate::stack::StackBranch]>,
 ) -> Result<()> {
-    if let Some(trunk) = trunk_tracked_ref(repo, remote_name, onto) {
+    if let Some(stack) = stack
+        && let Some(trunk) = trunk_tracked_ref(repo, remote_name, onto)
+    {
         let branches = stack_tracked_refs(repo, remote_name, &trunk.tracking, stack);
         if targeted_fetch(repo, remote_name, &trunk, &branches)? {
             return Ok(());
