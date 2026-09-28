@@ -1188,6 +1188,111 @@ fn test_abort_uses_exact_stash_message_match() {
     );
 }
 
+/// When the newest set-aside comes back with conflicts, `kin abort` still tries
+/// the older one, which Git refuses to apply over the unresolved conflicts.
+/// That refusal leaves nothing restored, so the older set-aside must stay in
+/// the journal and on the stash list, and the abort must fail naming it; once
+/// the conflicts are resolved, a second abort restores it.
+#[test]
+fn test_abort_keeps_an_older_set_aside_git_refuses_over_conflicts() {
+    let (dir, repo) = setup_repo();
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    let stash_oid = |dir: &Path| {
+        git_stdout(dir, &["rev-parse", "stash@{0}"])
+            .trim()
+            .to_string()
+    };
+
+    // The paused `kin commit --on` set its unstaged changes aside, then the
+    // staged changes it was carrying.
+    fs::write(dir.path().join("unstaged.txt"), "unstaged work").unwrap();
+    run_ok("git", &["add", "unstaged.txt"], dir.path());
+    run_ok("git", &["commit", "-qm", "add unstaged.txt"], dir.path());
+    fs::write(dir.path().join("unstaged.txt"), "unstaged edit").unwrap();
+    run_ok(
+        "git",
+        &["stash", "push", "-m", "kin-commit-on-1-1"],
+        dir.path(),
+    );
+    let changes_oid = stash_oid(dir.path());
+    stage(dir.path(), "file.txt", "carried");
+    run_ok(
+        "git",
+        &["stash", "push", "-m", "kin-commit-on-index-1-2"],
+        dir.path(),
+    );
+    let carry_oid = stash_oid(dir.path());
+    // Since then `main` changed the carried line, so the carry conflicts.
+    stage(dir.path(), "file.txt", "changed on main");
+    run_ok("git", &["commit", "-qm", "change file.txt"], dir.path());
+
+    let main_tip = git_stdout(dir.path(), &["rev-parse", "main"])
+        .trim()
+        .to_string();
+    let state = RebaseState {
+        original_tip_map: HashMap::from([("main".to_string(), main_tip.clone())]),
+        owned_tip_map: HashMap::from([("main".to_string(), main_tip)]),
+        set_asides: vec![
+            SetAside {
+                kind: Kind::UnstagedOnly,
+                stash: "kin-commit-on-1-1".to_string(),
+                oid: Some(changes_oid),
+                restore: Restore::UnstagedDelta,
+            },
+            SetAside {
+                kind: Kind::Carry,
+                stash: "kin-commit-on-index-1-2".to_string(),
+                oid: Some(carry_oid),
+                restore: Restore::WithIndex,
+            },
+        ]
+        .into(),
+        ..rebase_state(Operation::Commit, "main", "main")
+    };
+    save_state(&repo, &state).unwrap();
+
+    let output = kin_cmd()
+        .current_dir(dir.path())
+        .arg("abort")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("kin-commit-on-1-1"), "{stderr}");
+    assert!(
+        !stderr.contains("the stash entry 'kin-commit-on-1-1' was preserved as a backup"),
+        "the refused set-aside must not be reported as restored:\n{stderr}"
+    );
+    assert_eq!(
+        journal_set_asides(dir.path()),
+        [("UnstagedOnly".to_string(), "kin-commit-on-1-1".to_string())]
+    );
+    let stashes = git_stdout(dir.path(), &["stash", "list", "--format=%gs"]);
+    assert!(stashes.contains("kin-commit-on-1-1"), "{stashes}");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("unstaged.txt")).unwrap(),
+        "unstaged work"
+    );
+
+    stage(dir.path(), "file.txt", "resolved");
+    kin_cmd()
+        .current_dir(dir.path())
+        .arg("abort")
+        .assert()
+        .success();
+    assert!(!rebase_state_file(dir.path()).exists());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("unstaged.txt")).unwrap(),
+        "unstaged edit"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "resolved"
+    );
+    let stashes = git_stdout(dir.path(), &["stash", "list", "--format=%gs"]);
+    assert!(!stashes.contains("kin-commit-on-1-1"), "{stashes}");
+}
+
 #[test]
 fn test_abort_preserves_stash_when_owned_tip_map_mismatches() {
     let (dir, _repo) = setup_repo();

@@ -433,6 +433,16 @@ fn attempt(repo: &Repository, set_aside: &SetAside, how: Restore) -> Result<Outc
     // Derive revisions from the stash commit's id: `stash@{N}` names whichever
     // entry is at N when each Git command runs.
     let commit = git_output(&["rev-parse", "--verify", &reference])?;
+    // Git refuses to apply a stash over unresolved conflicts, such as those
+    // a newer set-aside of the same restore just left.
+    if crate::rebase_utils::unmerged_paths_exist()? {
+        return Ok(Outcome::NotRestored {
+            reason: format!(
+                "Stash entry '{}' cannot be restored while the working tree has unresolved conflicts, so nothing was restored. Resolve them first.",
+                set_aside.stash
+            ),
+        });
+    }
     // Git applies the tracked changes before it restores the untracked files,
     // so an untracked file already in the way leaves a half-applied entry that
     // a retry would apply twice. Refuse before touching anything instead.
@@ -497,8 +507,13 @@ fn apply(reference: &str, index: bool, set_aside: &SetAside) -> Result<Outcome> 
 }
 
 /// `git stash apply [--index] <reference>`: `None` when it failed without
-/// leaving conflicts.
+/// leaving conflicts of its own.
 fn try_apply(reference: &str, index: bool, set_aside: &SetAside) -> Result<Option<Outcome>> {
+    // Conflicts already in the index are not this apply's: Git refuses to
+    // apply over them, so they must not be read as the stash's conflicts.
+    if crate::rebase_utils::unmerged_paths_exist()? {
+        return Ok(None);
+    }
     let mut git = Command::new("git");
     git.arg("stash").arg("apply");
     if index {
