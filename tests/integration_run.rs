@@ -336,6 +336,7 @@ fn run_autostash_conflicted_restore_names_the_backup() {
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
     let backup = git_stdout(dir.path(), &["stash", "list", "--format=%gs"]);
     let backup = backup.split_once(": ").map_or(backup.as_str(), |(_, m)| m);
     assert!(
@@ -369,6 +370,7 @@ fn run_autostash_unrestorable_changes_come_with_recovery_steps() {
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
     let entry = git_stdout(dir.path(), &["stash", "list", "--format=%gs"]);
     let entry = entry.split_once(": ").map_or(entry.as_str(), |(_, m)| m);
     assert!(

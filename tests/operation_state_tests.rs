@@ -55,6 +55,7 @@
 //!   `stash_ref`, `stash_apply_index` and `carry_stash_ref` as `set_asides`;
 //!   and saves the journal inside a `{"version": 1, "journal": {...}}`
 //!   envelope. A flat journal (no `version`) is converted when it is loaded.
+//!   Version 2 lets an unstaged-only set-aside record `UnstagedDelta`.
 
 mod common;
 
@@ -916,7 +917,7 @@ fn journal_is_saved_in_an_envelope_older_kindra_cannot_parse() {
     let mut keys: Vec<_> = saved.as_object().unwrap().keys().cloned().collect();
     keys.sort();
     assert_eq!(keys, ["journal", "version"]);
-    assert_eq!(saved["version"], Value::from(1));
+    assert_eq!(saved["version"], Value::from(2));
     assert!(saved["journal"]["operation"].is_string());
 }
 
@@ -980,8 +981,8 @@ fn journal_from_a_newer_kindra_is_refused_with_advice() {
 fn journal_with_a_newer_version_is_refused_with_advice() {
     let paused = paused_commit_fixup();
     let mut journal = paused.repo.state_json();
-    assert_eq!(journal["version"], Value::from(1));
-    journal["version"] = Value::from(2);
+    assert_eq!(journal["version"], Value::from(2));
+    journal["version"] = Value::from(3);
     let saved = serde_json::to_string_pretty(&journal).unwrap();
     fs::write(paused.repo.state_path(), &saved).unwrap();
 
@@ -990,7 +991,7 @@ fn journal_with_a_newer_version_is_refused_with_advice() {
         assert!(!output.status.success(), "{}", describe(&output));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("newer version of kin"), "{stderr}");
-        assert!(stderr.contains("journal version 2"), "{stderr}");
+        assert!(stderr.contains("journal version 3"), "{stderr}");
         assert!(stderr.contains("kin abort --clear-state"), "{stderr}");
         assert_eq!(fs::read_to_string(paused.repo.state_path()).unwrap(), saved);
         assert!(paused.repo.rebase_in_progress());
@@ -1001,6 +1002,28 @@ fn journal_with_a_newer_version_is_refused_with_advice() {
     assert!(cleared.status.success(), "{}", describe(&cleared));
     assert!(!paused.repo.state_path().exists());
     assert_eq!(paused.repo.stash_list(), set_aside);
+}
+
+/// A journal saved in version 1 of the envelope, which holds nothing version 2
+/// added, still resumes to completion.
+#[test]
+fn journal_of_an_older_version_still_continues() {
+    let paused = paused_absorb();
+    let mut journal = paused.repo.state_json();
+    assert_eq!(journal["version"], Value::from(2));
+    journal["version"] = Value::from(1);
+    fs::write(
+        paused.repo.state_path(),
+        serde_json::to_string_pretty(&journal).unwrap(),
+    )
+    .unwrap();
+
+    paused.continue_to_completion();
+    assert_eq!(
+        fs::read_to_string(paused.repo.path().join("untracked.txt")).unwrap(),
+        "untracked\n"
+    );
+    assert_eq!(paused.repo.stash_list(), "");
 }
 
 // ---------------------------------------------------------------------------

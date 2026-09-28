@@ -567,8 +567,17 @@ fn untracked_in_the_way(repo: &Repository, stash: &str) -> Result<Vec<String>> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| anyhow!("Cannot restore set-aside changes in a bare repository."))?;
+    // `--full-tree`: from a subdirectory Git would otherwise list only the
+    // files under it, relative to it, and the paths are joined to the root.
     let output = Command::new("git")
-        .args(["ls-tree", "-r", "-z", "--name-only", &untracked])
+        .args([
+            "ls-tree",
+            "--full-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            &untracked,
+        ])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(

@@ -839,6 +839,18 @@ fn sync_autostash_can_abort_after_tip_checkout_is_blocked() {
 
 #[test]
 fn sync_no_delete_stash_conflict_preserves_state_until_resolved() {
+    sync_stash_conflict_preserves_state_until_resolved(None);
+}
+
+/// The same with `kin continue` run from a subdirectory while the conflict is
+/// outside it: Git limits paths to the current directory unless told
+/// otherwise, so the conflict must still be seen.
+#[test]
+fn sync_stash_conflict_outside_the_current_directory_preserves_state_until_resolved() {
+    sync_stash_conflict_preserves_state_until_resolved(Some("sub"));
+}
+
+fn sync_stash_conflict_preserves_state_until_resolved(subdirectory: Option<&str>) {
     let dir = sync_recovery_repo(true);
     fs::write(dir.path().join("shared.txt"), "dirty\n").unwrap();
     kin_cmd()
@@ -852,9 +864,16 @@ fn sync_no_delete_stash_conflict_preserves_state_until_resolved() {
     // restoring its saved working-tree edits conflicts after the rebase ends.
     fs::write(dir.path().join("shared.txt"), "rebased\n").unwrap();
     run_ok("git", &["add", "shared.txt"], dir.path());
+    let cwd = match subdirectory {
+        Some(sub) => {
+            fs::create_dir(dir.path().join(sub)).unwrap();
+            dir.path().join(sub)
+        }
+        None => dir.path().to_path_buf(),
+    };
     kin_cmd()
         .arg("continue")
-        .current_dir(dir.path())
+        .current_dir(&cwd)
         .assert()
         .failure()
         .stderr(predicate::str::contains(

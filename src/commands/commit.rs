@@ -1682,8 +1682,24 @@ fn unwind_unstarted_rebase(
         // it goes back first; the soft reset then returns the commit's content
         // to the index.
         None => {
+            let set_aside_anything = !state.set_asides.is_empty();
             let outcome = set_aside::unwind(repo, &mut state.set_asides);
-            run_git(&["reset", "--soft", &target]).map(|()| outcome)
+            match run_git(&["reset", "--soft", &target]) {
+                Ok(()) => Ok(outcome),
+                Err(reset_err) if set_aside_anything => {
+                    let changes = match outcome {
+                        Outcome::Restored => "your set-aside changes were restored",
+                        Outcome::ConflictsLeft { .. } => {
+                            "restoring your set-aside changes left conflicts in the working tree"
+                        }
+                        Outcome::NotRestored { .. } => {
+                            "your set-aside changes could not be restored"
+                        }
+                    };
+                    Err(anyhow!("{reset_err:#}; {changes}"))
+                }
+                Err(reset_err) => Err(reset_err),
+            }
         }
         // Checkout path: the stash taken on the caller branch before the switch
         // holds the staged changes as well as the non-staged ones, so the fixup
@@ -1784,8 +1800,23 @@ fn carry_staged_changes_onto(
 
     state.set_asides.push(carry_stash.clone());
     if let Err(err) = save_state(repo, state) {
-        state.set_asides.take_carry();
-        set_aside::restore(repo, &carry_stash, Phase::Unwind);
+        // The saved journal already records the unstaged changes, so only the
+        // carry goes back. If it cannot, keep it and try again to record it,
+        // with nothing to continue, so `kin abort` restores it.
+        if matches!(
+            set_aside::restore(repo, &carry_stash, Phase::Unwind),
+            Outcome::NotRestored { .. }
+        ) {
+            state.abort_only = true;
+            if let Err(save_err) = save_state(repo, state) {
+                return Err(err.context(format!(
+                    "Additionally, recording the staged changes set aside in stash entry '{}' failed ({save_err:#}).",
+                    carry_stash.stash
+                )));
+            }
+        } else {
+            state.set_asides.take_carry();
+        }
         return Err(err);
     }
 

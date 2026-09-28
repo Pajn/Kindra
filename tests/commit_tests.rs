@@ -2986,6 +2986,97 @@ fn test_commit_on_failed_checkout_keeps_the_unrestored_carry_in_state() {
     assert!(!rebase_state_file(repo_path).exists());
 }
 
+/// A `--on` switch that cannot record its carry puts the staged changes back
+/// at once. When that restore fails too, the journal must still come to
+/// record the carry, so `kin abort` restores it, rather than leave its stash
+/// entry unrecorded.
+#[test]
+#[cfg(unix)]
+fn test_commit_on_failed_carry_save_keeps_the_unrestored_carry_in_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    repo_init(repo_path);
+    setup_diverged_line_stack(repo_path);
+    run_ok("git", &["checkout", "-b", "other", "main"], repo_path);
+    edit_line(repo_path, 10, "10-other");
+    run_ok("git", &["commit", "-am", "other edit"], repo_path);
+    run_ok("git", &["checkout", "upper"], repo_path);
+
+    edit_line(repo_path, 20, "20-staged");
+    run_ok("git", &["add", "f.txt"], repo_path);
+    edit_line(repo_path, 35, "35-unstaged");
+
+    // Once the journal exists, the next stash is the carry: the first save
+    // recording it fails, and applying it fails until the test ends. The
+    // failing apply lifts the save failure, so the journal can be saved again.
+    let bin = tempdir().unwrap();
+    let marker = bin.path().join("fail-state-write");
+    let blocked = bin.path().join("block-apply");
+    let wrapper = bin.path().join("git");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh
+if [ \"$1\" = stash ] && [ \"$2\" = push ] && [ -f \"$KIN_TEST_STATE\" ] && [ ! -e '{blocked}' ]; then
+  \"$KIN_TEST_REAL_GIT\" \"$@\" || exit $?
+  printf '%s' \"$KIN_TEST_STATE\" > \"$KIN_TEST_FAIL_STATE_WRITE\"
+  : > '{blocked}'
+  exit 0
+fi
+if [ \"$1\" = stash ] && [ \"$2\" = apply ] && [ -e '{blocked}' ]; then
+  rm -f \"$KIN_TEST_FAIL_STATE_WRITE\"
+  echo 'apply blocked' >&2
+  exit 1
+fi
+exec \"$KIN_TEST_REAL_GIT\" \"$@\"
+",
+            blocked = blocked.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+
+    let output = kin_cmd()
+        .current_dir(repo_path)
+        .args(["commit", "--on", "other", "-m", "should not land"])
+        .env("PATH", path)
+        .env("KIN_TEST_REAL_GIT", which::which("git").unwrap())
+        .env("KIN_TEST_STATE", rebase_state_file(repo_path))
+        .env("KIN_TEST_FAIL_STATE_WRITE", &marker)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("Injected state write failure"), "{stderr}");
+    assert!(blocked.exists() && !marker.exists(), "{stderr}");
+
+    let kinds: Vec<String> = journal_set_asides(repo_path)
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect();
+    assert_eq!(kinds, ["UnstagedOnly", "Carry"], "{stderr}");
+    assert_journal_names_live_stashes(repo_path);
+    assert_continue_refuses_rollback_state(repo_path);
+
+    kin_cmd()
+        .arg("abort")
+        .current_dir(repo_path)
+        .assert()
+        .success();
+    assert_eq!(current_branch(repo_path), "upper");
+    let content = fs::read_to_string(repo_path.join("f.txt")).unwrap();
+    assert!(content.contains("20-staged") && content.contains("35-unstaged"));
+    assert_eq!(git_stdout(repo_path, &["stash", "list"]).trim(), "");
+    assert!(!rebase_state_file(repo_path).exists());
+}
+
 /// Stage a line `other` also changed, so carrying it there conflicts and the
 /// switch unwinds back to `upper`, with an untracked file set aside.
 /// `hook_script` runs once the unwind is back on `upper`. Returns the error.
@@ -4333,7 +4424,12 @@ fn test_commit_fixup_with_dependents_pre_start_hook_rejection_rolls_back() {
 #[cfg(unix)]
 fn test_commit_fixup_failed_rollback_keeps_the_unrestored_stash_in_state() {
     // A held lock on the branch ref also blocks the reset.
-    let (dir, stash_ref) = fixup_rollback_with_unrestorable_stash(true);
+    let (dir, stash_ref, stderr) = fixup_rollback_with_unrestorable_stash(true);
+    assert!(
+        stderr.contains("Rolling back the commit did not complete")
+            && stderr.contains("your set-aside changes could not be restored"),
+        "the failure must say the set-aside changes are not back, got:\n{stderr}"
+    );
     let stashes = git_stdout(dir.path(), &["stash", "list", "--format=%H %gs"]);
     assert!(
         stashes.lines().any(|line| line.contains(&stash_ref)),
@@ -4366,7 +4462,7 @@ fn assert_continue_refuses_rollback_state(dir: &Path) {
 #[test]
 #[cfg(unix)]
 fn test_commit_fixup_rollback_keeps_state_until_set_aside_changes_are_restored() {
-    let (dir, _) = fixup_rollback_with_unrestorable_stash(false);
+    let (dir, _, _) = fixup_rollback_with_unrestorable_stash(false);
     // The rollback itself went through: the fixup commit is gone again.
     assert_eq!(
         git_stdout(dir.path(), &["log", "-1", "--format=%s"]).trim(),
@@ -4393,8 +4489,10 @@ fn test_commit_fixup_rollback_keeps_state_until_set_aside_changes_are_restored()
 /// pre-rebase hook refuses the rebase and edits the stashed file, so the
 /// set-aside changes cannot be restored during rollback. With
 /// `lock_branch_ref`, the hook also blocks the reset. Returns the stash entry
-/// the saved state points at.
-fn fixup_rollback_with_unrestorable_stash(lock_branch_ref: bool) -> (tempfile::TempDir, String) {
+/// the saved state points at and the command's error output.
+fn fixup_rollback_with_unrestorable_stash(
+    lock_branch_ref: bool,
+) -> (tempfile::TempDir, String, String) {
     let (dir, repo) = setup_repo();
     let main_id = repo.revparse_single("main").unwrap().id();
     let main_commit = repo.find_commit(main_id).unwrap();
@@ -4464,7 +4562,7 @@ fn fixup_rollback_with_unrestorable_stash(lock_branch_ref: bool) -> (tempfile::T
         .as_str()
         .unwrap_or_else(|| panic!("state lost the stash reference: {state}"))
         .to_string();
-    (dir, stash_ref)
+    (dir, stash_ref, stderr.into_owned())
 }
 
 /// A fold that git refuses before starting must not leave the saved state

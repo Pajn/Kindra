@@ -948,6 +948,19 @@ fn test_absorb_conflicting_dependent_completes_via_continue() {
 /// restore everything once the way is clear.
 #[test]
 fn test_absorb_continue_restores_nothing_while_a_set_aside_untracked_file_exists() {
+    absorb_continue_with_a_set_aside_untracked_file_in_the_way(None);
+}
+
+/// The same from a subdirectory, with the file in the way outside it: Git
+/// limits paths to the current directory unless told otherwise, so the check
+/// must look at the whole tree.
+#[test]
+fn test_absorb_continue_from_a_subdirectory_restores_nothing_while_a_set_aside_untracked_file_exists()
+ {
+    absorb_continue_with_a_set_aside_untracked_file_in_the_way(Some("sub"));
+}
+
+fn absorb_continue_with_a_set_aside_untracked_file_in_the_way(subdirectory: Option<&str>) {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path();
     let repo = setup_stack(repo_path);
@@ -979,9 +992,16 @@ fn test_absorb_continue_restores_nothing_while_a_set_aside_untracked_file_exists
     run_ok("git", &["add", "code.txt"], repo_path);
     // Something else creates a file the set-aside will restore.
     std::fs::write(repo_path.join("untracked.txt"), "someone else's").unwrap();
+    let cwd = match subdirectory {
+        Some(dir) => {
+            std::fs::create_dir(repo_path.join(dir)).unwrap();
+            repo_path.join(dir)
+        }
+        None => repo_path.to_path_buf(),
+    };
 
     let output = kin_cmd()
-        .current_dir(repo_path)
+        .current_dir(&cwd)
         .env("GIT_EDITOR", "true")
         .arg("continue")
         .output()
@@ -1013,7 +1033,7 @@ fn test_absorb_continue_restores_nothing_while_a_set_aside_untracked_file_exists
 
     std::fs::remove_file(repo_path.join("untracked.txt")).unwrap();
     kin_cmd()
-        .current_dir(repo_path)
+        .current_dir(&cwd)
         .arg("continue")
         .assert()
         .success();

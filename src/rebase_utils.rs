@@ -214,7 +214,11 @@ pub fn load_state(repo: &Repository) -> Result<RebaseState> {
 /// existing field. Every Kindra reads every older format and refuses a newer
 /// one with advice. A file without `version` is a flat journal saved by
 /// Kindra 1.1 or earlier.
-pub const JOURNAL_VERSION: u64 = 1;
+///
+/// - 1: the first envelope.
+/// - 2: an unstaged-only set-aside may record `restore: UnstagedDelta`, which
+///   version 1 does not know.
+pub const JOURNAL_VERSION: u64 = 2;
 
 /// Parse a saved journal. One saved in a newer format, or that does not parse
 /// (for example because a newer Kindra saved an operation this one does not
@@ -862,9 +866,10 @@ pub fn ensure_rebase_working_tree(repo: &Repository, autostash: bool) -> Result<
 }
 
 pub fn unmerged_paths_exist() -> Result<bool> {
+    // `:/` covers the whole tree: from a subdirectory Git would otherwise see
+    // only the conflicts under it.
     let output = Command::new("git")
-        .arg("ls-files")
-        .arg("--unmerged")
+        .args(["ls-files", "--unmerged", "--", ":/"])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
@@ -1270,6 +1275,30 @@ mod tests {
         assert!(state.set_asides.is_empty());
     }
 
+    /// Every version up to this Kindra's reads the same way; a version 1
+    /// journal keeps the set-asides it recorded.
+    #[test]
+    fn a_journal_of_an_older_or_the_current_version_is_read() {
+        for version in 1..=JOURNAL_VERSION {
+            let state = loaded(&format!(
+                r#"{{"version":{version},"journal":{{{LEGACY_FIELDS},"set_asides":[
+                    {{"kind":"UnstagedOnly","stash":"kin-commit-on-1-2","oid":"abc",
+                      "restore":"Plain"}}]}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                state.set_asides,
+                SetAsides::from(vec![SetAside {
+                    kind: Kind::UnstagedOnly,
+                    stash: "kin-commit-on-1-2".to_string(),
+                    oid: Some("abc".to_string()),
+                    restore: Restore::Plain,
+                }]),
+                "version {version}"
+            );
+        }
+    }
+
     #[test]
     fn a_version_without_a_journal_is_malformed() {
         let err = loaded(&format!(
@@ -1284,7 +1313,8 @@ mod tests {
 
     #[test]
     fn a_journal_with_a_newer_version_is_refused_with_advice() {
-        for version in [format!("{}", JOURNAL_VERSION + 1), r#""2""#.to_string()] {
+        assert_eq!(JOURNAL_VERSION, 2);
+        for version in ["3", "4", r#""2""#] {
             let err = loaded(&format!(r#"{{"version":{version},"journal":{{}}}}"#))
                 .err()
                 .unwrap()
