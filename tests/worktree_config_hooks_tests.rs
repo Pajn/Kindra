@@ -186,6 +186,43 @@ fn worktree_hooks_run_for_create_checkout_and_remove() {
     assert_eq!(fs::read_to_string(&remove_marker).unwrap(), "removed");
 }
 
+/// Git exports `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` to hooks, and
+/// wrappers set them. Worktree hooks must not inherit them: they find the
+/// repository from the worktree they run in, as Git would there.
+#[cfg(unix)]
+#[test]
+fn worktree_hooks_do_not_inherit_git_env_naming_another_repository() {
+    let dir = setup_repo();
+    let out = TempDir::new().unwrap();
+    let marker = out.path().join("create-env.txt");
+    let hook = format!(
+        r#"echo "${{GIT_DIR-unset}} ${{GIT_WORK_TREE-unset}} ${{GIT_INDEX_FILE-unset}} $(git branch --show-current)" > '{}'"#,
+        marker.display()
+    );
+    write_repo_config(
+        dir.path(),
+        &format!(
+            "[worktrees.hooks]\non_create = [{}]\n",
+            toml_basic_string(&hook)
+        ),
+    );
+    run_ok("git", &["branch", "feature-b"], dir.path());
+    let foreign = common::ForeignRepository::new();
+
+    foreign
+        .kin_cmd()
+        .args(["wt", "review", "feature-b"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        "unset unset unset feature-b\n"
+    );
+    foreign.assert_untouched();
+}
+
 #[test]
 fn shell_write_command_escapes_single_quotes_for_each_platform() {
     let path = Path::new("dir/it's/hook's.txt");

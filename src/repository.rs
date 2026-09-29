@@ -8,10 +8,13 @@ pub fn open_repo() -> Result<Repository> {
         .context("Failed to find or open git repository. Are you in a git repo?")
 }
 
-/// Variables removed from a git child so it sees the same repository and the
-/// same history as the libgit2 handle, which `open_repo` builds without
-/// reading any of them. Git exports several to hooks, and wrappers set them
-/// too. This is git's own list of repository-local variables
+/// Variables that name a repository, work tree, index or view of history
+/// other than the one discovered from the working directory. `kin` removes
+/// them from its own environment at startup ([`forget_inherited_repository`])
+/// and from every git child, so each sees the same repository and the same
+/// history as the libgit2 handle, which `open_repo` builds without reading
+/// any of them. Git exports several to hooks, and wrappers set them too. This
+/// is git's own list of repository-local variables
 /// (`git rev-parse --local-env-vars`) plus `GIT_NAMESPACE`, which narrows the
 /// refs git lists.
 ///
@@ -33,6 +36,26 @@ const REPOSITORY_ENV: &[&str] = &[
     "GIT_PREFIX",
     "GIT_NAMESPACE",
 ];
+
+/// Remove [`REPOSITORY_ENV`] from `kin`'s own environment, so the whole
+/// process works on the repository discovered from its working directory:
+/// the absorb engine, which opens the repository in-process and would honour
+/// `GIT_DIR`, and every process `kin` starts that is not a git child built by
+/// [`git_command`] — `kin run`'s command, hooks, editors and `gh`, which
+/// then find the repository from their own working directory as git would
+/// there. Git children still get the discovered repository named explicitly.
+///
+/// # Safety
+///
+/// Changing the environment is unsound while another thread may read or
+/// write it. Call this once at the start of `main`, before any thread is
+/// spawned.
+pub unsafe fn forget_inherited_repository() {
+    for name in REPOSITORY_ENV {
+        // SAFETY: the caller guarantees the process is single-threaded.
+        unsafe { std::env::remove_var(name) };
+    }
+}
 
 /// A `git` command that acts on `repo`, the repository libgit2 opened, and
 /// its work tree and index, whatever the environment names. Every git child

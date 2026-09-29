@@ -150,6 +150,44 @@ fn test_absorb_folds_staged_change_and_restacks_dependents() {
     assert_eq!(String::from_utf8_lossy(&status.stdout), "");
 }
 
+/// Git exports `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` to hooks, and
+/// wrappers set them. The absorb engine runs inside `kin` and opens the
+/// repository itself, so it must find the discovered repository and its
+/// staged changes too, and create its fixups there, not in the repository the
+/// environment names.
+#[test]
+fn test_absorb_folds_into_the_discovered_repository_when_git_env_names_another() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = setup_stack(repo_path);
+    std::fs::write(repo_path.join("code.txt"), "line1 FIXED\nline2\nline3\n").unwrap();
+    run_ok("git", &["add", "code.txt"], repo_path);
+    let foreign = common::ForeignRepository::new();
+
+    let output = foreign
+        .kin_cmd()
+        .current_dir(repo_path)
+        .arg("absorb")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "absorb failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let review_tip = tip(&repo, "review");
+    assert_eq!(commit_summary(&repo, review_tip), "review: add extra");
+    let code_commit = first_parent(&repo, review_tip);
+    assert_eq!(
+        file_in_commit(&repo, code_commit, "code.txt"),
+        "line1 FIXED\nline2\nline3\n"
+    );
+    assert_eq!(first_parent(&repo, tip(&repo, "perf")), review_tip);
+    foreign.assert_untouched();
+}
+
 #[test]
 fn test_absorb_nothing_staged_is_a_noop() {
     let temp = TempDir::new().unwrap();

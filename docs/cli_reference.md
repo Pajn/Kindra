@@ -35,6 +35,8 @@ Kindra automatically identifies your stack by looking for local branches that ar
 
 The base branch is the **trunk**. Kindra resolves it in this order: `upstream_branch` in [repository config](#configuration) (an error if it names no existing branch; a name that exists only as `origin/<name>` resolves to that), otherwise `git config init.defaultBranch`, `main`, `master` and `trunk`. All of those are first looked up as local branches, in that order, and only if none exists as `origin/<name>`, in the same order. For example, with `init.defaultBranch = develop`, a local `main` is chosen over `origin/develop`.
 
+Kindra works on the repository that contains its working directory, as `git` run there without options would. It ignores the repository variables Git exports to its hooks and wrappers set — `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and the others `git rev-parse --local-env-vars` lists, and `GIT_NAMESPACE` — and does not pass them on: `kin run` commands, hooks, editors and `gh` find the repository from their own working directory. `kin` run from a Git hook therefore acts on the repository of the directory it runs in.
+
 ---
 
 ## Configuration
