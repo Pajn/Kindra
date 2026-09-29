@@ -4,7 +4,10 @@
     "caller_branch": null,
     "cleanup_checkout_fallback": null,
     "cleanup_merged_branches": [],
-    "in_progress_branch": "feature-b",
+    "cursor": {
+      "started": true,
+      "step": 1
+    },
     "new_base_map": {
       "feature-b": "refs/kindra/absorb/<absorb-namespace>/<commit: a: add code>"
     },
@@ -31,13 +34,27 @@
       "keep_other_refs": false,
       "no_restart": false
     },
-    "remaining_branches": [
-      "feature-b"
-    ],
     "set_asides": [],
+    "steps": [
+      {
+        "anchor_forks": true,
+        "base": "<main@before>",
+        "branch": "feature-a",
+        "kind": "Autosquash",
+        "no_rebase_merges": true
+      },
+      {
+        "branch": "feature-b",
+        "kind": "Replay"
+      },
+      {
+        "checkout": "feature-a",
+        "kind": "Complete"
+      }
+    ],
     "suppress_editor": true,
     "target_branch": "feature-a",
     "unstage_on_restore": false
   },
-  "version": 3
+  "version": 4
 }

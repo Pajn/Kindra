@@ -4,7 +4,10 @@
     "caller_branch": "feature-a",
     "cleanup_checkout_fallback": "main",
     "cleanup_merged_branches": [],
-    "in_progress_branch": "feature-b",
+    "cursor": {
+      "started": true,
+      "step": 1
+    },
     "new_base_map": {
       "feature-a": "main",
       "feature-b": "feature-a",
@@ -40,14 +43,28 @@
       "keep_other_refs": false,
       "no_restart": false
     },
-    "remaining_branches": [
-      "feature-b",
-      "feature-c"
-    ],
     "set_asides": [],
+    "steps": [
+      {
+        "branch": "feature-a",
+        "kind": "Replay"
+      },
+      {
+        "branch": "feature-b",
+        "kind": "Replay"
+      },
+      {
+        "branch": "feature-c",
+        "kind": "Replay"
+      },
+      {
+        "checkout": "feature-a",
+        "kind": "Complete"
+      }
+    ],
     "suppress_editor": false,
     "target_branch": "main",
     "unstage_on_restore": false
   },
-  "version": 3
+  "version": 4
 }

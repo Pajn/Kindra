@@ -4,7 +4,10 @@
     "caller_branch": null,
     "cleanup_checkout_fallback": null,
     "cleanup_merged_branches": [],
-    "in_progress_branch": "feature-a",
+    "cursor": {
+      "started": true,
+      "step": 0
+    },
     "new_base_map": {},
     "operation": "Commit",
     "original_branch": "feature-a",
@@ -31,9 +34,6 @@
       "keep_other_refs": false,
       "no_restart": false
     },
-    "remaining_branches": [
-      "feature-b"
-    ],
     "set_asides": [
       {
         "kind": "UnstagedOnly",
@@ -42,9 +42,26 @@
         "stash": "<kin-commit-on set-aside>"
       }
     ],
+    "steps": [
+      {
+        "anchor_forks": false,
+        "base": "<main@before>",
+        "branch": "feature-a",
+        "kind": "Autosquash",
+        "no_rebase_merges": false
+      },
+      {
+        "branch": "feature-b",
+        "kind": "Replay"
+      },
+      {
+        "checkout": "feature-a",
+        "kind": "Complete"
+      }
+    ],
     "suppress_editor": false,
     "target_branch": "feature-a",
     "unstage_on_restore": false
   },
-  "version": 3
+  "version": 4
 }

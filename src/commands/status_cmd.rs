@@ -47,7 +47,7 @@ pub fn status_cmd() -> Result<()> {
             println!("{}", describe_rebase_operation(&state));
             println!(
                 "Remaining branches: {}",
-                state.remaining_branches.join(", ")
+                state.remaining_branches().join(", ")
             );
         }
     }

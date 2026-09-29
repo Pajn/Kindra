@@ -1,5 +1,5 @@
 use crate::commands::{prompt_multi_select, resolve_restack_history_limit};
-use crate::rebase_utils::{Operation, RebaseState, begin_replay, run_rebase_loop};
+use crate::rebase_utils::{Operation, RebaseState, begin_replay, replay_plan, run_rebase_loop};
 use anyhow::{Result, anyhow};
 use clap::Args;
 use git2::{BranchType, Commit, Oid, Repository};
@@ -159,8 +159,8 @@ fn restack_locked(repo: &git2::Repository, args: &RestackArgs) -> Result<()> {
         original_branch: current_branch_name.clone(),
         target_branch: current_branch_name.clone(),
         caller_branch: Some(current_branch_name.clone()),
-        remaining_branches: remaining,
-        in_progress_branch: None,
+        steps: replay_plan(&remaining, Some(&current_branch_name)),
+        cursor: Default::default(),
         parent_id_map,
         parent_name_map,
         new_base_map: HashMap::new(),
@@ -177,7 +177,7 @@ fn restack_locked(repo: &git2::Repository, args: &RestackArgs) -> Result<()> {
         cleanup_checkout_fallback: None,
     };
 
-    crate::rebase_utils::check_worktrees(repo, &state.remaining_branches, false)?;
+    crate::rebase_utils::check_worktrees(repo, &remaining, false)?;
 
     // Snapshot for undo only now that the no-op checks ("No floating children",
     // "No branches selected") have passed and we are about to mutate branches.
@@ -185,7 +185,7 @@ fn restack_locked(repo: &git2::Repository, args: &RestackArgs) -> Result<()> {
     // leave a stale pending snapshot behind.
     let _snapshot = crate::oplog::begin(repo, "restack")?;
     begin_replay(repo, &mut state, autostash)?;
-    run_rebase_loop(repo, state)?;
+    run_rebase_loop(repo, &mut state)?;
 
     Ok(())
 }

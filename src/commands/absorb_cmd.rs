@@ -1,7 +1,8 @@
 use crate::commands::find_upstream;
 use crate::rebase_utils::{
-    RebaseState, check_worktrees, clear_state, ensure_git_supports_update_refs,
-    git_rebase_in_progress, local_branch_tips_in_range, run_rebase_loop, save_state,
+    RebaseNotStarted, RebaseState, Step, check_worktrees, clear_state,
+    ensure_git_supports_update_refs, local_branch_tips_in_range, replay_plan, run_rebase_loop,
+    save_state,
 };
 use crate::set_aside;
 use crate::stack::{collect_descendants, get_stack_branches_from_merge_base};
@@ -183,11 +184,11 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
             );
         }
     }
-    let sequence_editor = if new_base_map.is_empty() {
-        "true".to_string()
-    } else {
-        crate::rebase_todo::absorb_sequence_editor_command()?
-    };
+    // The fold anchors those fork points with Kindra's own sequence editor;
+    // fail here, before anything changes, if it cannot be named.
+    if !new_base_map.is_empty() {
+        crate::rebase_todo::absorb_sequence_editor_command()?;
+    }
     let mut guarded_branches = remaining_branches.clone();
     for (name, _) in &in_range_tips {
         if !guarded_branches.contains(name) {
@@ -256,14 +257,28 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
             .map(|(name, oid)| (name.clone(), oid.to_string())),
     );
 
+    // Fold the fixup commits, then restack the dependents, which the fold's
+    // `--update-refs` does not move (a replay skips any it did move).
+    // GIT_EDITOR is pinned (`suppress_editor`) so `--squash` folds don't open a
+    // commit-message editor per squash, including when `kin continue` resumes
+    // one. The fold anchors any unnamed fork point in the rewritten range with
+    // a sequence editor that rewrites a pick-based todo, so the ambient
+    // `rebase.rebaseMerges` config is neutralized.
+    let mut steps = vec![Step::Autosquash {
+        branch: current_branch_name.clone(),
+        base: Some(base_id.to_string()),
+        anchor_forks: !new_base_map.is_empty(),
+        no_rebase_merges: true,
+    }];
+    steps.extend(replay_plan(&remaining_branches, Some(&current_branch_name)));
     let mut state = RebaseState {
         operation: crate::rebase_utils::Operation::Absorb,
         rebase_options: Default::default(),
         original_branch: current_branch_name.clone(),
         target_branch: current_branch_name.clone(),
         caller_branch: None,
-        remaining_branches,
-        in_progress_branch: None,
+        steps,
+        cursor: Default::default(),
         parent_id_map,
         parent_name_map,
         new_base_map,
@@ -311,85 +326,44 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         return Err(rollback_fixups(&repo, head_before, err));
     }
 
-    // Fold the fixup commits. `--update-refs` moves every branch tip inside the
-    // rewritten range with the fold; branches stacked above are restacked
-    // afterwards by the rebase loop, which skips any this already moved.
-    // GIT_EDITOR is pinned so `--squash` folds don't open a commit-message
-    // editor per squash (the combined message is accepted as-is); the
-    // suppress_editor flag in the saved state makes `kin continue` do the same
-    // when resuming after a conflict.
-    // The sequence editor rewrites a pick-based todo, so neutralize the ambient
-    // `rebase.rebaseMerges` config that would turn it into labels and merges.
-    // A spawn error means no rebase started at all, so it takes the same
-    // rollback path as a pre-start rejection below rather than `?`-returning
-    // past the cleanup with the fixups and saved state left behind.
-    let status = crate::repository::git_command(&repo)
-        .env("GIT_SEQUENCE_EDITOR", sequence_editor)
-        .env("GIT_EDITOR", "true")
-        .arg("rebase")
-        .arg("-i")
-        .arg("--autosquash")
-        // The set-aside above empties the working tree; Git never sets
-        // anything aside for Kindra, whatever `rebase.autostash` says.
-        .arg("--no-autostash")
-        .arg("--no-rebase-merges")
-        .arg("--update-refs")
-        .arg(base_id.to_string())
-        .status();
-    let failure = match status {
-        Ok(status) if status.success() => None,
-        Ok(_) => Some(anyhow!("git rebase --autosquash failed before starting.")),
-        Err(err) => {
-            Some(anyhow::Error::from(err).context("failed to run git rebase --autosquash."))
-        }
+    // Fold, restack the dependents, restore the set-aside changes, clear the
+    // saved state and finalize the undo snapshot. A fold that stops on a
+    // conflict leaves the journal for `kin continue` or `kin abort`.
+    let Some(err) = RebaseNotStarted::reason(run_rebase_loop(&repo, &mut state))? else {
+        return Ok(());
     };
-    if let Some(err) = failure {
-        if git_rebase_in_progress(&repo) {
-            // The autosquash paused on a conflict. Record which branch is
-            // mid-rebase so `kin continue` matches the saved state.
-            state.in_progress_branch = Some(current_branch_name.clone());
-            save_state(&repo, &state)?;
-            return Err(anyhow!(
-                "git rebase --autosquash failed. Resolve conflicts and run 'kin continue', or run 'kin abort'."
-            ));
-        }
-        // The fold failed without starting a rebase (e.g. a pre-rebase hook
-        // rejected it, or git could not be run). Nothing was folded, so
-        // leaving the saved state behind would only invite `kin continue` to
-        // restack dependents onto the raw fixup commits. Roll the fixups back
-        // and restore the set-aside changes instead.
-        //
-        // The set-aside goes back before the fixups come off, onto the tip it
-        // was taken from. If it does not come back cleanly, the fixups stay and
-        // so does the state, with nothing left to continue and still naming the
-        // set-aside unless its changes are in the tree as conflicts: `kin abort`
-        // then restores what is left and takes the fixups off the same way.
-        if set_aside::unwind(&repo, &mut state.set_asides) == set_aside::Outcome::Restored {
-            let _ = clear_state(&repo);
-            return Err(rollback_fixups(
-                &repo,
-                head_before,
-                anyhow!("{err:#} The absorb was rolled back."),
-            ));
-        }
-        state.abort_only = true;
-        return Err(match save_state(&repo, &state) {
-            Ok(()) => anyhow!(
-                "{err:#} Your set-aside changes could not be restored (see the warning above), so the absorb was not rolled back. Clear the way, then run 'kin abort' to roll it back and restore them."
-            ),
-            Err(save_err) => rollback_fixups(
-                &repo,
-                head_before,
-                anyhow!(
-                    "{err:#} The absorb was rolled back, but your set-aside changes could not be restored (see the warning above) and saving the state failed ({save_err:#}); they remain in the stash list ('git stash list')."
-                ),
-            ),
-        });
+    // The fold failed without starting a rebase (e.g. a pre-rebase hook
+    // rejected it, or git could not be run). Nothing was folded, so
+    // leaving the saved state behind would only invite `kin continue` to
+    // restack dependents onto the raw fixup commits. Roll the fixups back
+    // and restore the set-aside changes instead.
+    //
+    // The set-aside goes back before the fixups come off, onto the tip it
+    // was taken from. If it does not come back cleanly, the fixups stay and
+    // so does the state, with nothing left to continue and still naming the
+    // set-aside unless its changes are in the tree as conflicts: `kin abort`
+    // then restores what is left and takes the fixups off the same way.
+    if set_aside::unwind(&repo, &mut state.set_asides) == set_aside::Outcome::Restored {
+        let _ = clear_state(&repo);
+        return Err(rollback_fixups(
+            &repo,
+            head_before,
+            anyhow!("{err:#} The absorb was rolled back."),
+        ));
     }
-
-    // Restack dependents; also restores the stash, clears the saved state, and
-    // finalizes the undo snapshot (a no-dependents run only does the latter).
-    run_rebase_loop(&repo, state)
+    state.abort_only = true;
+    Err(match save_state(&repo, &state) {
+        Ok(()) => anyhow!(
+            "{err:#} Your set-aside changes could not be restored (see the warning above), so the absorb was not rolled back. Clear the way, then run 'kin abort' to roll it back and restore them."
+        ),
+        Err(save_err) => rollback_fixups(
+            &repo,
+            head_before,
+            anyhow!(
+                "{err:#} The absorb was rolled back, but your set-aside changes could not be restored (see the warning above) and saving the state failed ({save_err:#}); they remain in the stash list ('git stash list')."
+            ),
+        ),
+    })
 }
 
 /// Error-path rollback, once the set-aside stash has been popped back (its

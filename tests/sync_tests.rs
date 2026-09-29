@@ -5,7 +5,7 @@ use common::{
     repo_init, run_ok, state_file, test_global_config_dir,
 };
 use git2::{BranchType, Repository};
-use kindra::rebase_utils::{Operation, RebaseState, load_state, save_state};
+use kindra::rebase_utils::{Cursor, Operation, RebaseState, load_state, replay_plan, save_state};
 use kindra::set_aside::{Kind, Restore, SetAside};
 use predicates::prelude::*;
 use std::collections::HashMap;
@@ -1222,8 +1222,11 @@ fn status_blocks_and_preserves_state_when_active_git_rebase_mismatches_kindra_st
     );
 
     let state = RebaseState {
-        remaining_branches: vec!["feature-a".to_string()],
-        in_progress_branch: Some("feature-a".to_string()),
+        steps: replay_plan(&["feature-a".to_string()], Some("feature-a")),
+        cursor: Cursor {
+            step: 0,
+            started: true,
+        },
         parent_id_map: HashMap::from([("feature-a".to_string(), base_id.to_string())]),
         original_tip_map: HashMap::from([("feature-a".to_string(), a_id.to_string())]),
         owned_tip_map: HashMap::from([("feature-a".to_string(), a_id.to_string())]),
@@ -1260,7 +1263,8 @@ fn status_blocks_and_preserves_state_when_active_git_rebase_mismatches_kindra_st
         ));
 
     let preserved = load_state(&repo).unwrap();
-    assert_eq!(preserved.in_progress_branch.as_deref(), Some("feature-a"));
+    assert_eq!(preserved.remaining_branches(), ["feature-a"]);
+    assert!(preserved.cursor.started);
     assert_eq!(
         preserved.set_asides.changes().map(|s| s.stash.as_str()),
         Some("stash@{0}")

@@ -61,8 +61,11 @@
 //!   still asks the rebase loop to set the tree aside. Version 3 drops
 //!   `replay`: `rebase_options` says how each rebase runs, a tree sync
 //!   records its planned parents in `new_base_map`, and sync finishes in the
-//!   shared rebase loop. The `@journal-v2` fixtures are version 2 journals,
-//!   saved by builds after 1.1.0 that no release shipped.
+//!   shared rebase loop. Version 4 drops `remaining_branches` and
+//!   `in_progress_branch`: the journal records its plan as `steps`, among
+//!   them the fold and move rebases of commit and absorb, and its progress
+//!   as a `cursor`. The `@journal-v2` and `@journal-v3` fixtures are version
+//!   2 and 3 journals, saved by builds after 1.1.0 that no release shipped.
 
 mod common;
 
@@ -992,7 +995,7 @@ fn journal_is_saved_in_an_envelope_older_kindra_cannot_parse() {
     let mut keys: Vec<_> = saved.as_object().unwrap().keys().cloned().collect();
     keys.sort();
     assert_eq!(keys, ["journal", "version"]);
-    assert_eq!(saved["version"], Value::from(3));
+    assert_eq!(saved["version"], Value::from(4));
     assert!(saved["journal"]["operation"].is_string());
 }
 
@@ -1057,8 +1060,8 @@ fn journal_from_a_newer_kindra_is_refused_with_advice() {
 fn journal_with_a_newer_version_is_refused_with_advice() {
     let paused = paused_commit_fixup();
     let mut journal = paused.repo.state_json();
-    assert_eq!(journal["version"], Value::from(3));
-    journal["version"] = Value::from(4);
+    assert_eq!(journal["version"], Value::from(4));
+    journal["version"] = Value::from(5);
     let saved = serde_json::to_string_pretty(&journal).unwrap();
     fs::write(paused.repo.state_path(), &saved).unwrap();
 
@@ -1067,7 +1070,7 @@ fn journal_with_a_newer_version_is_refused_with_advice() {
         assert!(!output.status.success(), "{}", describe(&output));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("newer version of kin"), "{stderr}");
-        assert!(stderr.contains("journal version 4"), "{stderr}");
+        assert!(stderr.contains("journal version 5"), "{stderr}");
         assert!(stderr.contains("kin abort --clear-state"), "{stderr}");
         assert_eq!(fs::read_to_string(paused.repo.state_path()).unwrap(), saved);
         assert!(paused.repo.rebase_in_progress());
@@ -1081,10 +1084,12 @@ fn journal_with_a_newer_version_is_refused_with_advice() {
 }
 
 /// A journal saved in version 1 of the envelope, which holds nothing version 2
-/// added, still resumes to completion.
+/// added, still resumes to completion. Version 1 recorded its progress as
+/// version 3 did, so the frozen version 3 journal stands in for it.
 #[test]
 fn journal_of_an_older_version_still_continues() {
-    let paused = paused_absorb();
+    let mut paused = paused_absorb();
+    paused.install_legacy("absorb@journal-v3");
     let mut journal = paused.repo.state_json();
     assert_eq!(journal["version"], Value::from(3));
     journal["version"] = Value::from(1);

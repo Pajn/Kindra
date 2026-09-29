@@ -1,7 +1,7 @@
 use crate::commands::find_upstream;
 use crate::rebase_utils::{
     Operation, RebaseOptions, RebaseState, begin_replay, checkout_branch, delete_merged_branches,
-    run_rebase_loop,
+    replay_plan, run_rebase_loop,
 };
 use crate::stack::{
     collect_merged_local_branches, find_sync_boundary, get_stack_branches_from_merge_base,
@@ -194,8 +194,13 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
             caller_branch: current_branch_name
                 .clone()
                 .filter(|branch| branch != &top_branch),
-            remaining_branches: vec![top_branch.clone()],
-            in_progress_branch: None,
+            // The sync ends on the branch it started on (the tip when it
+            // started detached).
+            steps: replay_plan(
+                std::slice::from_ref(&top_branch),
+                Some(current_branch_name.as_deref().unwrap_or(&top_branch)),
+            ),
+            cursor: Default::default(),
             // For sync, parent_id_map stores the old rebase base for recovery/rollback,
             // not the normal branch-parent relationship used by move/reorder.
             parent_id_map: HashMap::from([(top_branch.clone(), old_base.to_string())]),
@@ -224,7 +229,7 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
         if current_branch_name.as_deref() != Some(top_branch.as_str()) {
             checkout_branch(repo, &top_branch)?;
         }
-        return run_rebase_loop(repo, state);
+        return run_rebase_loop(repo, &mut state);
     } else {
         println!(
             "All commits in this stack appear to be integrated into {}.",
@@ -272,8 +277,8 @@ fn sync_upstream_branch(
             original_branch: upstream_name.to_string(),
             target_branch: rebase_onto_name.to_string(),
             caller_branch: None,
-            remaining_branches: vec![upstream_name.to_string()],
-            in_progress_branch: None,
+            steps: replay_plan(&[upstream_name.to_string()], Some(upstream_name)),
+            cursor: Default::default(),
             // For sync, parent_id_map stores the old rebase base for recovery/rollback,
             // not the normal branch-parent relationship used by move/reorder.
             parent_id_map: HashMap::from([(upstream_name.to_string(), rebase_root_id.to_string())]),
@@ -293,7 +298,7 @@ fn sync_upstream_branch(
         };
 
         begin_replay(repo, &mut state, autostash)?;
-        return run_rebase_loop(repo, state);
+        return run_rebase_loop(repo, &mut state);
     } else {
         println!("{} is already up to date.", upstream_name);
     }
@@ -651,8 +656,8 @@ fn sync_tree(
         original_branch: original.clone(),
         target_branch: upstream.to_string(),
         caller_branch: Some(original.clone()),
-        remaining_branches: remaining,
-        in_progress_branch: None,
+        steps: replay_plan(&remaining, Some(&original)),
+        cursor: Default::default(),
         parent_id_map: bases,
         // Every branch lands on its planned parent, the caller included, even
         // when it is a leaf.
@@ -674,5 +679,5 @@ fn sync_tree(
         cleanup_checkout_fallback: Some(local_upstream.to_string()),
     };
     begin_replay(repo, &mut state, autostash)?;
-    run_rebase_loop(repo, state)
+    run_rebase_loop(repo, &mut state)
 }
