@@ -943,8 +943,9 @@ such as `.env` files, are left on disk during suspension.
 
 The lifecycle covers `checkout`, `commit`, `absorb`, `move`, `reorder`, `sync`,
 `restack`, `split`, `run`, `undo`, and `redo`, plus review worktree switching.
-`absorb`, `split`, and review worktree switching always suspend overrides; the
-other commands keep them when they can. Once suspended, overrides stay
+`absorb` and review worktree switching always suspend overrides; the other
+commands keep them when they can. `split` never touches the working tree, so it
+always keeps them. Once suspended, overrides stay
 suspended throughout all intermediate checkouts, including commands executed by
 `kin run`. When `kin run` keeps them, its commands see the overlays on every
 branch. New worktrees apply overrides before their
@@ -1010,7 +1011,7 @@ kin split
 
 It generates a list of commits and branches. You can move the `branch <name>` lines to reassign branches to different commits, or add/remove them to create/delete branches. Leaving a row's name blank (a bare `branch` line) auto-names the branch by slugifying the summary of the commit it sits on, deduped against existing branches.
 
-Split changes only branch refs. HEAD stays at its commit: it stays on its branch while that branch still points there, attaches to a branch that points there once the split is done, or else is left detached. The index and working tree are never touched, so a split works with uncommitted changes of any kind and leaves them exactly as they are. `--autostash` and `--no-autostash` are still accepted but have no effect.
+Split changes only branch refs. HEAD stays at its commit: it stays on its branch while that branch still points there, attaches to a branch that points there once the split is done, or else is left detached. The index and working tree are never touched, so a split works with uncommitted changes of any kind and leaves them exactly as they are. `--autostash` and `--no-autostash` are still accepted but have no effect. Local overrides stay applied; the apply hook reruns only if HEAD ends on another branch (or detached) and `branch_env` is on.
 
 The branch and HEAD changes are made in one transaction that locks every ref before writing any. A split that fails its checks or cannot lock a ref changes nothing: a new name clashes with an existing branch (`foo/bar` next to `foo`), a branch to move or delete, or for HEAD to attach to, is checked out in another worktree, or another Git process holds a ref's lock. If writing the locked refs then fails part-way, some branches may have changed; the split is recorded all the same, and [`kin undo`](#undo--history) restores them, as it undoes a split that succeeded.
 
