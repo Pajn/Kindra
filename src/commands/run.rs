@@ -178,7 +178,7 @@ fn run_locked(repo: &git2::Repository, args: &RunArgs) -> Result<()> {
     // If persisting fails, nothing downstream knows to restore the autostash, so
     // pop it back now rather than stranding the user's uncommitted changes.
     if let Err(err) = persist_run_state(repo, &run_state) {
-        restore_run_stash(&mut run_state);
+        restore_run_stash(repo, &mut run_state);
         return Err(err);
     }
     execute_run(repo, &mut run_state)
@@ -188,7 +188,7 @@ pub(crate) fn abort_run(repo: &Repository) -> Result<()> {
     let mut run_state = load_run_state(repo)?;
     mark_aborted(repo, &mut run_state, None)?;
     checkout_original_checkout(&run_state.original_branch, &run_state.original_head_id)?;
-    restore_run_stash(&mut run_state);
+    restore_run_stash(repo, &mut run_state);
     clear_run_state(repo)?;
     println!("Run operation aborted (state cleared).");
     Ok(())
@@ -218,7 +218,7 @@ fn persist_run_state(repo: &Repository, run_state: &RunState) -> Result<()> {
 /// the original checkout, so uncommitted work lands where the user left it.
 /// (A run is not resumable: leftover state after a failed checkout-restore is
 /// recovered by `kin abort`, not `kin continue`.)
-fn restore_run_stash(run_state: &mut RunState) {
+fn restore_run_stash(repo: &Repository, run_state: &mut RunState) {
     let stash_ref = run_state.stash_ref.take();
     // Run state saved by Kindra 1.1 or earlier records only the stash message.
     let Some(set_aside) = run_state.stash.take().or_else(|| {
@@ -232,22 +232,10 @@ fn restore_run_stash(run_state: &mut RunState) {
     }) else {
         return;
     };
-    let stash_ref = &set_aside.stash;
-    if let Err(err) = crate::set_aside::apply(&set_aside) {
-        // `run` is a reporter, not a resumable operation, so callers clear the
-        // run-state file after this returns — keeping the ref in the (dropped)
-        // state would lose it. Surface an actionable message instead, so the
-        // surviving stash entry isn't orphaned silently. A failed apply does not
-        // drop the stash, so the user's changes remain recoverable.
-        eprintln!(
-            "Warning: could not reapply your autostashed changes: {err}\n         \
-             They are preserved in `git stash list` (\"{stash_ref}\"); reapply with `git stash pop`."
-        );
-        return;
-    }
-    if let Err(err) = crate::set_aside::drop_entry(&set_aside) {
-        eprintln!("Warning: {err}");
-    }
+    // `run` is a reporter, not a resumable operation, so callers clear the
+    // run-state file after this returns: a restore that does not go cleanly
+    // is reported with the entry that still holds the changes.
+    crate::set_aside::restore(repo, &set_aside, crate::set_aside::Phase::NonResumable);
 }
 
 fn clear_run_state(repo: &Repository) -> Result<()> {
@@ -398,7 +386,7 @@ fn execute_run(repo: &Repository, run_state: &mut RunState) -> Result<()> {
     // failed, the original checkout (above) and autostash are restored and the
     // state is cleared, so a non-zero command never leaves a blocking operation
     // behind. Failure is surfaced only through the error / exit code.
-    restore_run_stash(run_state);
+    restore_run_stash(repo, run_state);
     clear_run_state(repo)?;
 
     if run_state.failed_branches.is_empty() {
@@ -419,7 +407,7 @@ fn fail_and_restore(repo: &Repository, run_state: &mut RunState, state_error: &s
     // checkout keeps state, so `kin abort` can recover the stranded autostash.
     match checkout_original_checkout(&run_state.original_branch, &run_state.original_head_id) {
         Ok(()) => {
-            restore_run_stash(run_state);
+            restore_run_stash(repo, run_state);
             clear_run_state(repo)?;
             Err(anyhow!(state_error.to_string()))
         }

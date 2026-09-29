@@ -157,6 +157,16 @@ impl RebaseState {
     }
 }
 
+impl set_aside::Journal for RebaseState {
+    fn set_asides(&mut self) -> &mut SetAsides {
+        &mut self.set_asides
+    }
+
+    fn save(&self, repo: &Repository) -> Result<()> {
+        save_state(repo, self)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReconcileMode {
     Continue,
@@ -204,7 +214,11 @@ pub fn load_state(repo: &Repository) -> Result<RebaseState> {
 /// existing field. Every Kindra reads every older format and refuses a newer
 /// one with advice. A file without `version` is a flat journal saved by
 /// Kindra 1.1 or earlier.
-pub const JOURNAL_VERSION: u64 = 1;
+///
+/// - 1: the first envelope.
+/// - 2: an unstaged-only set-aside may record `restore: UnstagedDelta`, which
+///   version 1 does not know.
+pub const JOURNAL_VERSION: u64 = 2;
 
 /// Parse a saved journal. One saved in a newer format, or that does not parse
 /// (for example because a newer Kindra saved an operation this one does not
@@ -852,9 +866,10 @@ pub fn ensure_rebase_working_tree(repo: &Repository, autostash: bool) -> Result<
 }
 
 pub fn unmerged_paths_exist() -> Result<bool> {
+    // `:/` covers the whole tree: from a subdirectory Git would otherwise see
+    // only the conflicts under it.
     let output = Command::new("git")
-        .arg("ls-files")
-        .arg("--unmerged")
+        .args(["ls-files", "--unmerged", "--", ":/"])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
@@ -1009,7 +1024,7 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         }
         state.autostash = false;
         if let Err(err) = save_state(repo, &state) {
-            set_aside::restore_or_warn(state.set_asides.take_changes());
+            set_aside::unwind(repo, &mut state.set_asides);
             return Err(err);
         }
     }
@@ -1106,7 +1121,7 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         )
     })?;
 
-    restore_state_stash(repo, &mut state)?;
+    set_aside::restore_all(repo, &mut state, set_aside::Phase::Completion)?;
 
     if state.unstage_on_restore {
         unstage_all()?;
@@ -1194,38 +1209,6 @@ fn parse_git_semver(version_output: &str) -> Option<(u64, u64, u64)> {
     Some((numbers[0], numbers[1], numbers[2]))
 }
 
-/// Restore saved changes after returning to the caller, retaining recovery
-/// state on errors and avoiding a second stash apply after conflicts.
-pub fn restore_state_stash(repo: &Repository, state: &mut RebaseState) -> Result<()> {
-    if let Some(changes) = state.set_asides.changes().cloned() {
-        println!("Restoring set-aside changes...");
-        match set_aside::restore(&changes)? {
-            set_aside::Outcome::Applied => {
-                state.set_asides.take_changes();
-                save_state(repo, state)?;
-                if let Err(err) = set_aside::drop_entry(&changes) {
-                    eprintln!("Warning: {}", err);
-                }
-            }
-            set_aside::Outcome::ConflictsLeftInTree => {
-                // The changes are in the tree as conflict markers; a later
-                // `kin continue` must not apply the stash a second time, so
-                // drop it from the state but keep the entry as a backup. Keep
-                // the saved state itself: the operation stays resumable
-                // (`kin continue` finishes its bookkeeping) and abortable
-                // (`kin abort` rolls the branches back).
-                state.set_asides.take_changes();
-                save_state(repo, state)?;
-                return Err(anyhow!(
-                    "Restoring the set-aside changes hit conflicts; resolve the conflict markers in the working tree, then run 'kin continue' to finish (or 'kin abort' to roll the operation back). The original changes are also preserved in stash entry '{}'.",
-                    changes.stash
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{JOURNAL_VERSION, Operation, RebaseState, Replay, parse_git_semver, parse_state};
@@ -1269,12 +1252,12 @@ mod tests {
                 "carry_stash_ref":"kin-commit-on-index-1-3"}}"#
         ))
         .unwrap();
-        let carry = state.set_asides.take_carry().unwrap();
+        let carry = state.set_asides.pop().unwrap();
         assert_eq!(
             (carry.kind, carry.restore, carry.stash.as_str()),
             (Kind::Carry, Restore::WithIndex, "kin-commit-on-index-1-3")
         );
-        let changes = state.set_asides.take_changes().unwrap();
+        let changes = state.set_asides.pop().unwrap();
         assert_eq!(
             (changes.kind, changes.restore, changes.stash.as_str()),
             (Kind::WholeTree, Restore::WithIndex, "kin-absorb-1-2")
@@ -1292,6 +1275,30 @@ mod tests {
         assert!(state.set_asides.is_empty());
     }
 
+    /// Every version up to this Kindra's reads the same way; a version 1
+    /// journal keeps the set-asides it recorded.
+    #[test]
+    fn a_journal_of_an_older_or_the_current_version_is_read() {
+        for version in 1..=JOURNAL_VERSION {
+            let state = loaded(&format!(
+                r#"{{"version":{version},"journal":{{{LEGACY_FIELDS},"set_asides":[
+                    {{"kind":"UnstagedOnly","stash":"kin-commit-on-1-2","oid":"abc",
+                      "restore":"Plain"}}]}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                state.set_asides,
+                SetAsides::from(vec![SetAside {
+                    kind: Kind::UnstagedOnly,
+                    stash: "kin-commit-on-1-2".to_string(),
+                    oid: Some("abc".to_string()),
+                    restore: Restore::Plain,
+                }]),
+                "version {version}"
+            );
+        }
+    }
+
     #[test]
     fn a_version_without_a_journal_is_malformed() {
         let err = loaded(&format!(
@@ -1306,7 +1313,8 @@ mod tests {
 
     #[test]
     fn a_journal_with_a_newer_version_is_refused_with_advice() {
-        for version in [format!("{}", JOURNAL_VERSION + 1), r#""2""#.to_string()] {
+        assert_eq!(JOURNAL_VERSION, 2);
+        for version in ["3", "4", r#""2""#] {
             let err = loaded(&format!(r#"{{"version":{version},"journal":{{}}}}"#))
                 .err()
                 .unwrap()

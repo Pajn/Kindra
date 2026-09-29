@@ -481,6 +481,12 @@ fn test_absorb_rollback_keeps_state_until_set_aside_changes_are_restored() {
         .to_string();
     let stashes = git_output(repo_path, &["stash", "list", "--format=%gs"]);
     assert!(stashes.contains(&stash), "{stash} not in:\n{stashes}");
+    assert!(
+        stderr.contains(&format!(
+            "Warning: could not restore the set-aside changes; they remain in stash entry '{stash}'."
+        )),
+        "{stderr}"
+    );
     let continued = kin_cmd()
         .current_dir(repo_path)
         .arg("continue")
@@ -933,6 +939,114 @@ fn test_absorb_conflicting_dependent_completes_via_continue() {
         "untracked"
     );
     assert_eq!(repo.head().unwrap().shorthand().unwrap(), "review");
+}
+
+/// A set-aside that includes an untracked file cannot be restored while a file
+/// of that name exists: Git would apply the tracked changes and then refuse
+/// the untracked one, so a retry would apply the tracked changes twice.
+/// Completion must leave the tree untouched, name the file and the stash, and
+/// restore everything once the way is clear.
+#[test]
+fn test_absorb_continue_restores_nothing_while_a_set_aside_untracked_file_exists() {
+    absorb_continue_with_a_set_aside_untracked_file_in_the_way(None);
+}
+
+/// The same from a subdirectory, with the file in the way outside it: Git
+/// limits paths to the current directory unless told otherwise, so the check
+/// must look at the whole tree.
+#[test]
+fn test_absorb_continue_from_a_subdirectory_restores_nothing_while_a_set_aside_untracked_file_exists()
+ {
+    absorb_continue_with_a_set_aside_untracked_file_in_the_way(Some("sub"));
+}
+
+fn absorb_continue_with_a_set_aside_untracked_file_in_the_way(subdirectory: Option<&str>) {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = setup_stack(repo_path);
+
+    run_ok("git", &["checkout", "perf"], repo_path);
+    let perf_old_tip = tip(&repo, "perf");
+    make_commit(
+        &repo,
+        "HEAD",
+        "code.txt",
+        "line1 PERF\nline2\nline3\n",
+        "perf: edit line1",
+        &[&repo.find_commit(perf_old_tip).unwrap()],
+    );
+    run_ok("git", &["checkout", "review"], repo_path);
+
+    std::fs::write(repo_path.join("code.txt"), "line1 REVIEW\nline2\nline3\n").unwrap();
+    run_ok("git", &["add", "code.txt"], repo_path);
+    std::fs::write(repo_path.join("a.txt"), "A leftover").unwrap();
+    std::fs::write(repo_path.join("untracked.txt"), "untracked").unwrap();
+
+    kin_cmd()
+        .current_dir(repo_path)
+        .arg("absorb")
+        .assert()
+        .failure();
+
+    std::fs::write(repo_path.join("code.txt"), "line1 RESOLVED\nline2\nline3\n").unwrap();
+    run_ok("git", &["add", "code.txt"], repo_path);
+    // Something else creates a file the set-aside will restore.
+    std::fs::write(repo_path.join("untracked.txt"), "someone else's").unwrap();
+    let cwd = match subdirectory {
+        Some(dir) => {
+            std::fs::create_dir(repo_path.join(dir)).unwrap();
+            repo_path.join(dir)
+        }
+        None => repo_path.to_path_buf(),
+    };
+
+    let output = kin_cmd()
+        .current_dir(&cwd)
+        .env("GIT_EDITOR", "true")
+        .arg("continue")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(rebase_state_file(repo_path))
+            .expect("the journal must keep the unrestored set-aside"),
+    )
+    .unwrap();
+    let stash = state["journal"]["set_asides"][0]["stash"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the journal lost the set-aside: {state}"))
+        .to_string();
+    assert!(
+        stderr.contains("untracked.txt") && stderr.contains(&stash),
+        "{stderr}"
+    );
+    // Nothing was restored: not the tracked leftover, not the untracked file.
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("a.txt")).unwrap(),
+        "A"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("untracked.txt")).unwrap(),
+        "someone else's"
+    );
+
+    std::fs::remove_file(repo_path.join("untracked.txt")).unwrap();
+    kin_cmd()
+        .current_dir(&cwd)
+        .arg("continue")
+        .assert()
+        .success();
+    assert!(!rebase_state_file(repo_path).exists());
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("a.txt")).unwrap(),
+        "A leftover"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("untracked.txt")).unwrap(),
+        "untracked"
+    );
+    assert_eq!(git_output(repo_path, &["stash", "list"]), "");
 }
 
 #[test]

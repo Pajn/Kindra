@@ -1188,6 +1188,111 @@ fn test_abort_uses_exact_stash_message_match() {
     );
 }
 
+/// When the newest set-aside comes back with conflicts, `kin abort` still tries
+/// the older one, which Git refuses to apply over the unresolved conflicts.
+/// That refusal leaves nothing restored, so the older set-aside must stay in
+/// the journal and on the stash list, and the abort must fail naming it; once
+/// the conflicts are resolved, a second abort restores it.
+#[test]
+fn test_abort_keeps_an_older_set_aside_git_refuses_over_conflicts() {
+    let (dir, repo) = setup_repo();
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    let stash_oid = |dir: &Path| {
+        git_stdout(dir, &["rev-parse", "stash@{0}"])
+            .trim()
+            .to_string()
+    };
+
+    // The paused `kin commit --on` set its unstaged changes aside, then the
+    // staged changes it was carrying.
+    fs::write(dir.path().join("unstaged.txt"), "unstaged work").unwrap();
+    run_ok("git", &["add", "unstaged.txt"], dir.path());
+    run_ok("git", &["commit", "-qm", "add unstaged.txt"], dir.path());
+    fs::write(dir.path().join("unstaged.txt"), "unstaged edit").unwrap();
+    run_ok(
+        "git",
+        &["stash", "push", "-m", "kin-commit-on-1-1"],
+        dir.path(),
+    );
+    let changes_oid = stash_oid(dir.path());
+    stage(dir.path(), "file.txt", "carried");
+    run_ok(
+        "git",
+        &["stash", "push", "-m", "kin-commit-on-index-1-2"],
+        dir.path(),
+    );
+    let carry_oid = stash_oid(dir.path());
+    // Since then `main` changed the carried line, so the carry conflicts.
+    stage(dir.path(), "file.txt", "changed on main");
+    run_ok("git", &["commit", "-qm", "change file.txt"], dir.path());
+
+    let main_tip = git_stdout(dir.path(), &["rev-parse", "main"])
+        .trim()
+        .to_string();
+    let state = RebaseState {
+        original_tip_map: HashMap::from([("main".to_string(), main_tip.clone())]),
+        owned_tip_map: HashMap::from([("main".to_string(), main_tip)]),
+        set_asides: vec![
+            SetAside {
+                kind: Kind::UnstagedOnly,
+                stash: "kin-commit-on-1-1".to_string(),
+                oid: Some(changes_oid),
+                restore: Restore::UnstagedDelta,
+            },
+            SetAside {
+                kind: Kind::Carry,
+                stash: "kin-commit-on-index-1-2".to_string(),
+                oid: Some(carry_oid),
+                restore: Restore::WithIndex,
+            },
+        ]
+        .into(),
+        ..rebase_state(Operation::Commit, "main", "main")
+    };
+    save_state(&repo, &state).unwrap();
+
+    let output = kin_cmd()
+        .current_dir(dir.path())
+        .arg("abort")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("kin-commit-on-1-1"), "{stderr}");
+    assert!(
+        !stderr.contains("the stash entry 'kin-commit-on-1-1' was preserved as a backup"),
+        "the refused set-aside must not be reported as restored:\n{stderr}"
+    );
+    assert_eq!(
+        journal_set_asides(dir.path()),
+        [("UnstagedOnly".to_string(), "kin-commit-on-1-1".to_string())]
+    );
+    let stashes = git_stdout(dir.path(), &["stash", "list", "--format=%gs"]);
+    assert!(stashes.contains("kin-commit-on-1-1"), "{stashes}");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("unstaged.txt")).unwrap(),
+        "unstaged work"
+    );
+
+    stage(dir.path(), "file.txt", "resolved");
+    kin_cmd()
+        .current_dir(dir.path())
+        .arg("abort")
+        .assert()
+        .success();
+    assert!(!rebase_state_file(dir.path()).exists());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("unstaged.txt")).unwrap(),
+        "unstaged edit"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "resolved"
+    );
+    let stashes = git_stdout(dir.path(), &["stash", "list", "--format=%gs"]);
+    assert!(!stashes.contains("kin-commit-on-1-1"), "{stashes}");
+}
+
 #[test]
 fn test_abort_preserves_stash_when_owned_tip_map_mismatches() {
     let (dir, _repo) = setup_repo();
@@ -1868,6 +1973,64 @@ fn test_commit_on_other_stack_default_just_commits() {
     assert_no_staged_changes(dir.path());
 }
 
+/// Committing onto a branch of another stack takes the staged changes away
+/// from the caller: they land on the target, and the caller gets back only
+/// what was unstaged. The unstaged changes were set aside with the staged ones
+/// still in the tree, so restoring that whole snapshot would leave the
+/// committed content behind on the caller as a modification.
+#[test]
+fn test_commit_on_other_stack_leaves_only_the_unstaged_changes_on_the_caller() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let root_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
+    let root = repo.find_commit(root_id).unwrap();
+    let s1a_id = make_commit(&repo, "refs/heads/s1-a", "s1.txt", "s1-a", "s1-a", &[&root]);
+    let s1a = repo.find_commit(s1a_id).unwrap();
+    make_commit(&repo, "refs/heads/s2-a", "s2.txt", "s2-a", "s2-a", &[&root]);
+    repo.set_head("refs/heads/s1-a").unwrap();
+    repo.checkout_tree(
+        s1a.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .unwrap();
+
+    // Staged: an edit to a tracked file and a new file, both for `s2-a`.
+    stage(dir.path(), "root.txt", "root, edited on s2-a");
+    stage(dir.path(), "cross.txt", "cross stack commit");
+    // Unstaged: an edit that stays on the caller.
+    fs::write(dir.path().join("s1.txt"), "s1-a, unstaged").unwrap();
+
+    kin_commit(dir.path())
+        .args(["--on", "s2-a", "-m", "cross stack commit"])
+        .assert()
+        .success();
+
+    assert_eq!(current_branch(dir.path()), "s1-a");
+    assert_eq!(
+        git_stdout(dir.path(), &["show", "s2-a:root.txt"]),
+        "root, edited on s2-a"
+    );
+    assert_eq!(
+        git_stdout(dir.path(), &["show", "s2-a:cross.txt"]),
+        "cross stack commit"
+    );
+    // Only the unstaged edit came back; the committed content did not.
+    assert_eq!(
+        git_stdout(
+            dir.path(),
+            &["status", "--porcelain", "--untracked-files=all"]
+        ),
+        " M s1.txt\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("s1.txt")).unwrap(),
+        "s1-a, unstaged"
+    );
+    assert_eq!(git_stdout(dir.path(), &["stash", "list"]), "");
+    assert!(!rebase_state_file(dir.path()).exists());
+}
+
 #[test]
 fn test_commit_on_conflict_and_continue_restores_original_context() {
     let (dir, repo) = setup_repo();
@@ -2230,6 +2393,79 @@ fn test_commit_on_ancestor_moves_commit_without_switching_branches() {
     );
     assert!(!rebase_state_file(repo_path).exists());
     assert_eq!(git_stdout(repo_path, &["stash", "list"]).trim(), "");
+}
+
+/// Restoring the set-aside changes when the move onto an ancestor finishes
+/// completes the operation the same way `kin continue` does: a conflicted
+/// restore leaves the changes in the tree as conflict markers, keeps the
+/// stash entry as a backup and the operation resumable, and a later
+/// `kin continue` finishes without applying the entry a second time.
+#[test]
+#[cfg(unix)]
+fn test_commit_on_ancestor_conflicted_restore_finishes_with_continue() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    repo_init(repo_path);
+    setup_diverged_line_stack(repo_path);
+
+    edit_line(repo_path, 20, "20-staged");
+    run_ok("git", &["add", "f.txt"], repo_path);
+    edit_line(repo_path, 35, "35-unstaged");
+    // Once the move has rewritten `upper`, commit an edit to the line the
+    // set-aside change touches, so restoring it conflicts.
+    let hook = repo_path.join(".git/hooks/post-rewrite");
+    fs::write(
+        &hook,
+        "#!/bin/sh\n[ \"$1\" = rebase ] || exit 0\n\
+         sed 's/^35$/35-hook/' f.txt > f.tmp && mv f.tmp f.txt\n\
+         git commit -qam 'hook edit' </dev/null\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = kin_cmd()
+        .current_dir(repo_path)
+        .args(["commit", "--on", "lower", "-m", "onto lower"])
+        .output()
+        .unwrap();
+    fs::remove_file(&hook).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("hit conflicts") && stderr.contains("kin continue"),
+        "{stderr}"
+    );
+    assert_eq!(file_line(repo_path, "lower", 20), "20-staged");
+    let backup = git_stdout(repo_path, &["stash", "list"]);
+    assert_eq!(backup.lines().count(), 1, "the entry is kept as a backup");
+    // The changes are in the tree, so the journal no longer records them.
+    assert!(journal_set_asides(repo_path).is_empty());
+
+    write_numbered_file(
+        repo_path,
+        &[
+            (5, "5-lower"),
+            (20, "20-staged"),
+            (30, "30-upper"),
+            (35, "35-resolved"),
+        ],
+    );
+    run_ok("git", &["add", "f.txt"], repo_path);
+    kin_cmd()
+        .current_dir(repo_path)
+        .arg("continue")
+        .assert()
+        .success();
+
+    assert!(!rebase_state_file(repo_path).exists());
+    assert_eq!(current_branch(repo_path), "upper");
+    let content = fs::read_to_string(repo_path.join("f.txt")).unwrap();
+    assert!(
+        content.contains("35-resolved") && !content.contains("<<<<<<<"),
+        "{content}"
+    );
+    assert_eq!(git_stdout(repo_path, &["stash", "list"]), backup);
 }
 
 /// The replay rewrites everything between the target and HEAD, and the rebase
@@ -2840,6 +3076,97 @@ fn test_commit_on_failed_checkout_keeps_the_unrestored_carry_in_state() {
         .map(|(kind, _)| kind)
         .collect();
     assert_eq!(kinds, ["UnstagedOnly", "Carry"]);
+    assert_journal_names_live_stashes(repo_path);
+    assert_continue_refuses_rollback_state(repo_path);
+
+    kin_cmd()
+        .arg("abort")
+        .current_dir(repo_path)
+        .assert()
+        .success();
+    assert_eq!(current_branch(repo_path), "upper");
+    let content = fs::read_to_string(repo_path.join("f.txt")).unwrap();
+    assert!(content.contains("20-staged") && content.contains("35-unstaged"));
+    assert_eq!(git_stdout(repo_path, &["stash", "list"]).trim(), "");
+    assert!(!rebase_state_file(repo_path).exists());
+}
+
+/// A `--on` switch that cannot record its carry puts the staged changes back
+/// at once. When that restore fails too, the journal must still come to
+/// record the carry, so `kin abort` restores it, rather than leave its stash
+/// entry unrecorded.
+#[test]
+#[cfg(unix)]
+fn test_commit_on_failed_carry_save_keeps_the_unrestored_carry_in_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let repo_path = dir.path();
+    repo_init(repo_path);
+    setup_diverged_line_stack(repo_path);
+    run_ok("git", &["checkout", "-b", "other", "main"], repo_path);
+    edit_line(repo_path, 10, "10-other");
+    run_ok("git", &["commit", "-am", "other edit"], repo_path);
+    run_ok("git", &["checkout", "upper"], repo_path);
+
+    edit_line(repo_path, 20, "20-staged");
+    run_ok("git", &["add", "f.txt"], repo_path);
+    edit_line(repo_path, 35, "35-unstaged");
+
+    // Once the journal exists, the next stash is the carry: the first save
+    // recording it fails, and applying it fails until the test ends. The
+    // failing apply lifts the save failure, so the journal can be saved again.
+    let bin = tempdir().unwrap();
+    let marker = bin.path().join("fail-state-write");
+    let blocked = bin.path().join("block-apply");
+    let wrapper = bin.path().join("git");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh
+if [ \"$1\" = stash ] && [ \"$2\" = push ] && [ -f \"$KIN_TEST_STATE\" ] && [ ! -e '{blocked}' ]; then
+  \"$KIN_TEST_REAL_GIT\" \"$@\" || exit $?
+  printf '%s' \"$KIN_TEST_STATE\" > \"$KIN_TEST_FAIL_STATE_WRITE\"
+  : > '{blocked}'
+  exit 0
+fi
+if [ \"$1\" = stash ] && [ \"$2\" = apply ] && [ -e '{blocked}' ]; then
+  rm -f \"$KIN_TEST_FAIL_STATE_WRITE\"
+  echo 'apply blocked' >&2
+  exit 1
+fi
+exec \"$KIN_TEST_REAL_GIT\" \"$@\"
+",
+            blocked = blocked.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+
+    let output = kin_cmd()
+        .current_dir(repo_path)
+        .args(["commit", "--on", "other", "-m", "should not land"])
+        .env("PATH", path)
+        .env("KIN_TEST_REAL_GIT", which::which("git").unwrap())
+        .env("KIN_TEST_STATE", rebase_state_file(repo_path))
+        .env("KIN_TEST_FAIL_STATE_WRITE", &marker)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("Injected state write failure"), "{stderr}");
+    assert!(blocked.exists() && !marker.exists(), "{stderr}");
+
+    let kinds: Vec<String> = journal_set_asides(repo_path)
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect();
+    assert_eq!(kinds, ["UnstagedOnly", "Carry"], "{stderr}");
     assert_journal_names_live_stashes(repo_path);
     assert_continue_refuses_rollback_state(repo_path);
 
@@ -4202,7 +4529,12 @@ fn test_commit_fixup_with_dependents_pre_start_hook_rejection_rolls_back() {
 #[cfg(unix)]
 fn test_commit_fixup_failed_rollback_keeps_the_unrestored_stash_in_state() {
     // A held lock on the branch ref also blocks the reset.
-    let (dir, stash_ref) = fixup_rollback_with_unrestorable_stash(true);
+    let (dir, stash_ref, stderr) = fixup_rollback_with_unrestorable_stash(true);
+    assert!(
+        stderr.contains("Rolling back the commit did not complete")
+            && stderr.contains("your set-aside changes could not be restored"),
+        "the failure must say the set-aside changes are not back, got:\n{stderr}"
+    );
     let stashes = git_stdout(dir.path(), &["stash", "list", "--format=%H %gs"]);
     assert!(
         stashes.lines().any(|line| line.contains(&stash_ref)),
@@ -4235,7 +4567,7 @@ fn assert_continue_refuses_rollback_state(dir: &Path) {
 #[test]
 #[cfg(unix)]
 fn test_commit_fixup_rollback_keeps_state_until_set_aside_changes_are_restored() {
-    let (dir, _) = fixup_rollback_with_unrestorable_stash(false);
+    let (dir, _, _) = fixup_rollback_with_unrestorable_stash(false);
     // The rollback itself went through: the fixup commit is gone again.
     assert_eq!(
         git_stdout(dir.path(), &["log", "-1", "--format=%s"]).trim(),
@@ -4262,8 +4594,10 @@ fn test_commit_fixup_rollback_keeps_state_until_set_aside_changes_are_restored()
 /// pre-rebase hook refuses the rebase and edits the stashed file, so the
 /// set-aside changes cannot be restored during rollback. With
 /// `lock_branch_ref`, the hook also blocks the reset. Returns the stash entry
-/// the saved state points at.
-fn fixup_rollback_with_unrestorable_stash(lock_branch_ref: bool) -> (tempfile::TempDir, String) {
+/// the saved state points at and the command's error output.
+fn fixup_rollback_with_unrestorable_stash(
+    lock_branch_ref: bool,
+) -> (tempfile::TempDir, String, String) {
     let (dir, repo) = setup_repo();
     let main_id = repo.revparse_single("main").unwrap().id();
     let main_commit = repo.find_commit(main_id).unwrap();
@@ -4333,7 +4667,7 @@ fn fixup_rollback_with_unrestorable_stash(lock_branch_ref: bool) -> (tempfile::T
         .as_str()
         .unwrap_or_else(|| panic!("state lost the stash reference: {state}"))
         .to_string();
-    (dir, stash_ref)
+    (dir, stash_ref, stderr.into_owned())
 }
 
 /// A fold that git refuses before starting must not leave the saved state
@@ -5545,12 +5879,13 @@ fn test_continue_recovers_from_failed_pick_commit_during_fold() {
 /// from under the user.
 ///
 /// `--amend` puts this on the branch-switching path, where the unstaged edit is
-/// set aside *before* the commit, so restoring it afterwards has to contend with
-/// what landed in between. (A plain `--on` an ancestor branch never switches and
-/// sets the edit aside after committing, so the same overlap resolves quietly —
-/// `test_commit_on_ancestor_keeps_an_overlapping_unstaged_edit` covers that.)
+/// set aside *before* the commit. Only what was unstaged comes back, so its
+/// overlap with the committed line alone resolves quietly; a hook edits the
+/// same line while `upper` is restacked, which the restore cannot resolve.
 #[test]
+#[cfg(unix)]
 fn test_commit_on_conflicted_stash_restore_stays_resumable() {
+    use std::os::unix::fs::PermissionsExt;
     let dir = tempdir().unwrap();
     let repo_path = dir.path();
     let repo = repo_init(repo_path);
@@ -5583,11 +5918,20 @@ fn test_commit_on_conflicted_stash_restore_stays_resumable() {
     );
 
     // Stage a change destined for 'lower', with an overlapping unstaged edit
-    // that gets set aside. After the commit lands and 'upper' is restacked,
-    // restoring the set-aside edit conflicts with the committed line.
+    // that gets set aside. Once 'upper' is restacked onto the commit, a hook
+    // edits the same line there, so restoring the set-aside edit conflicts.
     fs::write(repo_path.join("f.txt"), "from-commit\nline2\n").unwrap();
     run_ok("git", &["add", "f.txt"], repo_path);
     fs::write(repo_path.join("f.txt"), "unstaged-edit\nline2\n").unwrap();
+    let hook = repo_path.join(".git/hooks/post-rewrite");
+    fs::write(
+        &hook,
+        "#!/bin/sh\n[ \"$1\" = rebase ] || exit 0\n\
+         printf 'hook-edit\\nline2\\n' > f.txt\n\
+         git commit -qam 'hook edit' </dev/null\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
 
     let mut cmd = kin_cmd();
     let output = cmd
@@ -5602,6 +5946,7 @@ fn test_commit_on_conflicted_stash_restore_stays_resumable() {
         ])
         .output()
         .unwrap();
+    fs::remove_file(&hook).unwrap();
     assert!(
         !output.status.success(),
         "the conflicted stash restore must surface as an error\nstdout:\n{}\nstderr:\n{}",

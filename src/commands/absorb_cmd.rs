@@ -310,7 +310,7 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         // Persisting failed, so no later `kin continue`/`abort` knows about the
         // stash; roll the fixups back and pop it rather than stranding the
         // user's changes.
-        set_aside::restore_or_warn(state.set_asides.take_changes());
+        set_aside::unwind(&repo, &mut state.set_asides);
         return Err(rollback_fixups(head_before, err));
     }
 
@@ -360,11 +360,11 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         // and restore the set-aside changes instead.
         //
         // The set-aside goes back before the fixups come off, onto the tip it
-        // was taken from. If it cannot, the fixups stay and so does the state,
-        // still naming it and with nothing left to continue: `kin abort` then
-        // restores the changes and takes the fixups off the same way.
-        if set_aside::restore_or_warn(state.set_asides.changes().cloned()) {
-            state.set_asides.take_changes();
+        // was taken from. If it does not come back cleanly, the fixups stay and
+        // so does the state, with nothing left to continue and still naming the
+        // set-aside unless its changes are in the tree as conflicts: `kin abort`
+        // then restores what is left and takes the fixups off the same way.
+        if set_aside::unwind(&repo, &mut state.set_asides) == set_aside::Outcome::Restored {
             let _ = clear_state(&repo);
             return Err(rollback_fixups(
                 head_before,
