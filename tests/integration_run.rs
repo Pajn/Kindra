@@ -286,6 +286,76 @@ fn run_autostash_keeps_untracked_files_in_place_while_commands_run() {
     assert!(git_stdout(dir.path(), &["stash", "list"]).trim().is_empty());
 }
 
+/// Staged and unstaged changes, including a file with both, as `git diff`
+/// shows them: the index against HEAD, then the working tree against the index.
+fn staged_and_unstaged(dir: &Path) -> (String, String) {
+    (
+        git_stdout(dir, &["diff", "--cached"]),
+        git_stdout(dir, &["diff"]),
+    )
+}
+
+/// `kin run` records its set-aside's staged state, so what was staged when the
+/// run started comes back staged, and what was not comes back unstaged.
+#[test]
+fn run_autostash_restores_staged_changes_staged() {
+    let dir = setup_run_repo();
+    fs::write(dir.path().join("base.txt"), "staged").unwrap();
+    run_ok("git", &["add", "base.txt"], dir.path());
+    fs::write(dir.path().join("base.txt"), "staged\nunstaged on top").unwrap();
+    fs::write(dir.path().join("a.txt"), "unstaged").unwrap();
+    let before = staged_and_unstaged(dir.path());
+
+    kin_cmd()
+        .arg("run")
+        .arg("-c")
+        .arg("true")
+        .arg("--autostash")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    assert_eq!(current_branch(dir.path()), "feature-b");
+    assert_eq!(staged_and_unstaged(dir.path()), before);
+    assert_eq!(git_stdout(dir.path(), &["stash", "list"]), "");
+}
+
+/// Run state saved by a Kindra that recorded only the stash message names an
+/// entry `git stash push` created, which holds the staged state too: `kin
+/// abort` restores it the same way.
+#[test]
+fn abort_restores_staged_changes_of_a_run_state_recording_only_its_message() {
+    let dir = setup_run_repo();
+    let head = git_stdout(dir.path(), &["rev-parse", "HEAD"]);
+    fs::write(dir.path().join("base.txt"), "staged").unwrap();
+    run_ok("git", &["add", "base.txt"], dir.path());
+    fs::write(dir.path().join("a.txt"), "unstaged").unwrap();
+    let before = staged_and_unstaged(dir.path());
+    run_ok(
+        "git",
+        &["stash", "push", "-q", "-m", "kin-autostash-1-2"],
+        dir.path(),
+    );
+    fs::write(
+        state_file(dir.path(), StateFile::Run),
+        format!(
+            r#"{{"target_branches":["feature-a","feature-b"],"current_index":0,
+                "args":{{"command":"true","continue_on_failure":false}},
+                "original_branch":"feature-b","original_head_id":"{head}",
+                "status":"in_progress","stash_ref":"kin-autostash-1-2"}}"#
+        ),
+    )
+    .unwrap();
+
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(staged_and_unstaged(dir.path()), before);
+    assert_eq!(git_stdout(dir.path(), &["stash", "list"]), "");
+}
+
 #[test]
 fn run_autostash_restored_on_failure() {
     let dir = setup_run_repo();

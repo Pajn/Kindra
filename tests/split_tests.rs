@@ -913,222 +913,574 @@ perl -i -pe 's/^[0-9a-f]{7}/deadbee/' "$file"
     );
 }
 
-#[test]
-fn test_split_refuses_dirty_working_tree_by_default() {
+/// An editor script kept in the Git directory, so it is not part of the
+/// working tree the tests compare.
+fn git_dir_editor(repo: &Repository, body: &str) -> std::path::PathBuf {
+    let path = repo.path().join("editor.sh");
+    fs::write(&path, format!("#!/bin/sh\nfile=$1\n{body}")).unwrap();
+    make_executable(&path);
+    path
+}
+
+fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
+    let output = common::git_command(dir).args(args).output().unwrap();
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// The index entries, the staged and unstaged diffs, the untracked files'
+/// contents and the stash stack, byte for byte.
+fn dirty_tree_snapshot(dir: &std::path::Path) -> String {
+    format!(
+        "index:\n{}staged:\n{}unstaged:\n{}status:\n{}untracked: {:?}\nstashes:\n{}",
+        git_out(dir, &["ls-files", "--stage"]),
+        git_out(dir, &["diff", "--cached", "--binary"]),
+        git_out(dir, &["diff", "--binary"]),
+        git_out(dir, &["status", "--porcelain=v1", "--untracked-files=all"]),
+        fs::read(dir.join("untracked.txt")).unwrap(),
+        git_out(dir, &["stash", "list"]),
+    )
+}
+
+/// Every ref and its reflog, what HEAD names and its reflog, and the undo log.
+fn refs_snapshot(dir: &std::path::Path) -> String {
+    let repo = Repository::open(dir).unwrap();
+    let head = if repo.head_detached().unwrap() {
+        git_out(dir, &["rev-parse", "HEAD"])
+    } else {
+        git_out(dir, &["symbolic-ref", "HEAD"])
+    };
+    let mut snapshot = format!("HEAD: {head}");
+    let refs = git_out(dir, &["for-each-ref", "--format=%(refname)"]);
+    for name in std::iter::once("HEAD").chain(refs.lines()) {
+        snapshot.push_str(&format!(
+            "{name} {}{}",
+            git_out(dir, &["rev-parse", name]),
+            git_out(dir, &["reflog", "show", "--format=%H %gs", name, "--"]),
+        ));
+    }
+    for file in ["kindra_oplog.json", "kindra_oplog_pending.json"] {
+        let content = fs::read_to_string(repo.path().join(file)).ok();
+        snapshot.push_str(&format!("{file}: {content:?}\n"));
+    }
+    snapshot
+}
+
+/// `setup_repo`'s stack with `feature-x` checked out at its tip, a staged
+/// change, an unstaged change on top of it and in another file, and an
+/// untracked file.
+fn dirty_feature_repo() -> (tempfile::TempDir, Repository) {
     let (dir, repo) = setup_repo();
     {
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         repo.branch("feature-x", &head, false).unwrap();
     }
     repo.set_head("refs/heads/feature-x").unwrap();
-
-    // Pin the config so the default resolves to "off" regardless of the host's
-    // global rebase.autostash setting.
-    repo.config()
-        .unwrap()
-        .set_bool("rebase.autostash", false)
-        .unwrap();
-
-    // Dirty a tracked file.
-    fs::write(dir.path().join("file.txt"), "dirty").unwrap();
-
-    // An editor that would move the branch — it must never be invoked because
-    // the dirty-tree check fires first.
-    let editor_script = dir.path().join("editor.sh");
-    fs::write(&editor_script, "#!/bin/sh\necho editor-ran >> editor.log\n").unwrap();
-    make_executable(&editor_script);
-
-    let mut cmd = kin_cmd();
-    cmd.arg("split")
-        .current_dir(dir.path())
-        .env("GIT_EDITOR", &editor_script)
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("uncommitted changes"));
-
-    // Editor never opened, dirty change preserved, no operation state left behind.
-    assert!(!dir.path().join("editor.log").exists());
-    assert_eq!(
-        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
-        "dirty"
-    );
-    assert!(!rebase_state_file(dir.path()).exists());
+    fs::write(dir.path().join("file.txt"), "staged").unwrap();
+    common::run_ok("git", &["add", "file.txt"], dir.path());
+    fs::write(dir.path().join("file.txt"), "staged\nunstaged on top").unwrap();
+    fs::write(dir.path().join("file1.txt"), "unstaged").unwrap();
+    fs::write(dir.path().join("untracked.txt"), "untracked").unwrap();
+    (dir, repo)
 }
 
-#[test]
-fn split_autostash_restored_when_apply_fails() {
-    // If apply_split_mutations fails after the autostash is taken, apply_split's
-    // rollback path must reapply the stashed working-tree changes onto the
-    // rolled-back state (and not strand the stash) rather than leaving the user's
-    // uncommitted work in limbo.
-    let (dir, repo) = setup_repo();
+/// Split only changes refs at HEAD's own commit, so it leaves uncommitted
+/// changes exactly as they are: staged changes stay staged, and nothing is
+/// set aside. `flags` are the autostash flags, which have no effect.
+fn assert_split_keeps_dirty_tree(flags: &[&str], configured_autostash: bool) -> String {
+    let (dir, repo) = dirty_feature_repo();
+    repo.config()
+        .unwrap()
+        .set_bool("rebase.autostash", configured_autostash)
+        .unwrap();
+    let before = dirty_tree_snapshot(dir.path());
+    let editor = git_dir_editor(
+        &repo,
+        "perl -i -pe 's/.*branch feature-x.*\\n?//g' \"$file\"\n\
+         perl -i -pe 's/(commit 2)/$1\\nbranch feature-x/' \"$file\"\n",
+    );
 
-    // A branch `foo` makes the new `foo/bar` branch below hit a git
-    // directory/file ref conflict, failing apply_split_mutations *after* the
-    // autostash has already been created.
+    let output = kin_cmd()
+        .arg("split")
+        .args(flags)
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{stderr}");
+
+    let branch = repo
+        .find_branch("feature-x", git2::BranchType::Local)
+        .unwrap();
+    let commit = repo.find_commit(branch.get().target().unwrap()).unwrap();
+    assert_eq!(commit.summary().unwrap(), "commit 2");
+    assert_eq!(dirty_tree_snapshot(dir.path()), before);
+    assert!(!rebase_state_file(dir.path()).exists());
+    stderr
+}
+
+const AUTOSTASH_NOTE: &str = "has no effect: kin split never touches uncommitted changes";
+
+/// A dirty tree is no longer refused, and needs no permission to stay as it
+/// is: `rebase.autostash` is ignored.
+#[test]
+fn test_split_leaves_a_dirty_working_tree_as_it_is() {
+    let stderr = assert_split_keeps_dirty_tree(&[], false);
+    assert!(!stderr.contains(AUTOSTASH_NOTE), "{stderr}");
+    assert_split_keeps_dirty_tree(&[], true);
+}
+
+/// `--autostash` used to stash the tree and restore it plainly, turning staged
+/// changes into unstaged ones. It is now accepted with a note and does nothing.
+#[test]
+fn test_split_autostash_flag_is_a_no_op_with_a_note() {
+    let stderr = assert_split_keeps_dirty_tree(&["--autostash"], false);
+    assert!(
+        stderr.contains(&format!("Note: --autostash {AUTOSTASH_NOTE}.")),
+        "{stderr}"
+    );
+}
+
+/// `--no-autostash` used to refuse a dirty tree even with autostash
+/// configured. It is now accepted with a note and does nothing.
+#[test]
+fn test_split_no_autostash_flag_is_a_no_op_with_a_note() {
+    let stderr = assert_split_keeps_dirty_tree(&["--no-autostash"], true);
+    assert!(
+        stderr.contains(&format!("Note: --no-autostash {AUTOSTASH_NOTE}.")),
+        "{stderr}"
+    );
+}
+
+/// A branch that cannot be created next to an existing ref (`foo/bar` while
+/// `foo` exists) is found before any ref changes, so the split fails with
+/// nothing to roll back and the dirty tree untouched.
+#[test]
+fn split_ref_conflict_fails_before_changing_anything() {
+    let (dir, repo) = dirty_feature_repo();
     let main_commit = repo
         .revparse_single("main")
         .unwrap()
         .peel_to_commit()
         .unwrap();
     repo.branch("foo", &main_commit, false).unwrap();
-
-    let pre_head = repo.head().unwrap().peel_to_commit().unwrap().id();
-
-    // Dirty a tracked file; `--autostash` routes it through take_autostash.
-    fs::write(dir.path().join("file.txt"), "dirty").unwrap();
-
-    // Editor assigns a new branch `foo/bar` to commit 1 — invalid to create while
-    // `foo` exists, so the ref mutation fails mid-apply.
-    let editor_script = dir.path().join("editor.sh");
-    fs::write(
-        &editor_script,
-        "#!/bin/sh\nfile=$1\nperl -i -pe 's{(commit 1)}{$1\\nbranch foo/bar}' \"$file\"\n",
-    )
-    .unwrap();
-    make_executable(&editor_script);
+    let before = refs_snapshot(dir.path());
+    let tree_before = dirty_tree_snapshot(dir.path());
+    let editor = git_dir_editor(
+        &repo,
+        "perl -i -pe 's/.*branch feature-x.*\\n?//g' \"$file\"\n\
+         perl -i -pe 's/(commit 2)/$1\\nbranch feature-x/' \"$file\"\n\
+         perl -i -pe 's{(commit 1)}{$1\\nbranch foo/bar}' \"$file\"\n",
+    );
 
     let output = kin_cmd()
         .arg("split")
-        .arg("--autostash")
         .current_dir(dir.path())
-        .env("GIT_EDITOR", &editor_script)
+        .env("GIT_EDITOR", &editor)
         .output()
         .unwrap();
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stdout}{stderr}");
     assert!(
-        !output.status.success(),
-        "split should fail on the ref conflict"
+        stderr.contains("Cannot create branch 'foo/bar': it conflicts with 'refs/heads/foo'"),
+        "{stderr}"
     );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        combined.contains("rolled back"),
-        "failure should report the rollback. Got:\n{combined}"
-    );
-
-    let repo = Repository::open(dir.path()).unwrap();
-    // Nothing was left half-applied: the conflicting branch was not created and
-    // HEAD is back where it started.
-    assert!(
-        repo.find_branch("foo/bar", git2::BranchType::Local)
-            .is_err(),
-        "the conflicting branch must not survive the rollback"
-    );
-    assert_eq!(
-        repo.head().unwrap().peel_to_commit().unwrap().id(),
-        pre_head,
-        "HEAD must be rolled back to its pre-split commit"
-    );
-    // The autostashed changes are restored onto the rolled-back tree, and no
-    // stash is left dangling.
-    assert_eq!(
-        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
-        "dirty",
-        "the autostashed working-tree change must be reapplied after rollback"
-    );
-    let stash_list = String::from_utf8(
-        std::process::Command::new("git")
-            .args(["stash", "list"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
-    assert!(
-        stash_list.trim().is_empty(),
-        "the autostash must be reapplied and dropped, not left behind. Got:\n{stash_list}"
-    );
+    assert!(stderr.contains("No branch was changed."), "{stderr}");
+    assert!(!stdout.contains("Moved branch"), "{stdout}");
+    assert_eq!(refs_snapshot(dir.path()), before);
+    assert_eq!(dirty_tree_snapshot(dir.path()), tree_before);
 }
 
+/// Every ref a split changes is locked before any is written, so a ref that
+/// cannot be locked (another Git process holds `<ref>.lock`) fails the split
+/// with every branch, HEAD and their reflogs as they were.
 #[test]
-fn test_split_no_autostash_flag_overrides_configured_autostash() {
-    let (dir, repo) = setup_repo();
-    {
-        let head = repo.head().unwrap().peel_to_commit().unwrap();
-        repo.branch("feature-x", &head, false).unwrap();
-    }
-    repo.set_head("refs/heads/feature-x").unwrap();
-
-    // Config would enable autostash, but the explicit --no-autostash flag must
-    // win, so a dirty tree is refused rather than stashed.
-    repo.config()
+fn split_locked_ref_leaves_every_ref_and_head_unchanged() {
+    let (dir, repo) = dirty_feature_repo();
+    let commit_1 = repo
+        .revparse_single("feature-x~2")
         .unwrap()
-        .set_bool("rebase.autostash", true)
+        .peel_to_commit()
+        .unwrap();
+    repo.branch("feature-old", &commit_1, false).unwrap();
+    // Held by "another process": the split has to delete `feature-old`.
+    fs::write(repo.path().join("refs/heads/feature-old.lock"), "").unwrap();
+
+    let before = refs_snapshot(dir.path());
+    let tree_before = dirty_tree_snapshot(dir.path());
+    // Move the checked-out `feature-x` (which detaches HEAD) and delete
+    // `feature-old`.
+    let editor = git_dir_editor(
+        &repo,
+        "perl -i -pe 's/.*branch feature-(x|old).*\\n?//g' \"$file\"\n\
+         perl -i -pe 's/(commit 2)/$1\\nbranch feature-x/' \"$file\"\n",
+    );
+
+    let output = kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .output()
         .unwrap();
 
-    fs::write(dir.path().join("file.txt"), "dirty").unwrap();
-
-    let editor_script = dir.path().join("editor.sh");
-    fs::write(&editor_script, "#!/bin/sh\necho editor-ran >> editor.log\n").unwrap();
-    make_executable(&editor_script);
-
-    let mut cmd = kin_cmd();
-    cmd.arg("split")
-        .arg("--no-autostash")
-        .current_dir(dir.path())
-        .env("GIT_EDITOR", &editor_script)
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("uncommitted changes"));
-
-    // The dirty change is preserved and the editor never opened.
-    assert!(!dir.path().join("editor.log").exists());
-    assert_eq!(
-        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
-        "dirty"
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stdout}{stderr}");
+    assert!(stderr.contains("No branch was changed."), "{stderr}");
+    assert!(!stdout.contains("Moved branch"), "{stdout}");
+    assert_eq!(refs_snapshot(dir.path()), before);
+    assert_eq!(dirty_tree_snapshot(dir.path()), tree_before);
+    assert!(repo.path().join("refs/heads/feature-old.lock").exists());
 }
 
+/// HEAD leaving its moved branch is logged once, as the checkout Git would
+/// log, and the moved branch logs the split. A deleted branch leaves no
+/// reflog or `branch.<name>` configuration behind, as with `git branch -D`.
 #[test]
-fn test_split_autostash_moves_branch_and_restores_changes() {
+fn split_logs_ref_changes_and_forgets_deleted_branches() {
     let (dir, repo) = setup_repo();
-    {
-        let head = repo.head().unwrap().peel_to_commit().unwrap();
-        repo.branch("feature-x", &head, false).unwrap();
-    }
+    let tip = repo.head().unwrap().peel_to_commit().unwrap().id();
+    repo.branch("feature-x", &repo.find_commit(tip).unwrap(), false)
+        .unwrap();
     repo.set_head("refs/heads/feature-x").unwrap();
-
-    // Dirty a tracked file before splitting.
-    fs::write(dir.path().join("file.txt"), "dirty").unwrap();
-
-    let editor_script = dir.path().join("editor.sh");
-    fs::write(
-        &editor_script,
-        r#"#!/bin/sh
-file=$1
-perl -i -pe 's/.*branch feature-x.*\n?//g' "$file"
-perl -i -pe 's/(commit 2)/$1\nbranch feature-x/' "$file"
-"#,
-    )
-    .unwrap();
-    make_executable(&editor_script);
-
-    let mut cmd = kin_cmd();
-    cmd.arg("split")
-        .arg("--autostash")
+    let head_log = |dir: &std::path::Path| {
+        git_out(dir, &["reflog", "show", "--format=%H %gs", "HEAD"])
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let head_log_before = head_log(dir.path());
+    let editor = git_dir_editor(
+        &repo,
+        "perl -i -pe 's/.*branch feature-x.*\\n?//g' \"$file\"\n\
+         perl -i -pe 's/(commit 2)/$1\\nbranch feature-x/' \"$file\"\n\
+         perl -i -pe 's/(commit 1)/$1\\nbranch part-1/' \"$file\"\n",
+    );
+    kin_cmd()
+        .arg("split")
         .current_dir(dir.path())
-        .env("GIT_EDITOR", &editor_script)
+        .env("GIT_EDITOR", &editor)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("HEAD is detached at"));
+
+    let commit_2 = repo.revparse_single("feature-x").unwrap().id();
+    let head_log_after = head_log(dir.path());
+    assert_eq!(head_log_after.len(), head_log_before.len() + 1);
+    assert_eq!(
+        head_log_after[0],
+        format!("{tip} checkout: moving from feature-x to {tip}")
+    );
+    assert_eq!(
+        git_out(
+            dir.path(),
+            &["reflog", "show", "-1", "--format=%H %gs", "feature-x"]
+        )
+        .trim(),
+        format!("{commit_2} kin split: move branch at {commit_2}")
+    );
+
+    common::run_ok(
+        "git",
+        &["config", "branch.part-1.remote", "origin"],
+        dir.path(),
+    );
+    let editor = git_dir_editor(
+        &repo,
+        "perl -i -pe 's/.*branch part-1.*\\n?//g' \"$file\"\n",
+    );
+    kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Deleted branch: part-1"));
+    assert!(repo.find_branch("part-1", git2::BranchType::Local).is_err());
+    assert!(!repo.path().join("logs/refs/heads/part-1").exists());
+    let config = Repository::open(dir.path()).unwrap().config().unwrap();
+    assert!(config.get_string("branch.part-1.remote").is_err());
+}
+
+/// A split is recorded for `kin undo`, which puts the branches back.
+#[test]
+fn split_can_be_undone() {
+    let (dir, repo) = setup_repo();
+    let tip = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature-x", &tip, false).unwrap();
+    repo.set_head("refs/heads/feature-x").unwrap();
+    let editor = git_dir_editor(
+        &repo,
+        "perl -i -pe 's/.*branch feature-x.*\\n?//g' \"$file\"\n\
+         perl -i -pe 's/(commit 2)/$1\\nbranch feature-x/' \"$file\"\n\
+         perl -i -pe 's/(commit 1)/$1\\nbranch part-1/' \"$file\"\n",
+    );
+
+    kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
         .assert()
         .success();
-
-    // Branch moved as instructed...
-    let branch = repo
-        .find_branch("feature-x", git2::BranchType::Local)
-        .unwrap();
-    let commit = repo.find_commit(branch.get().target().unwrap()).unwrap();
-    assert_eq!(commit.summary().unwrap(), "commit 2");
-
-    // ...and the uncommitted change is restored afterward.
-    assert_eq!(
-        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
-        "dirty"
+    assert_ne!(
+        repo.revparse_single("feature-x").unwrap().id(),
+        tip.id(),
+        "the split should have moved feature-x"
     );
-    assert!(!rebase_state_file(dir.path()).exists());
+
+    kin_cmd()
+        .arg("undo")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(repo.revparse_single("feature-x").unwrap().id(), tip.id());
+    assert!(repo.find_branch("part-1", git2::BranchType::Local).is_err());
+}
+
+/// Git refuses to delete a branch another worktree has checked out; split
+/// checks that before changing anything.
+#[test]
+fn split_refuses_to_delete_a_branch_checked_out_in_another_worktree() {
+    let (dir, repo) = setup_repo();
+    let commit_1 = repo
+        .revparse_single("HEAD~2")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    repo.branch("elsewhere", &commit_1, false).unwrap();
+    let tip = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature-x", &tip, false).unwrap();
+    repo.set_head("refs/heads/feature-x").unwrap();
+    let other = tempdir().unwrap();
+    let other_path = other.path().join("other");
+    common::run_ok(
+        "git",
+        &["worktree", "add", other_path.to_str().unwrap(), "elsewhere"],
+        dir.path(),
+    );
+    let before = refs_snapshot(dir.path());
+    let editor = git_dir_editor(
+        &repo,
+        "perl -i -pe 's/.*branch (elsewhere|feature-x).*\\n?//g' \"$file\"\n\
+         perl -i -pe 's/(commit 2)/$1\\nbranch feature-x/' \"$file\"\n",
+    );
+
+    let output = kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Cannot delete branch 'elsewhere': it is checked out in"),
+        "{stderr}"
+    );
+    assert_eq!(refs_snapshot(dir.path()), before);
+}
+
+/// Check `branch` out in a new linked worktree, kept until the returned
+/// directory is dropped.
+fn check_out_elsewhere(dir: &std::path::Path, branch: &str) -> tempfile::TempDir {
+    let other = tempdir().unwrap();
+    let path = other.path().join("other");
+    common::run_ok(
+        "git",
+        &["worktree", "add", path.to_str().unwrap(), branch],
+        dir,
+    );
+    other
+}
+
+/// Moving a branch another worktree has checked out would change that
+/// worktree's HEAD commit underneath it, so split refuses before changing
+/// anything.
+#[test]
+fn split_refuses_to_move_a_branch_checked_out_in_another_worktree() {
+    let (dir, repo) = setup_repo();
+    let commit_1 = repo
+        .revparse_single("HEAD~2")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    repo.branch("elsewhere", &commit_1, false).unwrap();
+    let tip = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature-x", &tip, false).unwrap();
+    repo.set_head("refs/heads/feature-x").unwrap();
+    let _other = check_out_elsewhere(dir.path(), "elsewhere");
+    let before = refs_snapshot(dir.path());
+    let editor = git_dir_editor(
+        &repo,
+        "perl -i -pe 's/.*branch elsewhere.*\\n?//g' \"$file\"\n\
+         perl -i -pe 's/(commit 2)/$1\\nbranch elsewhere/' \"$file\"\n",
+    );
+
+    let output = kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Cannot update branch 'elsewhere': it is checked out in"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("No branch was changed."), "{stderr}");
+    assert_eq!(refs_snapshot(dir.path()), before);
+}
+
+/// A detached HEAD attaches to a branch at its commit, but not to one another
+/// worktree has checked out: Git never has two worktrees on one branch.
+#[test]
+fn split_refuses_to_attach_head_to_a_branch_checked_out_in_another_worktree() {
+    let (dir, repo) = setup_repo();
+    assert!(repo.head_detached().unwrap());
+    let tip = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("held", &tip, false).unwrap();
+    let _other = check_out_elsewhere(dir.path(), "held");
+    let before = refs_snapshot(dir.path());
+    let editor = git_dir_editor(
+        &repo,
+        "perl -i -pe 's/(commit 1)/$1\\nbranch part-1/' \"$file\"\n",
+    );
+
+    let output = kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Cannot attach HEAD to branch 'held': it is checked out in"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("No branch was changed."), "{stderr}");
+    assert_eq!(refs_snapshot(dir.path()), before);
+    assert!(repo.head_detached().unwrap());
+}
+
+/// Every ref is locked before any is written, but writing can still fail part
+/// way: deleting a packed branch rewrites `packed-refs`, whose lock another
+/// Git process may hold. The refs written by then stay changed, the split is
+/// recorded, and `kin undo` puts them back.
+///
+/// libgit2 writes a transaction's refs in the order of its hash map, so the
+/// split creates many branches to have some written before the delete fails.
+#[test]
+fn split_that_fails_while_writing_refs_can_be_undone() {
+    let (dir, repo) = setup_repo();
+    let tip = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature-x", &tip, false).unwrap();
+    repo.set_head("refs/heads/feature-x").unwrap();
+    let commit_1 = repo
+        .revparse_single("HEAD~2")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    repo.branch("packed", &commit_1, false).unwrap();
+    common::run_ok("git", &["pack-refs", "--all"], dir.path());
+    let branches = |dir: &std::path::Path| {
+        git_out(
+            dir,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+            ],
+        )
+    };
+    let before = branches(dir.path());
+    let editor = git_dir_editor(
+        &repo,
+        "perl -i -pe 's/.*branch packed.*\\n?//g' \"$file\"\n\
+         perl -i -pe 's/(commit 1)$/$1 . join(\"\", map { \"\\nbranch new-$_\" } 1..20)/e' \"$file\"\n",
+    );
+    let packed_lock = repo.path().join("packed-refs.lock");
+    fs::write(&packed_lock, "").unwrap();
+
+    let output = kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .output()
+        .unwrap();
+    fs::remove_file(&packed_lock).unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "Some branches may have changed; the split is recorded, so 'kin undo' restores them."
+        ),
+        "{stderr}"
+    );
+    let after = branches(dir.path());
+    assert!(
+        after.contains("refs/heads/new-") && after.contains("refs/heads/packed "),
+        "some new branches should have been written before the delete failed:\n{after}"
+    );
+
+    kin_cmd()
+        .arg("undo")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(branches(dir.path()), before);
+}
+
+/// A deleted branch's configuration goes with it, however its values are
+/// spread over the config file: a key can have several values, and a section
+/// can appear more than once.
+#[test]
+fn split_forgets_every_config_value_of_a_deleted_branch() {
+    let (dir, repo) = setup_repo();
+    let commit_1 = repo
+        .revparse_single("HEAD~2")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    repo.branch("part-1", &commit_1, false).unwrap();
+    let config_path = repo.path().join("config");
+    let mut config = fs::read_to_string(&config_path).unwrap();
+    config.push_str(
+        "[branch \"part-1\"]\n\tremote = origin\n\tmerge = refs/heads/a\n\tmerge = refs/heads/b\n\
+         [branch \"other\"]\n\tremote = origin\n\
+         [branch \"part-1\"]\n\tremote = upstream\n\tdescription = kept apart\n",
+    );
+    fs::write(&config_path, config).unwrap();
+    let editor = git_dir_editor(
+        &repo,
+        "perl -i -pe 's/.*branch part-1.*\\n?//g' \"$file\"\n",
+    );
+
+    let output = kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("Warning"), "{stderr}");
+    assert_eq!(
+        git_out(dir.path(), &["config", "--list", "--local"])
+            .lines()
+            .filter(|line| line.starts_with("branch."))
+            .collect::<Vec<_>>(),
+        vec!["branch.other.remote=origin"]
+    );
 }
 
 /// A bare `branch` row (no name) is auto-named by slugifying the commit it sits

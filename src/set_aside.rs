@@ -180,9 +180,9 @@ pub enum Phase {
     /// names the stash entry, and the record stays in the journal (if there
     /// is one) until the changes are back.
     Unwind,
-    /// A command that keeps no resumable journal (`kin run`, `kin split`)
-    /// restores its set-aside when it ends. Any problem is a warning that
-    /// names the stash entry and how to recover it.
+    /// A command that keeps no resumable journal (`kin run`) restores its
+    /// set-aside when it ends. Any problem is a warning that names the stash
+    /// entry and how to recover it.
     NonResumable,
 }
 
@@ -237,11 +237,10 @@ pub fn take_whole_tree(repo: &Repository, allowed: bool) -> Result<Option<SetAsi
 /// - `Ok(Some(..))` if the tree was dirty and its changes were set aside.
 ///
 /// Untracked files stay in place: `kin run` uses this so the commands it runs
-/// keep local untracked files such as `.env`. `kin split` uses it too, and so
-/// does the rebase loop for an older journal that still asks it to set the
-/// tree aside (see `RebaseState::legacy_autostash`). The
-/// entry is named `kin-autostash`; `restore` is how the operation's completion
-/// and abort bring it back.
+/// keep local untracked files such as `.env`, and so does the rebase loop for
+/// an older journal that still asks it to set the tree aside (see
+/// `RebaseState::legacy_autostash`). The entry is named `kin-autostash`;
+/// `restore` is how the operation's completion and abort bring it back.
 pub fn take_tracked(
     repo: &Repository,
     allowed: bool,
