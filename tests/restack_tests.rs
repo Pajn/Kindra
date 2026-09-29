@@ -271,6 +271,58 @@ fn test_restack_pick_non_interactive_errors() {
     );
 }
 
+/// `restack` sets an untracked file aside for its rebases and restores it: the
+/// floating child tracks the same path, so checking it out to replay it would
+/// otherwise be refused, and a pre-rebase hook fails unless the file is out of
+/// the working tree.
+#[test]
+#[cfg(unix)]
+fn test_restack_sets_untracked_files_aside_and_restores_them() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    repo_init(repo_path);
+    std::fs::write(repo_path.join("a.txt"), "A").unwrap();
+    run_ok("git", &["add", "a.txt"], repo_path);
+    run_ok("git", &["commit", "-m", "feat: A"], repo_path);
+    run_ok("git", &["checkout", "-b", "feat"], repo_path);
+    std::fs::write(repo_path.join("notes.txt"), "feat's notes").unwrap();
+    run_ok("git", &["add", "notes.txt"], repo_path);
+    run_ok("git", &["commit", "-m", "feat: notes"], repo_path);
+    run_ok("git", &["checkout", "main"], repo_path);
+    std::fs::write(repo_path.join("a.txt"), "A amended").unwrap();
+    run_ok(
+        "git",
+        &["commit", "-a", "--amend", "-m", "feat: A"],
+        repo_path,
+    );
+    std::fs::write(repo_path.join("notes.txt"), "my notes").unwrap();
+    let hook = repo_path.join(".git/hooks/pre-rebase");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\ntest ! -e notes.txt\n").unwrap();
+    run_ok("chmod", &["+x", hook.to_str().unwrap()], repo_path);
+
+    kin_cmd()
+        .current_dir(repo_path)
+        .arg("restack")
+        .assert()
+        .success();
+
+    let repo = Repository::open(repo_path).unwrap();
+    let main = repo.revparse_single("main").unwrap().id();
+    let feat = repo
+        .revparse_single("feat")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    assert_eq!(feat.parent_id(0).unwrap(), main);
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("notes.txt")).unwrap(),
+        "my notes"
+    );
+    assert!(repo.find_reference("refs/stash").is_err());
+    assert!(!rebase_state_file(repo_path).exists());
+}
+
 #[test]
 fn test_restack_refuses_dirty_working_tree_before_pick_prompt() {
     // With --no-autostash and a dirty tree, restack must refuse up front — before

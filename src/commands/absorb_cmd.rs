@@ -283,9 +283,7 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         suppress_editor: true,
         abort_only: false,
         unstage_on_restore: false,
-        // The stash below empties the working tree, so the rebases never have
-        // anything to autostash.
-        autostash: false,
+        legacy_autostash: false,
         cleanup_merged_branches: Vec::new(),
         cleanup_checkout_fallback: None,
     };
@@ -332,6 +330,9 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         .arg("rebase")
         .arg("-i")
         .arg("--autosquash")
+        // The set-aside above empties the working tree; Git never sets
+        // anything aside for Kindra, whatever `rebase.autostash` says.
+        .arg("--no-autostash")
         .arg("--no-rebase-merges")
         .arg("--update-refs")
         .arg(base_id.to_string())

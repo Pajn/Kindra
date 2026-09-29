@@ -1,5 +1,5 @@
 use crate::commands::find_upstream;
-use crate::rebase_utils::{Operation, RebaseState, Replay, run_rebase_loop, save_state};
+use crate::rebase_utils::{Operation, RebaseState, Replay, begin_replay, run_rebase_loop};
 use anyhow::{Result, anyhow};
 use clap::Args;
 use std::collections::{HashMap, HashSet};
@@ -9,10 +9,10 @@ pub struct ReorderArgs {
     /// Force the reorder even if branches are checked out in other worktrees
     #[arg(long)]
     pub force: bool,
-    /// Allow git rebase to autostash tracked worktree changes
+    /// Permit setting uncommitted tracked changes aside for the operation
     #[arg(long, overrides_with = "no_autostash")]
     pub autostash: bool,
-    /// Disable git rebase autostash even if configured
+    /// Refuse to start with uncommitted tracked changes, even if autostash is configured
     #[arg(long, overrides_with = "autostash")]
     pub no_autostash: bool,
 }
@@ -73,7 +73,7 @@ fn reorder_locked(repo: &git2::Repository, args: &ReorderArgs) -> Result<()> {
         return Ok(());
     }
 
-    let prepared = (|| -> Result<RebaseState> {
+    let prepared = (|| -> Result<(RebaseState, bool)> {
         let plan = crate::stack::plan_graph_reorder(
             repo,
             &stack_component,
@@ -126,14 +126,14 @@ fn reorder_locked(repo: &git2::Repository, args: &ReorderArgs) -> Result<()> {
             suppress_editor: false,
             abort_only: false,
             unstage_on_restore: false,
-            autostash,
+            legacy_autostash: false,
             cleanup_merged_branches: Vec::new(),
             cleanup_checkout_fallback: None,
         };
 
-        Ok(state)
+        Ok((state, autostash))
     })();
-    let state = prepared.inspect_err(|_| {
+    let (mut state, autostash) = prepared.inspect_err(|_| {
         eprintln!(
             "  Your reorder edits were saved to {} — fix the issue and re-run `kin reorder`.",
             draft.path().display()
@@ -142,10 +142,10 @@ fn reorder_locked(repo: &git2::Repository, args: &ReorderArgs) -> Result<()> {
 
     // Snapshot for undo only now that all no-op/validation checks have passed and
     // we are about to mutate branches. The guard settles the snapshot on every
-    // exit from here on (including a failing `save_state`), so no path can leave
+    // exit from here on (including a failing `begin_replay`), so no path can leave
     // a stale pending snapshot behind.
     let _snapshot = crate::oplog::begin(repo, "reorder")?;
-    save_state(repo, &state)?;
+    begin_replay(repo, &mut state, autostash)?;
     draft.discard();
     run_rebase_loop(repo, state)
 }

@@ -202,7 +202,8 @@ pub fn restack_history_limit(repo: &Repository, cli_override: Option<usize>) -> 
     Ok(configured.unwrap_or(DEFAULT_RESTACK_HISTORY_LIMIT))
 }
 
-/// Whether rebase-style commands autostash: the CLI flag, then
+/// Whether rebase-style commands may set uncommitted tracked changes aside
+/// (Kindra's own set-aside; Git's autostash is never used): the CLI flag, then
 /// `[rebase] autostash` from repository then global config, then Git's own
 /// `rebase.autostash`, then off.
 pub fn rebase_autostash(repo: &Repository, cli_override: Option<bool>) -> Result<bool> {

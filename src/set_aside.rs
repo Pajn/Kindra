@@ -209,15 +209,34 @@ fn stash_message(name: &str) -> Result<String> {
     Ok(format!("{name}-{}-{ts}", std::process::id()))
 }
 
-/// Set the tracked changes aside as a whole tree, for commands that manage
-/// the working tree themselves rather than through `git rebase`, honouring
-/// the clean-or-autostash contract. Returns:
+/// Set the whole working tree aside for an operation that checks out and
+/// rewrites branches, untracked files included (except untracked local
+/// override files, see [`take`]). `allowed` is the permission the autostash
+/// flags and configuration grant: tracked changes without it are refused
+/// before anything is set aside. Untracked files need no permission. Returns
+/// `None` when there was nothing to set aside.
+///
+/// The entry is named `kin-autostash`; completion and abort restore it with
+/// its staged state.
+pub fn take_whole_tree(repo: &Repository, allowed: bool) -> Result<Option<SetAside>> {
+    if !allowed && crate::rebase_utils::working_tree_dirty(repo)? {
+        return Err(crate::rebase_utils::dirty_working_tree_error());
+    }
+    take(repo, Kind::WholeTree, "kin-autostash")
+}
+
+/// Set the tracked changes aside as a whole tree, honouring the permission
+/// `allowed` as [`take_whole_tree`] does. Returns:
 /// - `Ok(None)` if the tree is clean (nothing set aside),
 /// - `Err(..)` if the tree is dirty and `allowed` (autostash) is off,
 /// - `Ok(Some(..))` if the tree was dirty and its changes were set aside.
 ///
-/// Untracked files stay in place. The entry is named `kin-autostash`;
-/// `restore` is how the operation's completion and abort bring it back.
+/// Untracked files stay in place: `kin run` uses this so the commands it runs
+/// keep local untracked files such as `.env`. `kin split` uses it too, and so
+/// does the rebase loop for an older journal that still asks it to set the
+/// tree aside (see `RebaseState::legacy_autostash`). The
+/// entry is named `kin-autostash`; `restore` is how the operation's completion
+/// and abort bring it back.
 pub fn take_tracked(
     repo: &Repository,
     allowed: bool,

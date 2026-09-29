@@ -1353,6 +1353,49 @@ fn commit_on_keeps_untracked_overlays_out_of_its_stash() {
     assert_eq!(hook_log(dir.path()), "");
     assert_applied(dir.path());
 }
+/// `move` sets the user's untracked files aside for its rebases, but never an
+/// untracked overlay file: a pre-rebase hook checks both.
+#[test]
+fn move_keeps_untracked_overlays_out_of_its_set_aside() {
+    let dir = logging_setup("");
+    fs::write(
+        dir.path().join(".git/kindra.toml"),
+        "[overrides]\npaths = ['AGENTS.md', '.claude']\napply = ['sh \"$(git rev-parse --git-common-dir)/apply.sh\"', 'mkdir -p .claude && printf local > .claude/settings.json']\n",
+    )
+    .unwrap();
+    fs::create_dir(dir.path().join(".claude")).unwrap();
+    fs::write(dir.path().join(".claude/settings.json"), "local").unwrap();
+    fs::write(dir.path().join("scratch.txt"), "untracked\n").unwrap();
+    let hook = dir.path().join(".git/hooks/pre-rebase");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(
+        &hook,
+        "#!/bin/sh\ntest -f .claude/settings.json && test ! -e scratch.txt\n",
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", hook.to_str().unwrap()], dir.path());
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["move", "--onto", "sibling"])
+        .assert()
+        .success();
+    run_ok(
+        "git",
+        &["merge-base", "--is-ancestor", "sibling", "child"],
+        dir.path(),
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap(),
+        "local"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "untracked\n"
+    );
+    assert_eq!(git(dir.path(), &["stash", "list"]), "");
+    assert_eq!(hook_log(dir.path()), "");
+    assert_applied(dir.path());
+}
 #[test]
 fn planned_operation_refuses_staged_override_changes_before_saving_state() {
     let dir = logging_setup("");

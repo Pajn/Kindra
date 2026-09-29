@@ -1,5 +1,5 @@
 use crate::commands::find_upstream;
-use crate::rebase_utils::{Operation, RebaseState, Replay, run_rebase_loop, save_state};
+use crate::rebase_utils::{Operation, RebaseState, Replay, begin_replay, run_rebase_loop};
 use crate::stack::{
     collect_descendants, get_stack_branches_from_merge_base, plan_descendant_reorder,
     visualize_stack,
@@ -20,10 +20,10 @@ pub struct MoveArgs {
     /// Force the move even if branches are checked out in other worktrees
     #[arg(long)]
     pub force: bool,
-    /// Allow git rebase to autostash tracked worktree changes
+    /// Permit setting uncommitted tracked changes aside for the operation
     #[arg(long, overrides_with = "no_autostash")]
     pub autostash: bool,
-    /// Disable git rebase autostash even if configured
+    /// Refuse to start with uncommitted tracked changes, even if autostash is configured
     #[arg(long, overrides_with = "autostash")]
     pub no_autostash: bool,
 }
@@ -220,7 +220,7 @@ fn start_move_locked(repo: &Repository, args: &MoveArgs) -> Result<()> {
         .map(|branch| (branch.name.clone(), branch.id.to_string()))
         .collect::<HashMap<_, _>>();
 
-    let state = RebaseState {
+    let mut state = RebaseState {
         operation: Operation::Move,
         replay: Some(Replay::Branches),
         original_branch: current_branch_name,
@@ -239,7 +239,7 @@ fn start_move_locked(repo: &Repository, args: &MoveArgs) -> Result<()> {
         suppress_editor: false,
         abort_only: false,
         unstage_on_restore: false,
-        autostash,
+        legacy_autostash: false,
         cleanup_merged_branches: Vec::new(),
         cleanup_checkout_fallback: None,
     };
@@ -248,6 +248,6 @@ fn start_move_locked(repo: &Repository, args: &MoveArgs) -> Result<()> {
     // and we are about to mutate branches. The guard settles the snapshot on
     // every exit from here on, so no path can leave a stale pending snapshot.
     let _snapshot = crate::oplog::begin(repo, "move")?;
-    save_state(repo, &state)?;
+    begin_replay(repo, &mut state, autostash)?;
     run_rebase_loop(repo, state)
 }

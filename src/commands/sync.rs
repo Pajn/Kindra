@@ -23,11 +23,11 @@ pub struct SyncArgs {
     #[arg(long)]
     pub no_delete: bool,
 
-    /// Allow git rebase to autostash tracked worktree changes
+    /// Permit setting uncommitted tracked changes aside for the operation
     #[arg(long, overrides_with = "no_autostash")]
     pub autostash: bool,
 
-    /// Disable git rebase autostash even if configured
+    /// Refuse to start with uncommitted tracked changes, even if autostash is configured
     #[arg(long, overrides_with = "autostash")]
     pub no_autostash: bool,
 }
@@ -197,30 +197,17 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
             suppress_editor: false,
             abort_only: false,
             unstage_on_restore: false,
-            autostash,
+            legacy_autostash: false,
             cleanup_merged_branches: merged_branches.clone(),
             cleanup_checkout_fallback: Some(local_upstream.clone()),
         };
 
         crate::overrides::prepare(repo, &crate::rebase_utils::override_plan(repo, &state)?)?;
 
-        // Git's autostash runs too late to protect the checkout to the tip.
-        // Keep these changes in Kindra's state until we return to the caller,
-        // including across rebase conflicts and aborts.
-        if state.caller_branch.is_some() {
-            if let Some(taken) = crate::set_aside::take_tracked(
-                repo,
-                autostash,
-                crate::set_aside::Restore::WithIndex,
-            )? {
-                state.set_asides.push(taken);
-            }
-            state.autostash = false;
-        }
-        if let Err(err) = save_state(repo, &state) {
-            crate::set_aside::unwind(repo, &mut state.set_asides);
-            return Err(err);
-        }
+        // Set the tree aside before the checkout to the tip, and keep it in
+        // the journal until the sync returns to the caller, including across
+        // rebase conflicts and aborts.
+        crate::rebase_utils::set_aside_working_tree(repo, &mut state, autostash)?;
 
         if current_branch_name.as_deref() != Some(top_branch.as_str()) {
             checkout_branch(&top_branch)?;
@@ -231,11 +218,7 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
             .arg("rebase")
             .arg("--reapply-cherry-picks")
             .arg("--empty=keep")
-            .arg(if state.autostash {
-                "--autostash"
-            } else {
-                "--no-autostash"
-            })
+            .arg("--no-autostash")
             .arg("--update-refs")
             .arg("--onto")
             .arg(&rebase_onto_name)
@@ -279,7 +262,7 @@ fn sync_upstream_branch(
         let autostash =
             crate::commands::resolve_and_check_autostash(repo, args.autostash, args.no_autostash)?;
 
-        let state = RebaseState {
+        let mut state = RebaseState {
             operation: Operation::Sync,
             replay: Some(Replay::SyncLinear),
             original_branch: upstream_name.to_string(),
@@ -300,23 +283,20 @@ fn sync_upstream_branch(
             suppress_editor: false,
             abort_only: false,
             unstage_on_restore: false,
-            autostash,
+            legacy_autostash: false,
             cleanup_merged_branches: merged_branches.clone(),
             cleanup_checkout_fallback: Some(upstream_name.to_string()),
         };
 
         crate::overrides::prepare(repo, &crate::rebase_utils::override_plan(repo, &state)?)?;
+        crate::rebase_utils::set_aside_working_tree(repo, &mut state, autostash)?;
 
         let mut rebase = Command::new("git");
         rebase
             .arg("rebase")
             .arg("--reapply-cherry-picks")
             .arg("--empty=keep")
-            .arg(if autostash {
-                "--autostash"
-            } else {
-                "--no-autostash"
-            })
+            .arg("--no-autostash")
             .arg(rebase_onto_name);
 
         return run_sync_rebase(repo, state, rebase);
@@ -830,19 +810,10 @@ fn sync_tree(
         suppress_editor: false,
         abort_only: false,
         unstage_on_restore: false,
-        autostash,
+        legacy_autostash: false,
         cleanup_merged_branches: merged,
         cleanup_checkout_fallback: Some(local_upstream.to_string()),
     };
-    if let Some(taken) =
-        crate::set_aside::take_tracked(repo, autostash, crate::set_aside::Restore::WithIndex)?
-    {
-        state.set_asides.push(taken);
-    }
-    state.autostash = false;
-    if let Err(err) = save_state(repo, &state) {
-        crate::set_aside::unwind(repo, &mut state.set_asides);
-        return Err(err);
-    }
+    crate::rebase_utils::begin_replay(repo, &mut state, autostash)?;
     crate::rebase_utils::run_rebase_loop(repo, state)
 }

@@ -268,7 +268,7 @@ history_limit = 250
 
 ## Rebase Autostash
 
-Commands that rebase or check out branches (`commit`, `move`, `sync`, `restack`, `reorder`, `split`, and `run`) default to `--no-autostash` so dirty tracked changes do not get hidden implicitly.
+Kindra sets uncommitted changes aside itself for the commands that rebase or check out branches, records them with a paused operation so `kin continue` and `kin abort` restore them, and never uses Git's own autostash. `--autostash` is the permission to set uncommitted tracked changes aside: `move`, `sync`, `restack`, `reorder`, `split`, and `run` default to `--no-autostash`, refusing up front when tracked files have changes, so those changes do not get hidden implicitly. Untracked files need no permission: `move`, `sync`, `restack`, and `reorder` set them aside with everything else, while `run` and `split` leave them in place. `commit` always sets aside the unstaged changes it has to move out of the way and ignores the flags. See the [CLI reference](docs/cli_reference.md#uncommitted-changes-and---autostash).
 
 Resolution order:
 

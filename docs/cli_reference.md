@@ -55,7 +55,7 @@ Repository config keys:
 | Key | Purpose |
 | --- | --- |
 | `upstream_branch` | The trunk; see [Core Concepts](#core-concepts). |
-| `[rebase]` | `autostash`; see [restack](#restack) for the resolution order. |
+| `[rebase]` | `autostash`; see [Uncommitted changes](#uncommitted-changes-and---autostash). |
 | `[restack]` | `history_limit`; see [restack](#restack). |
 | `[worktrees]` | Managed worktrees; see [worktree](#worktree-alias-wt). |
 | `[overrides]` | Local file replacements; see [Local overrides](#local-overrides). |
@@ -188,8 +188,7 @@ Any arguments you pass to `kin commit` (e.g., `-m "my message"`) are passed dire
 - `--insert`: With `-b`, splice the new branch *into* the stack instead of forking a sibling: after the commit, the current branch's children are restacked onto the new branch, forming `current -> new -> children`. Requires `-b`. Without it, `-b` leaves existing children in place.
 - `--interactive`: Open an interactive commit picker showing all commits in the stack. Squashes the staged changes into the selected commit.
 - `--fixup <sha>`: Non-interactive fixup mode targeting a specific commit. Squashes the staged changes into the given commit and rebases the dependent branches. The commit must be in the current stack, or in the checked-out base branch's first-parent history when run from that base branch (for example, from `main`). Accepts `--fixup=<sha>` as well. Mutually exclusive with `--interactive` and `--on`.
-- `--autostash`: Allow the descendant rebase phase to use Git autostash.
-- `--no-autostash`: Disable Git autostash even if configured globally or for the repo.
+- `--autostash`, `--no-autostash`: Accepted, but no-ops: whenever `kin commit` rewrites or switches branches it sets the unstaged changes and untracked files aside and restores them when it finishes (see [Uncommitted changes](#uncommitted-changes-and---autostash)).
 
 **Interactive mode behavior:**
 
@@ -268,8 +267,8 @@ kin move [--onto <target>] [--all] [--autostash|--no-autostash]
 
 - `--onto <target>`: The branch to move the current stack onto.
 - `--all`: If no target is specified, list all local branches to choose from (instead of just branches in the current stack).
-- `--autostash`: Allow the rebase loop to use Git autostash.
-- `--no-autostash`: Disable Git autostash even if configured globally or for the repo.
+- `--autostash`: Permit setting uncommitted tracked changes aside for the operation (see [Uncommitted changes](#uncommitted-changes-and---autostash)).
+- `--no-autostash`: Refuse to start with uncommitted tracked changes, even if autostash is configured.
 
 **When to use it:** Use this when you want to relocate a whole set of changes to a new base branch (e.g., moving a feature stack from `develop` to `main`).
 
@@ -328,8 +327,8 @@ kin reorder [--force] [--autostash|--no-autostash]
 ```
 
 - `--force`: Continue even if a branch that needs rebasing is checked out in another worktree.
-- `--autostash`: Allow the reorder rebase loop to use Git autostash.
-- `--no-autostash`: Disable Git autostash even if configured globally or for the repo.
+- `--autostash`: Permit setting uncommitted tracked changes aside for the operation (see [Uncommitted changes](#uncommitted-changes-and---autostash)).
+- `--no-autostash`: Refuse to start with uncommitted tracked changes, even if autostash is configured.
 
 **Editor format:**
 
@@ -374,8 +373,8 @@ kin sync [--force] [--no-delete] [--autostash|--no-autostash]
 **Arguments:**
 - `--force`: Force the sync even if branches it has to rebase are checked out in other worktrees.
 - `--no-delete`: Do not automatically delete branches that have already been integrated into the upstream branch.
-- `--autostash`: Allow the sync rebase to use Git autostash.
-- `--no-autostash`: Disable Git autostash even if configured globally or for the repo.
+- `--autostash`: Permit setting uncommitted tracked changes aside for the operation (see [Uncommitted changes](#uncommitted-changes-and---autostash)).
+- `--no-autostash`: Refuse to start with uncommitted tracked changes, even if autostash is configured.
 
 **What it does:**
 
@@ -418,8 +417,8 @@ kin restack [--history-limit <n>] [--autostash|--no-autostash] [--pick]
 
 **Arguments:**
 - `--history-limit <n>`: Maximum first-parent history depth to scan while detecting floating branches. `0` disables the limit and scans the full history.
-- `--autostash`: Allow the rebase loop to use Git autostash.
-- `--no-autostash`: Disable Git autostash even if configured globally or for the repo.
+- `--autostash`: Permit setting uncommitted tracked changes aside for the operation (see [Uncommitted changes](#uncommitted-changes-and---autostash)).
+- `--no-autostash`: Refuse to start with uncommitted tracked changes, even if autostash is configured.
 - `--pick`: Show an interactive picker to select which branches to restack. Requires an interactive terminal. If no branches are selected, the command exits without performing any rebases.
 
 **History limit resolution order:**
@@ -435,7 +434,16 @@ Example config:
 history_limit = 250
 ```
 
-**Rebase autostash resolution order** (shared by every command that accepts `--autostash`: `commit`, `move`, `sync`, `restack`, `reorder`, `split` and `run`):
+#### Uncommitted changes and `--autostash`
+
+Commands that check out or rebase branches move your uncommitted changes out of the way themselves and put them back when they finish: on the branch the operation returns to, never on a branch it replays. What they set aside is recorded with the paused operation, so after a conflict `kin continue` restores it once the operation completes and `kin abort` restores it when it rolls the operation back. Kindra never uses Git's own autostash: every rebase it runs passes `--no-autostash`, and Git's `rebase.autostash` is only read as the permission below.
+
+- **Tracked changes need permission.** `--autostash`, `--no-autostash` and the configuration below decide whether `move`, `sync`, `restack`, `reorder`, `split` and `run` may set uncommitted tracked changes aside. Without it, a command that finds such changes refuses before it changes anything, with nothing saved to continue, abort or undo.
+- **Untracked files need none.** A tree with only untracked files does not count as dirty. `move`, `sync`, `restack` and `reorder` set untracked files aside with everything else, so they cannot block a checkout, and restore them at the end. Untracked [local override](#local-overrides) files stay in place, and ignored files are left alone.
+- **`kin run` and `kin split` set aside tracked changes only.** The commands `kin run` runs keep local untracked files such as `.env` in place.
+- **`kin commit` and `kin absorb` always set aside** what they have to move out of the way; `kin commit` accepts the autostash flags as no-ops, and `kin absorb` takes none.
+
+**Autostash resolution order** (for `move`, `sync`, `restack`, `reorder`, `split` and `run`):
 - CLI override: `--autostash` or `--no-autostash`
 - [Repository config](#configuration): `[rebase] autostash`
 - [Global config](#configuration): `[rebase] autostash`
@@ -713,6 +721,8 @@ kin run --continue-on-failure --command <command>
 - `-c, --command <command>`: The shell command to run on each branch. Required.
 - `--continue-on-failure`: If the command fails on a branch, continue to the next branch instead of stopping. By default, the command stops on the first failure.
 - `--tree`: Run on every branch in the stack component, including branches that fork off below HEAD, instead of only those on HEAD's own line of descent.
+- `--autostash`: Set uncommitted tracked changes aside for the run and restore them when it finishes. Untracked files stay in place for the commands. See [Uncommitted changes](#uncommitted-changes-and---autostash).
+- `--no-autostash`: Refuse to run with uncommitted tracked changes, even if autostash is configured.
 
 **What it does:**
 - Discovers stack branches from the current HEAD using the same logic as other Kindra commands.

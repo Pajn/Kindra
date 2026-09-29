@@ -55,7 +55,10 @@
 //!   `stash_ref`, `stash_apply_index` and `carry_stash_ref` as `set_asides`;
 //!   and saves the journal inside a `{"version": 1, "journal": {...}}`
 //!   envelope. A flat journal (no `version`) is converted when it is loaded.
-//!   Version 2 lets an unstaged-only set-aside record `UnstagedDelta`.
+//!   Version 2 lets an unstaged-only set-aside record `UnstagedDelta`. Later
+//!   version 2 journals record every set-aside up front and no longer save
+//!   `autostash` (absent reads as `false`), except while an older journal
+//!   still asks the rebase loop to set the tree aside.
 
 mod common;
 
@@ -622,6 +625,18 @@ fn paused_sync_linear() -> Paused {
     Paused::start(repo, &["sync"])
 }
 
+/// [`paused_sync_linear`] with a tracked file edited and an untracked file
+/// added, which the sync sets aside itself and records in the journal.
+fn paused_sync_linear_dirty() -> Paused {
+    let repo = linear_stack();
+    repo.switch("main");
+    repo.commit("shared.txt", "main\n", "main moved");
+    repo.switch("feature-b");
+    repo.write("b.txt", "dirty\n");
+    repo.write("untracked.txt", "untracked\n");
+    Paused::start(repo, &["sync", "--autostash"])
+}
+
 /// `kin sync` on `main` when `origin/main` changed the line local `main`
 /// changes.
 fn paused_sync_upstream() -> Paused {
@@ -707,8 +722,9 @@ fn paused_commit_fixup() -> Paused {
     paused_commit_fixup_with(&[])
 }
 
-/// [`paused_commit_fixup`] with `--autostash`, which the journal records
-/// alongside the unstaged changes it has already set aside.
+/// [`paused_commit_fixup`] with `--autostash`. The flag is a no-op for
+/// `kin commit`, so the journal is the same; Kindra 1.1 recorded it alongside
+/// the unstaged changes it had already set aside.
 fn paused_commit_fixup_autostash() -> Paused {
     paused_commit_fixup_with(&["--autostash"])
 }
@@ -724,6 +740,22 @@ fn paused_commit_fixup_with(extra_args: &[&str]) -> Paused {
     let mut args = vec!["commit", "--fixup", &a1];
     args.extend_from_slice(extra_args);
     Paused::start(repo, &args)
+}
+
+/// [`paused_commit_fixup`] with feature-b stacked on feature-a, so the fixup
+/// sets the unstaged changes aside itself before folding.
+fn paused_commit_fixup_dependents() -> Paused {
+    let repo = Repo::new();
+    repo.branch("feature-a");
+    repo.commit("shared.txt", "a1\n", "a1");
+    let a1 = repo.rev("HEAD");
+    repo.commit("shared.txt", "a2\n", "a2");
+    repo.branch("feature-b");
+    repo.commit("b.txt", "b\n", "b");
+    repo.switch("feature-a");
+    repo.stage("shared.txt", "fix\n");
+    repo.write("unstaged.txt", "unstaged\n");
+    Paused::start(repo, &["commit", "--fixup", &a1])
 }
 
 /// `kin commit -b inserted --insert` on feature-a, whose restack of feature-b
@@ -810,6 +842,23 @@ fn sync_linear_journal_and_status() {
 }
 
 #[test]
+fn sync_linear_dirty_journal_and_status() {
+    let mut paused = paused_sync_linear_dirty();
+    paused.assert_golden("sync_linear_dirty");
+    paused.assert_status(&format!(
+        "Sync in progress: feature-b onto main\nRemaining branches: feature-b\n{NATIVE_REBASE}"
+    ));
+    paused.continue_to_completion();
+    assert_eq!(paused.repo.current_branch(), "feature-b");
+    assert_eq!(
+        paused.repo.porcelain(),
+        " M b.txt\n?? untracked.txt\n",
+        "the set-aside changes come back when the sync completes"
+    );
+    assert_eq!(paused.repo.stash_list(), "");
+}
+
+#[test]
 fn sync_upstream_journal_and_status() {
     let mut paused = paused_sync_upstream();
     paused.assert_golden("sync_upstream");
@@ -861,6 +910,28 @@ fn commit_fixup_autostash_journal_and_status() {
     paused.assert_status(&format!(
         "Commit in progress on feature-a\nRemaining branches: \n{NATIVE_REBASE}"
     ));
+}
+
+#[test]
+fn commit_fixup_dependents_journal_and_status() {
+    let mut paused = paused_commit_fixup_dependents();
+    paused.assert_golden("commit_fixup_dependents");
+    paused.assert_status(&format!(
+        "Commit in progress on feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"
+    ));
+    let output = paused.abort();
+    assert!(
+        stdout(&output).contains("Operation aborted (state cleared)."),
+        "{}",
+        describe(&output)
+    );
+    assert_eq!(
+        paused.repo.porcelain(),
+        "M  shared.txt\n?? unstaged.txt\n",
+        "abort gives the fixup back staged and restores the set-aside changes"
+    );
+    assert_eq!(paused.repo.stash_list(), "");
+    paused.assert_restored();
 }
 
 #[test]

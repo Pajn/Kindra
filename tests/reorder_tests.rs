@@ -112,6 +112,47 @@ fn reorder_linear_stack() {
     assert_direct_parent(&repo, "feature-b", "feature-a");
 }
 
+/// `reorder` sets an untracked file aside for its rebases and restores it. A
+/// pre-rebase hook fails unless the file is out of the working tree.
+#[test]
+#[cfg(unix)]
+fn reorder_sets_untracked_files_aside_and_restores_them() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let main_id = make_commit(&repo, "refs/heads/main", "root.txt", "root", "root", &[]);
+    let main = repo.find_commit(main_id).unwrap();
+    let a_id = make_commit(&repo, "refs/heads/feature-a", "a.txt", "a", "A", &[&main]);
+    let a = repo.find_commit(a_id).unwrap();
+    make_commit(&repo, "refs/heads/feature-b", "b.txt", "b", "B", &[&a]);
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    let editor = write_editor_script(
+        &dir.path().join(".git"),
+        "branch feature-b parent main\nbranch feature-a\n",
+    );
+    fs::write(dir.path().join("scratch.txt"), "untracked\n").unwrap();
+    let hook = dir.path().join(".git/hooks/pre-rebase");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(&hook, "#!/bin/sh\ntest ! -e scratch.txt\n").unwrap();
+    run_ok("chmod", &["+x", hook.to_str().unwrap()], dir.path());
+
+    kin_cmd()
+        .arg("reorder")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_direct_parent(&repo, "feature-b", "main");
+    assert_direct_parent(&repo, "feature-a", "feature-b");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "untracked\n"
+    );
+    assert!(repo.find_reference("refs/stash").is_err());
+    assert!(!rebase_state_file(dir.path()).exists());
+}
+
 #[test]
 fn reorder_creates_fork() {
     let dir = tempdir().unwrap();
