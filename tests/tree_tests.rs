@@ -172,6 +172,100 @@ fn test_tree_simple_stack() {
     );
 }
 
+/// Git exports `GIT_DIR` to hooks, and wrappers set it too. Kindra reads the
+/// repository it discovered from the working directory, so the git queries
+/// behind stack discovery must read that same repository, not the one
+/// `GIT_DIR` names. HEAD on the trunk tip takes discovery through those queries.
+/// The other repository is a clone, so it has the same commits but only `main`
+/// as a local branch: reading it finds no stack rather than failing.
+#[test]
+fn test_tree_reads_the_discovered_repository_when_git_dir_names_another() {
+    let (dir, _repo) = setup_simple_stack();
+    let other = tempdir().unwrap();
+    common::run_ok(
+        "git",
+        &[
+            "clone",
+            "--quiet",
+            dir.path().to_str().unwrap(),
+            other.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+
+    let mut cmd = kin_cmd();
+    cmd.env("GIT_DIR", other.path().join(".git"));
+    assert_tree_lists_simple_stack(dir.path(), cmd, "GIT_DIR naming another repository");
+}
+
+/// Run `kin tree` in `dir` with `cmd`'s environment and assert it lists both
+/// branches of [`setup_simple_stack`].
+fn assert_tree_lists_simple_stack(dir: &std::path::Path, mut cmd: assert_cmd::Command, why: &str) {
+    let output = cmd
+        .arg("tree")
+        .current_dir(dir)
+        .output()
+        .expect("Failed to execute kin tree");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "kin tree failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for branch in ["feature-a", "feature-b"] {
+        assert!(
+            stdout.contains(branch),
+            "Missing {branch} with {why}:\n{stdout}"
+        );
+    }
+}
+
+/// `GIT_SHALLOW_FILE` makes git treat the commits it lists as having no
+/// parents. Kindra reads the repository's own history, so a shallow file
+/// that cuts `feature-a` off from `main` must not drop the stack.
+#[test]
+fn test_tree_ignores_a_shallow_file_from_the_environment() {
+    let (dir, repo) = setup_simple_stack();
+    let feature_a = repo.revparse_single("feature-a").unwrap().id();
+    let shallow = tempdir().unwrap();
+    let shallow_file = shallow.path().join("shallow");
+    std::fs::write(&shallow_file, format!("{feature_a}\n")).unwrap();
+
+    let mut cmd = kin_cmd();
+    cmd.env("GIT_SHALLOW_FILE", &shallow_file);
+    assert_tree_lists_simple_stack(dir.path(), cmd, "GIT_SHALLOW_FILE cutting feature-a");
+}
+
+/// Git substitutes `refs/replace/` objects by default; libgit2, which Kindra
+/// reads the stack with, does not. A replacement that gives `feature-a` no
+/// parent must not make the git side of discovery drop the stack.
+#[test]
+fn test_tree_ignores_replace_refs() {
+    let (dir, repo) = setup_simple_stack();
+    let feature_a = repo
+        .revparse_single("feature-a")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    let orphan = repo
+        .commit(
+            None,
+            &feature_a.author(),
+            &feature_a.committer(),
+            "add feature a (replacement without a parent)",
+            &feature_a.tree().unwrap(),
+            &[],
+        )
+        .unwrap();
+    common::run_ok(
+        "git",
+        &["replace", &feature_a.id().to_string(), &orphan.to_string()],
+        dir.path(),
+    );
+
+    assert_tree_lists_simple_stack(dir.path(), kin_cmd(), "a replace ref orphaning feature-a");
+}
+
 /// A fork's siblings remain visible from either tip, even without a named parent.
 #[test]
 fn test_tree_shows_full_stack_from_every_branch() {

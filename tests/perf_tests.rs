@@ -19,8 +19,8 @@ mod common;
 use common::{kin_cmd, push_remote_commit, repo_init, run_ok};
 use git2::{Repository, Signature};
 use kindra::stack::{
-    StackBranch, get_full_stack_branches_for_head, get_stack_branches_from_merge_base,
-    plan_tree_sync, resolve_merge_base,
+    StackBranch, collect_stack_component, get_full_stack_branches_for_head, get_stack_branches,
+    get_stack_branches_from_merge_base, plan_tree_sync, resolve_merge_base,
 };
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -350,6 +350,125 @@ fn full_stack_discovery_is_proportional_to_stack_size_not_branch_count() {
     eprintln!(
         "✓ Full stack discovery: {avg:?} avg over {RUNS} runs \
          (2-branch stack, {MAIN_COMMITS}-commit main, {NOISE_BRANCHES} unrelated branches)"
+    );
+}
+
+/// The fastest of a few runs of `f` after a warm-up. The minimum is less
+/// sensitive to a busy machine than the mean.
+fn fastest_run<T>(mut f: impl FnMut() -> T) -> Duration {
+    let _ = f();
+    (0..3)
+        .map(|_| {
+            let start = Instant::now();
+            let _ = f();
+            start.elapsed()
+        })
+        .min()
+        .unwrap()
+}
+
+/// Stack discovery for the commands that work on HEAD's lineage (`commit`,
+/// `move`, `absorb`, `split`, `checkout up`/`top`, `push`, `sync`) must not
+/// ask about each local branch in turn. A graph walk per branch costs local
+/// branches × history depth, which on a long history with a few hundred
+/// branches forked from old points takes seconds before the command does
+/// anything. That holds for HEAD inside a stack and for HEAD on the trunk,
+/// as on a branch just created there.
+///
+///   main (3100 commits)
+///     ├ at commit 3000: feature-a (3 commits)
+///     │                   └ feature-b (3 commits)  ← HEAD inside the stack
+///     └ at the tip: next (1 commit)                ← HEAD on the trunk tip
+///   plus 400 unrelated branches forked from points across main
+#[test]
+fn lineage_discovery_is_proportional_to_stack_not_local_branch_count() {
+    const NOISE_BRANCHES: usize = 400;
+    const MAIN_COMMITS: u32 = 3000;
+
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+
+    let _pre_stack_tip = append_commits(&repo, "refs/heads/main", MAIN_COMMITS);
+    let fork_point = repo.refname_to_id("refs/heads/main").unwrap();
+    let fa_tip = branch_with_commits(&repo, "feature-a", fork_point, 3);
+    let stack_head = branch_with_commits(&repo, "feature-b", fa_tip, 3);
+    let upstream_id = append_commits(&repo, "refs/heads/main", 100);
+    branch_with_content_commits(&repo, "next", upstream_id, 1);
+    let merge_base = resolve_merge_base(&repo, upstream_id, stack_head).unwrap();
+
+    let discover = |repo: &Repository| {
+        let in_stack =
+            get_stack_branches_from_merge_base(repo, merge_base, stack_head, upstream_id, "main")
+                .unwrap();
+        let on_trunk =
+            get_stack_branches_from_merge_base(repo, upstream_id, upstream_id, upstream_id, "main")
+                .unwrap();
+        let component =
+            collect_stack_component(repo, "feature-b", merge_base, upstream_id, "main").unwrap();
+        let lineage = get_stack_branches(repo, stack_head, upstream_id, "main").unwrap();
+        (in_stack, on_trunk, component, lineage)
+    };
+
+    // The cost of the stack alone, measured on the same machine moments before
+    // the unrelated branches exist, so runner speed and load cancel out of the
+    // comparison below.
+    pack_objects(dir.path());
+    let baseline = fastest_run(|| discover(&repo));
+
+    // Spread the unrelated branches across main so they fork from many
+    // different points rather than sharing one cheap boundary. Skip the
+    // stack's fork point and the trunk tip: a branch there would build commits
+    // identical to a stack branch's and so land on the same OIDs.
+    let main_commits: Vec<git2::Oid> = {
+        let mut walk = repo.revwalk().unwrap();
+        walk.push(upstream_id).unwrap();
+        walk.collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .filter(|&oid| oid != fork_point && oid != upstream_id)
+            .collect()
+    };
+    let step = (main_commits.len() / (NOISE_BRANCHES + 1)).max(1);
+    for (i, &base) in main_commits
+        .iter()
+        .step_by(step)
+        .take(NOISE_BRANCHES)
+        .enumerate()
+    {
+        branch_with_commits(&repo, &format!("noise-{i}"), base, 2);
+    }
+
+    pack_objects(dir.path());
+    let with_noise = fastest_run(|| discover(&repo));
+
+    let names = |branches: &[StackBranch]| {
+        let mut names: Vec<String> = branches.iter().map(|b| b.name.clone()).collect();
+        names.sort();
+        names
+    };
+    let (in_stack, on_trunk, component, lineage) = discover(&repo);
+    assert_eq!(names(&in_stack), ["feature-a", "feature-b"]);
+    assert_eq!(names(&on_trunk), ["next"]);
+    assert_eq!(names(&component), ["feature-a", "feature-b"]);
+    assert_eq!(names(&lineage), ["feature-a", "feature-b"]);
+
+    // Relating every branch to HEAD at once adds a single pass over the
+    // branch list. A walk per branch makes the unrelated branches cost two
+    // orders of magnitude more than the stack itself. The ratio is what is
+    // asserted: absolute times swing with the machine and with whatever else
+    // the runner is doing.
+    const MAX_SLOWDOWN: u32 = 4;
+    assert!(
+        with_noise < baseline * MAX_SLOWDOWN + Duration::from_millis(500),
+        "Lineage discovery took {with_noise:?} with {NOISE_BRANCHES} unrelated branches \
+         against {baseline:?} without them — expected at most {MAX_SLOWDOWN}x.\n\
+         This suggests a history walk per local branch is back.\n\
+         Scenario: 2-branch stack on a {MAIN_COMMITS}-commit main."
+    );
+
+    eprintln!(
+        "✓ Lineage discovery: {with_noise:?} with {NOISE_BRANCHES} unrelated branches, \
+         {baseline:?} without (2-branch stack, {MAIN_COMMITS}-commit main)"
     );
 }
 
