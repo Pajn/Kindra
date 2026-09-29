@@ -12,6 +12,12 @@
 //! the operation's lifecycle it happens in, not the command:
 //! [`restore_all`] applies that policy to a journal's set-asides and
 //! [`restore`] to a single one.
+//!
+//! Restoring applies an entry but does not drop it: whoever records the
+//! set-aside drops the entry with [`drop_restored`] once the record is gone,
+//! and [`restore_all`] does so after saving the journal without it. A record
+//! whose entry is no longer on the stash stack is treated as restored, since
+//! an entry is dropped only after its changes were applied.
 
 use anyhow::{Result, anyhow};
 use git2::Repository;
@@ -178,7 +184,8 @@ pub enum Phase {
 /// How restoring one set-aside ended.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Outcome {
-    /// The changes are back and the entry was dropped.
+    /// The changes are back. The entry stays on the stash stack until the
+    /// caller drops it with [`drop_restored`].
     Restored,
     /// The changes are in the tree as conflict markers, so the entry must not
     /// be applied again; it is kept as a backup.
@@ -311,7 +318,8 @@ pub fn from_message(kind: Kind, stash: String, restore: Restore) -> SetAside {
 ///
 /// A set-aside leaves the journal once its changes are back in the tree,
 /// cleanly or as conflict markers, and Completion and Abort save the journal
-/// each time; Unwind and NonResumable never save it. Restoring stops at the
+/// each time; Unwind and NonResumable never save it. A cleanly restored
+/// entry is dropped after that save. Restoring stops at the
 /// first set-aside that does not come back cleanly (Abort alone goes on past
 /// conflicts): an older one could overlap it (the carry of `kin commit --on`
 /// is also part of its unstaged changes' entry).
@@ -329,9 +337,15 @@ pub fn restore_all(repo: &Repository, journal: &mut impl Journal, phase: Phase) 
         let outcome = restore(repo, &set_aside, phase);
         if !matches!(outcome, Outcome::NotRestored { .. }) {
             journal.set_asides().pop();
-            if saves {
-                journal.save(repo)?;
+            let saved = if saves { journal.save(repo) } else { Ok(()) };
+            // Drop the entry even when the save failed: the journal on disk
+            // then still records it, and an entry left in place would be
+            // applied a second time over its own changes. A record whose
+            // entry is gone is skipped as restored.
+            if outcome == Outcome::Restored {
+                drop_restored(&set_aside);
             }
+            saved?;
         }
         match (&outcome, phase) {
             (Outcome::Restored, _) => continue,
@@ -363,7 +377,8 @@ pub fn restore_all(repo: &Repository, journal: &mut impl Journal, phase: Phase) 
 
 /// Restore every set-aside in `set_asides` while unwinding a command,
 /// newest first, whether or not a journal records them: [`restore_all`] in
-/// [`Phase::Unwind`], which never saves and never fails.
+/// [`Phase::Unwind`], which never saves and never fails, and drops each
+/// restored entry at once.
 pub fn unwind(repo: &Repository, set_asides: &mut SetAsides) -> Outcome {
     struct Unsaved<'a>(&'a mut SetAsides);
     impl Journal for Unsaved<'_> {
@@ -381,8 +396,9 @@ pub fn unwind(repo: &Repository, set_asides: &mut SetAsides) -> Outcome {
     })
 }
 
-/// Restore one set-aside in `phase` and drop its entry once the changes are
-/// back cleanly. The phase picks how it is applied (the record's
+/// Restore one set-aside in `phase`, leaving its entry on the stash stack:
+/// on [`Outcome::Restored`] the caller drops it with [`drop_restored`] once no
+/// saved journal records it. The phase picks how it is applied (the record's
 /// [`Restore`], except that Unwind always tries to bring the staged state
 /// back and Abort applies an unstaged-only entry whole) and, in Abort, Unwind
 /// and NonResumable, prints the warning for an outcome that is not clean.
@@ -426,10 +442,30 @@ impl SetAside {
     }
 }
 
-/// Apply `set_aside` as `how` says, and drop its entry once it applied
-/// cleanly. An error means the changes are not back.
+/// Drop the entry of a set-aside whose changes are back, once no saved
+/// journal records it (or none ever did). An entry already gone needs
+/// nothing; one that cannot be dropped is a warning, since the changes are
+/// back either way.
+pub fn drop_restored(set_aside: &SetAside) {
+    if let Err(err) = drop_entry(set_aside) {
+        eprintln!("Warning: {err:#}");
+    }
+}
+
+/// Apply `set_aside` as `how` says, leaving its entry in place. An error means
+/// the changes are not back.
+///
+/// A record whose entry is no longer on the stash stack was restored already:
+/// an entry is dropped only after its changes were applied, and a journal
+/// outlives that when saving it without the record failed.
 fn attempt(repo: &Repository, set_aside: &SetAside, how: Restore) -> Result<Outcome> {
-    let reference = resolve(set_aside)?;
+    let Located::Entry(reference) = locate(set_aside)? else {
+        eprintln!(
+            "Warning: stash entry '{}' is no longer on the stash stack, so there is nothing to restore from it; treating it as already restored.",
+            set_aside.stash
+        );
+        return Ok(Outcome::Restored);
+    };
     // Derive revisions from the stash commit's id: `stash@{N}` names whichever
     // entry is at N when each Git command runs.
     let commit = git_output(&["rev-parse", "--verify", &reference])?;
@@ -456,17 +492,11 @@ fn attempt(repo: &Repository, set_aside: &SetAside, how: Restore) -> Result<Outc
             ),
         });
     }
-    let outcome = match how {
-        Restore::Plain => apply(&reference, false, set_aside)?,
-        Restore::WithIndex => apply_with_index(&reference, set_aside)?,
-        Restore::UnstagedDelta => apply(&unstaged_delta(&commit)?, false, set_aside)?,
-    };
-    if outcome == Outcome::Restored
-        && let Err(err) = drop_entry(set_aside)
-    {
-        eprintln!("Warning: {err}");
+    match how {
+        Restore::Plain => apply(&reference, false, set_aside),
+        Restore::WithIndex => apply_with_index(&reference, set_aside),
+        Restore::UnstagedDelta => apply(&unstaged_delta(&commit)?, false, set_aside),
     }
-    Ok(outcome)
 }
 
 /// Apply a stash with its recorded index state (`--index`) so previously
@@ -629,9 +659,11 @@ fn status_porcelain() -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-/// Drop `set_aside`'s stash entry.
+/// Drop `set_aside`'s stash entry, if it is still there.
 fn drop_entry(set_aside: &SetAside) -> Result<()> {
-    let resolved_ref = resolve(set_aside)?;
+    let Located::Entry(resolved_ref) = locate(set_aside)? else {
+        return Ok(());
+    };
     let status = Command::new("git")
         .arg("stash")
         .arg("drop")
@@ -643,20 +675,37 @@ fn drop_entry(set_aside: &SetAside) -> Result<()> {
     Ok(())
 }
 
-/// The `stash@{N}` reference of `set_aside`'s entry: by its stash commit when
-/// the record has one, otherwise by its exact message.
-fn resolve(set_aside: &SetAside) -> Result<String> {
-    if set_aside.stash.starts_with("stash@{") {
-        return Ok(set_aside.stash.clone());
-    }
+/// Where a set-aside's entry is on the stash stack.
+#[derive(Debug, PartialEq, Eq)]
+enum Located {
+    /// The entry's `stash@{N}` reference.
+    Entry(String),
+    /// No entry matches the record.
+    Gone,
+}
 
-    let entry = match &set_aside.oid {
-        Some(oid) => entries()?.into_iter().find(|entry| &entry.oid == oid),
-        None => find_by_message(&set_aside.stash)?,
-    };
-    entry
-        .map(|entry| entry.reference)
-        .ok_or_else(|| anyhow!("Could not locate stash entry '{}'.", set_aside.stash))
+/// Find `set_aside`'s entry: by its stash commit when the record has one,
+/// otherwise by its exact message. A `stash@{N}` record (Kindra 1.1 or
+/// earlier) names a position rather than an entry, so it is used as it is
+/// and never found gone.
+fn locate(set_aside: &SetAside) -> Result<Located> {
+    if set_aside.stash.starts_with("stash@{") {
+        return Ok(Located::Entry(set_aside.stash.clone()));
+    }
+    Ok(locate_in(&entries()?, set_aside))
+}
+
+/// [`locate`] among `entries`.
+fn locate_in(entries: &[Entry], set_aside: &SetAside) -> Located {
+    entries
+        .iter()
+        .find(|entry| match &set_aside.oid {
+            Some(oid) => &entry.oid == oid,
+            None => entry.message == set_aside.stash,
+        })
+        .map_or(Located::Gone, |entry| {
+            Located::Entry(entry.reference.clone())
+        })
 }
 
 struct Entry {
@@ -706,7 +755,7 @@ fn entries() -> Result<Vec<Entry>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, Restore, SetAside, SetAsides};
+    use super::{Entry, Kind, Located, Restore, SetAside, SetAsides, locate_in};
 
     fn set_aside(kind: Kind, stash: &str, restore: Restore) -> SetAside {
         SetAside {
@@ -769,6 +818,46 @@ mod tests {
         );
         assert_eq!(set_asides.pop().map(|s| s.kind), Some(Kind::UnstagedOnly));
         assert!(set_asides.is_empty());
+    }
+
+    fn entry(reference: &str, oid: &str, message: &str) -> Entry {
+        Entry {
+            reference: reference.to_string(),
+            oid: oid.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    /// A record is matched by its stash commit, so an entry pushed later with
+    /// the same message is not mistaken for it: the record's own entry is
+    /// gone, and restoring treats it as already restored.
+    #[test]
+    fn a_record_whose_stash_commit_is_not_listed_is_gone() {
+        let entries = [
+            entry("stash@{0}", "bbbb", "kin-autostash-1-2"),
+            entry("stash@{1}", "cccc", "kin-autostash-1-1"),
+        ];
+        let mut record = set_aside(Kind::WholeTree, "kin-autostash-1-2", Restore::WithIndex);
+        record.oid = Some("aaaa".to_string());
+        assert_eq!(locate_in(&entries, &record), Located::Gone);
+
+        record.oid = Some("cccc".to_string());
+        assert_eq!(
+            locate_in(&entries, &record),
+            Located::Entry("stash@{1}".to_string())
+        );
+    }
+
+    #[test]
+    fn a_record_without_a_stash_commit_is_found_by_its_message() {
+        let entries = [entry("stash@{0}", "bbbb", "kin-autostash-1-2")];
+        let found = set_aside(Kind::WholeTree, "kin-autostash-1-2", Restore::WithIndex);
+        assert_eq!(
+            locate_in(&entries, &found),
+            Located::Entry("stash@{0}".to_string())
+        );
+        let gone = set_aside(Kind::WholeTree, "kin-autostash-1-1", Restore::WithIndex);
+        assert_eq!(locate_in(&entries, &gone), Located::Gone);
     }
 
     #[test]

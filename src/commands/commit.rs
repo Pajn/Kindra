@@ -1803,19 +1803,23 @@ fn carry_staged_changes_onto(
         // The saved journal already records the unstaged changes, so only the
         // carry goes back. If it cannot, keep it and try again to record it,
         // with nothing to continue, so `kin abort` restores it.
-        if matches!(
-            set_aside::restore(repo, &carry_stash, Phase::Unwind),
-            Outcome::NotRestored { .. }
-        ) {
-            state.abort_only = true;
-            if let Err(save_err) = save_state(repo, state) {
-                return Err(err.context(format!(
-                    "Additionally, recording the staged changes set aside in stash entry '{}' failed ({save_err:#}).",
-                    carry_stash.stash
-                )));
+        match set_aside::restore(repo, &carry_stash, Phase::Unwind) {
+            Outcome::NotRestored { .. } => {
+                state.abort_only = true;
+                if let Err(save_err) = save_state(repo, state) {
+                    return Err(err.context(format!(
+                        "Additionally, recording the staged changes set aside in stash entry '{}' failed ({save_err:#}).",
+                        carry_stash.stash
+                    )));
+                }
             }
-        } else {
-            state.set_asides.take_carry();
+            outcome => {
+                state.set_asides.take_carry();
+                // No saved journal ever recorded the carry.
+                if outcome == Outcome::Restored {
+                    set_aside::drop_restored(&carry_stash);
+                }
+            }
         }
         return Err(err);
     }
@@ -1824,14 +1828,20 @@ fn carry_staged_changes_onto(
         // Nothing moved, so put the staged content back on the branch it was
         // taken from and leave the rest of the state for `kin abort`. Nothing
         // was committed either, so there is nothing for `kin continue` to do.
-        if !matches!(
-            set_aside::restore(repo, &carry_stash, Phase::Unwind),
-            Outcome::NotRestored { .. }
-        ) {
+        let outcome = set_aside::restore(repo, &carry_stash, Phase::Unwind);
+        if !matches!(outcome, Outcome::NotRestored { .. }) {
             state.set_asides.take_carry();
         }
         state.abort_only = true;
-        save_state(repo, state)?;
+        // The entry goes once the journal no longer records it, and also if
+        // saving that failed, as `set_aside::restore_all` does: the saved
+        // journal then skips a carry whose entry is gone rather than apply
+        // it twice.
+        let saved = save_state(repo, state);
+        if outcome == Outcome::Restored {
+            set_aside::drop_restored(&carry_stash);
+        }
+        saved?;
         return Err(err.context(
             "Failed to checkout target branch. Use 'kin abort' to restore original state.",
         ));
@@ -1840,7 +1850,10 @@ fn carry_staged_changes_onto(
     match set_aside::restore(repo, &carry_stash, Phase::Completion) {
         Outcome::Restored => {
             state.set_asides.take_carry();
-            save_state(repo, state)
+            // Dropped after the save, whether or not it succeeded, as above.
+            let saved = save_state(repo, state);
+            set_aside::drop_restored(&carry_stash);
+            saved
         }
         Outcome::ConflictsLeft { .. } => {
             // A real conflict between the staged change and the target branch —
