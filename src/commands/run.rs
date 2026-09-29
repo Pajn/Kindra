@@ -235,7 +235,11 @@ fn restore_run_stash(repo: &Repository, run_state: &mut RunState) {
     // `run` is a reporter, not a resumable operation, so callers clear the
     // run-state file after this returns: a restore that does not go cleanly
     // is reported with the entry that still holds the changes.
-    crate::set_aside::restore(repo, &set_aside, crate::set_aside::Phase::NonResumable);
+    if crate::set_aside::restore(repo, &set_aside, crate::set_aside::Phase::NonResumable)
+        == crate::set_aside::Outcome::Restored
+    {
+        crate::set_aside::drop_restored(&set_aside);
+    }
 }
 
 fn clear_run_state(repo: &Repository) -> Result<()> {

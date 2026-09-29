@@ -446,8 +446,11 @@ fn apply_split(
 /// `split` is not resumable, so a restore that does not go cleanly keeps the
 /// entry and points the user straight at it.
 fn restore_split_autostash(repo: &Repository, set_aside: Option<crate::set_aside::SetAside>) {
-    if let Some(set_aside) = set_aside {
-        crate::set_aside::restore(repo, &set_aside, crate::set_aside::Phase::NonResumable);
+    if let Some(set_aside) = set_aside
+        && crate::set_aside::restore(repo, &set_aside, crate::set_aside::Phase::NonResumable)
+            == crate::set_aside::Outcome::Restored
+    {
+        crate::set_aside::drop_restored(&set_aside);
     }
 }
 

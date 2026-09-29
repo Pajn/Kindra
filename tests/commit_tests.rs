@@ -1293,6 +1293,159 @@ fn test_abort_keeps_an_older_set_aside_git_refuses_over_conflicts() {
     assert!(!stashes.contains("kin-commit-on-1-1"), "{stashes}");
 }
 
+/// A paused `kin commit` journal on `main` recording two set-asides, oldest
+/// first: `older.txt` then `newer.txt`, each an edit of a committed file.
+/// Returns their stash messages.
+fn save_journal_with_two_set_asides(dir: &Path, repo: &Repository) -> [&'static str; 2] {
+    run_ok("git", &["checkout", "-f", "main"], dir);
+    for file in ["older.txt", "newer.txt"] {
+        fs::write(dir.join(file), "committed\n").unwrap();
+    }
+    run_ok("git", &["add", "older.txt", "newer.txt"], dir);
+    run_ok("git", &["commit", "-qm", "add files"], dir);
+
+    let messages = ["kin-autostash-1-1", "kin-autostash-1-2"];
+    let mut set_asides = Vec::new();
+    for (file, message) in ["older.txt", "newer.txt"].into_iter().zip(messages) {
+        fs::write(dir.join(file), "set aside\n").unwrap();
+        run_ok("git", &["stash", "push", "-m", message], dir);
+        set_asides.push(SetAside {
+            kind: Kind::WholeTree,
+            stash: message.to_string(),
+            oid: Some(
+                git_stdout(dir, &["rev-parse", "stash@{0}"])
+                    .trim()
+                    .to_string(),
+            ),
+            restore: Restore::WithIndex,
+        });
+    }
+    assert_eq!(git_stdout(dir, &["status", "--porcelain"]), "");
+
+    let main_tip = git_stdout(dir, &["rev-parse", "main"]).trim().to_string();
+    let state = RebaseState {
+        original_tip_map: HashMap::from([("main".to_string(), main_tip.clone())]),
+        owned_tip_map: HashMap::from([("main".to_string(), main_tip)]),
+        set_asides: set_asides.into(),
+        ..rebase_state(Operation::Commit, "main", "main")
+    };
+    save_state(repo, &state).unwrap();
+    messages
+}
+
+/// Restoring a set-aside removes its record from the journal, and the stash
+/// entry goes once its changes are back. When saving the journal without the
+/// record fails, the journal on disk still names the entry. A later
+/// `kin abort` must not apply those changes a second time, nor stop on the
+/// missing entry: it restores the older set-aside and finishes.
+#[test]
+#[cfg(unix)]
+fn test_abort_recovers_when_the_journal_save_after_a_restore_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, repo) = setup_repo();
+    let [older, newer] = save_journal_with_two_set_asides(dir.path(), &repo);
+
+    // The first stash apply that succeeds makes every later save of the
+    // journal fail.
+    let bin = tempdir().unwrap();
+    let marker = bin.path().join("fail-state-write");
+    let wrapper = bin.path().join("git");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh
+if [ \"$1\" = stash ] && [ \"$2\" = apply ]; then
+  \"$KIN_TEST_REAL_GIT\" \"$@\" || exit $?
+  printf '%s' \"$KIN_TEST_STATE\" > \"$KIN_TEST_FAIL_STATE_WRITE\"
+  exit 0
+fi
+exec \"$KIN_TEST_REAL_GIT\" \"$@\"
+",
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+
+    let output = kin_cmd()
+        .current_dir(dir.path())
+        .arg("abort")
+        .env("PATH", path)
+        .env("KIN_TEST_REAL_GIT", which::which("git").unwrap())
+        .env("KIN_TEST_STATE", rebase_state_file(dir.path()))
+        .env("KIN_TEST_FAIL_STATE_WRITE", &marker)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("Injected state write failure"), "{stderr}");
+
+    // The newest set-aside is back; the journal on disk still names both.
+    assert_eq!(
+        fs::read_to_string(dir.path().join("newer.txt")).unwrap(),
+        "set aside\n"
+    );
+    assert_eq!(
+        journal_set_asides(dir.path()),
+        [
+            ("WholeTree".to_string(), older.to_string()),
+            ("WholeTree".to_string(), newer.to_string()),
+        ]
+    );
+
+    let output = kin_cmd()
+        .current_dir(dir.path())
+        .arg("abort")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains(newer), "{stderr}");
+    assert!(!rebase_state_file(dir.path()).exists());
+    for file in ["older.txt", "newer.txt"] {
+        assert_eq!(
+            fs::read_to_string(dir.path().join(file)).unwrap(),
+            "set aside\n",
+            "{file}"
+        );
+    }
+    assert_eq!(
+        git_stdout(dir.path(), &["status", "--porcelain"]),
+        " M newer.txt\n M older.txt\n"
+    );
+    assert_eq!(git_stdout(dir.path(), &["stash", "list"]), "");
+}
+
+/// A journal can name a set-aside whose stash entry is gone: it is removed
+/// only after its changes were restored. `kin continue` treats such a record
+/// as restored, says so naming the entry, and goes on to the older ones.
+#[test]
+fn test_continue_skips_a_set_aside_whose_stash_entry_is_gone() {
+    let (dir, repo) = setup_repo();
+    let [older, newer] = save_journal_with_two_set_asides(dir.path(), &repo);
+    // The newest set-aside was restored and dropped, but its record stayed.
+    run_ok("git", &["stash", "pop", "-q", "stash@{0}"], dir.path());
+
+    let output = kin_cmd()
+        .current_dir(dir.path())
+        .arg("continue")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains(newer), "{stderr}");
+    assert!(!stderr.contains(older), "{stderr}");
+    assert!(!rebase_state_file(dir.path()).exists());
+    assert_eq!(
+        git_stdout(dir.path(), &["status", "--porcelain"]),
+        " M newer.txt\n M older.txt\n"
+    );
+    assert_eq!(git_stdout(dir.path(), &["stash", "list"]), "");
+}
+
 #[test]
 fn test_abort_preserves_stash_when_owned_tip_map_mismatches() {
     let (dir, _repo) = setup_repo();
