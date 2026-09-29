@@ -1,7 +1,7 @@
 use crate::operation_state::{KindraOperation, NativeOperation};
 use crate::rebase_utils::{
-    RebaseState, ReconcileMode, Replay, git_rebase_in_progress, has_staged_changes,
-    reconcile_saved_rebase_state, run_rebase_loop,
+    RebaseState, ReconcileMode, git_rebase_in_progress, has_staged_changes,
+    reconcile_saved_rebase_state, resume_rebase_loop,
 };
 use anyhow::{Result, anyhow};
 use git2::Repository;
@@ -74,12 +74,9 @@ fn continue_cmd_locked(repo: &git2::Repository, kindra: &KindraOperation) -> Res
         }
     }
 
-    // A linear sync's single rebase is finished; every other replay resumes
-    // the loop, which finishes the operation once no branch remains.
-    match state.replay() {
-        Replay::SyncLinear => crate::commands::sync::finish_sync_after_rebase(repo, state),
-        Replay::Branches | Replay::SyncTree => run_rebase_loop(repo, state),
-    }
+    // The loop replays what remains and finishes the operation once no
+    // branch remains.
+    resume_rebase_loop(repo, state)
 }
 
 /// Run `git rebase <step>` with the editor resolved per the saved state.

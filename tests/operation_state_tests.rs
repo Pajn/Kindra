@@ -58,7 +58,11 @@
 //!   Version 2 lets an unstaged-only set-aside record `UnstagedDelta`. Later
 //!   version 2 journals record every set-aside up front and no longer save
 //!   `autostash` (absent reads as `false`), except while an older journal
-//!   still asks the rebase loop to set the tree aside.
+//!   still asks the rebase loop to set the tree aside. Version 3 drops
+//!   `replay`: `rebase_options` says how each rebase runs, a tree sync
+//!   records its planned parents in `new_base_map`, and sync finishes in the
+//!   shared rebase loop. The `@journal-v2` fixtures are version 2 journals,
+//!   saved by builds after 1.1.0 that no release shipped.
 
 mod common;
 
@@ -988,14 +992,15 @@ fn journal_is_saved_in_an_envelope_older_kindra_cannot_parse() {
     let mut keys: Vec<_> = saved.as_object().unwrap().keys().cloned().collect();
     keys.sort();
     assert_eq!(keys, ["journal", "version"]);
-    assert_eq!(saved["version"], Value::from(2));
+    assert_eq!(saved["version"], Value::from(3));
     assert!(saved["journal"]["operation"].is_string());
 }
 
 /// The `operation` label only names the command that paused: how the paused
-/// rebase is resumed and finished comes from `replay`. A linear sync whose
-/// label says otherwise still finishes as a sync, deleting the merged branches
-/// it recorded.
+/// rebase is resumed and finished comes from what the journal records (its
+/// `rebase_options` and `cleanup_merged_branches`). A linear sync whose label
+/// says otherwise still finishes as a sync, deleting the merged branches it
+/// recorded.
 #[test]
 fn replay_not_the_label_decides_how_a_paused_sync_finishes() {
     let paused = paused_sync_linear();
@@ -1052,8 +1057,8 @@ fn journal_from_a_newer_kindra_is_refused_with_advice() {
 fn journal_with_a_newer_version_is_refused_with_advice() {
     let paused = paused_commit_fixup();
     let mut journal = paused.repo.state_json();
-    assert_eq!(journal["version"], Value::from(2));
-    journal["version"] = Value::from(3);
+    assert_eq!(journal["version"], Value::from(3));
+    journal["version"] = Value::from(4);
     let saved = serde_json::to_string_pretty(&journal).unwrap();
     fs::write(paused.repo.state_path(), &saved).unwrap();
 
@@ -1062,7 +1067,7 @@ fn journal_with_a_newer_version_is_refused_with_advice() {
         assert!(!output.status.success(), "{}", describe(&output));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("newer version of kin"), "{stderr}");
-        assert!(stderr.contains("journal version 3"), "{stderr}");
+        assert!(stderr.contains("journal version 4"), "{stderr}");
         assert!(stderr.contains("kin abort --clear-state"), "{stderr}");
         assert_eq!(fs::read_to_string(paused.repo.state_path()).unwrap(), saved);
         assert!(paused.repo.rebase_in_progress());
@@ -1081,7 +1086,7 @@ fn journal_with_a_newer_version_is_refused_with_advice() {
 fn journal_of_an_older_version_still_continues() {
     let paused = paused_absorb();
     let mut journal = paused.repo.state_json();
-    assert_eq!(journal["version"], Value::from(2));
+    assert_eq!(journal["version"], Value::from(3));
     journal["version"] = Value::from(1);
     fs::write(
         paused.repo.state_path(),
@@ -1395,6 +1400,123 @@ fn legacy_sync_tree_1_1_0_continues() {
             ("feature-a", "feature-c"),
         ],
     );
+}
+
+// Version 2 journals, saved before sync finished in the shared rebase loop,
+// record `replay` instead of `rebase_options`.
+
+#[test]
+fn legacy_sync_linear_journal_v2_aborts() {
+    assert_legacy_replay_aborts(
+        paused_sync_linear,
+        "sync_linear@journal-v2",
+        &sync_linear_status(),
+    );
+}
+
+#[test]
+fn legacy_sync_linear_journal_v2_continues() {
+    assert_legacy_replay_continues(
+        paused_sync_linear,
+        "sync_linear@journal-v2",
+        "feature-b",
+        &[("main", "feature-a"), ("feature-a", "feature-b")],
+    );
+}
+
+/// A version 2 linear sync ran its one rebase only when it started: once
+/// that rebase is aborted with Git, `kin continue` refuses rather than start
+/// it again, and leaves the journal for `kin abort`.
+#[test]
+fn legacy_sync_linear_journal_v2_refuses_to_restart_an_abandoned_rebase() {
+    let paused = paused_with_legacy(paused_sync_linear, "sync_linear@journal-v2");
+    paused.repo.git(&["rebase", "--abort"]);
+    let tips = paused.repo.tips();
+
+    let output = paused.repo.kin(&["continue"]);
+    assert!(!output.status.success(), "{}", describe(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Sync did not complete: 'feature-b' is not rebased onto 'main'"),
+        "{stderr}"
+    );
+    assert!(paused.repo.state_path().exists());
+    assert!(!paused.repo.rebase_in_progress());
+    assert_eq!(paused.repo.tips(), tips);
+
+    paused.abort();
+    paused.assert_restored();
+}
+
+/// A version 2 linear sync keeps the working-tree changes it set aside, and
+/// gives them back when it completes or is aborted.
+#[test]
+fn legacy_sync_linear_dirty_journal_v2_restores_its_set_aside() {
+    for abort in [false, true] {
+        let paused = paused_with_legacy(paused_sync_linear_dirty, "sync_linear_dirty@journal-v2");
+        if abort {
+            paused.abort();
+            paused.assert_restored();
+        } else {
+            paused.continue_to_completion();
+            assert_eq!(paused.repo.current_branch(), "feature-b");
+            assert!(paused.repo.is_ancestor("main", "feature-a"));
+            assert!(paused.repo.is_ancestor("feature-a", "feature-b"));
+        }
+        assert_eq!(
+            paused.repo.porcelain(),
+            " M b.txt\n?? untracked.txt\n",
+            "abort: {abort}"
+        );
+        assert_eq!(paused.repo.stash_list(), "");
+    }
+}
+
+#[test]
+fn legacy_sync_upstream_journal_v2_aborts() {
+    assert_legacy_replay_aborts(
+        paused_sync_upstream,
+        "sync_upstream@journal-v2",
+        &sync_upstream_status(),
+    );
+}
+
+#[test]
+fn legacy_sync_upstream_journal_v2_continues() {
+    assert_legacy_replay_continues(
+        paused_sync_upstream,
+        "sync_upstream@journal-v2",
+        "main",
+        &[("origin/main", "main")],
+    );
+}
+
+#[test]
+fn legacy_sync_tree_journal_v2_aborts() {
+    assert_legacy_replay_aborts(
+        paused_sync_tree,
+        "sync_tree@journal-v2",
+        &sync_tree_status(),
+    );
+}
+
+/// The tree sync's original branch was already rebased when it paused; the
+/// rest land on it, each directly on its planned parent.
+#[test]
+fn legacy_sync_tree_journal_v2_continues() {
+    let paused = assert_legacy_replay_continues(
+        paused_sync_tree,
+        "sync_tree@journal-v2",
+        "feature-a",
+        &[
+            ("main", "feature-a"),
+            ("feature-a", "feature-b"),
+            ("feature-a", "feature-c"),
+        ],
+    );
+    assert_eq!(paused.repo.rev("feature-a^"), paused.repo.rev("main"));
+    assert_eq!(paused.repo.rev("feature-b^"), paused.repo.rev("feature-a"));
+    assert_eq!(paused.repo.rev("feature-c^"), paused.repo.rev("feature-a"));
 }
 
 /// What `kin abort` leaves behind for a paused commit or absorb, besides an

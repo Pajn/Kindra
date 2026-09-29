@@ -12,7 +12,8 @@ use crate::set_aside::{self, SetAsides};
 use crate::stack::collect_first_parent_chain;
 
 /// The command that paused, persisted as `operation`. It is a label for `kin
-/// status`, refusals and messages only: behaviour comes from [`Replay`].
+/// status`, refusals and messages only: behaviour comes from what the journal
+/// records, such as its [`RebaseOptions`] and bases.
 ///
 /// Kindra 1.1 and earlier saved restack as `Move` and absorb as `Commit`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,40 +38,123 @@ impl Operation {
             Operation::Absorb => "absorb",
         }
     }
+
+    /// The command's name at the start of a sentence.
+    fn title(self) -> &'static str {
+        match self {
+            Operation::Move => "Move",
+            Operation::Reorder => "Reorder",
+            Operation::Commit => "Commit",
+            Operation::Sync => "Sync",
+            Operation::Restack => "Restack",
+            Operation::Absorb => "Absorb",
+        }
+    }
 }
 
-/// How a paused operation's rebases are replayed and finished.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Replay {
-    /// Replay each remaining branch onto its new base; the original branch,
-    /// if it is replayed, lands on `target_branch`. Finishes by returning to
-    /// the caller (or original) branch and restoring what was set aside.
+/// How [`run_rebase_loop`] runs each branch's `git rebase`. Every option is
+/// off by default, which is how move, restack, reorder, commit and absorb
+/// replay their branches.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct RebaseOptions {
+    /// Keep commits the new base already has and commits that become empty
+    /// (`--reapply-cherry-picks --empty=keep`), so a sync never drops a
+    /// commit because the trunk has an equivalent one.
+    pub keep_cherry_picks: bool,
+    /// Leave a branch already on its new base as it is instead of recreating
+    /// its commits (no `--no-ff`).
+    pub fast_forward: bool,
+    /// Leave other branches that point into the replayed range where they
+    /// are (no `--update-refs`): a sync of the trunk moves only the trunk.
+    pub keep_other_refs: bool,
+    /// Each rebase runs only when the operation starts. `kin continue`
+    /// finishes a stopped rebase, but where one is neither stopped nor
+    /// complete, for example because it was aborted with Git, it refuses
+    /// rather than start it again.
+    pub no_restart: bool,
+}
+
+/// What a journal saved before [`JOURNAL_VERSION`] 3 recorded in `replay`
+/// about how its rebases run. Loading converts it into the [`RebaseOptions`]
+/// and bases that version 3 records instead.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyReplay {
+    /// Replay each remaining branch onto its new base; the original branch
+    /// lands on `target_branch`.
     Branches,
     /// Tree sync: replay each remaining branch onto its planned parent,
-    /// keeping cherry-picks and empty commits, then finish as a sync
-    /// (return to the caller, delete merged branches).
+    /// keeping cherry-picks and empty commits.
     SyncTree,
     /// Linear sync: one Git rebase of `original_branch` onto `target_branch`,
-    /// complete once the one descends from the other, then finish as a sync.
+    /// run once, keeping cherry-picks and empty commits.
     SyncLinear,
 }
 
-impl Replay {
-    /// What a journal saved without `replay` (Kindra 1.1 and earlier) meant:
-    /// a sync with parent names is a tree sync, one without is linear, and
-    /// every other operation replays branches.
-    fn of_legacy(operation: Operation, parent_name_map: &HashMap<String, String>) -> Self {
-        match operation {
-            Operation::Sync if parent_name_map.is_empty() => Replay::SyncLinear,
-            Operation::Sync => Replay::SyncTree,
-            _ => Replay::Branches,
-        }
+/// The fields of a journal saved before version 3 that say how it replays.
+#[derive(Deserialize)]
+struct LegacyReplayFields {
+    operation: Operation,
+    #[serde(default)]
+    replay: Option<LegacyReplay>,
+    #[serde(default)]
+    parent_name_map: HashMap<String, String>,
+}
+
+impl LegacyReplay {
+    /// How the journal `fields` replays: its `replay`, or for a journal saved
+    /// without one (Kindra 1.1 and earlier) what its label meant then: a sync
+    /// with parent names is a tree sync, one without is linear, and every
+    /// other operation replays branches.
+    fn of(fields: &LegacyReplayFields) -> Self {
+        fields.replay.unwrap_or(match fields.operation {
+            Operation::Sync if fields.parent_name_map.is_empty() => LegacyReplay::SyncLinear,
+            Operation::Sync => LegacyReplay::SyncTree,
+            _ => LegacyReplay::Branches,
+        })
     }
 
-    /// Whether the rebases keep cherry-picks and empty commits and the
-    /// operation finishes with sync's cleanup.
-    pub fn is_sync(self) -> bool {
-        matches!(self, Replay::SyncTree | Replay::SyncLinear)
+    /// Record in `state` what this replay meant, so the rebase loop runs and
+    /// finishes it as the Kindra that saved it would have. The merged
+    /// branches a sync deletes are already recorded in
+    /// `cleanup_merged_branches`.
+    fn apply(self, state: &mut RebaseState) {
+        match self {
+            LegacyReplay::Branches => {}
+            LegacyReplay::SyncTree => {
+                state.rebase_options = RebaseOptions {
+                    keep_cherry_picks: true,
+                    ..RebaseOptions::default()
+                };
+                // Every branch lands on its planned parent, the original one
+                // included, which a replay of branches would put on
+                // `target_branch` instead.
+                for branch in &state.remaining_branches {
+                    let base = state
+                        .parent_name_map
+                        .get(branch)
+                        .or_else(|| state.parent_id_map.get(branch));
+                    if let Some(base) = base {
+                        state
+                            .new_base_map
+                            .entry(branch.clone())
+                            .or_insert_with(|| base.clone());
+                    }
+                }
+            }
+            LegacyReplay::SyncLinear => {
+                state.rebase_options = RebaseOptions {
+                    keep_cherry_picks: true,
+                    fast_forward: true,
+                    // A sync of the trunk rebased the trunk alone, and is the
+                    // one linear sync whose fallback checkout is the branch
+                    // it rebases.
+                    keep_other_refs: state.cleanup_checkout_fallback.as_ref()
+                        == Some(&state.original_branch),
+                    no_restart: true,
+                };
+            }
+        }
     }
 }
 
@@ -78,11 +162,9 @@ impl Replay {
 pub struct RebaseState {
     /// The command that paused; a label only (see [`Operation`]).
     pub operation: Operation,
-    /// How the rebases are replayed and finished. Read it through
-    /// [`RebaseState::replay`]: `None` in a journal saved before the field
-    /// existed, whose replay is derived from its label.
+    /// How each branch's `git rebase` runs.
     #[serde(default)]
-    pub replay: Option<Replay>,
+    pub rebase_options: RebaseOptions,
     /// Branch that acts as the rebase-root for this operation.
     pub original_branch: String,
     /// Operation target branch (for move: onto branch, for commit: commit target).
@@ -100,7 +182,8 @@ pub struct RebaseState {
     /// branch_name -> original_parent_name (if it was a branch in the sub-stack)
     #[serde(default)]
     pub parent_name_map: HashMap<String, String>,
-    /// branch_name -> explicit new base (branch name or commit id) for reorder-like flows
+    /// branch_name -> explicit new base (branch name or commit id), for
+    /// reorder-like flows and for every branch a tree sync replays
     #[serde(default)]
     pub new_base_map: HashMap<String, String>,
     /// branch_name -> number of first-parent commits originally in the branch delta
@@ -149,20 +232,13 @@ pub struct RebaseState {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub legacy_autostash: bool,
-    /// Branches to clean up after a sync rebase finishes.
+    /// Merged branches the operation deletes once it completes (sync).
     #[serde(default)]
     pub cleanup_merged_branches: Vec<String>,
-    /// Fallback branch to checkout before deleting the current branch after sync.
+    /// Branch to check out before deleting a merged branch that is checked
+    /// out when the operation completes; `target_branch` when unset.
     #[serde(default)]
     pub cleanup_checkout_fallback: Option<String>,
-}
-
-impl RebaseState {
-    /// How this operation's rebases are replayed and finished.
-    pub fn replay(&self) -> Replay {
-        self.replay
-            .unwrap_or_else(|| Replay::of_legacy(self.operation, &self.parent_name_map))
-    }
 }
 
 impl set_aside::Journal for RebaseState {
@@ -187,7 +263,6 @@ pub fn state_path(repo: &Repository) -> PathBuf {
 
 pub fn save_state(repo: &Repository, state: &RebaseState) -> Result<()> {
     let mut persisted_state = state.clone();
-    persisted_state.replay = Some(state.replay());
     merge_persisted_original_tips(repo, &mut persisted_state)?;
     augment_original_tip_map(repo, &mut persisted_state)?;
     persisted_state.owned_tip_map = capture_owned_tip_map(repo, &persisted_state);
@@ -229,7 +304,14 @@ pub fn load_state(repo: &Repository) -> Result<RebaseState> {
 ///   set-aside when it is taken and omit `autostash`; a reader of version 2
 ///   takes its absence as `false`, which is what it means for them (nothing
 ///   left for the rebase loop to set aside), so this needed no new version.
-pub const JOURNAL_VERSION: u64 = 2;
+/// - 3: `replay` is gone. How each rebase runs is recorded in
+///   `rebase_options`, a tree sync records every branch's planned parent in
+///   `new_base_map`, and every operation finishes in the rebase loop, which
+///   deletes the `cleanup_merged_branches` it recorded. A version 2 reader
+///   takes a journal without `replay` as a flat one and derives how it
+///   replays from its label, not from what it records. Journals of versions 1
+///   and 2, and flat ones, are converted when loaded (see [`LegacyReplay`]).
+pub const JOURNAL_VERSION: u64 = 3;
 
 /// Parse a saved journal. One saved in a newer format, or that does not parse
 /// (for example because a newer Kindra saved an operation this one does not
@@ -248,14 +330,14 @@ fn parse_state(path: &Path, json: &str) -> Result<RebaseState> {
     };
     let mut saved: serde_json::Value =
         serde_json::from_str(json).map_err(|err| unreadable(&err))?;
-    let journal = match saved.get("version").map(serde_json::Value::as_u64) {
+    let (journal, version) = match saved.get("version").map(serde_json::Value::as_u64) {
         None => {
             convert_legacy_journal(&mut saved).map_err(|err| unreadable(&err))?;
-            saved
+            (saved, 0)
         }
         Some(Some(version)) if version <= JOURNAL_VERSION => {
             match saved.get_mut("journal").map(serde_json::Value::take) {
-                Some(journal @ serde_json::Value::Object(_)) => journal,
+                Some(journal @ serde_json::Value::Object(_)) => (journal, version),
                 _ => return Err(unreadable(&"it has a version but no journal")),
             }
         }
@@ -269,7 +351,20 @@ fn parse_state(path: &Path, json: &str) -> Result<RebaseState> {
             ));
         }
     };
-    serde_json::from_value(journal).map_err(|err| unreadable(&err))
+    // Before version 3 the journal said how it replays in `replay`, or only
+    // through its label.
+    let replay = if version < 3 {
+        let fields: LegacyReplayFields =
+            serde_json::from_value(journal.clone()).map_err(|err| unreadable(&err))?;
+        Some(LegacyReplay::of(&fields))
+    } else {
+        None
+    };
+    let mut state: RebaseState = serde_json::from_value(journal).map_err(|err| unreadable(&err))?;
+    if let Some(replay) = replay {
+        replay.apply(&mut state);
+    }
+    Ok(state)
 }
 
 /// The set-aside fields of a journal saved by Kindra 1.1 or earlier.
@@ -369,28 +464,19 @@ pub fn reconcile_saved_rebase_state(
     }
 
     let mut changed = false;
-    // A linear sync is one Git rebase; every other replay reconciles each branch.
-    if state.replay() == Replay::SyncLinear {
-        if sync_rebase_completed(repo, &state)? {
-            state.remaining_branches.clear();
-            state.in_progress_branch = None;
-            changed = true;
+    while let Some(current_name) = state.remaining_branches.first().cloned() {
+        if !branch_rebase_completed(repo, &state, &current_name)? {
+            break;
         }
-    } else {
-        while let Some(current_name) = state.remaining_branches.first().cloned() {
-            if !branch_rebase_completed(repo, &state, &current_name)? {
-                break;
-            }
 
-            if mode == ReconcileMode::Continue {
-                println!("Branch {} already rebased.", current_name);
-            }
-            state.remaining_branches.remove(0);
-            if state.in_progress_branch.as_ref() == Some(&current_name) {
-                state.in_progress_branch = None;
-            }
-            changed = true;
+        if mode == ReconcileMode::Continue {
+            println!("Branch {} already rebased.", current_name);
         }
+        state.remaining_branches.remove(0);
+        if state.in_progress_branch.as_ref() == Some(&current_name) {
+            state.in_progress_branch = None;
+        }
+        changed = true;
     }
 
     if state.remaining_branches.is_empty()
@@ -562,10 +648,11 @@ fn branch_rebase_target(state: &RebaseState, branch_name: &str) -> Result<(Strin
         .ok_or_else(|| anyhow!("Parent ID not found for branch '{}'", branch_name))?
         .clone();
 
-    // In tree sync the caller may be a leaf: it must still land on its planned parent.
+    // A tree sync records every branch's planned parent in `new_base_map`, so
+    // its original branch lands there rather than on `target_branch`.
     let new_base = if let Some(explicit_base) = state.new_base_map.get(branch_name) {
         explicit_base.clone()
-    } else if branch_name == state.original_branch && state.replay() == Replay::Branches {
+    } else if branch_name == state.original_branch {
         state.target_branch.clone()
     } else {
         match state.parent_name_map.get(branch_name) {
@@ -685,12 +772,6 @@ fn worktree_git_dir(worktree: &Path) -> Option<PathBuf> {
     } else {
         worktree.join(git_dir)
     })
-}
-
-fn sync_rebase_completed(repo: &Repository, state: &RebaseState) -> Result<bool> {
-    let original_tip = repo.revparse_single(&state.original_branch)?.id();
-    let target_tip = repo.revparse_single(&state.target_branch)?.id();
-    Ok(original_tip == target_tip || repo.graph_descendant_of(original_tip, target_tip)?)
 }
 
 fn can_passively_clear_completed_state(repo: &Repository, state: &RebaseState) -> Result<bool> {
@@ -1059,12 +1140,12 @@ pub fn set_aside_working_tree(
     Ok(())
 }
 
-/// Begin an operation that replays branches (move, restack, reorder, tree
-/// sync) before handing `state` to [`run_rebase_loop`]: set the working tree
-/// aside for it with the permission `allowed` and save the journal. Nothing
-/// is saved when this fails.
+/// Begin an operation that replays branches (move, restack, reorder, sync)
+/// before handing `state` to [`run_rebase_loop`]: set the working tree aside
+/// for it with the permission `allowed` and save the journal. Nothing is
+/// saved when this fails.
 pub fn begin_replay(repo: &Repository, state: &mut RebaseState, allowed: bool) -> Result<()> {
-    ensure_git_supports_update_refs()?;
+    ensure_git_supports(state.rebase_options)?;
     crate::overrides::prepare(repo, &override_plan(repo, state)?)?;
     if state.remaining_branches.is_empty() {
         return save_state(repo, state);
@@ -1072,8 +1153,39 @@ pub fn begin_replay(repo: &Repository, state: &mut RebaseState, allowed: bool) -
     set_aside_working_tree(repo, state, allowed)
 }
 
-pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> {
-    ensure_git_supports_update_refs()?;
+/// Check the installed Git has every `git rebase` flag `options` uses.
+fn ensure_git_supports(options: RebaseOptions) -> Result<()> {
+    if !options.keep_other_refs {
+        ensure_git_supports_update_refs()
+    } else if options.keep_cherry_picks {
+        ensure_git_supports_reapply_cherry_picks()
+    } else {
+        Ok(())
+    }
+}
+
+/// Replay each of `state`'s remaining branches onto its new base, then finish
+/// the operation: return to the caller (or original) branch, restore what was
+/// set aside, clear the journal, delete the merged branches it recorded and
+/// record the operation for `kin undo`. A rebase that stops on a conflict
+/// saves the journal and returns an error for `kin continue` or `kin abort`.
+///
+/// The command that starts an operation calls this; `kin continue` calls
+/// [`resume_rebase_loop`].
+pub fn run_rebase_loop(repo: &Repository, state: RebaseState) -> Result<()> {
+    replay_branches(repo, state, false)
+}
+
+/// [`run_rebase_loop`] for `kin continue`, once the stopped rebase, if any,
+/// has finished. A journal whose rebases run only when the operation starts
+/// ([`RebaseOptions::no_restart`]) is refused here if one of them is still
+/// incomplete.
+pub fn resume_rebase_loop(repo: &Repository, state: RebaseState) -> Result<()> {
+    replay_branches(repo, state, true)
+}
+
+fn replay_branches(repo: &Repository, mut state: RebaseState, resumed: bool) -> Result<()> {
+    ensure_git_supports(state.rebase_options)?;
     crate::overrides::prepare(repo, &override_plan(repo, &state)?)?;
 
     // A journal saved by an older Kindra may still ask the loop to set the
@@ -1118,6 +1230,19 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
             continue;
         }
 
+        let options = state.rebase_options;
+        if resumed && options.no_restart {
+            let operation = state.operation;
+            return Err(anyhow!(
+                "{} did not complete: '{}' is not rebased onto '{}'. If the Git rebase was aborted manually, run 'kin abort' to clear the saved {} state or rerun 'kin {}'.",
+                operation.title(),
+                current_name,
+                new_base,
+                operation.command(),
+                operation.command()
+            ));
+        }
+
         if !is_resuming {
             state.in_progress_branch = Some(current_name.clone());
             save_state(repo, &state)?;
@@ -1126,15 +1251,19 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         println!("Rebasing {}...", current_name);
         let mut rebase = git_command(repo);
         rebase.arg("rebase");
-        if state.replay().is_sync() {
+        if options.keep_cherry_picks {
             rebase.args(["--reapply-cherry-picks", "--empty=keep"]);
+        }
+        if !options.fast_forward {
+            rebase.arg("--no-ff");
         }
         // Kindra owns every set-aside: Git's autostash (or `rebase.autostash`)
         // would restore the changes on each replayed branch instead.
+        rebase.arg("--no-autostash");
+        if !options.keep_other_refs {
+            rebase.arg("--update-refs");
+        }
         let status = rebase
-            .arg("--no-ff")
-            .arg("--no-autostash")
-            .arg("--update-refs")
             .arg("--onto")
             .arg(&new_base)
             .arg(&old_parent_id_str)
@@ -1158,6 +1287,12 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
             } else {
                 state.in_progress_branch = None;
                 save_state(repo, &state)?;
+                if options.no_restart {
+                    let command = state.operation.command();
+                    return Err(anyhow!(
+                        "git rebase failed before {command} could enter an in-progress state. Run 'kin abort' to clear the saved state, then run 'kin {command}' again (or otherwise fix the rebase)."
+                    ));
+                }
                 return Err(anyhow!(
                     "Rebase failed for branch {}. It seems to have failed before starting (e.g., dirty working tree). Fix the issue and run 'kin continue'.",
                     current_name
@@ -1166,9 +1301,6 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         }
     }
 
-    if state.replay().is_sync() {
-        return crate::commands::sync::finish_sync_after_rebase(repo, state);
-    }
     let restore_branch = state
         .caller_branch
         .clone()
@@ -1192,8 +1324,82 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
     }
 
     clear_state(repo)?;
-    crate::oplog::finalize(repo)?;
 
+    let checkout_fallback = state
+        .cleanup_checkout_fallback
+        .as_deref()
+        .unwrap_or(state.target_branch.as_str());
+    let deleted = delete_merged_branches(repo, &state.cleanup_merged_branches, checkout_fallback);
+    // Record the operation for undo from the branches as they are now, even if
+    // a deletion failed, so the pending snapshot is never orphaned once the
+    // journal is gone; the deletion error is reported afterwards.
+    crate::oplog::finalize(repo)?;
+    deleted
+}
+
+/// Delete the merged `branches`, first checking out `checkout_fallback` if
+/// one of them is checked out. A branch Git refuses to delete is reported and
+/// kept. Each deleted branch's tip is printed so it can be restored.
+pub fn delete_merged_branches(
+    repo: &Repository,
+    branches: &[String],
+    checkout_fallback: &str,
+) -> Result<()> {
+    if branches.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(current) = current_branch_name(repo)?
+        && branches.contains(&current)
+    {
+        println!(
+            "Current branch '{}' is merged. Switching to '{}' before deletion.",
+            current, checkout_fallback
+        );
+        let mut plan = crate::overrides::Plan::default();
+        crate::overrides::prepare(repo, plan.checkout_rev(repo, checkout_fallback))?;
+        checkout_branch(repo, checkout_fallback).map_err(|e| {
+            anyhow!(
+                "fallback git checkout failed for branch '{}': {}",
+                checkout_fallback,
+                e
+            )
+        })?;
+    }
+
+    for branch_name in branches {
+        // Capture the tip before deletion so it is recoverable from the printed
+        // SHA (and from `kin undo`) even after the branch ref is gone.
+        let old_tip = repo
+            .find_branch(branch_name, git2::BranchType::Local)
+            .ok()
+            .and_then(|b| b.get().target())
+            .map(|oid| oid.to_string());
+
+        let status = git_command(repo)
+            .arg("branch")
+            .arg("-D")
+            .arg("--quiet")
+            .arg(branch_name)
+            .status()?;
+
+        if !status.success() {
+            println!(
+                "Warning: Failed to delete merged branch: {}. It might be checked out in another worktree.",
+                branch_name
+            );
+        } else if let Some(tip) = old_tip {
+            println!(
+                "Deleted merged branch: {} (was {}); run 'kin undo' or 'git branch {} {}' to restore",
+                branch_name,
+                &tip[..tip.len().min(12)],
+                branch_name,
+                tip,
+            );
+        } else {
+            println!("Deleted merged branch: {}", branch_name);
+        }
+    }
     Ok(())
 }
 
@@ -1277,8 +1483,11 @@ fn parse_git_semver(version_output: &str) -> Option<(u64, u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JOURNAL_VERSION, Operation, RebaseState, Replay, parse_git_semver, parse_state};
+    use super::{
+        JOURNAL_VERSION, Operation, RebaseOptions, RebaseState, parse_git_semver, parse_state,
+    };
     use crate::set_aside::{Kind, Restore, SetAside, SetAsides};
+    use std::collections::HashMap;
     use std::path::Path;
 
     fn saved(json: &str) -> RebaseState {
@@ -1395,8 +1604,8 @@ mod tests {
 
     #[test]
     fn a_journal_with_a_newer_version_is_refused_with_advice() {
-        assert_eq!(JOURNAL_VERSION, 2);
-        for version in ["3", "4", r#""2""#] {
+        assert_eq!(JOURNAL_VERSION, 3);
+        for version in ["4", "5", r#""3""#] {
             let err = loaded(&format!(r#"{{"version":{version},"journal":{{}}}}"#))
                 .err()
                 .unwrap()
@@ -1406,32 +1615,144 @@ mod tests {
         }
     }
 
+    /// A journal's fields, with `remaining` left to rebase and `parents` as
+    /// its `parent_name_map`.
+    fn fields(operation: &str, remaining: &str, parents: &str, extra: &str) -> String {
+        format!(
+            r#""operation":"{operation}","original_branch":"a","target_branch":"main",
+                "remaining_branches":{remaining},"in_progress_branch":null,
+                "parent_id_map":{{"a":"1111","b":"2222"}},"parent_name_map":{parents},
+                "cleanup_checkout_fallback":"main"{extra}"#
+        )
+    }
+
+    const LINEAR: RebaseOptions = RebaseOptions {
+        keep_cherry_picks: true,
+        fast_forward: true,
+        keep_other_refs: false,
+        no_restart: true,
+    };
+
+    const TREE: RebaseOptions = RebaseOptions {
+        keep_cherry_picks: true,
+        fast_forward: false,
+        keep_other_refs: false,
+        no_restart: false,
+    };
+
+    /// A flat journal (Kindra 1.1 and earlier) replays as its label said: a
+    /// sync with parent names is a tree sync, one without is linear, and
+    /// every other operation replays branches.
     #[test]
-    fn replay_of_a_journal_without_one_follows_its_label() {
-        let journal = |operation: &str, parents: &str| {
-            saved(&format!(
-                r#"{{"operation":"{operation}","original_branch":"a","target_branch":"main",
-                    "remaining_branches":[],"in_progress_branch":null,"parent_name_map":{parents}}}"#
-            ))
-        };
-        assert_eq!(journal("Sync", "{}").replay(), Replay::SyncLinear);
-        assert_eq!(journal("Sync", r#"{"b":"a"}"#).replay(), Replay::SyncTree);
+    fn a_flat_journal_replays_as_its_label_said() {
+        let linear = loaded(&format!("{{{}}}", fields("Sync", r#"["a"]"#, "{}", ""))).unwrap();
+        assert_eq!(linear.rebase_options, LINEAR);
+        assert!(linear.new_base_map.is_empty());
+
+        let tree = loaded(&format!(
+            "{{{}}}",
+            fields("Sync", r#"["a","b"]"#, r#"{"b":"a"}"#, "")
+        ))
+        .unwrap();
+        assert_eq!(tree.rebase_options, TREE);
+        // The original branch lands on its old parent, as it did then, and
+        // not on the target a replay of branches would put it on.
+        assert_eq!(
+            tree.new_base_map,
+            HashMap::from([
+                ("a".to_string(), "1111".to_string()),
+                ("b".to_string(), "a".to_string()),
+            ])
+        );
+
         for operation in ["Move", "Reorder", "Commit"] {
+            let state = loaded(&format!(
+                "{{{}}}",
+                fields(operation, r#"["a","b"]"#, r#"{"b":"a"}"#, "")
+            ))
+            .unwrap();
             assert_eq!(
-                journal(operation, r#"{"b":"a"}"#).replay(),
-                Replay::Branches
+                state.rebase_options,
+                RebaseOptions::default(),
+                "{operation}"
+            );
+            assert!(state.new_base_map.is_empty(), "{operation}");
+        }
+    }
+
+    /// A version 1 or 2 journal replays as its `replay` says, whatever its
+    /// label; a linear sync of the trunk leaves other branches alone.
+    #[test]
+    fn a_version_2_journal_replays_as_its_replay_says() {
+        for version in 1..=2 {
+            let journal = |operation: &str, replay: &str, parents: &str| {
+                loaded(&format!(
+                    r#"{{"version":{version},"journal":{{{}}}}}"#,
+                    fields(
+                        operation,
+                        r#"["a"]"#,
+                        parents,
+                        &format!(r#","replay":"{replay}""#)
+                    )
+                ))
+                .unwrap()
+            };
+            let tree = journal("Move", "SyncTree", "{}");
+            assert_eq!(tree.operation, Operation::Move);
+            assert_eq!(tree.rebase_options, TREE);
+            assert_eq!(tree.new_base_map["a"], "1111");
+
+            assert_eq!(journal("Move", "SyncLinear", "{}").rebase_options, LINEAR);
+            assert_eq!(
+                journal("Sync", "Branches", r#"{"b":"a"}"#).rebase_options,
+                RebaseOptions::default()
+            );
+
+            // A sync of the trunk: the branch it rebases is its fallback.
+            let trunk = loaded(
+                &format!(
+                    r#"{{"version":{version},"journal":{{{}}}}}"#,
+                    fields("Sync", r#"["a"]"#, "{}", r#","replay":"SyncLinear""#)
+                )
+                .replace(
+                    r#""cleanup_checkout_fallback":"main""#,
+                    r#""cleanup_checkout_fallback":"a""#,
+                ),
+            )
+            .unwrap();
+            assert_eq!(
+                trunk.rebase_options,
+                RebaseOptions {
+                    keep_other_refs: true,
+                    ..LINEAR
+                }
             );
         }
     }
 
+    /// From version 3 the journal records how it replays, and neither its
+    /// label nor a leftover `replay` changes that.
     #[test]
-    fn a_saved_replay_wins_over_the_label() {
-        let state = saved(
-            r#"{"operation":"Move","replay":"SyncTree","original_branch":"a","target_branch":"main",
-                "remaining_branches":[],"in_progress_branch":null}"#,
+    fn a_version_3_journal_replays_as_it_records() {
+        let state = loaded(&format!(
+            r#"{{"version":3,"journal":{{{}}}}}"#,
+            fields("Sync", r#"["a"]"#, "{}", r#","replay":"SyncLinear""#)
+        ))
+        .unwrap();
+        assert_eq!(state.rebase_options, RebaseOptions::default());
+        assert!(state.new_base_map.is_empty());
+
+        let journal = serde_json::to_value(&state).unwrap();
+        assert!(journal.get("replay").is_none(), "{journal}");
+        assert_eq!(
+            journal["rebase_options"],
+            serde_json::json!({
+                "keep_cherry_picks": false,
+                "fast_forward": false,
+                "keep_other_refs": false,
+                "no_restart": false,
+            })
         );
-        assert_eq!(state.operation, Operation::Move);
-        assert_eq!(state.replay(), Replay::SyncTree);
     }
 
     #[test]

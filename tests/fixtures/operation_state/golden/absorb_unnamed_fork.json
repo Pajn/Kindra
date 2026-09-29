@@ -25,14 +25,19 @@
     },
     "parent_name_map": {},
     "preserve_content_on_abort": true,
+    "rebase_options": {
+      "fast_forward": false,
+      "keep_cherry_picks": false,
+      "keep_other_refs": false,
+      "no_restart": false
+    },
     "remaining_branches": [
       "feature-b"
     ],
-    "replay": "Branches",
     "set_asides": [],
     "suppress_editor": true,
     "target_branch": "feature-a",
     "unstage_on_restore": false
   },
-  "version": 2
+  "version": 3
 }

@@ -22,10 +22,15 @@
     },
     "parent_name_map": {},
     "preserve_content_on_abort": false,
+    "rebase_options": {
+      "fast_forward": true,
+      "keep_cherry_picks": true,
+      "keep_other_refs": false,
+      "no_restart": true
+    },
     "remaining_branches": [
       "feature-b"
     ],
-    "replay": "SyncLinear",
     "set_asides": [
       {
         "kind": "WholeTree",
@@ -38,5 +43,5 @@
     "target_branch": "main",
     "unstage_on_restore": false
   },
-  "version": 2
+  "version": 3
 }

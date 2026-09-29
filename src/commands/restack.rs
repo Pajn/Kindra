@@ -1,5 +1,5 @@
 use crate::commands::{prompt_multi_select, resolve_restack_history_limit};
-use crate::rebase_utils::{Operation, RebaseState, Replay, begin_replay, run_rebase_loop};
+use crate::rebase_utils::{Operation, RebaseState, begin_replay, run_rebase_loop};
 use anyhow::{Result, anyhow};
 use clap::Args;
 use git2::{BranchType, Commit, Oid, Repository};
@@ -155,7 +155,7 @@ fn restack_locked(repo: &git2::Repository, args: &RestackArgs) -> Result<()> {
 
     let mut state = RebaseState {
         operation: Operation::Restack,
-        replay: Some(Replay::Branches),
+        rebase_options: Default::default(),
         original_branch: current_branch_name.clone(),
         target_branch: current_branch_name.clone(),
         caller_branch: Some(current_branch_name.clone()),

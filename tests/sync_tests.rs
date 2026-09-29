@@ -4097,3 +4097,233 @@ fn sync_fetches_and_rebases_the_discovered_repository_when_git_env_names_another
     common::assert_no_kindra_operation(dir.path());
     foreign.assert_untouched();
 }
+
+// ---------------------------------------------------------------------------
+// Paused syncs, finished by the shared rebase loop
+// ---------------------------------------------------------------------------
+
+/// The shape of the stack a paused sync is continued or aborted on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SyncShape {
+    /// `main <- feature-a <- feature-b`, synced from feature-a, so that the
+    /// one rebase of the tip carries feature-a along.
+    Linear,
+    /// `main <- feature-a <- {feature-b, feature-c}`, synced from the leaf
+    /// feature-c.
+    Tree,
+}
+
+impl SyncShape {
+    /// The branch the sync starts from and returns to.
+    fn caller(self) -> &'static str {
+        match self {
+            SyncShape::Linear => "feature-a",
+            SyncShape::Tree => "feature-c",
+        }
+    }
+
+    /// Each branch of the stack with the branch it sits directly on.
+    fn parents(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            SyncShape::Linear => &[("feature-a", "main"), ("feature-b", "feature-a")],
+            SyncShape::Tree => &[
+                ("feature-a", "main"),
+                ("feature-b", "feature-a"),
+                ("feature-c", "feature-a"),
+            ],
+        }
+    }
+}
+
+fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
+    let output = common::git_command(dir).args(args).output().unwrap();
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn commit_file(dir: &std::path::Path, file: &str, content: &str, message: &str) {
+    fs::write(dir.join(file), content).unwrap();
+    run_ok("git", &["add", file], dir);
+    run_ok("git", &["commit", "-q", "-m", message], dir);
+}
+
+/// Every local branch and its tip, one per line.
+fn branch_tips(dir: &std::path::Path) -> String {
+    git_stdout(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short) %(objectname)",
+            "refs/heads",
+        ],
+    )
+}
+
+/// A stack of `shape` whose branch `landed`, below feature-a, was merged into
+/// `main`, after which `main` changed the line feature-a (linear) or
+/// feature-b (tree) changes, so the sync stops on that conflict. The caller
+/// is checked out with a tracked file edited and an untracked file added,
+/// which the sync sets aside. Returns the repository and its branch tips
+/// from before the sync.
+fn paused_sync(shape: SyncShape) -> (TempDir, String) {
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    repo_init(path);
+    commit_file(path, "shared.txt", "base\n", "base");
+    run_ok("git", &["checkout", "-q", "-b", "landed"], path);
+    commit_file(path, "landed.txt", "landed\n", "landed");
+    run_ok("git", &["checkout", "-q", "main"], path);
+    run_ok("git", &["merge", "-q", "--ff-only", "landed"], path);
+
+    run_ok(
+        "git",
+        &["checkout", "-q", "-b", "feature-a", "landed"],
+        path,
+    );
+    match shape {
+        SyncShape::Linear => {
+            commit_file(path, "shared.txt", "a\n", "a");
+            run_ok("git", &["checkout", "-q", "-b", "feature-b"], path);
+            commit_file(path, "b.txt", "b\n", "b");
+        }
+        SyncShape::Tree => {
+            commit_file(path, "a.txt", "a\n", "a");
+            run_ok("git", &["checkout", "-q", "-b", "feature-b"], path);
+            commit_file(path, "shared.txt", "b\n", "b");
+            run_ok(
+                "git",
+                &["checkout", "-q", "-b", "feature-c", "feature-a"],
+                path,
+            );
+            commit_file(path, "c.txt", "c\n", "c");
+        }
+    }
+    run_ok("git", &["checkout", "-q", "main"], path);
+    commit_file(path, "shared.txt", "main\n", "main moved");
+
+    run_ok("git", &["checkout", "-q", shape.caller()], path);
+    fs::write(path.join("landed.txt"), "dirty\n").unwrap();
+    fs::write(path.join("scratch.txt"), "untracked\n").unwrap();
+    let before = branch_tips(path);
+
+    kin_cmd()
+        .args(["sync", "--autostash"])
+        .current_dir(path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Resolve conflicts"));
+    let state = load_state(&Repository::open(path).unwrap()).unwrap();
+    assert_eq!(state.operation, Operation::Sync);
+    assert_eq!(state.cleanup_merged_branches, vec!["landed"]);
+    assert!(state.set_asides.changes().is_some());
+    assert!(!path.join("scratch.txt").exists());
+    (dir, before)
+}
+
+/// The caller is checked out again with the changes the sync set aside, and
+/// nothing is left in progress.
+fn assert_returned_to_caller(dir: &std::path::Path, shape: SyncShape) {
+    assert_eq!(common::current_branch(dir), shape.caller());
+    assert_eq!(
+        git_stdout(dir, &["status", "--porcelain", "--untracked-files=all"]),
+        "M landed.txt\n?? scratch.txt"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("landed.txt")).unwrap(),
+        "dirty\n"
+    );
+    assert_eq!(git_stdout(dir, &["stash", "list"]), "");
+    assert!(!rebase_state_file(dir).exists());
+    common::assert_no_rebase_in_progress(dir);
+}
+
+fn check_paused_sync_continues(shape: SyncShape) {
+    let (dir, _) = paused_sync(shape);
+    let path = dir.path();
+    fs::write(path.join("shared.txt"), "resolved\n").unwrap();
+    run_ok("git", &["add", "shared.txt"], path);
+    kin_cmd()
+        .arg("continue")
+        .current_dir(path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Deleted merged branch: landed"));
+
+    for (branch, parent) in shape.parents() {
+        assert_eq!(
+            git_stdout(path, &["rev-parse", &format!("{branch}^")]),
+            git_stdout(path, &["rev-parse", parent]),
+            "{branch} must sit directly on {parent}"
+        );
+    }
+    assert!(
+        !common::branch_exists(path, "landed"),
+        "completing the sync deletes the merged branch its journal recorded"
+    );
+    assert_returned_to_caller(path, shape);
+}
+
+fn check_paused_sync_aborts(shape: SyncShape) {
+    let (dir, before) = paused_sync(shape);
+    let path = dir.path();
+    kin_cmd()
+        .arg("abort")
+        .current_dir(path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Operation aborted"));
+
+    assert_eq!(
+        branch_tips(path),
+        before,
+        "every branch is back where it was, and the merged one is kept"
+    );
+    assert_returned_to_caller(path, shape);
+}
+
+#[test]
+fn paused_linear_sync_continues_to_completion() {
+    check_paused_sync_continues(SyncShape::Linear);
+}
+
+#[test]
+fn paused_linear_sync_aborts() {
+    check_paused_sync_aborts(SyncShape::Linear);
+}
+
+#[test]
+fn paused_tree_sync_continues_to_completion() {
+    check_paused_sync_continues(SyncShape::Tree);
+}
+
+#[test]
+fn paused_tree_sync_aborts() {
+    check_paused_sync_aborts(SyncShape::Tree);
+}
+
+/// A linear sync runs its one rebase only when it starts: once that rebase is
+/// aborted with Git, `kin continue` refuses rather than start it again, and
+/// deletes nothing, leaving the journal for `kin abort`.
+#[test]
+fn paused_linear_sync_refuses_to_restart_a_rebase_aborted_with_git() {
+    let (dir, before) = paused_sync(SyncShape::Linear);
+    let path = dir.path();
+    run_ok("git", &["rebase", "--abort"], path);
+    let abandoned = branch_tips(path);
+
+    kin_cmd()
+        .arg("continue")
+        .current_dir(path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Sync did not complete: 'feature-b' is not rebased onto 'main'",
+        ));
+    assert_eq!(branch_tips(path), abandoned);
+    assert!(rebase_state_file(path).exists());
+    common::assert_no_rebase_in_progress(path);
+
+    kin_cmd().arg("abort").current_dir(path).assert().success();
+    assert_eq!(branch_tips(path), before);
+    assert_returned_to_caller(path, SyncShape::Linear);
+}

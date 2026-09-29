@@ -1,7 +1,7 @@
 use crate::commands::find_upstream;
 use crate::rebase_utils::{
-    Operation, RebaseState, Replay, checkout_branch, clear_state, git_rebase_in_progress,
-    save_state,
+    Operation, RebaseOptions, RebaseState, begin_replay, checkout_branch, delete_merged_branches,
+    run_rebase_loop,
 };
 use crate::stack::{
     collect_merged_local_branches, find_sync_boundary, get_stack_branches_from_merge_base,
@@ -11,7 +11,19 @@ use anyhow::{Result, anyhow};
 use clap::Args;
 use git2::BranchType;
 use std::collections::{HashMap, HashSet};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+
+/// How a linear sync rebases: the whole stack in one Git rebase of its tip,
+/// keeping every commit the trunk already has an equivalent of, leaving a
+/// stack already on the trunk as it is, and never restarted by `kin
+/// continue`. A tree sync replays branch by branch and only keeps
+/// cherry-picks.
+const LINEAR_SYNC: RebaseOptions = RebaseOptions {
+    keep_cherry_picks: true,
+    fast_forward: true,
+    keep_other_refs: false,
+    no_restart: true,
+};
 
 #[derive(Args, Default)]
 pub struct SyncArgs {
@@ -176,7 +188,7 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
 
         let mut state = RebaseState {
             operation: Operation::Sync,
-            replay: Some(Replay::SyncLinear),
+            rebase_options: LINEAR_SYNC,
             original_branch: top_branch.clone(),
             target_branch: rebase_onto_name.clone(),
             caller_branch: current_branch_name
@@ -202,30 +214,17 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
             cleanup_checkout_fallback: Some(local_upstream.clone()),
         };
 
-        crate::overrides::prepare(repo, &crate::rebase_utils::override_plan(repo, &state)?)?;
-
-        // Set the tree aside before the checkout to the tip, and keep it in
-        // the journal until the sync returns to the caller, including across
-        // rebase conflicts and aborts.
-        crate::rebase_utils::set_aside_working_tree(repo, &mut state, autostash)?;
-
+        // One rebase of the tip onto the trunk from the old base carries
+        // every branch below it along (--update-refs), except one checked
+        // out when the rebase starts, so the tip is checked out first. Set the
+        // tree aside before that checkout, and keep it in the journal until
+        // the sync returns to the caller, including across rebase conflicts
+        // and aborts.
+        begin_replay(repo, &mut state, autostash)?;
         if current_branch_name.as_deref() != Some(top_branch.as_str()) {
             checkout_branch(repo, &top_branch)?;
         }
-
-        let mut rebase = crate::repository::git_command(repo);
-        rebase
-            .arg("rebase")
-            .arg("--reapply-cherry-picks")
-            .arg("--empty=keep")
-            .arg("--no-autostash")
-            .arg("--update-refs")
-            .arg("--onto")
-            .arg(&rebase_onto_name)
-            .arg(old_base.to_string())
-            .arg(&top_branch);
-
-        return run_sync_rebase(repo, state, rebase);
+        return run_rebase_loop(repo, state);
     } else {
         println!(
             "All commits in this stack appear to be integrated into {}.",
@@ -264,7 +263,12 @@ fn sync_upstream_branch(
 
         let mut state = RebaseState {
             operation: Operation::Sync,
-            replay: Some(Replay::SyncLinear),
+            // The trunk is rebased alone: branches pointing into its
+            // unpublished commits stay where they are.
+            rebase_options: RebaseOptions {
+                keep_other_refs: true,
+                ..LINEAR_SYNC
+            },
             original_branch: upstream_name.to_string(),
             target_branch: rebase_onto_name.to_string(),
             caller_branch: None,
@@ -288,18 +292,8 @@ fn sync_upstream_branch(
             cleanup_checkout_fallback: Some(upstream_name.to_string()),
         };
 
-        crate::overrides::prepare(repo, &crate::rebase_utils::override_plan(repo, &state)?)?;
-        crate::rebase_utils::set_aside_working_tree(repo, &mut state, autostash)?;
-
-        let mut rebase = crate::repository::git_command(repo);
-        rebase
-            .arg("rebase")
-            .arg("--reapply-cherry-picks")
-            .arg("--empty=keep")
-            .arg("--no-autostash")
-            .arg(rebase_onto_name);
-
-        return run_sync_rebase(repo, state, rebase);
+        begin_replay(repo, &mut state, autostash)?;
+        return run_rebase_loop(repo, state);
     } else {
         println!("{} is already up to date.", upstream_name);
     }
@@ -309,151 +303,8 @@ fn sync_upstream_branch(
     }
 
     // The undo guard held by the calling `sync` settles the pending snapshot on
-    // return (the rebase path defers to `finish_sync_after_rebase`).
+    // return (the rebase path defers to the rebase loop's completion).
     Ok(())
-}
-
-fn delete_merged_branches(
-    repo: &git2::Repository,
-    branches: &[String],
-    checkout_fallback: &str,
-) -> Result<()> {
-    if branches.is_empty() {
-        return Ok(());
-    }
-
-    let head = repo.head()?;
-    let current_branch = if !repo.head_detached()? {
-        head.shorthand()
-    } else {
-        None
-    };
-
-    if let Some(cb) = current_branch
-        && branches.iter().any(|b| b == cb)
-    {
-        println!(
-            "Current branch '{}' is merged. Switching to '{}' before deletion.",
-            cb, checkout_fallback
-        );
-        let mut plan = crate::overrides::Plan::default();
-        crate::overrides::prepare(repo, plan.checkout_rev(repo, checkout_fallback))?;
-        checkout_branch(repo, checkout_fallback).map_err(|e| {
-            anyhow!(
-                "fallback git checkout failed for branch '{}': {}",
-                checkout_fallback,
-                e
-            )
-        })?;
-    }
-
-    for branch_name in branches {
-        // Capture the tip before deletion so it is recoverable from the printed
-        // SHA (and from `kin undo`) even after the branch ref is gone.
-        let old_tip = repo
-            .find_branch(branch_name, BranchType::Local)
-            .ok()
-            .and_then(|b| b.get().target())
-            .map(|oid| oid.to_string());
-
-        let status = crate::repository::git_command(repo)
-            .arg("branch")
-            .arg("-D")
-            .arg("--quiet")
-            .arg(branch_name)
-            .status()?;
-
-        if !status.success() {
-            println!(
-                "Warning: Failed to delete merged branch: {}. It might be checked out in another worktree.",
-                branch_name
-            );
-        } else if let Some(tip) = old_tip {
-            println!(
-                "Deleted merged branch: {} (was {}); run 'kin undo' or 'git branch {} {}' to restore",
-                branch_name,
-                &tip[..tip.len().min(12)],
-                branch_name,
-                tip,
-            );
-        } else {
-            println!("Deleted merged branch: {}", branch_name);
-        }
-    }
-    Ok(())
-}
-
-fn run_sync_rebase(
-    repo: &git2::Repository,
-    mut state: RebaseState,
-    mut rebase: Command,
-) -> Result<()> {
-    state.in_progress_branch = Some(state.original_branch.clone());
-    save_state(repo, &state)?;
-
-    let status = rebase.status()?;
-    if status.success() {
-        return finish_sync_after_rebase(repo, state);
-    }
-
-    if git_rebase_in_progress(repo) {
-        save_state(repo, &state)?;
-        return Err(anyhow!(
-            "git rebase failed during sync. Resolve conflicts and run 'kin continue' or 'kin abort'."
-        ));
-    }
-
-    state.in_progress_branch = None;
-    save_state(repo, &state)?;
-    Err(anyhow!(
-        "git rebase failed before sync could enter an in-progress state. Run 'kin abort' to clear the saved state, then run 'kin sync' again (or otherwise fix the rebase)."
-    ))
-}
-
-pub(crate) fn finish_sync_after_rebase(
-    repo: &git2::Repository,
-    mut state: RebaseState,
-) -> Result<()> {
-    if state.replay() == Replay::SyncLinear {
-        ensure_sync_rebase_completed(repo, &state)?;
-    }
-    // The tip drives --update-refs, but the caller should return to the branch
-    // they synced from. Restore before cleanup so a merged caller uses the
-    // normal checkout fallback, and keep recovery state if checkout fails.
-    if let Some(caller) = &state.caller_branch {
-        checkout_branch(repo, caller)?;
-    }
-    crate::set_aside::restore_all(repo, &mut state, crate::set_aside::Phase::Completion)?;
-    clear_state(repo)?;
-
-    let checkout_fallback = state
-        .cleanup_checkout_fallback
-        .as_deref()
-        .unwrap_or(state.target_branch.as_str());
-    let delete_result =
-        delete_merged_branches(repo, &state.cleanup_merged_branches, checkout_fallback);
-    // Finalize from the post-rebase branch state even if deletion failed, so the
-    // pending snapshot is never orphaned after `clear_state`. Surface the deletion
-    // error afterwards.
-    crate::oplog::finalize(repo)?;
-    delete_result
-}
-
-fn ensure_sync_rebase_completed(repo: &git2::Repository, state: &RebaseState) -> Result<()> {
-    let original_tip = repo.revparse_single(&state.original_branch)?.id();
-    let target_tip = repo.revparse_single(&state.target_branch)?.id();
-    let completed =
-        original_tip == target_tip || repo.graph_descendant_of(original_tip, target_tip)?;
-
-    if completed {
-        return Ok(());
-    }
-
-    Err(anyhow!(
-        "Sync did not complete: '{}' is not rebased onto '{}'. If the Git rebase was aborted manually, run 'kin abort' to clear the saved sync state or rerun 'kin sync'.",
-        state.original_branch,
-        state.target_branch
-    ))
 }
 
 /// The branches sync rebases, with their merge base with the trunk `onto`: the
@@ -793,15 +644,20 @@ fn sync_tree(
         crate::commands::resolve_and_check_autostash(repo, args.autostash, args.no_autostash)?;
     let mut state = RebaseState {
         operation: Operation::Sync,
-        replay: Some(Replay::SyncTree),
+        rebase_options: RebaseOptions {
+            keep_cherry_picks: true,
+            ..RebaseOptions::default()
+        },
         original_branch: original.clone(),
         target_branch: upstream.to_string(),
         caller_branch: Some(original.clone()),
         remaining_branches: remaining,
         in_progress_branch: None,
         parent_id_map: bases,
+        // Every branch lands on its planned parent, the caller included, even
+        // when it is a leaf.
+        new_base_map: parents.clone(),
         parent_name_map: parents,
-        new_base_map: HashMap::new(),
         original_commit_count_map: HashMap::new(),
         original_tip_map: branches
             .iter()
@@ -817,6 +673,6 @@ fn sync_tree(
         cleanup_merged_branches: merged,
         cleanup_checkout_fallback: Some(local_upstream.to_string()),
     };
-    crate::rebase_utils::begin_replay(repo, &mut state, autostash)?;
-    crate::rebase_utils::run_rebase_loop(repo, state)
+    begin_replay(repo, &mut state, autostash)?;
+    run_rebase_loop(repo, state)
 }
