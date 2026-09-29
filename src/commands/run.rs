@@ -159,7 +159,9 @@ fn run_locked(repo: &git2::Repository, args: &RunArgs) -> Result<()> {
         plan.checkout(branch.id);
     }
     crate::overrides::prepare(repo, &plan)?;
-    let stash = crate::set_aside::take_tracked(repo, autostash, crate::set_aside::Restore::Plain)?;
+    // Staged changes come back staged: the entry records the index.
+    let stash =
+        crate::set_aside::take_tracked(repo, autostash, crate::set_aside::Restore::WithIndex)?;
 
     let mut run_state = RunState {
         target_branches: stack_branches.into_iter().map(|b| b.name).collect(),
@@ -221,12 +223,13 @@ fn persist_run_state(repo: &Repository, run_state: &RunState) -> Result<()> {
 fn restore_run_stash(repo: &Repository, run_state: &mut RunState) {
     let stash_ref = run_state.stash_ref.take();
     // Run state saved by Kindra 1.1 or earlier records only the stash message.
+    // Its entry was pushed the same way, so it holds the staged state too.
     let Some(set_aside) = run_state.stash.take().or_else(|| {
         stash_ref.map(|stash| {
             crate::set_aside::from_message(
                 crate::set_aside::Kind::WholeTree,
                 stash,
-                crate::set_aside::Restore::Plain,
+                crate::set_aside::Restore::WithIndex,
             )
         })
     }) else {

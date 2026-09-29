@@ -438,12 +438,13 @@ history_limit = 250
 
 Commands that check out or rebase branches move your uncommitted changes out of the way themselves and put them back when they finish: on the branch the operation returns to, never on a branch it replays. What they set aside is recorded with the paused operation, so after a conflict `kin continue` restores it once the operation completes and `kin abort` restores it when it rolls the operation back. Kindra never uses Git's own autostash: every rebase it runs passes `--no-autostash`, and Git's `rebase.autostash` is only read as the permission below.
 
-- **Tracked changes need permission.** `--autostash`, `--no-autostash` and the configuration below decide whether `move`, `sync`, `restack`, `reorder`, `split` and `run` may set uncommitted tracked changes aside. Without it, a command that finds such changes refuses before it changes anything, with nothing saved to continue, abort or undo.
+- **Tracked changes need permission.** `--autostash`, `--no-autostash` and the configuration below decide whether `move`, `sync`, `restack`, `reorder` and `run` may set uncommitted tracked changes aside. Without it, a command that finds such changes refuses before it changes anything, with nothing saved to continue, abort or undo.
 - **Untracked files need none.** A tree with only untracked files does not count as dirty. `move`, `sync`, `restack` and `reorder` set untracked files aside with everything else, so they cannot block a checkout, and restore them at the end. Untracked [local override](#local-overrides) files stay in place, and ignored files are left alone.
-- **`kin run` and `kin split` set aside tracked changes only.** The commands `kin run` runs keep local untracked files such as `.env` in place.
+- **`kin run` sets aside tracked changes only**, and restores staged changes staged. The commands it runs keep local untracked files such as `.env` in place.
+- **`kin split` sets nothing aside.** It only moves branch refs and never touches the index or working tree, so uncommitted changes of any kind stay as they are. It accepts `--autostash` and `--no-autostash` for compatibility, notes that they have no effect, and ignores the configuration below.
 - **`kin commit` and `kin absorb` always set aside** what they have to move out of the way; `kin commit` accepts the autostash flags as no-ops, and `kin absorb` takes none.
 
-**Autostash resolution order** (for `move`, `sync`, `restack`, `reorder`, `split` and `run`):
+**Autostash resolution order** (for `move`, `sync`, `restack`, `reorder` and `run`):
 - CLI override: `--autostash` or `--no-autostash`
 - [Repository config](#configuration): `[rebase] autostash`
 - [Global config](#configuration): `[rebase] autostash`
@@ -1008,6 +1009,10 @@ kin split
 ```
 
 It generates a list of commits and branches. You can move the `branch <name>` lines to reassign branches to different commits, or add/remove them to create/delete branches. Leaving a row's name blank (a bare `branch` line) auto-names the branch by slugifying the summary of the commit it sits on, deduped against existing branches.
+
+Split changes only branch refs. HEAD stays at its commit: it stays on its branch while that branch still points there, attaches to a branch that points there once the split is done, or else is left detached. The index and working tree are never touched, so a split works with uncommitted changes of any kind and leaves them exactly as they are. `--autostash` and `--no-autostash` are still accepted but have no effect.
+
+The branch and HEAD changes are made in one transaction that locks every ref before writing any. A split that cannot make one of its changes fails before anything changes: a new name clashes with an existing branch (`foo/bar` next to `foo`), a branch to delete is checked out in another worktree, or another Git process holds a ref's lock. A split is recorded for [`kin undo`](#undo--history).
 
 **When to use it:** Use this when you've made a long series of commits on a single branch and want to "split" them into multiple separate, dependent branches for easier review.
 

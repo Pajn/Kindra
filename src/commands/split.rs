@@ -7,33 +7,37 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Args, Default)]
 pub struct SplitArgs {
-    /// Stash uncommitted changes for the duration of the split and restore them
-    /// afterward (defaults to the rebase.autostash config)
+    /// Deprecated, has no effect: split never touches uncommitted changes
     #[arg(long, overrides_with = "no_autostash")]
     pub autostash: bool,
 
-    /// Refuse to split with a dirty working tree even if autostash is configured
+    /// Deprecated, has no effect: split never touches uncommitted changes
     #[arg(long = "no-autostash", overrides_with = "autostash")]
     pub no_autostash: bool,
 }
 
+/// Split only moves refs, leaving HEAD at its commit, so it never touches the
+/// index or working tree: uncommitted changes of any kind stay as they are,
+/// and nothing is set aside.
 pub fn split(args: &SplitArgs) -> Result<()> {
+    for (passed, flag) in [
+        (args.autostash, "--autostash"),
+        (args.no_autostash, "--no-autostash"),
+    ] {
+        if passed {
+            eprintln!("Note: {flag} has no effect: kin split never touches uncommitted changes.");
+        }
+    }
     let repo = crate::open_repo()?;
     let lock = crate::state_io::RepoLock::acquire(&repo)?;
     crate::operation_state::ensure_idle(&repo, &lock, crate::operation_state::Allow::NOTHING)?;
-    crate::overrides::with_suspended(&repo, false, || split_locked(&repo, args))
+    crate::overrides::with_suspended(&repo, false, || split_locked(&repo))
 }
 
-fn split_locked(repo: &git2::Repository, args: &SplitArgs) -> Result<()> {
-    // Enforce the uniform clean-or-autostash contract up front (before any
-    // oplog entry or ref mutation); the actual stash is taken later, right
-    // before the mutations in `apply_split`.
-    let autostash =
-        crate::commands::resolve_and_check_autostash(repo, args.autostash, args.no_autostash)?;
-
+fn split_locked(repo: &git2::Repository) -> Result<()> {
     // Snapshot for undo. The guard settles it on every exit — the "no commits"
-    // no-op, an editor/parse failure, a successful apply, or a rolled-back
-    // failure — so `split` can never leave a stale pending snapshot behind.
+    // no-op, an editor/parse failure, a successful apply, or a failed one —
+    // so `split` can never leave a stale pending snapshot behind.
     let _snapshot = crate::oplog::begin(repo, "split")?;
 
     let upstream_name = find_upstream(repo)?.ok_or_else(|| {
@@ -143,14 +147,7 @@ fn split_locked(repo: &git2::Repository, args: &SplitArgs) -> Result<()> {
     ));
     let edited_buffer = draft.edit_or_resume(&buffer)?;
 
-    match split_from_buffer(
-        repo,
-        &edited_buffer,
-        &commits,
-        &path_branches,
-        commit_ids,
-        autostash,
-    ) {
+    match split_from_buffer(repo, &edited_buffer, &commits, &path_branches, commit_ids) {
         Ok(()) => {
             draft.discard();
             Ok(())
@@ -198,7 +195,6 @@ fn split_from_buffer(
     commits: &[CommitInfo],
     path_branches: &[crate::stack::StackBranch],
     commit_ids: HashSet<String>,
-    autostash: bool,
 ) -> Result<()> {
     // Parse and Validate
     let mut new_commits_short = Vec::new();
@@ -316,10 +312,61 @@ fn split_from_buffer(
         new_branch_map_full,
         path_branches.iter().map(|b| b.name.clone()).collect(),
         commit_ids,
-        autostash,
     )?;
 
     Ok(())
+}
+
+/// One branch the split changes.
+enum BranchChange {
+    /// Create the branch (`from` is `None`) or move it to `to`.
+    Set {
+        name: String,
+        from: Option<Oid>,
+        to: Oid,
+    },
+    Delete {
+        name: String,
+        from: Oid,
+    },
+}
+
+impl BranchChange {
+    fn name(&self) -> &str {
+        match self {
+            BranchChange::Set { name, .. } | BranchChange::Delete { name, .. } => name,
+        }
+    }
+
+    fn refname(&self) -> String {
+        format!("refs/heads/{}", self.name())
+    }
+
+    /// Where the branch points once the split is done.
+    fn to(&self) -> Option<Oid> {
+        match self {
+            BranchChange::Set { to, .. } => Some(*to),
+            BranchChange::Delete { .. } => None,
+        }
+    }
+}
+
+/// What HEAD names once the split is done. HEAD's commit never changes, so
+/// neither do the index and working tree.
+#[derive(Debug, PartialEq, Eq)]
+enum HeadChange {
+    /// HEAD's branch moves or goes away, so HEAD stays at its commit, detached.
+    Detach,
+    /// A branch points at HEAD's commit, so HEAD attaches to it.
+    Attach(String),
+}
+
+/// How applying the split failed.
+enum SplitFailure {
+    /// The split stopped before writing any ref.
+    NothingChanged(anyhow::Error),
+    /// Writing the refs failed after some may have been written.
+    Partial(anyhow::Error),
 }
 
 fn apply_split(
@@ -328,38 +375,33 @@ fn apply_split(
     new_branch_map: Vec<(String, String)>,
     initial_branches: Vec<String>,
     allowed_ids: HashSet<String>,
-    autostash: bool,
 ) -> Result<()> {
     let initial_names: HashSet<String> = initial_branches.into_iter().collect();
 
-    // 1. Pre-flight validation and commit resolution.
-    // This phase performs no ref mutations: it only resolves commits and decides
-    // which branches to create, move, skip, or delete.
-    let mut resolved_commits = Vec::new(); // (branch_name, commit_to_set, should_overwrite)
-    let mut skip_branches = HashSet::new();
-
-    for (name, id) in &next_branches {
+    // 1. Decide which branches to create, move, leave or delete, in the
+    // buffer's order. Nothing changes yet.
+    let mut changes = Vec::new();
+    for (name, id) in &new_branch_map {
         let commit_obj = repo.revparse_single(id).context(format!(
             "Failed to resolve target commit {} for branch {}",
             id, name
         ))?;
-        let _ = commit_obj
+        let to = commit_obj
             .as_commit()
-            .ok_or_else(|| anyhow!("Target {} for branch {} is not a commit", id, name))?;
+            .ok_or_else(|| anyhow!("Target {} for branch {} is not a commit", id, name))?
+            .id();
 
         match repo.find_branch(name, BranchType::Local) {
             Ok(existing) => {
-                let target = existing.get().target();
-                let target_str = target.map(|t| t.to_string());
-                if target_str.as_deref() == Some(id) {
-                    skip_branches.insert(name.clone());
+                let from = existing.get().target();
+                if from == Some(to) {
                     continue;
                 }
 
                 // Guard: Only allow moving an existing branch if it was part of the original
                 // stack (by name or by pointing to one of the commits in the stack).
                 let is_safe = initial_names.contains(name)
-                    || target_str.as_ref().is_some_and(|t| allowed_ids.contains(t));
+                    || from.is_some_and(|t| allowed_ids.contains(&t.to_string()));
 
                 if !is_safe {
                     let confirm_msg = format!(
@@ -371,14 +413,21 @@ fn apply_split(
                         crate::commands::Fallback::Default(false),
                     )? {
                         println!("Skipping branch '{}'", name);
-                        skip_branches.insert(name.clone());
                         continue;
                     }
                 }
-                resolved_commits.push((name.clone(), id.clone(), true));
+                changes.push(BranchChange::Set {
+                    name: name.clone(),
+                    from,
+                    to,
+                });
             }
             Err(e) if e.code() == ErrorCode::NotFound => {
-                resolved_commits.push((name.clone(), id.clone(), false));
+                changes.push(BranchChange::Set {
+                    name: name.clone(),
+                    from: None,
+                    to,
+                });
             }
             Err(e) => {
                 return Err(anyhow!(e)
@@ -387,131 +436,23 @@ fn apply_split(
         }
     }
 
-    let delete_names: Vec<String> = initial_names
+    let mut delete_names: Vec<&String> = initial_names
         .iter()
         .filter(|name| !next_branches.contains_key(*name))
-        .cloned()
         .collect();
-
-    // 2. Snapshot every ref we might touch, plus HEAD, so a mid-apply failure can
-    // be rolled back to the pre-split state rather than left half-applied.
-    let mut touched: Vec<String> = resolved_commits
-        .iter()
-        .filter(|(name, _, _)| !skip_branches.contains(name))
-        .map(|(name, _, _)| name.clone())
-        .collect();
-    touched.extend(delete_names.iter().cloned());
-    // Snapshot the refs and HEAD first (both read-only). Only then set aside
-    // uncommitted changes, so a failure while snapshotting can't strand the
-    // autostash — `set_aside::take_tracked` is the last fallible step before the mutations
-    // that `restore_split_autostash` pairs with. The stash is restored below onto
-    // the final HEAD (on success) or the rolled-back HEAD (on failure).
-    let snapshot = snapshot_branches(repo, &touched)?;
-    let head_snapshot = HeadSnapshot::capture(repo)?;
-    let set_aside =
-        crate::set_aside::take_tracked(repo, autostash, crate::set_aside::Restore::Plain)?;
-
-    // 3. Perform the ref mutations, rolling back on any error.
-    let result = apply_split_mutations(
-        repo,
-        &resolved_commits,
-        &delete_names,
-        &skip_branches,
-        &new_branch_map,
-    );
-
-    if let Err(err) = result {
-        eprintln!("kin split failed partway through: {err:#}");
-        eprintln!("Rolling back branch changes to the pre-split state...");
-        if let Err(rollback_err) = restore_branches(repo, &snapshot) {
-            eprintln!(
-                "Warning: rollback of branch refs was incomplete: {rollback_err:#}. Use 'git reflog' to recover."
-            );
-        }
-        if let Err(rollback_err) = head_snapshot.restore(repo) {
-            eprintln!("Warning: rollback of HEAD was incomplete: {rollback_err:#}");
-        }
-        restore_split_autostash(repo, set_aside);
-        // The undo guard in `split` finalizes on return: if rollback fully
-        // restored the pre-split refs it records nothing; if it was incomplete,
-        // the residual changes become an undoable entry.
-        return Err(err.context("kin split was aborted and rolled back"));
-    }
-
-    restore_split_autostash(repo, set_aside);
-    Ok(())
-}
-
-/// Restore the autostash taken by [`apply_split`] onto the current HEAD.
-/// `split` is not resumable, so a restore that does not go cleanly keeps the
-/// entry and points the user straight at it.
-fn restore_split_autostash(repo: &Repository, set_aside: Option<crate::set_aside::SetAside>) {
-    if let Some(set_aside) = set_aside
-        && crate::set_aside::restore(repo, &set_aside, crate::set_aside::Phase::NonResumable)
-            == crate::set_aside::Outcome::Restored
-    {
-        crate::set_aside::drop_restored(&set_aside);
-    }
-}
-
-/// Apply the resolved branch creations/moves and deletions.
-///
-/// Creations and moves run first because they are non-destructive: the original
-/// branch tips still exist until the delete phase, so a failure here leaves the
-/// stack recoverable. Deletions run last and echo the old tip SHA so a mistaken
-/// delete can be undone from the printed value or the reflog.
-fn apply_split_mutations(
-    repo: &Repository,
-    resolved_commits: &[(String, String, bool)],
-    delete_names: &[String],
-    skip_branches: &HashSet<String>,
-    new_branch_map: &[(String, String)],
-) -> Result<()> {
-    let current_branch = current_branch_name(repo)?;
-
-    for (name, id, force) in resolved_commits {
-        if skip_branches.contains(name) {
-            continue;
-        }
-
-        let commit_obj = repo.revparse_single(id)?;
-        let commit = commit_obj
-            .as_commit()
-            .ok_or_else(|| anyhow!("Target {} for branch {} is not a commit", id, name))?;
-
-        if Some(name) == current_branch.as_ref() {
-            println!("Detaching HEAD to move current branch: {}", name);
-            detach_head(repo)?;
-        }
-
-        repo.branch(name, commit, *force)?;
-        if *force {
-            println!("Moved branch: {} -> {}", name, &id[..7]);
-        } else {
-            println!("Created branch: {} -> {}", name, &id[..7]);
-        }
-    }
-
+    delete_names.sort();
     for name in delete_names {
         match repo.find_branch(name, BranchType::Local) {
-            Ok(mut branch) => {
-                let old_tip = branch.get().target().map(|t| t.to_string());
-                if Some(name) == current_branch.as_ref() && !repo.head_detached()? {
-                    println!(
-                        "Cannot delete current branch: {}. Detaching HEAD first.",
-                        name
-                    );
-                    detach_head(repo)?;
-                }
-                branch.delete()?;
-                match old_tip {
-                    Some(old) => println!("Deleted branch: {} (was {})", name, &old[..7]),
-                    None => println!("Deleted branch: {}", name),
+            Ok(branch) => {
+                if let Some(from) = branch.get().target() {
+                    changes.push(BranchChange::Delete {
+                        name: name.clone(),
+                        from,
+                    });
                 }
             }
-            Err(e) if e.code() == ErrorCode::NotFound => {
-                // Branch already gone, skip.
-            }
+            // Branch already gone, skip.
+            Err(e) if e.code() == ErrorCode::NotFound => {}
             Err(e) => {
                 return Err(
                     anyhow!(e).context(format!("Failed to find branch {} for deletion", name))
@@ -520,29 +461,259 @@ fn apply_split_mutations(
         }
     }
 
-    if repo.head_detached()? {
-        let head_commit = repo.head()?.peel_to_commit()?;
-        let head_id_str = head_commit.id().to_string();
-        for (name, commit_id) in new_branch_map {
-            if commit_id != &head_id_str {
-                continue;
-            }
-            // A skipped overwrite branch may still target its old commit even
-            // though its desired commit equals HEAD. Only reattach to a branch
-            // that actually points at HEAD now.
-            let points_at_head = repo
-                .find_branch(name, BranchType::Local)
-                .ok()
-                .and_then(|branch| branch.get().target())
-                .is_some_and(|target| target == head_commit.id());
-            if points_at_head {
-                repo.set_head(&format!("refs/heads/{}", name))?;
-                break;
-            }
+    let head = head_change(repo, &changes, &new_branch_map)?;
+
+    // 2. Change every ref at once.
+    match check_changes(repo, &changes).and_then(|()| commit_changes(repo, &changes, &head)) {
+        Ok(()) => {}
+        Err(SplitFailure::NothingChanged(err)) => {
+            return Err(anyhow!("{err:#} No branch was changed."));
+        }
+        Err(SplitFailure::Partial(err)) => {
+            return Err(anyhow!(
+                "{err:#} Some branches may have changed; 'kin undo' reverts the ones that did."
+            ));
         }
     }
 
+    // Deletions echo the old tip so a mistaken delete can be undone from the
+    // printed value as well as with `kin undo`.
+    for change in &changes {
+        match change {
+            BranchChange::Set { name, from, to } => {
+                let verb = if from.is_some() { "Moved" } else { "Created" };
+                println!("{verb} branch: {name} -> {}", short(*to));
+            }
+            BranchChange::Delete { name, from } => {
+                println!("Deleted branch: {name} (was {})", short(*from));
+                forget_deleted_branch(repo, name);
+            }
+        }
+    }
+    match &head {
+        Some(HeadChange::Detach) => println!(
+            "HEAD is detached at {}: its branch no longer points there.",
+            short(repo.head()?.peel_to_commit()?.id())
+        ),
+        Some(HeadChange::Attach(name)) => println!("HEAD is now on branch {name}."),
+        None => {}
+    }
     Ok(())
+}
+
+fn short(oid: Oid) -> String {
+    oid.to_string()[..7].to_string()
+}
+
+/// How the split changes what HEAD names, if it does. HEAD stays on its
+/// branch while that branch still points at HEAD's commit; otherwise it
+/// attaches to the first branch in the buffer that points there once the
+/// split is done, or else stays at its commit, detached.
+fn head_change(
+    repo: &Repository,
+    changes: &[BranchChange],
+    new_branch_map: &[(String, String)],
+) -> Result<Option<HeadChange>> {
+    let head_id = repo.head()?.peel_to_commit()?.id();
+    let current = current_branch_name(repo)?;
+    let final_target = |name: &str| -> Option<Oid> {
+        match changes.iter().find(|change| change.name() == name) {
+            Some(change) => change.to(),
+            None => repo
+                .find_branch(name, BranchType::Local)
+                .ok()
+                .and_then(|branch| branch.get().target()),
+        }
+    };
+
+    if current
+        .as_deref()
+        .is_some_and(|name| final_target(name) == Some(head_id))
+    {
+        return Ok(None);
+    }
+    // A skipped overwrite branch may still target its old commit even though
+    // its desired commit equals HEAD, so look at where each branch ends up.
+    let head_id_str = head_id.to_string();
+    if let Some((name, _)) = new_branch_map
+        .iter()
+        .find(|(name, id)| id == &head_id_str && final_target(name) == Some(head_id))
+    {
+        return Ok(Some(HeadChange::Attach(name.clone())));
+    }
+    Ok(current.map(|_| HeadChange::Detach))
+}
+
+/// Refuse the changes Git would refuse, before any ref is locked: a new
+/// branch whose name clashes with another ref's path (`foo/bar` next to
+/// `foo`), or deleting a branch another worktree holds.
+fn check_changes(repo: &Repository, changes: &[BranchChange]) -> Result<(), SplitFailure> {
+    let failure = SplitFailure::NothingChanged;
+    let mut existing = Vec::new();
+    for reference in repo.references().map_err(|e| failure(e.into()))? {
+        let reference = reference.map_err(|e| failure(e.into()))?;
+        if let Some(name) = reference.name() {
+            existing.push(name.to_string());
+        }
+    }
+    let created: Vec<String> = changes
+        .iter()
+        .filter(|change| matches!(change, BranchChange::Set { from: None, .. }))
+        .map(BranchChange::refname)
+        .collect();
+    for (index, refname) in created.iter().enumerate() {
+        let clash = existing
+            .iter()
+            .chain(created.iter().take(index))
+            .find(|other| paths_clash(refname, other));
+        if let Some(other) = clash {
+            return Err(failure(anyhow!(
+                "Cannot create branch '{}': it conflicts with '{other}'.",
+                refname.trim_start_matches("refs/heads/")
+            )));
+        }
+    }
+
+    let deleted: Vec<String> = changes
+        .iter()
+        .filter(|change| matches!(change, BranchChange::Delete { .. }))
+        .map(|change| change.name().to_string())
+        .collect();
+    if let Some((branch, held)) =
+        crate::rebase_utils::first_held_elsewhere(&deleted).map_err(failure)?
+    {
+        return Err(failure(anyhow!(
+            "Cannot delete branch '{branch}': it is {held}."
+        )));
+    }
+    Ok(())
+}
+
+/// Whether one ref name is a directory of the other, so both cannot exist.
+fn paths_clash(a: &str, b: &str) -> bool {
+    a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
+        || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Write every branch change and HEAD's in one ref transaction: all the refs
+/// are locked before any is written, so a ref that cannot be locked (another
+/// Git process holds it) fails the split with nothing changed.
+///
+/// HEAD's reflog, and that of HEAD's branch when it moves, are written
+/// explicitly: otherwise updating HEAD's branch would log the move in HEAD's
+/// reflog too, or not, depending on the order the transaction writes them in.
+fn commit_changes(
+    repo: &Repository,
+    changes: &[BranchChange],
+    head: &Option<HeadChange>,
+) -> Result<(), SplitFailure> {
+    let failure = |err: git2::Error| SplitFailure::NothingChanged(err.into());
+    let head_id = repo
+        .head()
+        .and_then(|head| head.peel_to_commit())
+        .map_err(failure)?
+        .id();
+    let current = current_branch_name(repo).map_err(SplitFailure::NothingChanged)?;
+    let log_refs = repo
+        .config()
+        .and_then(|config| config.get_bool("core.logAllRefUpdates"))
+        .unwrap_or(true);
+    let signature = repo
+        .signature()
+        .or_else(|_| git2::Signature::now("unknown", "unknown"))
+        .map_err(failure)?;
+    let mut tx = repo.transaction().map_err(failure)?;
+
+    for change in changes {
+        tx.lock_ref(&change.refname()).map_err(failure)?;
+    }
+    if head.is_some() {
+        tx.lock_ref("HEAD").map_err(failure)?;
+    }
+
+    for change in changes {
+        let refname = change.refname();
+        match change {
+            BranchChange::Set { from, to, .. } => {
+                let verb = if from.is_some() { "move" } else { "create" };
+                let message = format!("kin split: {verb} branch at {to}");
+                tx.set_target(&refname, *to, Some(&signature), &message)
+                    .map_err(failure)?;
+                if log_refs && head.is_some() && current.as_deref() == Some(change.name()) {
+                    let mut reflog = repo.reflog(&refname).map_err(failure)?;
+                    reflog
+                        .append(*to, &signature, Some(&message))
+                        .map_err(failure)?;
+                    tx.set_reflog(&refname, reflog).map_err(failure)?;
+                }
+            }
+            BranchChange::Delete { .. } => tx.remove(&refname).map_err(failure)?,
+        }
+    }
+
+    if let Some(head) = head {
+        let from = current.clone().unwrap_or_else(|| head_id.to_string());
+        let message = match head {
+            HeadChange::Detach => {
+                let message = format!("checkout: moving from {from} to {head_id}");
+                tx.set_target("HEAD", head_id, Some(&signature), &message)
+                    .map_err(failure)?;
+                message
+            }
+            HeadChange::Attach(name) => {
+                let message = format!("checkout: moving from {from} to {name}");
+                tx.set_symbolic_target(
+                    "HEAD",
+                    &format!("refs/heads/{name}"),
+                    Some(&signature),
+                    &message,
+                )
+                .map_err(failure)?;
+                message
+            }
+        };
+        if log_refs {
+            let mut reflog = repo.reflog("HEAD").map_err(failure)?;
+            reflog
+                .append(head_id, &signature, Some(&message))
+                .map_err(failure)?;
+            tx.set_reflog("HEAD", reflog).map_err(failure)?;
+        }
+    }
+
+    tx.commit()
+        .map_err(|err| SplitFailure::Partial(anyhow!(err).context("Failed to update the branches")))
+}
+
+/// Remove what Git removes with a deleted branch besides the ref: its reflog
+/// and its `branch.<name>` configuration. The branch is gone either way, so a
+/// failure is only a warning.
+fn forget_deleted_branch(repo: &Repository, name: &str) {
+    let result = (|| -> Result<()> {
+        repo.reflog_delete(&format!("refs/heads/{name}"))?;
+        let mut config = repo.config()?.open_level(git2::ConfigLevel::Local)?;
+        let prefix = format!("branch.{name}.");
+        let mut keys = Vec::new();
+        config.entries(None)?.for_each(|entry| {
+            if let Some(key) = entry.name()
+                && key
+                    .strip_prefix(&prefix)
+                    .is_some_and(|variable| !variable.contains('.'))
+            {
+                keys.push(key.to_string());
+            }
+        })?;
+        keys.dedup();
+        for key in keys {
+            config.remove_multivar(&key, ".*")?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = result {
+        eprintln!(
+            "Warning: could not remove the reflog and configuration of deleted branch {name}: {err:#}"
+        );
+    }
 }
 
 fn current_branch_name(repo: &Repository) -> Result<Option<String>> {
@@ -550,99 +721,5 @@ fn current_branch_name(repo: &Repository) -> Result<Option<String>> {
         Ok(None)
     } else {
         Ok(repo.head()?.shorthand().map(|s| s.to_string()))
-    }
-}
-
-fn detach_head(repo: &Repository) -> Result<()> {
-    let head_commit = repo.head()?.peel_to_commit()?;
-    repo.set_head_detached(head_commit.id())?;
-    Ok(())
-}
-
-/// Record the current tip of each named branch (`None` if it does not exist yet)
-/// so it can be restored on rollback.
-fn snapshot_branches(repo: &Repository, names: &[String]) -> Result<Vec<(String, Option<Oid>)>> {
-    let mut seen = HashSet::new();
-    let mut snapshot = Vec::new();
-    for name in names {
-        if !seen.insert(name.clone()) {
-            continue;
-        }
-        let target = match repo.find_branch(name, BranchType::Local) {
-            Ok(branch) => branch.get().target(),
-            Err(e) if e.code() == ErrorCode::NotFound => None,
-            Err(e) => {
-                return Err(anyhow!(e).context(format!("Failed to snapshot branch {}", name)));
-            }
-        };
-        snapshot.push((name.clone(), target));
-    }
-    Ok(snapshot)
-}
-
-/// Best-effort restore of branches to their snapshotted tips. Continues past
-/// individual failures and returns the first error encountered, if any.
-fn restore_branches(repo: &Repository, snapshot: &[(String, Option<Oid>)]) -> Result<()> {
-    let mut first_err: Option<anyhow::Error> = None;
-    for (name, target) in snapshot {
-        let outcome = match target {
-            Some(oid) => repo
-                .reference(
-                    &format!("refs/heads/{name}"),
-                    *oid,
-                    true,
-                    "kin split rollback",
-                )
-                .map(|_| ())
-                .map_err(anyhow::Error::from),
-            None => match repo.find_branch(name, BranchType::Local) {
-                Ok(mut branch) => branch.delete().map_err(anyhow::Error::from),
-                Err(e) if e.code() == ErrorCode::NotFound => Ok(()),
-                Err(e) => Err(anyhow::Error::from(e)),
-            },
-        };
-        if let Err(e) = outcome
-            && first_err.is_none()
-        {
-            first_err = Some(e.context(format!("failed to restore branch {name}")));
-        }
-    }
-    match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
-/// Snapshot of HEAD taken before mutations so it can be restored on rollback.
-enum HeadSnapshot {
-    Branch(String),
-    Detached(Oid),
-}
-
-impl HeadSnapshot {
-    fn capture(repo: &Repository) -> Result<Self> {
-        if repo.head_detached()? {
-            let oid = repo.head()?.peel_to_commit()?.id();
-            Ok(HeadSnapshot::Detached(oid))
-        } else {
-            let name = repo
-                .head()?
-                .shorthand()
-                .map(|s| s.to_string())
-                .ok_or_else(|| anyhow!("Could not determine current branch for HEAD snapshot"))?;
-            Ok(HeadSnapshot::Branch(name))
-        }
-    }
-
-    fn restore(&self, repo: &Repository) -> Result<()> {
-        match self {
-            HeadSnapshot::Branch(name) => {
-                repo.set_head(&format!("refs/heads/{name}"))?;
-            }
-            HeadSnapshot::Detached(oid) => {
-                repo.set_head_detached(*oid)?;
-            }
-        }
-        Ok(())
     }
 }

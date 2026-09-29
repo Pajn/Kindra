@@ -744,6 +744,20 @@ pub fn check_worktrees(branches: &[String], force: bool) -> Result<()> {
     Ok(())
 }
 
+/// The first of `branches` another worktree holds, and how it holds it (for
+/// example `checked out in <path>`).
+pub fn first_held_elsewhere(branches: &[String]) -> Result<Option<(String, String)>> {
+    if branches.is_empty() {
+        return Ok(None);
+    }
+    let elsewhere = branches_checked_out_elsewhere()?;
+    Ok(branches.iter().find_map(|branch| {
+        elsewhere
+            .get(branch)
+            .map(|held| (branch.clone(), held.to_string()))
+    }))
+}
+
 /// Removes the branches another worktree has checked out from `branches`,
 /// which are about to be deleted as merged, and says which were kept. Git
 /// refuses to delete a branch checked out elsewhere, and nothing else in a sync
