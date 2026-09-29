@@ -2,11 +2,11 @@ use crate::operation_state::{KindraOperation, NativeOperation};
 use crate::rebase_utils::{
     checkout_branch, git_rebase_in_progress, load_state, owned_tip_state_matches, unstage_all,
 };
+use crate::repository::git_command;
 use crate::set_aside::{self, Phase};
 use anyhow::{Result, anyhow};
 use git2::Oid;
 use std::collections::HashMap;
-use std::process::Command;
 
 pub fn abort_cmd(clear_state_only: bool) -> Result<()> {
     let repo = crate::open_repo()?;
@@ -107,7 +107,7 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
 
         if git_rebase_active && kindra_owns_current_state {
             println!("Aborting active git rebase...");
-            let status = Command::new("git").arg("rebase").arg("--abort").status()?;
+            let status = git_command(repo).arg("rebase").arg("--abort").status()?;
             if !status.success() {
                 return Err(anyhow!("Failed to abort git rebase."));
             }
@@ -127,20 +127,20 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
                 // while the worktree matches the stash's base; the tip restore
                 // below then moves the ref out from underneath, so the
                 // discarded content reappears as staged changes.
-                checkout_branch(&parsed_state.original_branch)?;
+                checkout_branch(repo, &parsed_state.original_branch)?;
                 set_aside::restore_all(repo, &mut parsed_state, Phase::Abort)?;
-                restore_original_branch_tips(&parsed_state.original_tip_map)?;
+                restore_original_branch_tips(repo, &parsed_state.original_tip_map)?;
                 if restore_branch != parsed_state.original_branch {
-                    checkout_branch(&restore_branch)?;
+                    checkout_branch(repo, &restore_branch)?;
                 }
             } else {
-                restore_original_branch_tips(&parsed_state.original_tip_map)?;
-                checkout_branch(&restore_branch)?;
+                restore_original_branch_tips(repo, &parsed_state.original_tip_map)?;
+                checkout_branch(repo, &restore_branch)?;
                 set_aside::restore_all(repo, &mut parsed_state, Phase::Abort)?;
             }
 
             if parsed_state.unstage_on_restore {
-                unstage_all()?;
+                unstage_all(repo)?;
             }
         }
 
@@ -226,7 +226,10 @@ impl Drop for AbortOplogSettle<'_> {
     }
 }
 
-fn restore_original_branch_tips(original_tip_map: &HashMap<String, String>) -> Result<()> {
+fn restore_original_branch_tips(
+    repo: &git2::Repository,
+    original_tip_map: &HashMap<String, String>,
+) -> Result<()> {
     for (branch_name, original_tip) in original_tip_map {
         let oid = Oid::from_str(original_tip).map_err(|_| {
             anyhow!(
@@ -236,7 +239,7 @@ fn restore_original_branch_tips(original_tip_map: &HashMap<String, String>) -> R
             )
         })?;
 
-        let status = Command::new("git")
+        let status = git_command(repo)
             .arg("update-ref")
             .arg(format!("refs/heads/{branch_name}"))
             .arg(oid.to_string())

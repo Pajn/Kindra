@@ -355,12 +355,10 @@ fn run_after_pr_hooks(
 
 /// `git remote get-url --push <remote>`, or `None` if Git cannot answer.
 fn push_url(repo: &Repository, remote: &str) -> Option<String> {
-    let mut command = std::process::Command::new("git");
-    command.args(["remote", "get-url", "--push", remote]);
-    if let Some(root) = repo.workdir() {
-        command.current_dir(root);
-    }
-    let output = command.output().ok()?;
+    let output = crate::repository::git_command(repo)
+        .args(["remote", "get-url", "--push", remote])
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }

@@ -1336,8 +1336,8 @@ pub fn update_pr_base(pr_number: u64, new_base: &str) -> Result<()> {
 /// Delete a branch on the remote (e.g. after its PR was merged). A missing
 /// remote branch is treated as success so a re-run or a server-side
 /// auto-delete-on-merge setting does not turn into an error.
-pub fn delete_remote_branch(remote: &str, branch: &str) -> Result<()> {
-    let output = Command::new("git")
+pub fn delete_remote_branch(repo: &git2::Repository, remote: &str, branch: &str) -> Result<()> {
+    let output = crate::repository::git_command(repo)
         .args(["push", remote, "--delete", branch])
         .output()
         .with_context(|| format!("Failed to run `git push {remote} --delete {branch}`"))?;

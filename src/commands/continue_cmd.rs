@@ -5,7 +5,6 @@ use crate::rebase_utils::{
 };
 use anyhow::{Result, anyhow};
 use git2::Repository;
-use std::process::Command;
 
 pub fn continue_cmd() -> Result<()> {
     let repo = crate::open_repo()?;
@@ -57,7 +56,7 @@ fn continue_cmd_locked(repo: &git2::Repository, kindra: &KindraOperation) -> Res
         let repaired = repair_stalled_pick_commit(repo)?;
 
         println!("Continuing git rebase...");
-        let status = git_rebase_step(&state, "--continue")?;
+        let status = git_rebase_step(repo, &state, "--continue")?;
         if !status.success() {
             // A repaired stall re-executes the pick whose changes were just
             // committed; that replay usually comes up empty and stops. Nothing
@@ -65,12 +64,12 @@ fn continue_cmd_locked(repo: &git2::Repository, kindra: &KindraOperation) -> Res
             // with --skip is the completion of the recovery, not a decision.
             if repaired && rebase_stopped_on_empty_pick(repo)? {
                 println!("The recovered commit made the replayed pick empty; skipping it...");
-                let status = git_rebase_step(&state, "--skip")?;
+                let status = git_rebase_step(repo, &state, "--skip")?;
                 if !status.success() {
-                    return Err(continue_failure_error());
+                    return Err(continue_failure_error(repo));
                 }
             } else {
-                return Err(continue_failure_error());
+                return Err(continue_failure_error(repo));
             }
         }
     }
@@ -84,9 +83,12 @@ fn continue_cmd_locked(repo: &git2::Repository, kindra: &KindraOperation) -> Res
 }
 
 /// Run `git rebase <step>` with the editor resolved per the saved state.
-fn git_rebase_step(rebase_state: &RebaseState, step: &str) -> Result<std::process::ExitStatus> {
-    let mut git = Command::new("git");
-    git.envs(std::env::vars_os());
+fn git_rebase_step(
+    repo: &Repository,
+    rebase_state: &RebaseState,
+    step: &str,
+) -> Result<std::process::ExitStatus> {
+    let mut git = crate::repository::git_command(repo);
     if rebase_state.suppress_editor {
         // The paused operation ran its rebase editor-less (absorb pins
         // GIT_EDITOR so squash! folds never open a commit-message editor);
@@ -103,8 +105,8 @@ fn git_rebase_step(rebase_state: &RebaseState, step: &str) -> Result<std::proces
     Ok(git.arg("rebase").arg(step).status()?)
 }
 
-fn continue_failure_error() -> anyhow::Error {
-    if crate::rebase_utils::unmerged_paths_exist().unwrap_or(false) {
+fn continue_failure_error(repo: &Repository) -> anyhow::Error {
+    if crate::rebase_utils::unmerged_paths_exist(repo).unwrap_or(false) {
         anyhow!("git rebase --continue failed. Resolve conflicts and run 'kin continue' again.")
     } else {
         anyhow!(
@@ -136,7 +138,9 @@ fn repair_stalled_pick_commit(repo: &Repository) -> Result<bool> {
         return Ok(false);
     }
     let merge_msg = repo.path().join("MERGE_MSG");
-    if !merge_msg.exists() || !has_staged_changes()? || crate::rebase_utils::unmerged_paths_exist()?
+    if !merge_msg.exists()
+        || !has_staged_changes(repo)?
+        || crate::rebase_utils::unmerged_paths_exist(repo)?
     {
         return Ok(false);
     }
@@ -158,5 +162,5 @@ fn rebase_stopped_on_empty_pick(repo: &Repository) -> Result<bool> {
     if !git_rebase_in_progress(repo) {
         return Ok(false);
     }
-    Ok(!has_staged_changes()? && !crate::rebase_utils::unmerged_paths_exist()?)
+    Ok(!has_staged_changes(repo)? && !crate::rebase_utils::unmerged_paths_exist(repo)?)
 }

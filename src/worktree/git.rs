@@ -4,7 +4,8 @@ use git2::{BranchType, ErrorCode, Oid, Repository};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use crate::repository::{git_command, git_command_in_worktree};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveWorktree {
@@ -20,9 +21,7 @@ impl LiveWorktree {
 }
 
 pub fn list_live_worktrees(repo: &Repository) -> Result<Vec<LiveWorktree>> {
-    let cwd = repo_root(repo)?;
-    let output = Command::new("git")
-        .current_dir(cwd)
+    let output = git_command(repo)
         .arg("worktree")
         .arg("list")
         .arg("--porcelain")
@@ -115,7 +114,7 @@ pub fn add_worktree(repo: &Repository, path: &Path, branch: &str, force: bool) -
     // out elsewhere can still be materialized in its slot. `kin wt add` passes
     // `force = false` so git refuses to check a branch out twice — the correct
     // safety, and it keeps branch -> worktree a unique mapping for target lookup.
-    let mut command = Command::new("git");
+    let mut command = git_command(repo);
     command
         .current_dir(repo_root(repo)?)
         .arg("worktree")
@@ -157,8 +156,8 @@ fn checkout_worktree_reference(
     discard_local_changes: bool,
     detached: bool,
 ) -> Result<()> {
-    let mut command = Command::new("git");
-    command.current_dir(path).arg("checkout");
+    let mut command = git_command_in_worktree(path)?;
+    command.arg("checkout");
     if discard_local_changes {
         command.arg("--force");
     }
@@ -180,7 +179,7 @@ fn checkout_worktree_reference(
 }
 
 pub fn remove_worktree(repo: &Repository, path: &Path, force: bool) -> Result<()> {
-    let mut command = Command::new("git");
+    let mut command = git_command(repo);
     command
         .current_dir(repo_root(repo)?)
         .arg("worktree")
@@ -202,8 +201,7 @@ pub fn remove_worktree(repo: &Repository, path: &Path, force: bool) -> Result<()
 }
 
 pub fn is_worktree_dirty(path: &Path) -> Result<bool> {
-    let output = Command::new("git")
-        .current_dir(path)
+    let output = git_command_in_worktree(path)?
         .arg("status")
         .arg("--porcelain")
         .arg("--untracked-files=normal")
@@ -232,8 +230,7 @@ pub fn current_branch(repo: &Repository) -> Result<Option<String>> {
 }
 
 pub fn current_head_oid(path: &Path) -> Result<String> {
-    let output = Command::new("git")
-        .current_dir(path)
+    let output = git_command_in_worktree(path)?
         .args(["rev-parse", "HEAD"])
         .output()
         .with_context(|| format!("Failed to resolve HEAD for worktree '{}'.", path.display()))?;
@@ -254,7 +251,7 @@ pub fn ensure_local_branch_exists(repo: &Repository, branch: &str) -> Result<()>
             if let Some(remote) = remote_for_branch(repo, branch)? {
                 // Auto-create local branch tracking the remote
                 let start_point = format!("{}/{}", remote, branch);
-                let mut cmd = Command::new("git");
+                let mut cmd = git_command(repo);
                 cmd.current_dir(repo_root(repo)?)
                     .arg("branch")
                     .arg("--track")
@@ -287,7 +284,7 @@ pub fn ensure_local_branch_exists_from_start_point(
         return Ok(());
     }
 
-    let mut command = Command::new("git");
+    let mut command = git_command(repo);
     command.current_dir(repo_root(repo)?).arg("branch");
     if repo.find_branch(start_point, BranchType::Remote).is_ok() {
         command.arg("--track");
@@ -321,7 +318,7 @@ pub fn create_local_branch_from_start_point_strict(
         Err(err) => return Err(err.into()),
     }
 
-    let mut command = Command::new("git");
+    let mut command = git_command(repo);
     command.current_dir(repo_root(repo)?).arg("branch");
     if repo.find_branch(start_point, BranchType::Remote).is_ok() {
         // An explicit remote start point tracks it, matching `git branch --track`.
@@ -363,8 +360,7 @@ pub fn delete_local_branch_if_tip_matches(
 
     let ref_name = format!("refs/heads/{branch}");
     let expected_tip_text = expected_tip.to_string();
-    let output = Command::new("git")
-        .current_dir(repo_root(repo)?)
+    let output = git_command(repo)
         .args(["update-ref", "-d", &ref_name, &expected_tip_text])
         .output()?;
     if output.status.success() {
@@ -388,8 +384,7 @@ pub fn delete_local_branch_if_tip_matches(
 }
 
 pub fn force_delete_local_branch(repo: &Repository, branch: &str) -> Result<()> {
-    let output = Command::new("git")
-        .current_dir(repo_root(repo)?)
+    let output = git_command(repo)
         .args(["branch", "-D", "--quiet", branch])
         .output()?;
     if output.status.success() {
@@ -429,6 +424,8 @@ mod tests {
     use git2::BranchType;
     use tempfile::TempDir;
 
+    // The `git` runs in these tests are not `git_command`: they build the
+    // fixtures, before any repository.
     fn git(dir: &std::path::Path, args: &[&str]) {
         let ok = std::process::Command::new("git")
             .current_dir(dir)

@@ -119,6 +119,7 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
+        // Not `git_command`: this builds the fixture, before any repository.
         let status = std::process::Command::new("git")
             .current_dir(dir)
             .args(args)

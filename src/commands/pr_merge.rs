@@ -345,7 +345,7 @@ fn delete_merged_remote_branch(
         return;
     }
 
-    match gh::delete_remote_branch(remote, remote_branch) {
+    match gh::delete_remote_branch(repo, remote, remote_branch) {
         Ok(()) => println!("✓ Deleted remote branch {upstream}"),
         Err(err) => eprintln!("Warning: failed to delete remote branch {upstream}: {err}"),
     }

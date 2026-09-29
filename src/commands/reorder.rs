@@ -85,7 +85,7 @@ fn reorder_locked(repo: &git2::Repository, args: &ReorderArgs) -> Result<()> {
         let autostash =
             crate::commands::resolve_and_check_autostash(repo, args.autostash, args.no_autostash)?;
 
-        crate::rebase_utils::check_worktrees(&plan.remaining_branches, args.force)?;
+        crate::rebase_utils::check_worktrees(repo, &plan.remaining_branches, args.force)?;
 
         let original_commit_count_map = stack_component
             .iter()

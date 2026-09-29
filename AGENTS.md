@@ -25,6 +25,7 @@
 ### Shared Logic
 - Stack discovery and branch relationship logic must be centralized in `src/stack.rs`. Avoid duplicating Git graph traversal logic across different commands.
 - Read Kindra config only through `src/config.rs`: repository config lives in the common Git directory (never `repo.path()`), and each module deserializes its own section with `ConfigFile::section`. Register new top-level keys in `KNOWN_REPO_KEYS`. Resolve the trunk only through `src/trunk.rs`.
+- Build every `git` child with `repository::git_command(repo)`, or `git_command_in_worktree(path)` for another worktree, never `Command::new("git")`: Git exports `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and more to hooks, and libgit2 ignores them, so an inherited environment would point the child at another repository, work tree or index. The helper clears git's repository variables, names the repository's Git directory and work tree in `GIT_DIR`/`GIT_WORK_TREE` and turns replace refs off, so the child sees what libgit2 sees; it leaves the arguments to the caller (mocks still see the subcommand first) and keeps the current directory, so relative paths and pathspecs mean what they mean to git run there. Set any variable it clears, such as a temporary `GIT_INDEX_FILE`, after building the command. Only `git --version` and test fixtures bypass it, each with a comment saying why.
 
 ### Safety & State
 - Operations that modify multiple branches (like `move`) must persist their state to allow for `continue`/`abort` workflows.

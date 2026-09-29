@@ -6,6 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::repository::git_command;
+
 use crate::set_aside::{self, SetAsides};
 use crate::stack::collect_first_parent_chain;
 
@@ -303,8 +305,8 @@ fn convert_legacy_journal(journal: &mut serde_json::Value) -> serde_json::Result
     Ok(())
 }
 
-pub fn checkout_branch(branch_name: &str) -> Result<()> {
-    let status = Command::new("git")
+pub fn checkout_branch(repo: &Repository, branch_name: &str) -> Result<()> {
+    let status = git_command(repo)
         .arg("checkout")
         .arg(branch_name)
         .status()?;
@@ -694,7 +696,7 @@ fn sync_rebase_completed(repo: &Repository, state: &RebaseState) -> Result<bool>
 fn can_passively_clear_completed_state(repo: &Repository, state: &RebaseState) -> Result<bool> {
     // A conflicted stash is removed from state to avoid applying it twice,
     // but recovery must remain available until its index conflicts are resolved.
-    if unmerged_paths_exist()? {
+    if unmerged_paths_exist(repo)? {
         return Ok(false);
     }
     // Anything still set aside, including staged changes caught mid-carry,
@@ -725,12 +727,12 @@ fn current_branch_name(repo: &Repository) -> Result<Option<String>> {
     Ok(repo.head()?.shorthand().map(ToString::to_string))
 }
 
-pub fn check_worktrees(branches: &[String], force: bool) -> Result<()> {
+pub fn check_worktrees(repo: &Repository, branches: &[String], force: bool) -> Result<()> {
     if force || branches.is_empty() {
         return Ok(());
     }
 
-    let elsewhere = branches_checked_out_elsewhere()?;
+    let elsewhere = branches_checked_out_elsewhere(repo)?;
     for branch in branches {
         if let Some(held) = elsewhere.get(branch) {
             return Err(anyhow!(
@@ -746,11 +748,14 @@ pub fn check_worktrees(branches: &[String], force: bool) -> Result<()> {
 
 /// The first of `branches` another worktree holds, and how it holds it (for
 /// example `checked out in <path>`).
-pub fn first_held_elsewhere(branches: &[String]) -> Result<Option<(String, String)>> {
+pub fn first_held_elsewhere(
+    repo: &Repository,
+    branches: &[String],
+) -> Result<Option<(String, String)>> {
     if branches.is_empty() {
         return Ok(None);
     }
-    let elsewhere = branches_checked_out_elsewhere()?;
+    let elsewhere = branches_checked_out_elsewhere(repo)?;
     Ok(branches.iter().find_map(|branch| {
         elsewhere
             .get(branch)
@@ -762,12 +767,15 @@ pub fn first_held_elsewhere(branches: &[String]) -> Result<Option<(String, Strin
 /// which are about to be deleted as merged, and says which were kept. Git
 /// refuses to delete a branch checked out elsewhere, and nothing else in a sync
 /// touches a merged branch, so keeping them never needs to block the sync.
-pub fn keep_merged_branches_checked_out_elsewhere(branches: &mut Vec<String>) -> Result<()> {
+pub fn keep_merged_branches_checked_out_elsewhere(
+    repo: &Repository,
+    branches: &mut Vec<String>,
+) -> Result<()> {
     if branches.is_empty() {
         return Ok(());
     }
 
-    let elsewhere = branches_checked_out_elsewhere()?;
+    let elsewhere = branches_checked_out_elsewhere(repo)?;
     branches.retain(|branch| match elsewhere.get(branch) {
         Some(held) => {
             println!("Keeping merged branch {}: it is {}.", branch, held);
@@ -798,8 +806,8 @@ impl std::fmt::Display for HeldBy {
 /// Branches held by a worktree other than the current one: checked out
 /// there, or detached from while a native rebase rewrites it or a bisect will
 /// return to it. Git refuses to rewrite such a branch from another worktree.
-fn branches_checked_out_elsewhere() -> Result<HashMap<String, HeldBy>> {
-    let current_worktree_output = Command::new("git")
+fn branches_checked_out_elsewhere(repo: &Repository) -> Result<HashMap<String, HeldBy>> {
+    let current_worktree_output = git_command(repo)
         .arg("rev-parse")
         .arg("--show-toplevel")
         .output()?;
@@ -810,7 +818,7 @@ fn branches_checked_out_elsewhere() -> Result<HashMap<String, HeldBy>> {
         .trim()
         .to_string();
 
-    let worktree_list_output = Command::new("git")
+    let worktree_list_output = git_command(repo)
         .arg("worktree")
         .arg("list")
         .arg("--porcelain")
@@ -890,10 +898,10 @@ pub fn ensure_rebase_working_tree(repo: &Repository, autostash: bool) -> Result<
     Ok(())
 }
 
-pub fn unmerged_paths_exist() -> Result<bool> {
+pub fn unmerged_paths_exist(repo: &Repository) -> Result<bool> {
     // `:/` covers the whole tree: from a subdirectory Git would otherwise see
     // only the conflicts under it.
-    let output = Command::new("git")
+    let output = git_command(repo)
         .args(["ls-files", "--unmerged", "--", ":/"])
         .output()?;
     if !output.status.success() {
@@ -905,8 +913,8 @@ pub fn unmerged_paths_exist() -> Result<bool> {
     Ok(!output.stdout.is_empty())
 }
 
-pub fn has_staged_changes() -> Result<bool> {
-    let output = Command::new("git")
+pub fn has_staged_changes(repo: &Repository) -> Result<bool> {
+    let output = git_command(repo)
         .args(["diff", "--cached", "--name-only"])
         .output()?;
     // Exit code 0 either way; presence of output is the signal.
@@ -1003,8 +1011,8 @@ pub fn record_branch_tips_in_range(
     Ok(())
 }
 
-pub fn unstage_all() -> Result<()> {
-    let status = Command::new("git").arg("reset").status()?;
+pub fn unstage_all(repo: &Repository) -> Result<()> {
+    let status = git_command(repo).arg("reset").status()?;
     if !status.success() {
         return Err(anyhow!(
             "Failed to unstage files after returning to the original branch."
@@ -1116,7 +1124,7 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         }
 
         println!("Rebasing {}...", current_name);
-        let mut rebase = Command::new("git");
+        let mut rebase = git_command(repo);
         rebase.arg("rebase");
         if state.replay().is_sync() {
             rebase.args(["--reapply-cherry-picks", "--empty=keep"]);
@@ -1169,7 +1177,7 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         "Operation completed. Checking out original branch {}...",
         restore_branch
     );
-    checkout_branch(&restore_branch).map_err(|e| {
+    checkout_branch(repo, &restore_branch).map_err(|e| {
         anyhow!(
             "Failed to checkout back to original branch '{}'. State file preserved. {}",
             restore_branch,
@@ -1180,7 +1188,7 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
     set_aside::restore_all(repo, &mut state, set_aside::Phase::Completion)?;
 
     if state.unstage_on_restore {
-        unstage_all()?;
+        unstage_all(repo)?;
     }
 
     clear_state(repo)?;
@@ -1210,6 +1218,8 @@ fn ensure_git_version_at_least(
     detected_message_prefix: &str,
     generic_message_prefix: &str,
 ) -> Result<()> {
+    // Not `git_command`: the version is the installed git's, whatever the
+    // repository.
     let output = Command::new("git").arg("--version").output()?;
     if !output.status.success() {
         return Err(anyhow!(

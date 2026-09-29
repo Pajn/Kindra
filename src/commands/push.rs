@@ -380,8 +380,8 @@ fn announce_force(force: bool) {
 /// `--force-if-includes`, the extra check that the remote's commits were actually
 /// integrated locally — the one that rejects a push when a background fetch has
 /// re-pointed the remote-tracking ref at commits the branch never incorporated.
-fn push_command(force: bool) -> Command {
-    let mut cmd = Command::new("git");
+fn push_command(repo: &Repository, force: bool) -> Command {
+    let mut cmd = crate::repository::git_command(repo);
     cmd.arg("push").arg("--atomic").arg("--force-with-lease");
     cmd.arg(if force {
         "--no-force-if-includes"
@@ -410,7 +410,7 @@ fn perform_push_with_upstream(
         println!("  {branch} -> {remote}/{branch}");
     }
     announce_force(force);
-    let mut cmd = push_command(force);
+    let mut cmd = push_command(repo, force);
     cmd.arg("-u").arg(remote);
 
     for branch in branches {
@@ -503,7 +503,7 @@ fn perform_push(
             }
         }
         announce_force(force);
-        let mut cmd = push_command(force);
+        let mut cmd = push_command(repo, force);
         cmd.arg(&remote);
 
         for (local_name, remote_ref) in &refs {

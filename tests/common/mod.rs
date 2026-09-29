@@ -861,3 +861,58 @@ pub fn assert_repository_locked(cwd: &Path) {
             "Another 'kin' process is operating on this repository",
         ));
 }
+
+/// Another repository, which a test names in Git's repository variables the
+/// way Git does for the hooks it runs and wrappers do for the commands they
+/// wrap. Kindra works on the repository it discovers from its working
+/// directory, so every Git command it runs must leave this one as it was.
+#[allow(dead_code)]
+pub struct ForeignRepository {
+    dir: tempfile::TempDir,
+    before: String,
+}
+
+#[allow(dead_code)]
+impl ForeignRepository {
+    /// A repository with one commit on `main`, whose files and branches are
+    /// not those of any test fixture.
+    pub fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        repo_init(dir.path());
+        fs::write(dir.path().join("foreign.txt"), "foreign").unwrap();
+        run_ok("git", &["add", "foreign.txt"], dir.path());
+        run_ok("git", &["commit", "-m", "foreign"], dir.path());
+        let before = repository_snapshot(dir.path());
+        Self { dir, before }
+    }
+
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// Name this repository's Git directory, work tree and index in `cmd`'s
+    /// environment.
+    pub fn name_in<'a>(&self, cmd: &'a mut Command) -> &'a mut Command {
+        let git_dir = self.path().join(".git");
+        cmd.env("GIT_DIR", &git_dir)
+            .env("GIT_WORK_TREE", self.path())
+            .env("GIT_INDEX_FILE", git_dir.join("index"))
+    }
+
+    /// A `kin` command whose environment names this repository.
+    pub fn kin_cmd(&self) -> Command {
+        let mut cmd = kin_cmd();
+        self.name_in(&mut cmd);
+        cmd
+    }
+
+    /// Assert nothing changed here: refs, HEAD, index, work tree and Kindra
+    /// files.
+    pub fn assert_untouched(&self) {
+        assert_eq!(
+            repository_snapshot(self.path()),
+            self.before,
+            "the repository named in the environment changed"
+        );
+    }
+}

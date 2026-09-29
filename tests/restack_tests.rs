@@ -3138,3 +3138,165 @@ fn restack_refuses_during_native_revert() {
     );
     common::assert_no_kindra_operation(dir.path());
 }
+
+/// `main` -> `topic` -> `child`, with `topic` then gaining a commit that
+/// `child` must be restacked onto, and HEAD on `topic`. `child` and the new
+/// commit both write `child_file`, so they conflict when it is `new.txt`.
+/// Returns the new tip of `topic`.
+fn stack_with_parent_ahead(path: &std::path::Path, child_file: &str) -> git2::Oid {
+    repo_init(path);
+    let commit = |name: &str, content: &str| {
+        let file = path.join(name);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, content).unwrap();
+        run_ok("git", &["add", name], path);
+        run_ok("git", &["commit", "-m", name], path);
+        Repository::open(path)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+    };
+    commit("root", "root");
+    commit("sub/nested.txt", "nested");
+    run_ok("git", &["checkout", "-b", "topic"], path);
+    commit("topic", "topic");
+    run_ok("git", &["checkout", "-b", "child"], path);
+    commit(child_file, "child");
+    run_ok("git", &["checkout", "topic"], path);
+    commit("new.txt", "new")
+}
+
+fn assert_child_restacked_onto(path: &std::path::Path, tip: git2::Oid) {
+    let repo = Repository::open(path).unwrap();
+    let child = repo
+        .revparse_single("child")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    assert_eq!(child.parent_id(0).unwrap(), tip);
+    assert_eq!(repo.head().unwrap().shorthand(), Some("topic"));
+    // A rebase finished with `--continue` leaves REBASE_HEAD behind.
+    assert!(!path.join(".git/rebase-merge").exists());
+    common::assert_no_kindra_operation(path);
+}
+
+/// Git exports `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` to hooks, and
+/// wrappers set them. Kindra restacks the repository it discovered, so the
+/// checkouts, rebases and set-asides it runs Git for must act on that
+/// repository's work tree and index, not the ones the environment names.
+#[test]
+fn test_restack_acts_on_the_discovered_repository_when_git_env_names_another() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path();
+    let tip = stack_with_parent_ahead(path, "child.txt");
+    std::fs::write(path.join("root"), "edited").unwrap();
+    std::fs::write(path.join("sub/untracked.txt"), "untracked").unwrap();
+    let foreign = common::ForeignRepository::new();
+
+    foreign
+        .kin_cmd()
+        .current_dir(path)
+        .args(["restack", "--autostash"])
+        .assert()
+        .success();
+
+    assert_child_restacked_onto(path, tip);
+    assert_eq!(
+        std::fs::read_to_string(path.join("root")).unwrap(),
+        "edited"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("sub/untracked.txt")).unwrap(),
+        "untracked"
+    );
+    foreign.assert_untouched();
+}
+
+/// Resuming and undoing a paused restack run Git too: `kin continue` and
+/// `kin abort` act on the discovered repository whatever the environment
+/// names.
+#[test]
+fn test_restack_continues_in_the_discovered_repository_when_git_env_names_another() {
+    resume_paused_restack_with_git_env_naming_another("continue");
+}
+
+#[test]
+fn test_restack_aborts_in_the_discovered_repository_when_git_env_names_another() {
+    resume_paused_restack_with_git_env_naming_another("abort");
+}
+
+fn resume_paused_restack_with_git_env_naming_another(resume: &str) {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path();
+    let tip = stack_with_parent_ahead(path, "new.txt");
+    let child_before = Repository::open(path)
+        .unwrap()
+        .revparse_single("child")
+        .unwrap()
+        .id();
+    let foreign = common::ForeignRepository::new();
+
+    kin_cmd()
+        .current_dir(path)
+        .arg("restack")
+        .assert()
+        .failure();
+    assert!(path.join(".git/rebase-merge").exists());
+
+    if resume == "continue" {
+        std::fs::write(path.join("new.txt"), "resolved").unwrap();
+        run_ok("git", &["add", "new.txt"], path);
+    }
+    foreign
+        .kin_cmd()
+        .current_dir(path)
+        .arg(resume)
+        .assert()
+        .success();
+
+    if resume == "continue" {
+        assert_child_restacked_onto(path, tip);
+    } else {
+        let repo = Repository::open(path).unwrap();
+        assert_eq!(repo.revparse_single("child").unwrap().id(), child_before);
+        assert_eq!(repo.head().unwrap().shorthand(), Some("topic"));
+        assert_no_rebase_in_progress(path);
+        common::assert_no_kindra_operation(path);
+    }
+    foreign.assert_untouched();
+}
+
+/// From a subdirectory, Git sees the whole work tree Kindra discovered: the
+/// changes set aside and restored around the restack include those outside
+/// the subdirectory.
+#[test]
+fn test_restack_from_a_subdirectory_sets_aside_and_restores_the_whole_tree() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path();
+    let tip = stack_with_parent_ahead(path, "child.txt");
+    std::fs::write(path.join("root"), "edited").unwrap();
+    std::fs::write(path.join("sub/nested.txt"), "nested edited").unwrap();
+    std::fs::write(path.join("untracked.txt"), "untracked").unwrap();
+
+    kin_cmd()
+        .current_dir(path.join("sub"))
+        .args(["restack", "--autostash"])
+        .assert()
+        .success();
+
+    assert_child_restacked_onto(path, tip);
+    assert_eq!(
+        std::fs::read_to_string(path.join("root")).unwrap(),
+        "edited"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("sub/nested.txt")).unwrap(),
+        "nested edited"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("untracked.txt")).unwrap(),
+        "untracked"
+    );
+}

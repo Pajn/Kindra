@@ -1032,6 +1032,28 @@ fn diff_handles_globs_and_subdirectories_without_including_unmanaged_changes() {
     assert!(!output.contains("+local override"), "{output}");
 }
 
+/// The diff's temporary index and object database are Kindra's own: the
+/// index, objects and repository the environment names (as Git names them
+/// for hooks) take no part in it.
+#[test]
+fn diff_reads_the_discovered_repository_when_git_env_names_another() {
+    let dir = setup();
+    let foreign = common::ForeignRepository::new();
+    let output = foreign
+        .kin_cmd()
+        .current_dir(dir.path())
+        .args(["overrides", "diff"])
+        .env("GIT_OBJECT_DIRECTORY", foreign.path().join(".git/objects"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("-feature\n+local override"), "{output}");
+    foreign.assert_untouched();
+}
+
 #[test]
 fn diff_in_linked_worktree_uses_its_head_and_files() {
     let dir = setup();

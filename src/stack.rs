@@ -2,7 +2,6 @@ use anyhow::{Result, anyhow};
 use git2::{Commit, Oid, Repository};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::process::Command;
 use std::process::Stdio;
 use std::rc::Rc;
 
@@ -60,7 +59,7 @@ impl TargetPathHistory {
     /// branch, and walking it would scan the whole of the target's history.
     fn load(repo: &Repository, floor: Oid, target_tip: Oid, paths: &[String]) -> Result<Self> {
         let unfiltered = paths.is_empty();
-        let mut log = Command::new("git");
+        let mut log = crate::repository::git_command(repo);
         // Names are matched against real tree paths, so they are read NUL-framed
         // and unquoted, and the touched paths are matched literally, not as globs.
         log.args(["--literal-pathspecs", "-c", "core.quotePath=false"])
@@ -1553,7 +1552,7 @@ fn touched_path_sets(repo: &Repository, commit_ids: &[Oid]) -> Result<HashMap<Oi
     if commit_ids.is_empty() {
         return Ok(sets);
     }
-    let mut child = Command::new("git")
+    let mut child = crate::repository::git_command(repo)
         .arg("diff-tree")
         .arg("-r")
         .arg("--root")
@@ -2157,22 +2156,16 @@ fn ensure_patch_ids(
 }
 
 fn compute_patch_ids(repo: &Repository, commit_ids: &[Oid]) -> Result<HashMap<Oid, String>> {
-    compute_patch_ids_for_commits(repo_root(repo)?, commit_ids)
-}
-
-fn compute_patch_ids_for_commits(
-    repo_root: &Path,
-    commit_ids: &[Oid],
-) -> Result<HashMap<Oid, String>> {
     if commit_ids.is_empty() {
         return Ok(HashMap::new());
     }
 
+    let repo_root = repo_root(repo)?;
     let mut result = HashMap::new();
     const PATCH_ID_BATCH_SIZE: usize = 512;
 
     for chunk in commit_ids.chunks(PATCH_ID_BATCH_SIZE) {
-        let mut show = Command::new("git");
+        let mut show = crate::repository::git_command(repo);
         show.arg("show").arg("--no-ext-diff").arg("--no-color");
         for oid in chunk {
             show.arg(oid.to_string());
@@ -2184,7 +2177,7 @@ fn compute_patch_ids_for_commits(
             anyhow!("Failed to capture git show output for patch-id calculation.")
         })?;
 
-        let patch_output = Command::new("git")
+        let patch_output = crate::repository::git_command(repo)
             .arg("patch-id")
             .arg("--stable")
             .current_dir(repo_root)
@@ -2431,7 +2424,7 @@ pub fn resolve_merge_base(repo: &Repository, a: Oid, b: Oid) -> Result<Oid> {
 }
 
 fn git_merge_base(repo: &Repository, a: Oid, b: Oid) -> Result<Oid> {
-    let output = Command::new("git")
+    let output = crate::repository::git_command(repo)
         .arg("merge-base")
         .arg(a.to_string())
         .arg(b.to_string())

@@ -4,12 +4,10 @@ use crate::gh;
 use crate::stack::{
     discover_pr_connected_stack, get_immediate_successors, get_stack_tips, visualize_stack,
 };
-use crate::worktree::git::repo_root;
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Repository};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::process::Command;
 
 pub fn checkout(
     subcommand: &Option<CheckoutSubcommand>,
@@ -258,7 +256,7 @@ pub(crate) fn continue_hydration(repo: &Repository) -> Result<()> {
     }
     let mut plan = crate::overrides::Plan::default();
     crate::overrides::prepare(repo, plan.checkout_rev(repo, &state.branch))?;
-    git_checkout(&state.branch).context(
+    git_checkout(repo, &state.branch).context(
         "Checkout hydration stopped. Run 'kin continue' to retry checkout or 'kin abort'",
     )?;
     std::fs::remove_file(hydration_state_path(repo))?;
@@ -274,8 +272,7 @@ pub(crate) fn abort_hydration(repo: &Repository) -> Result<()> {
 }
 
 fn fetch_all_remotes(repo: &Repository) -> Result<()> {
-    let output = Command::new("git")
-        .current_dir(repo_root(repo)?)
+    let output = crate::repository::git_command(repo)
         .args(["fetch", "--all", "--prune"])
         .output()
         .context("Failed to run `git fetch --all --prune`")?;
@@ -358,12 +355,12 @@ fn perform_git_checkout(name: &str) -> Result<()> {
     crate::overrides::with_planned(&repo, false, || {
         let mut plan = crate::overrides::Plan::default();
         crate::overrides::prepare(&repo, plan.checkout_rev(&repo, name))?;
-        git_checkout(name)
+        git_checkout(&repo, name)
     })
 }
 
-fn git_checkout(name: &str) -> Result<()> {
-    let output = Command::new("git")
+fn git_checkout(repo: &Repository, name: &str) -> Result<()> {
+    let output = crate::repository::git_command(repo)
         .arg("checkout")
         .arg(name)
         .output()
@@ -385,16 +382,7 @@ fn find_first_parent_branches_via_git_log(
     upstream_name: &str,
     current_branch: &str,
 ) -> Result<Vec<String>> {
-    let repo_root = if let Some(workdir) = repo.workdir() {
-        workdir.to_path_buf()
-    } else {
-        repo.path()
-            .parent()
-            .ok_or_else(|| anyhow!("Failed to resolve repository root path."))?
-            .to_path_buf()
-    };
-
-    let output = Command::new("git")
+    let output = crate::repository::git_command(repo)
         .args([
             "log",
             "--first-parent",
@@ -403,7 +391,6 @@ fn find_first_parent_branches_via_git_log(
             "HEAD",
             &format!("^{upstream_name}"),
         ])
-        .current_dir(repo_root)
         .output()?;
 
     if !output.status.success() {
