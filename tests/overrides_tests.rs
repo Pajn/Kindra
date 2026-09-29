@@ -1507,3 +1507,91 @@ fn commit_finishes_a_resolved_native_merge_with_overrides_configured() {
     assert!(!dir.path().join(".git/MERGE_HEAD").exists());
     assert_applied(dir.path());
 }
+// A split stack of `feature` then `child`, with HEAD on `child`, and an
+// editor in the Git directory that runs `edit` on the split buffer.
+fn split_setup(extra_config: &str, edit: &str) -> (TempDir, std::path::PathBuf) {
+    let dir = logging_setup(extra_config);
+    run_ok("git", &["branch", "-D", "sibling"], dir.path());
+    let editor = dir.path().join(".git/split-editor.sh");
+    fs::write(&editor, format!("#!/bin/sh\nperl -i -pe '{edit}' \"$1\"\n")).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    (dir, editor)
+}
+#[test]
+fn split_keeps_overlays_and_skips_the_hook_while_head_stays_on_its_branch() {
+    let (dir, editor) = split_setup("", r"s/^(\w{7} feature)$/$1\nbranch part/");
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    kin_cmd()
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .arg("split")
+        .assert()
+        .success();
+    assert_eq!(
+        git(dir.path(), &["rev-parse", "part"]),
+        git(dir.path(), &["rev-parse", "feature"])
+    );
+    assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        git(dir.path(), &["branch", "--show-current"]).trim(),
+        "child"
+    );
+    // Only the hook writes the overlay back, so an empty log means split never
+    // replaced it with the branch's own file.
+    assert_eq!(hook_log(dir.path()), "");
+    assert_applied(dir.path());
+}
+#[test]
+fn split_that_moves_head_to_another_branch_reruns_the_hook_over_the_kept_overlay() {
+    // Renaming `child` attaches HEAD to `renamed` at the same commit. A hook
+    // that reads KINDRA_WORKTREE_BRANCH reruns for it, over the overlay that
+    // stayed in place; with branch_env off, nothing reruns.
+    for (config, log) in [
+        ("", "local override renamed\n"),
+        ("branch_env = false\n", ""),
+    ] {
+        let (dir, editor) = split_setup(config, r"s/^branch child$/branch renamed/");
+        let head = git(dir.path(), &["rev-parse", "HEAD"]);
+        kin_cmd()
+            .current_dir(dir.path())
+            .env("GIT_EDITOR", &editor)
+            .arg("split")
+            .assert()
+            .success();
+        assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            git(dir.path(), &["branch", "--show-current"]).trim(),
+            "renamed"
+        );
+        assert_eq!(hook_log(dir.path()), log, "config {config:?}");
+        assert_applied(dir.path());
+    }
+}
+#[test]
+fn split_is_refused_while_override_recovery_is_pending() {
+    let (dir, editor) = split_setup("", r"s/^(\w{7} feature)$/$1\nbranch part/");
+    fs::write(dir.path().join(".git/apply.sh"), "exit 42\n").unwrap();
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["checkout", "down"])
+        .assert()
+        .failure();
+    let recovery = dir.path().join(".git/kindra_overrides_state.json");
+    let saved = fs::read_to_string(&recovery).unwrap();
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    kin_cmd()
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .arg("split")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "Local overrides are suspended or awaiting recovery",
+        ));
+    assert!(git(dir.path(), &["branch", "--list", "part"]).is_empty());
+    assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), head);
+    assert_eq!(fs::read_to_string(&recovery).unwrap(), saved);
+}

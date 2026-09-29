@@ -31,7 +31,10 @@ pub fn split(args: &SplitArgs) -> Result<()> {
     let repo = crate::open_repo()?;
     let lock = crate::state_io::RepoLock::acquire(&repo)?;
     crate::operation_state::ensure_idle(&repo, &lock, crate::operation_state::Allow::NOTHING)?;
-    crate::overrides::with_suspended(&repo, false, || split_locked(&repo))
+    // Nothing to `prepare`: the working tree never changes, so overlays stay
+    // applied. The wrapper still reruns the apply hook if HEAD ends on another
+    // branch, for hooks that read KINDRA_WORKTREE_BRANCH.
+    crate::overrides::with_planned(&repo, false, || split_locked(&repo))
 }
 
 fn split_locked(repo: &git2::Repository) -> Result<()> {
