@@ -98,6 +98,11 @@ impl SetAsides {
         self.0.push(set_aside);
     }
 
+    /// Every set-aside, in the order they are restored (newest first).
+    pub fn newest_first(&self) -> impl Iterator<Item = &SetAside> {
+        self.0.iter().rev()
+    }
+
     /// The set-aside restored next.
     pub fn newest(&self) -> Option<&SetAside> {
         self.0.last()

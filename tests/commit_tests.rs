@@ -4881,7 +4881,7 @@ fn check_fixup_with_dependents_set_aside(abort: bool) {
 #[cfg(unix)]
 fn test_commit_fixup_failed_rollback_keeps_the_unrestored_stash_in_state() {
     // A held lock on the branch ref also blocks the reset.
-    let (dir, stash_ref, stderr) = fixup_rollback_with_unrestorable_stash(true);
+    let (dir, stash_ref, stderr) = fixup_rollback_with_unrestorable_stash(true, false);
     assert!(
         stderr.contains("Rolling back the commit did not complete")
             && stderr.contains("your set-aside changes could not be restored"),
@@ -4893,6 +4893,36 @@ fn test_commit_fixup_failed_rollback_keeps_the_unrestored_stash_in_state() {
         "state points at {stash_ref}, which is not in the stash list:\n{stashes}"
     );
     assert_continue_refuses_rollback_state(dir.path());
+}
+
+/// When the rollback cannot finish and saving the recovery state fails too,
+/// `kin abort` cannot be relied on: the error names both failures and says how
+/// to recover by hand, naming the commit to reset to and the stash entry that
+/// holds the set-aside changes.
+#[test]
+#[cfg(unix)]
+fn test_commit_fixup_failed_rollback_and_recovery_save_give_manual_recovery_steps() {
+    let (dir, stash_message, stderr) = fixup_rollback_with_unrestorable_stash(true, true);
+    assert!(
+        stderr.contains("Rolling back the commit did not complete")
+            && stderr.contains("Injected state write failure"),
+        "the error must name both failures, got:\n{stderr}"
+    );
+    let before_fixup = git_stdout(dir.path(), &["rev-parse", "HEAD^"]);
+    assert!(
+        stderr.contains(&format!("git reset --soft {}", before_fixup.trim())),
+        "the error must say how to take the commit back off, got:\n{stderr}"
+    );
+    let stash_oid = git_stdout(dir.path(), &["stash", "list", "-1", "--format=%H"]);
+    assert!(
+        stderr.contains(&stash_message)
+            && stderr.contains(&format!("git stash apply {}", stash_oid.trim())),
+        "the error must name the stash entry and how to apply it, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("run 'kin abort' to restore the original state"),
+        "a journal that may not be saved cannot be relied on, got:\n{stderr}"
+    );
 }
 
 /// A rolled-back commit has nothing left to continue: `kin continue` must
@@ -4919,7 +4949,7 @@ fn assert_continue_refuses_rollback_state(dir: &Path) {
 #[test]
 #[cfg(unix)]
 fn test_commit_fixup_rollback_keeps_state_until_set_aside_changes_are_restored() {
-    let (dir, _, _) = fixup_rollback_with_unrestorable_stash(false);
+    let (dir, _, _) = fixup_rollback_with_unrestorable_stash(false, false);
     // The rollback itself went through: the fixup commit is gone again.
     assert_eq!(
         git_stdout(dir.path(), &["log", "-1", "--format=%s"]).trim(),
@@ -4945,10 +4975,13 @@ fn test_commit_fixup_rollback_keeps_state_until_set_aside_changes_are_restored()
 /// Runs `kin commit --fixup` on a branch without dependents while a
 /// pre-rebase hook refuses the rebase and edits the stashed file, so the
 /// set-aside changes cannot be restored during rollback. With
-/// `lock_branch_ref`, the hook also blocks the reset. Returns the stash entry
+/// `lock_branch_ref`, the hook also blocks the reset. With
+/// `fail_recovery_save`, the hook also makes every later journal write fail,
+/// so the rollback cannot record its recovery state. Returns the stash entry
 /// the saved state points at and the command's error output.
 fn fixup_rollback_with_unrestorable_stash(
     lock_branch_ref: bool,
+    fail_recovery_save: bool,
 ) -> (tempfile::TempDir, String, String) {
     let (dir, repo) = setup_repo();
     let main_id = repo.revparse_single("main").unwrap().id();
@@ -4984,9 +5017,19 @@ fn fixup_rollback_with_unrestorable_stash(
     } else {
         ""
     };
+    // The journal recording the set-aside is saved before the rebase starts;
+    // the hook makes every write after that fail.
+    let fail_save = if fail_recovery_save {
+        format!(
+            "printf '%s' \"$(git rev-parse --absolute-git-dir)/{}\" > \"$KIN_TEST_FAIL_STATE_WRITE\"\n",
+            StateFile::Rebase.file_name()
+        )
+    } else {
+        String::new()
+    };
     fs::write(
         dir.path().join(".git/hooks/pre-rebase"),
-        format!("#!/bin/sh\nprintf 'hook edit' > a2.txt\n{lock}exit 1\n"),
+        format!("#!/bin/sh\nprintf 'hook edit' > a2.txt\n{lock}{fail_save}exit 1\n"),
     )
     .unwrap();
     run_ok("chmod", &["+x", ".git/hooks/pre-rebase"], dir.path());
@@ -4997,14 +5040,20 @@ fn fixup_rollback_with_unrestorable_stash(
         .arg(a1_id.to_string())
         .arg("--autostash")
         .current_dir(dir.path())
+        .env(
+            "KIN_TEST_FAIL_STATE_WRITE",
+            repo.path().join("fail-state-write"),
+        )
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "the fold should have failed");
-    assert!(
-        stderr.contains("run 'kin abort'"),
-        "expected the failure to point at kin abort, got:\n{stderr}"
-    );
+    if !fail_recovery_save {
+        assert!(
+            stderr.contains("run 'kin abort'"),
+            "expected the failure to point at kin abort, got:\n{stderr}"
+        );
+    }
     fs::remove_file(dir.path().join(".git/hooks/pre-rebase")).unwrap();
     if lock_branch_ref {
         fs::remove_file(dir.path().join(".git/refs/heads/feature-a.lock")).unwrap();

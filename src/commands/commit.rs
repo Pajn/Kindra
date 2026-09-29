@@ -1718,13 +1718,63 @@ fn unwind_unstarted_rebase(
         Ok(Outcome::NotRestored { .. }) => anyhow!(
             "{err:#} The commit was rolled back, but your set-aside changes could not be restored (see the warning above). Clear the way, then run 'kin abort' to restore them."
         ),
-        Err(unwind_err) => {
-            let _ = save_state(repo, state);
-            anyhow!(
+        Err(unwind_err) => match save_state(repo, state) {
+            Ok(()) => anyhow!(
                 "{err:#} Rolling back the commit did not complete ({unwind_err:#}); run 'kin abort' to restore the original state."
-            )
-        }
+            ),
+            // Without a saved journal that lists what is still set aside,
+            // `kin abort` cannot be relied on: say how to recover by hand.
+            Err(save_err) => anyhow!(
+                "{err:#} Rolling back the commit did not complete ({unwind_err:#}), and saving the recovery state also failed ({save_err:#}), so 'kin abort' may not be able to finish it. Recover by hand:{}",
+                manual_recovery_steps(state, target_old_head_id)
+            ),
+        },
     }
+}
+
+/// How to finish rolling back a commit by hand when no journal records what
+/// is left to undo, in the order [`unwind_unstarted_rebase`] undoes it: in
+/// place, every set-aside not yet restored (newest first, based on the new
+/// commit) and then the commit to take back off; after a branch switch, the
+/// branch tip to put back and then the set-asides, on the caller branch.
+fn manual_recovery_steps(state: &RebaseState, target_old_head_id: Oid) -> String {
+    let mut steps = Vec::new();
+    if let Some(caller) = &state.caller_branch {
+        steps.push(format!(
+            "'{}' should point at {target_old_head_id} again: find its tip from before the commit with 'git reflog show refs/heads/{}' and reset it there, then check out '{caller}'",
+            state.original_branch, state.original_branch
+        ));
+    }
+    for set_aside in state.set_asides.newest_first() {
+        let index = if set_aside.restore == set_aside::Restore::WithIndex {
+            "--index "
+        } else {
+            ""
+        };
+        let apply = match &set_aside.oid {
+            Some(oid) => format!("'git stash apply {index}{oid}'"),
+            None => format!("'git stash apply {index}<entry>' (find it with 'git stash list')"),
+        };
+        steps.push(format!(
+            "restore the changes set aside in stash entry '{}' with {apply}, then drop that entry",
+            set_aside.stash
+        ));
+    }
+    if state.caller_branch.is_none()
+        && head_commit_id().is_ok_and(|head| head != target_old_head_id)
+    {
+        steps.push(format!(
+            "take the new commit back off with 'git reset --soft {target_old_head_id}' (its changes return to the index)"
+        ));
+    }
+    if steps.is_empty() {
+        return " nothing is left to undo; remove the saved state with 'kin abort --clear-state' if it remains.".to_string();
+    }
+    steps
+        .iter()
+        .enumerate()
+        .map(|(n, step)| format!(" {}. {step}.", n + 1))
+        .collect()
 }
 
 fn run_git(args: &[&str]) -> Result<()> {
