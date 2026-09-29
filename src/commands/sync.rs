@@ -158,7 +158,7 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
     } else {
         boundary.merged_branches.clone()
     };
-    crate::rebase_utils::keep_merged_branches_checked_out_elsewhere(&mut merged_branches)?;
+    crate::rebase_utils::keep_merged_branches_checked_out_elsewhere(repo, &mut merged_branches)?;
 
     // Merged branches sit at or below the rebase's old base, so only the rest
     // of the stack is rewritten and must not be checked out elsewhere.
@@ -167,7 +167,7 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
         .filter(|sb| !boundary.merged_branches.contains(&sb.name))
         .map(|sb| sb.name.clone())
         .collect::<Vec<_>>();
-    crate::rebase_utils::check_worktrees(&branches_to_check, args.force)?;
+    crate::rebase_utils::check_worktrees(repo, &branches_to_check, args.force)?;
 
     if let Some(old_base) = boundary.old_base {
         crate::rebase_utils::ensure_git_supports_update_refs()?;
@@ -210,10 +210,10 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
         crate::rebase_utils::set_aside_working_tree(repo, &mut state, autostash)?;
 
         if current_branch_name.as_deref() != Some(top_branch.as_str()) {
-            checkout_branch(&top_branch)?;
+            checkout_branch(repo, &top_branch)?;
         }
 
-        let mut rebase = Command::new("git");
+        let mut rebase = crate::repository::git_command(repo);
         rebase
             .arg("rebase")
             .arg("--reapply-cherry-picks")
@@ -252,7 +252,7 @@ fn sync_upstream_branch(
     } else {
         collect_merged_local_branches(repo, rebase_onto_name, &[upstream_name])?
     };
-    crate::rebase_utils::keep_merged_branches_checked_out_elsewhere(&mut merged_branches)?;
+    crate::rebase_utils::keep_merged_branches_checked_out_elsewhere(repo, &mut merged_branches)?;
 
     let upstream_id = repo.revparse_single(upstream_name)?.id();
     let rebase_onto_id = repo.revparse_single(rebase_onto_name)?.id();
@@ -291,7 +291,7 @@ fn sync_upstream_branch(
         crate::overrides::prepare(repo, &crate::rebase_utils::override_plan(repo, &state)?)?;
         crate::rebase_utils::set_aside_working_tree(repo, &mut state, autostash)?;
 
-        let mut rebase = Command::new("git");
+        let mut rebase = crate::repository::git_command(repo);
         rebase
             .arg("rebase")
             .arg("--reapply-cherry-picks")
@@ -338,7 +338,7 @@ fn delete_merged_branches(
         );
         let mut plan = crate::overrides::Plan::default();
         crate::overrides::prepare(repo, plan.checkout_rev(repo, checkout_fallback))?;
-        checkout_branch(checkout_fallback).map_err(|e| {
+        checkout_branch(repo, checkout_fallback).map_err(|e| {
             anyhow!(
                 "fallback git checkout failed for branch '{}': {}",
                 checkout_fallback,
@@ -356,7 +356,7 @@ fn delete_merged_branches(
             .and_then(|b| b.get().target())
             .map(|oid| oid.to_string());
 
-        let status = Command::new("git")
+        let status = crate::repository::git_command(repo)
             .arg("branch")
             .arg("-D")
             .arg("--quiet")
@@ -421,7 +421,7 @@ pub(crate) fn finish_sync_after_rebase(
     // they synced from. Restore before cleanup so a merged caller uses the
     // normal checkout fallback, and keep recovery state if checkout fails.
     if let Some(caller) = &state.caller_branch {
-        checkout_branch(caller)?;
+        checkout_branch(repo, caller)?;
     }
     crate::set_aside::restore_all(repo, &mut state, crate::set_aside::Phase::Completion)?;
     clear_state(repo)?;
@@ -573,7 +573,10 @@ fn fetch_sync_remote(
         }
     }
 
-    let status = Command::new("git").arg("fetch").arg(remote_name).status()?;
+    let status = crate::repository::git_command(repo)
+        .arg("fetch")
+        .arg(remote_name)
+        .status()?;
     if !status.success() {
         return Err(anyhow!(
             "git fetch failed for remote '{}' while preparing sync.",
@@ -611,7 +614,7 @@ fn targeted_fetch(
         .collect();
 
     loop {
-        let output = Command::new("git")
+        let output = crate::repository::git_command(repo)
             .args(["fetch", "--quiet", "--no-tags", remote_name])
             .args(
                 std::iter::once(trunk)
@@ -779,9 +782,9 @@ fn sync_tree(
         .filter(|b| !merged.contains(&b.name))
         .map(|b| b.name.clone())
         .collect();
-    crate::rebase_utils::check_worktrees(&check, args.force)?;
+    crate::rebase_utils::check_worktrees(repo, &check, args.force)?;
     let mut merged = if args.no_delete { Vec::new() } else { merged };
-    crate::rebase_utils::keep_merged_branches_checked_out_elsewhere(&mut merged)?;
+    crate::rebase_utils::keep_merged_branches_checked_out_elsewhere(repo, &mut merged)?;
     if remaining.is_empty() {
         return delete_merged_branches(repo, &merged, local_upstream);
     }

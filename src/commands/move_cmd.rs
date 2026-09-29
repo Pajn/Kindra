@@ -188,7 +188,7 @@ fn start_move_locked(repo: &Repository, args: &MoveArgs) -> Result<()> {
     // checked out in another worktree is a hard blocker that autostashing can't
     // resolve, so surface it first rather than sending the user to clean their
     // tree only to hit the worktree error afterwards.
-    crate::rebase_utils::check_worktrees(&remaining_branches, args.force)?;
+    crate::rebase_utils::check_worktrees(repo, &remaining_branches, args.force)?;
 
     let autostash =
         crate::commands::resolve_and_check_autostash(repo, args.autostash, args.no_autostash)?;

@@ -177,7 +177,7 @@ fn restack_locked(repo: &git2::Repository, args: &RestackArgs) -> Result<()> {
         cleanup_checkout_fallback: None,
     };
 
-    crate::rebase_utils::check_worktrees(&state.remaining_branches, false)?;
+    crate::rebase_utils::check_worktrees(repo, &state.remaining_branches, false)?;
 
     // Snapshot for undo only now that the no-op checks ("No floating children",
     // "No branches selected") have passed and we are about to mutate branches.

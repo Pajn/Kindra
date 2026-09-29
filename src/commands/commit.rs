@@ -1,8 +1,10 @@
 use crate::commands::find_upstream;
 use crate::rebase_utils::{
     RebaseState, check_worktrees, checkout_branch, clear_state, git_rebase_in_progress,
-    local_branch_tips_in_range, record_branch_tips_in_range, run_rebase_loop, save_state,
+    has_staged_changes, local_branch_tips_in_range, record_branch_tips_in_range, run_rebase_loop,
+    save_state,
 };
+use crate::repository::git_command;
 use crate::set_aside::{self, Outcome, Phase, SetAside};
 use crate::stack::{
     StackBranch, StackCommit, build_parent_maps, collect_descendants, collect_descendants_of_id,
@@ -12,7 +14,6 @@ use crate::stack::{
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Oid, Repository};
 use std::collections::{HashMap, HashSet};
-use std::process::Command;
 
 pub fn commit(args: &[String]) -> Result<()> {
     let repo = crate::open_repo()?;
@@ -78,7 +79,7 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
                     "Create an initial commit before using --on, --interactive, --fixup, or --new-branch."
                 ));
             }
-            let status = Command::new("git")
+            let status = git_command(repo)
                 .arg("commit")
                 .args(&parsed.git_commit_args)
                 .status()?;
@@ -328,7 +329,7 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
                 }
             }
         }
-        check_worktrees(&guarded_branches, parsed.force)?;
+        check_worktrees(repo, &guarded_branches, parsed.force)?;
     }
     // The move rebase rewrites the branches between the target and HEAD as well,
     // which the dependent list above does not cover.
@@ -343,7 +344,7 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
         .filter(|name| name != &current_branch_name)
         .chain(std::iter::once(ancestor_target.clone()))
         .collect();
-        check_worktrees(&in_range, parsed.force)?;
+        check_worktrees(repo, &in_range, parsed.force)?;
     }
     // Both in-place rebases replay HEAD's history from below the current
     // branch, where a merge of another branch would be flattened.
@@ -496,7 +497,7 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
         }
 
         // Run the actual git commit
-        let status = Command::new("git")
+        let status = git_command(repo)
             .arg("commit")
             .args(&parsed.git_commit_args)
             .status()?;
@@ -522,7 +523,7 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
             // only the dependent restack, keeping the user's committed work.
             // Parent maps still refer to the old tip so descendants replay the
             // correct range; only the rollback checkpoint advances here.
-            let committed_tip = head_commit_id()?;
+            let committed_tip = head_commit_id(repo)?;
             state
                 .original_tip_map
                 .insert(target_branch.clone(), committed_tip.to_string());
@@ -554,7 +555,7 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
         }
 
         if let Some(ancestor_target) = &ancestor_on_target {
-            let moved_commit_id = head_commit_id()?;
+            let moved_commit_id = head_commit_id(repo)?;
 
             // Take the stash only *after* the commit, for the same reason the
             // autosquash below does: the staged content is now committed, so a
@@ -564,7 +565,7 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
             match stash_non_staged_changes(repo) {
                 Ok(changes) => state.set_asides.extend(changes),
                 Err(err) => {
-                    match Command::new("git")
+                    match git_command(repo)
                         .args(["reset", "--soft", "HEAD^"])
                         .status()
                     {
@@ -601,7 +602,7 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
             }
 
             println!("Moving the new commit onto '{}'...", ancestor_target);
-            let mut cmd = Command::new("git");
+            let mut cmd = git_command(repo);
             cmd.env(
                 "GIT_SEQUENCE_EDITOR",
                 crate::rebase_todo::sequence_editor_command(
@@ -681,7 +682,7 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
                 None => "--root".to_string(),
             };
 
-            let mut cmd = Command::new("git");
+            let mut cmd = git_command(repo);
             cmd.env("GIT_SEQUENCE_EDITOR", "true")
                 .arg("rebase")
                 .arg("-i")
@@ -748,7 +749,7 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
         run_rebase_loop(&repo, state)
     } else {
         // Run the actual git commit
-        let status = Command::new("git")
+        let status = git_command(repo)
             .arg("commit")
             .args(&parsed.git_commit_args)
             .status()?;
@@ -803,7 +804,7 @@ fn commit_on_new_branch(
         if !children.is_empty() {
             crate::rebase_utils::ensure_git_supports_update_refs()?;
             let names: Vec<String> = children.iter().map(|c| c.name.clone()).collect();
-            check_worktrees(&names, parsed.force)?;
+            check_worktrees(repo, &names, parsed.force)?;
         }
         Some((merge_base, all_branches, children))
     } else {
@@ -817,7 +818,7 @@ fn commit_on_new_branch(
     repo.branch(&branch_name, &head_commit, false)
         .with_context(|| format!("Failed to create branch '{branch_name}'."))?;
 
-    if let Err(err) = checkout_branch(&branch_name) {
+    if let Err(err) = checkout_branch(repo, &branch_name) {
         // Checkout failed, so we are still on the original branch; drop the
         // branch we just created. Surface a rollback failure rather than hiding it.
         let err = err.context(format!("Failed to check out new branch '{branch_name}'."));
@@ -829,7 +830,7 @@ fn commit_on_new_branch(
         return Err(err);
     }
 
-    let status = Command::new("git")
+    let status = git_command(repo)
         .arg("commit")
         .args(&parsed.git_commit_args)
         .status()?;
@@ -839,7 +840,7 @@ fn commit_on_new_branch(
         // safe to delete. If a rollback step fails, surface it (with the commit
         // failure as context) instead of swallowing it and reporting a clean
         // failure while stranded on the new branch.
-        if let Err(checkout_err) = checkout_branch(current_branch_name) {
+        if let Err(checkout_err) = checkout_branch(repo, current_branch_name) {
             return Err(checkout_err.context(format!(
                 "git commit failed, and returning to '{current_branch_name}' also failed; you are left on '{branch_name}'. Switch back and delete it manually."
             )));
@@ -1510,10 +1511,6 @@ fn insert_generated_commit_arg(args: &mut Vec<String>, value: String) {
     args.insert(insert_at, value);
 }
 
-fn has_staged_changes(_repo: &Repository) -> Result<bool> {
-    crate::rebase_utils::has_staged_changes()
-}
-
 /// Whether a commit needs a non-empty index: true unless `-a`/`--all`/`-p`/
 /// `--patch` or a forwarded pathspec will supply the content instead. Shared by
 /// the interactive-fold guard and the new-branch guard so both stay in sync.
@@ -1672,7 +1669,7 @@ fn unwind_unstarted_rebase(
         None => {
             let set_aside_anything = !state.set_asides.is_empty();
             let outcome = set_aside::unwind(repo, &mut state.set_asides);
-            match run_git(&["reset", "--soft", &target]) {
+            match run_git(repo, &["reset", "--soft", &target]) {
                 Ok(()) => Ok(outcome),
                 Err(reset_err) if set_aside_anything => {
                     let changes = match outcome {
@@ -1692,8 +1689,8 @@ fn unwind_unstarted_rebase(
         // Checkout path: the stash taken on the caller branch before the switch
         // holds the staged changes as well as the non-staged ones, so the fixup
         // commit can be dropped outright and the stash applied back on its base.
-        Some(caller_branch) => run_git(&["reset", "--hard", &target])
-            .and_then(|()| checkout_branch(&caller_branch))
+        Some(caller_branch) => run_git(repo, &["reset", "--hard", &target])
+            .and_then(|()| checkout_branch(repo, &caller_branch))
             .map(|()| set_aside::unwind(repo, &mut state.set_asides)),
     };
     // Until the set-aside changes are back, keep the state so `kin abort` can
@@ -1726,7 +1723,7 @@ fn unwind_unstarted_rebase(
             // `kin abort` cannot be relied on: say how to recover by hand.
             Err(save_err) => anyhow!(
                 "{err:#} Rolling back the commit did not complete ({unwind_err:#}), and saving the recovery state also failed ({save_err:#}), so 'kin abort' may not be able to finish it. Recover by hand:{}",
-                manual_recovery_steps(state, target_old_head_id)
+                manual_recovery_steps(repo, state, target_old_head_id)
             ),
         },
     }
@@ -1737,7 +1734,11 @@ fn unwind_unstarted_rebase(
 /// place, every set-aside not yet restored (newest first, based on the new
 /// commit) and then the commit to take back off; after a branch switch, the
 /// branch tip to put back and then the set-asides, on the caller branch.
-fn manual_recovery_steps(state: &RebaseState, target_old_head_id: Oid) -> String {
+fn manual_recovery_steps(
+    repo: &Repository,
+    state: &RebaseState,
+    target_old_head_id: Oid,
+) -> String {
     let mut steps = Vec::new();
     if let Some(caller) = &state.caller_branch {
         steps.push(format!(
@@ -1758,7 +1759,7 @@ fn manual_recovery_steps(state: &RebaseState, target_old_head_id: Oid) -> String
         ));
     }
     if state.caller_branch.is_none()
-        && head_commit_id().is_ok_and(|head| head != target_old_head_id)
+        && head_commit_id(repo).is_ok_and(|head| head != target_old_head_id)
     {
         steps.push(format!(
             "take the new commit back off with 'git reset --soft {target_old_head_id}' (its changes return to the index)"
@@ -1774,8 +1775,8 @@ fn manual_recovery_steps(state: &RebaseState, target_old_head_id: Oid) -> String
         .collect()
 }
 
-fn run_git(args: &[&str]) -> Result<()> {
-    let status = Command::new("git").args(args).status()?;
+fn run_git(repo: &Repository, args: &[&str]) -> Result<()> {
+    let status = git_command(repo).args(args).status()?;
     if !status.success() {
         return Err(anyhow!("git {} failed", args.join(" ")));
     }
@@ -1784,8 +1785,8 @@ fn run_git(args: &[&str]) -> Result<()> {
 
 /// The commit id at HEAD, read through git so it reflects a commit just made by
 /// a subprocess rather than whatever the open repository handle has cached.
-fn head_commit_id() -> Result<Oid> {
-    let output = Command::new("git").args(["rev-parse", "HEAD"]).output()?;
+fn head_commit_id(repo: &Repository) -> Result<Oid> {
+    let output = git_command(repo).args(["rev-parse", "HEAD"]).output()?;
     if !output.status.success() {
         return Err(anyhow!(
             "Failed to resolve HEAD after committing: {}",
@@ -1828,7 +1829,7 @@ fn carry_staged_changes_onto(
     let Some(carry_stash) = carry_stash else {
         // Nothing staged to carry (an empty or `-a`-style commit): the tree is
         // already clean, so the switch cannot be refused for our changes.
-        return checkout_branch(target_branch).context(
+        return checkout_branch(repo, target_branch).context(
             "Failed to checkout target branch. Use 'kin abort' to restore original state.",
         );
     };
@@ -1852,14 +1853,14 @@ fn carry_staged_changes_onto(
                 state.set_asides.take_carry();
                 // No saved journal ever recorded the carry.
                 if outcome == Outcome::Restored {
-                    set_aside::drop_restored(&carry_stash);
+                    set_aside::drop_restored(repo, &carry_stash);
                 }
             }
         }
         return Err(err);
     }
 
-    if let Err(err) = checkout_branch(target_branch) {
+    if let Err(err) = checkout_branch(repo, target_branch) {
         // Nothing moved, so put the staged content back on the branch it was
         // taken from and leave the rest of the state for `kin abort`. Nothing
         // was committed either, so there is nothing for `kin continue` to do.
@@ -1874,7 +1875,7 @@ fn carry_staged_changes_onto(
         // it twice.
         let saved = save_state(repo, state);
         if outcome == Outcome::Restored {
-            set_aside::drop_restored(&carry_stash);
+            set_aside::drop_restored(repo, &carry_stash);
         }
         saved?;
         return Err(err.context(
@@ -1887,7 +1888,7 @@ fn carry_staged_changes_onto(
             state.set_asides.take_carry();
             // Dropped after the save, whether or not it succeeded, as above.
             let saved = save_state(repo, state);
-            set_aside::drop_restored(&carry_stash);
+            set_aside::drop_restored(repo, &carry_stash);
             saved
         }
         Outcome::ConflictsLeft { .. } => {
@@ -1903,7 +1904,7 @@ fn carry_staged_changes_onto(
             // nothing left to continue, so `kin abort` restores the rest. The
             // carry is newest, so it goes back first, onto the branch it was
             // taken on.
-            let unwound = discard_conflicted_carry(&caller_branch)
+            let unwound = discard_conflicted_carry(repo, &caller_branch)
                 .map(|()| set_aside::unwind(repo, &mut state.set_asides));
             let err = anyhow!(
                 "The staged changes conflict with '{}', so committing them there would leave conflicts to resolve. Restack this branch onto '{}' first, or move the overlapping changes by hand.",
@@ -1932,14 +1933,14 @@ fn carry_staged_changes_onto(
 
 /// Drop a conflicted carry from the tree and return to `caller_branch`, where
 /// the carry applies cleanly again.
-fn discard_conflicted_carry(caller_branch: &str) -> Result<()> {
-    let status = Command::new("git").args(["reset", "--hard"]).status()?;
+fn discard_conflicted_carry(repo: &Repository, caller_branch: &str) -> Result<()> {
+    let status = git_command(repo).args(["reset", "--hard"]).status()?;
     if !status.success() {
         return Err(anyhow!(
             "Failed to discard the conflicted changes from the working tree."
         ));
     }
-    checkout_branch(caller_branch)
+    checkout_branch(repo, caller_branch)
 }
 
 fn stash_non_staged_changes(repo: &Repository) -> Result<Option<SetAside>> {

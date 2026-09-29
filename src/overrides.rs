@@ -119,7 +119,7 @@ fn root(repo: &Repository) -> Result<&Path> {
 }
 
 fn git(repo: &Repository, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
-    let mut command = Command::new("git");
+    let mut command = crate::repository::git_command(repo);
     command.current_dir(root(repo)?);
     run_git(command, args, input)
 }
@@ -879,13 +879,12 @@ pub fn diff_current(repo: &Repository) -> Result<()> {
         }
     }
     quoted.push('"');
-    let mut alternates = std::ffi::OsString::from(quoted);
-    if let Some(existing) = std::env::var_os("GIT_ALTERNATE_OBJECT_DIRECTORIES") {
-        alternates.push(if cfg!(windows) { ";" } else { ":" });
-        alternates.push(existing);
-    }
+    // The repository's own alternates are reached through its object
+    // directory; any in the environment are not the repository's.
+    let alternates = quoted;
     let command = || -> Result<Command> {
-        let mut command = Command::new("git");
+        // Replaces the index and object variables the helper cleared.
+        let mut command = crate::repository::git_command(repo);
         command
             .current_dir(root(repo)?)
             .arg("--no-pager")

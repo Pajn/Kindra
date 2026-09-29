@@ -48,7 +48,6 @@ use git2::{BranchType, ErrorCode, Oid, Repository};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Version stamp for the on-disk log, so a future format change can be detected.
@@ -485,7 +484,7 @@ fn restore(repo: &Repository, entry: &Entry, dir: Direction, force: bool) -> Res
     }
     detach_args.push("--detach");
     detach_args.push(&head_oid_str);
-    git(&detach_args).context("Failed to reposition HEAD while restoring")?;
+    git(repo, &detach_args).context("Failed to reposition HEAD while restoring")?;
 
     // Move the branch refs with `git update-ref --stdin`. Prefer a *single* atomic
     // transaction (deletions and creates together) so a mid-restore failure can
@@ -520,13 +519,15 @@ fn restore(repo: &Repository, entry: &Entry, dir: Direction, force: bool) -> Res
 
     if df_conflict {
         if !deletions.is_empty() {
-            git_update_refs(&deletions).context("Failed to delete branches while restoring")?;
+            git_update_refs(repo, &deletions)
+                .context("Failed to delete branches while restoring")?;
         }
         if !updates.is_empty() {
-            git_update_refs(&updates).context("Failed to restore branches")?;
+            git_update_refs(repo, &updates).context("Failed to restore branches")?;
         }
     } else if !deletions.is_empty() || !updates.is_empty() {
-        git_update_refs(&format!("{deletions}{updates}")).context("Failed to restore branches")?;
+        git_update_refs(repo, &format!("{deletions}{updates}"))
+            .context("Failed to restore branches")?;
     }
 
     // Reattach HEAD to the branch it was on (if any); the working tree is
@@ -537,7 +538,8 @@ fn restore(repo: &Repository, entry: &Entry, dir: Direction, force: bool) -> Res
             reattach_args.push("--force");
         }
         reattach_args.push(head_str);
-        git(&reattach_args).with_context(|| format!("Failed to switch back to '{head_str}'"))?;
+        git(repo, &reattach_args)
+            .with_context(|| format!("Failed to switch back to '{head_str}'"))?;
     }
 
     Ok(())
@@ -746,8 +748,8 @@ fn ensure_no_operation_in_progress(
     crate::operation_state::ensure_idle(repo, lock, allow).map(drop)
 }
 
-fn git(args: &[&str]) -> Result<()> {
-    let status = Command::new("git").args(args).status()?;
+fn git(repo: &Repository, args: &[&str]) -> Result<()> {
+    let status = crate::repository::git_command(repo).args(args).status()?;
     if !status.success() {
         return Err(anyhow!("git {} failed", args.join(" ")));
     }
@@ -757,9 +759,9 @@ fn git(args: &[&str]) -> Result<()> {
 /// Apply a batch of ref changes atomically via `git update-ref --stdin`. `input`
 /// is the newline-oriented command list (`update <ref> <oid>` / `delete <ref>`);
 /// either every command applies or none do.
-fn git_update_refs(input: &str) -> Result<()> {
+fn git_update_refs(repo: &Repository, input: &str) -> Result<()> {
     use std::io::Write;
-    let mut child = Command::new("git")
+    let mut child = crate::repository::git_command(repo)
         .args(["update-ref", "--stdin"])
         .stdin(std::process::Stdio::piped())
         .spawn()?;
@@ -876,6 +878,7 @@ mod tests {
     use std::process::Command;
 
     fn init_repo_with_commit(dir: &std::path::Path) -> (Repository, String) {
+        // Not `git_command`: this builds the fixture, before any repository.
         let run = |args: &[&str]| {
             let ok = Command::new("git")
                 .args(args)

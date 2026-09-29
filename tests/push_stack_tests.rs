@@ -122,6 +122,77 @@ fn test_push_entire_stack() {
     );
 }
 
+/// Git exports `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` to hooks, and
+/// wrappers set them. `kin push` pushes the stack of the repository it
+/// discovered, to that repository's remote.
+#[test]
+fn test_push_pushes_the_discovered_repository_when_git_env_names_another() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let main_id = make_commit(&repo, "refs/heads/main", "main.txt", "main", "main", &[]);
+    let a_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a.txt",
+        "a",
+        "feat: a",
+        &[&repo.find_commit(main_id).unwrap()],
+    );
+    make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "feat: b",
+        &[&repo.find_commit(a_id).unwrap()],
+    );
+    let remote_dir = tempdir().unwrap();
+    run_ok("git", &["init", "--bare"], remote_dir.path());
+    run_ok(
+        "git",
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    for branch in ["main", "feature-a", "feature-b"] {
+        run_ok("git", &["push", "-u", "origin", branch], dir.path());
+    }
+    let a_tip = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2.txt",
+        "a2",
+        "feat: a2",
+        &[&repo.find_commit(a_id).unwrap()],
+    );
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    run_ok("git", &["rebase", "feature-a", "feature-b"], dir.path());
+    run_ok("git", &["checkout", "feature-a"], dir.path());
+    let b_tip = repo.revparse_single("feature-b").unwrap().id();
+    let foreign = common::ForeignRepository::new();
+
+    let output = foreign
+        .kin_cmd()
+        .arg("push")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "kin push failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(remote_tip(remote_dir.path(), "refs/heads/feature-a"), a_tip);
+    assert_eq!(remote_tip(remote_dir.path(), "refs/heads/feature-b"), b_tip);
+    foreign.assert_untouched();
+}
+
 #[test]
 fn test_push_on_main_pushes_main() {
     let dir = tempdir().unwrap();

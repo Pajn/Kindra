@@ -22,8 +22,9 @@
 use anyhow::{Result, anyhow};
 use git2::Repository;
 use serde::{Deserialize, Serialize};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::repository::git_command;
 
 /// What a set-aside took out of the working tree.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,7 +258,7 @@ pub fn take_tracked(
     // Capture (rather than inherit) git's output so the internal stash name
     // doesn't leak onto the user's terminal via git's "Saved working
     // directory and index state …" confirmation.
-    let output = Command::new("git")
+    let output = git_command(repo)
         .args(["stash", "push", "-m", &message])
         .output()?;
     if !output.status.success() {
@@ -269,7 +270,7 @@ pub fn take_tracked(
     // status can report the tree dirty (e.g. a stat-dirty file whose content
     // still matches HEAD) when git stash disagrees, so confirm an entry was
     // actually created before claiming there's something to restore.
-    recorded(Kind::WholeTree, message, restore)
+    recorded(repo, Kind::WholeTree, message, restore)
 }
 
 /// Set changes aside, including untracked files, as `kind`: the whole tree,
@@ -282,7 +283,7 @@ pub fn take_tracked(
 /// whole tree or a carry with their staged state.
 pub fn take(repo: &Repository, kind: Kind, name: &str) -> Result<Option<SetAside>> {
     let message = stash_message(name)?;
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command(repo);
     cmd.arg("stash").arg("push");
     if kind == Kind::UnstagedOnly {
         cmd.arg("--keep-index");
@@ -312,13 +313,18 @@ pub fn take(repo: &Repository, kind: Kind, name: &str) -> Result<Option<SetAside
     // `git stash push` exits 0 without creating an entry when there is nothing
     // to save; confirm an entry was actually created before claiming there's
     // something to restore.
-    recorded(kind, message, restore)
+    recorded(repo, kind, message, restore)
 }
 
 /// The record of the entry just pushed with `message`, or `None` if Git
 /// created none.
-fn recorded(kind: Kind, message: String, restore: Restore) -> Result<Option<SetAside>> {
-    Ok(find_by_message(&message)?.map(|entry| SetAside {
+fn recorded(
+    repo: &Repository,
+    kind: Kind,
+    message: String,
+    restore: Restore,
+) -> Result<Option<SetAside>> {
+    Ok(find_by_message(repo, &message)?.map(|entry| SetAside {
         kind,
         stash: message,
         oid: Some(entry.oid),
@@ -366,7 +372,7 @@ pub fn restore_all(repo: &Repository, journal: &mut impl Journal, phase: Phase) 
             // applied a second time over its own changes. A record whose
             // entry is gone is skipped as restored.
             if outcome == Outcome::Restored {
-                drop_restored(&set_aside);
+                drop_restored(repo, &set_aside);
             }
             saved?;
         }
@@ -469,8 +475,8 @@ impl SetAside {
 /// journal records it (or none ever did). An entry already gone needs
 /// nothing; one that cannot be dropped is a warning, since the changes are
 /// back either way.
-pub fn drop_restored(set_aside: &SetAside) {
-    if let Err(err) = drop_entry(set_aside) {
+pub fn drop_restored(repo: &Repository, set_aside: &SetAside) {
+    if let Err(err) = drop_entry(repo, set_aside) {
         eprintln!("Warning: {err:#}");
     }
 }
@@ -482,7 +488,7 @@ pub fn drop_restored(set_aside: &SetAside) {
 /// an entry is dropped only after its changes were applied, and a journal
 /// outlives that when saving it without the record failed.
 fn attempt(repo: &Repository, set_aside: &SetAside, how: Restore) -> Result<Outcome> {
-    let Located::Entry(reference) = locate(set_aside)? else {
+    let Located::Entry(reference) = locate(repo, set_aside)? else {
         eprintln!(
             "Warning: stash entry '{}' is no longer on the stash stack, so there is nothing to restore from it; treating it as already restored.",
             set_aside.stash
@@ -491,10 +497,10 @@ fn attempt(repo: &Repository, set_aside: &SetAside, how: Restore) -> Result<Outc
     };
     // Derive revisions from the stash commit's id: `stash@{N}` names whichever
     // entry is at N when each Git command runs.
-    let commit = git_output(&["rev-parse", "--verify", &reference])?;
+    let commit = git_output(repo, &["rev-parse", "--verify", &reference])?;
     // Git refuses to apply a stash over unresolved conflicts, such as those
     // a newer set-aside of the same restore just left.
-    if crate::rebase_utils::unmerged_paths_exist()? {
+    if crate::rebase_utils::unmerged_paths_exist(repo)? {
         return Ok(Outcome::NotRestored {
             reason: format!(
                 "Stash entry '{}' cannot be restored while the working tree has unresolved conflicts, so nothing was restored. Resolve them first.",
@@ -516,9 +522,12 @@ fn attempt(repo: &Repository, set_aside: &SetAside, how: Restore) -> Result<Outc
         });
     }
     match how {
-        Restore::Plain => apply(&reference, false, set_aside),
-        Restore::WithIndex => apply_with_index(&reference, set_aside),
-        Restore::UnstagedDelta => apply(&unstaged_delta(&commit)?, false, set_aside),
+        Restore::Plain => apply(repo, &reference, false, set_aside),
+        Restore::WithIndex => apply_with_index(repo, &reference, set_aside),
+        Restore::UnstagedDelta => {
+            let delta = unstaged_delta(repo, &commit)?;
+            apply(repo, &delta, false, set_aside)
+        }
     }
 }
 
@@ -526,9 +535,9 @@ fn attempt(repo: &Repository, set_aside: &SetAside, how: Restore) -> Result<Outc
 /// staged hunks come back staged. Distinguishes a conflicted merge (stash
 /// content delivered as conflict markers — retrying would double-apply) from
 /// an apply that failed before touching the tree.
-fn apply_with_index(reference: &str, set_aside: &SetAside) -> Result<Outcome> {
-    let before = status_porcelain()?;
-    if let Some(outcome) = try_apply(reference, true, set_aside)? {
+fn apply_with_index(repo: &Repository, reference: &str, set_aside: &SetAside) -> Result<Outcome> {
+    let before = status_porcelain(repo)?;
+    if let Some(outcome) = try_apply(repo, reference, true, set_aside)? {
         return Ok(outcome);
     }
     // `--index` failures come in shapes: the working-tree merge ran and left
@@ -536,7 +545,7 @@ fn apply_with_index(reference: &str, set_aside: &SetAside) -> Result<Outcome> {
     // stash on top of itself), a partial application without conflicts, or a
     // refusal before touching anything. Only a provably untouched tree can
     // safely fall back to a plain apply.
-    if status_porcelain()? != before {
+    if status_porcelain(repo)? != before {
         return Err(anyhow!(
             "git stash apply --index failed after partially applying stash '{}'. The stash entry is preserved; clean up the partial application and restore it manually with 'git stash apply --index'.",
             set_aside.stash
@@ -545,13 +554,13 @@ fn apply_with_index(reference: &str, set_aside: &SetAside) -> Result<Outcome> {
     eprintln!(
         "Warning: could not restore the staged state of the set-aside changes; restoring them unstaged."
     );
-    apply(reference, false, set_aside)
+    apply(repo, reference, false, set_aside)
 }
 
 /// `git stash apply [--index] <reference>`, failing unless it applied cleanly
 /// or left conflicts.
-fn apply(reference: &str, index: bool, set_aside: &SetAside) -> Result<Outcome> {
-    try_apply(reference, index, set_aside)?.ok_or_else(|| {
+fn apply(repo: &Repository, reference: &str, index: bool, set_aside: &SetAside) -> Result<Outcome> {
+    try_apply(repo, reference, index, set_aside)?.ok_or_else(|| {
         anyhow!(
             "Failed to apply stashed changes from '{}'.",
             set_aside.stash
@@ -563,8 +572,13 @@ fn apply(reference: &str, index: bool, set_aside: &SetAside) -> Result<Outcome> 
 /// leaving conflicts of its own. Only reached through `attempt`, which refuses
 /// to apply while the index already has unmerged paths, so any conflicts found
 /// after a failed apply are this apply's.
-fn try_apply(reference: &str, index: bool, set_aside: &SetAside) -> Result<Option<Outcome>> {
-    let mut git = Command::new("git");
+fn try_apply(
+    repo: &Repository,
+    reference: &str,
+    index: bool,
+    set_aside: &SetAside,
+) -> Result<Option<Outcome>> {
+    let mut git = git_command(repo);
     git.arg("stash").arg("apply");
     if index {
         git.arg("--index");
@@ -572,7 +586,7 @@ fn try_apply(reference: &str, index: bool, set_aside: &SetAside) -> Result<Optio
     if git.arg(reference).status()?.success() {
         return Ok(Some(Outcome::Restored));
     }
-    if crate::rebase_utils::unmerged_paths_exist()? {
+    if crate::rebase_utils::unmerged_paths_exist(repo)? {
         return Ok(Some(Outcome::ConflictsLeft {
             backup: set_aside.stash.clone(),
         }));
@@ -584,16 +598,19 @@ fn try_apply(reference: &str, index: bool, set_aside: &SetAside) -> Result<Optio
 /// `stash` (a commit id): its base is the stash's index, and its own index is that same
 /// state, so a plain apply merges in the index-to-worktree difference (and
 /// the untracked files) and nothing that was staged.
-fn unstaged_delta(stash: &str) -> Result<String> {
+fn unstaged_delta(repo: &Repository, stash: &str) -> Result<String> {
     let index = format!("{stash}^2");
-    let base = git_output(&[
-        "commit-tree",
-        &format!("{index}^{{tree}}"),
-        "-p",
-        &index,
-        "-m",
-        "kin: set-aside index",
-    ])?;
+    let base = git_output(
+        repo,
+        &[
+            "commit-tree",
+            &format!("{index}^{{tree}}"),
+            "-p",
+            &index,
+            "-m",
+            "kin: set-aside index",
+        ],
+    )?;
     let mut args = vec![
         "commit-tree".to_string(),
         format!("{stash}^{{tree}}"),
@@ -602,19 +619,19 @@ fn unstaged_delta(stash: &str) -> Result<String> {
         "-p".to_string(),
         base,
     ];
-    if let Some(untracked) = untracked_commit(stash)? {
+    if let Some(untracked) = untracked_commit(repo, stash)? {
         args.extend(["-p".to_string(), untracked]);
     }
     args.extend([
         "-m".to_string(),
         "kin: set-aside unstaged changes".to_string(),
     ]);
-    git_output(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    git_output(repo, &args.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
 /// The commit holding the stash's untracked files, if it has any.
-fn untracked_commit(stash: &str) -> Result<Option<String>> {
-    let output = Command::new("git")
+fn untracked_commit(repo: &Repository, stash: &str) -> Result<Option<String>> {
+    let output = git_command(repo)
         .args(["rev-parse", "--quiet", "--verify"])
         .arg(format!("{stash}^3"))
         .output()?;
@@ -626,7 +643,7 @@ fn untracked_commit(stash: &str) -> Result<Option<String>> {
 
 /// The stash's untracked files that already exist in the working tree.
 fn untracked_in_the_way(repo: &Repository, stash: &str) -> Result<Vec<String>> {
-    let Some(untracked) = untracked_commit(stash)? else {
+    let Some(untracked) = untracked_commit(repo, stash)? else {
         return Ok(Vec::new());
     };
     let workdir = repo
@@ -634,7 +651,7 @@ fn untracked_in_the_way(repo: &Repository, stash: &str) -> Result<Vec<String>> {
         .ok_or_else(|| anyhow!("Cannot restore set-aside changes in a bare repository."))?;
     // `--full-tree`: from a subdirectory Git would otherwise list only the
     // files under it, relative to it, and the paths are joined to the root.
-    let output = Command::new("git")
+    let output = git_command(repo)
         .args([
             "ls-tree",
             "--full-tree",
@@ -658,8 +675,8 @@ fn untracked_in_the_way(repo: &Repository, stash: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-fn git_output(args: &[&str]) -> Result<String> {
-    let output = Command::new("git").args(args).output()?;
+fn git_output(repo: &Repository, args: &[&str]) -> Result<String> {
+    let output = git_command(repo).args(args).output()?;
     if !output.status.success() {
         return Err(anyhow!(
             "git {} failed: {}",
@@ -672,8 +689,8 @@ fn git_output(args: &[&str]) -> Result<String> {
 
 /// Machine-readable snapshot of the working tree and index state, for
 /// detecting whether a failed apply touched anything.
-fn status_porcelain() -> Result<Vec<u8>> {
-    let output = Command::new("git")
+fn status_porcelain(repo: &Repository) -> Result<Vec<u8>> {
+    let output = git_command(repo)
         .args(["status", "--porcelain", "-z", "--untracked-files=all"])
         .output()?;
     if !output.status.success() {
@@ -683,11 +700,11 @@ fn status_porcelain() -> Result<Vec<u8>> {
 }
 
 /// Drop `set_aside`'s stash entry, if it is still there.
-fn drop_entry(set_aside: &SetAside) -> Result<()> {
-    let Located::Entry(resolved_ref) = locate(set_aside)? else {
+fn drop_entry(repo: &Repository, set_aside: &SetAside) -> Result<()> {
+    let Located::Entry(resolved_ref) = locate(repo, set_aside)? else {
         return Ok(());
     };
-    let status = Command::new("git")
+    let status = git_command(repo)
         .arg("stash")
         .arg("drop")
         .arg(&resolved_ref)
@@ -711,11 +728,11 @@ enum Located {
 /// otherwise by its exact message. A `stash@{N}` record (Kindra 1.1 or
 /// earlier) names a position rather than an entry, so it is used as it is
 /// and never found gone.
-fn locate(set_aside: &SetAside) -> Result<Located> {
+fn locate(repo: &Repository, set_aside: &SetAside) -> Result<Located> {
     if set_aside.stash.starts_with("stash@{") {
         return Ok(Located::Entry(set_aside.stash.clone()));
     }
-    Ok(locate_in(&entries()?, set_aside))
+    Ok(locate_in(&entries(repo)?, set_aside))
 }
 
 /// [`locate`] among `entries`.
@@ -738,15 +755,15 @@ struct Entry {
 }
 
 /// The entry created with exactly `message`, if any.
-fn find_by_message(message: &str) -> Result<Option<Entry>> {
-    Ok(entries()?
+fn find_by_message(repo: &Repository, message: &str) -> Result<Option<Entry>> {
+    Ok(entries(repo)?
         .into_iter()
         .find(|entry| entry.message == message))
 }
 
 /// Every stash entry, newest first.
-fn entries() -> Result<Vec<Entry>> {
-    let output = Command::new("git")
+fn entries(repo: &Repository) -> Result<Vec<Entry>> {
+    let output = git_command(repo)
         .arg("stash")
         .arg("list")
         .arg("--format=%gd%x09%H%x09%gs")

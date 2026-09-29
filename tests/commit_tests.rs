@@ -7591,3 +7591,132 @@ fn commit_on_a_parent_the_child_merged_restacks_the_child() {
     assert_eq!(own.len(), 2);
     assert_eq!(current_branch(root), "child");
 }
+
+/// The parent of `branch`'s tip and the paths that tip changes.
+fn tip_parent_and_paths(root: &Path, branch: &str) -> (git2::Oid, Vec<String>) {
+    let repo = Repository::open(root).unwrap();
+    let tip = repo
+        .revparse_single(branch)
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    let parent = tip.parent(0).unwrap();
+    let diff = repo
+        .diff_tree_to_tree(
+            Some(&parent.tree().unwrap()),
+            Some(&tip.tree().unwrap()),
+            None,
+        )
+        .unwrap();
+    let paths = diff
+        .deltas()
+        .map(|delta| {
+            delta
+                .new_file()
+                .path()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    (parent.id(), paths)
+}
+
+/// Git exports `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` to hooks, and
+/// wrappers set them. `kin commit` commits in the repository it discovered:
+/// the index it commits, the pre-commit hook Git runs, the unstaged changes
+/// set aside while the dependents are restacked, and the restack itself all
+/// belong to that repository, not the one the environment names.
+#[test]
+fn test_commit_acts_on_the_discovered_repository_when_git_env_names_another() {
+    let (dir, _repo) = setup_repo();
+    let root = dir.path();
+    fs::write(
+        root.join(".git/hooks/pre-commit"),
+        "#!/bin/sh\ntouch \"$(git rev-parse --absolute-git-dir)/pre-commit-ran\"\n",
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", ".git/hooks/pre-commit"], root);
+    fs::write(root.join("new.txt"), "new").unwrap();
+    run_ok("git", &["add", "new.txt"], root);
+    fs::write(root.join("file.txt"), "unstaged").unwrap();
+    fs::write(root.join("untracked.txt"), "untracked").unwrap();
+    let foreign = common::ForeignRepository::new();
+
+    foreign
+        .kin_cmd()
+        .current_dir(root)
+        .args(["commit", "-m", "add new"])
+        .assert()
+        .success();
+
+    let repo = Repository::open(root).unwrap();
+    let main = repo
+        .revparse_single("main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    assert_eq!(main.summary(), Some("add new"));
+    assert_eq!(tip_parent_and_paths(root, "main").1, vec!["new.txt"]);
+    assert_eq!(tip_parent_and_paths(root, "feature").0, main.id());
+    assert!(root.join(".git/pre-commit-ran").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("file.txt")).unwrap(),
+        "unstaged"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("untracked.txt")).unwrap(),
+        "untracked"
+    );
+    assert_eq!(
+        git_stdout(root, &["status", "--porcelain"]),
+        " M file.txt\n?? untracked.txt\n"
+    );
+    assert!(git_stdout(root, &["stash", "list"]).is_empty());
+    assert_no_rebase_in_progress(root);
+    foreign.assert_untouched();
+}
+
+/// A pathspec forwarded to `git commit` from a subdirectory names paths
+/// relative to it, as it does for `git commit` run there, and the unstaged
+/// changes set aside around the restack include those outside it.
+#[test]
+fn test_commit_from_a_subdirectory_resolves_pathspecs_against_it() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    repo_init(root);
+    fs::create_dir(root.join("sub")).unwrap();
+    for (file, content) in [("file.txt", "initial"), ("sub/nested.txt", "nested")] {
+        fs::write(root.join(file), content).unwrap();
+        run_ok("git", &["add", file], root);
+    }
+    run_ok("git", &["commit", "-m", "initial"], root);
+    run_ok("git", &["checkout", "-b", "feature"], root);
+    fs::write(root.join("feature.txt"), "feature").unwrap();
+    run_ok("git", &["add", "feature.txt"], root);
+    run_ok("git", &["commit", "-m", "feature"], root);
+    run_ok("git", &["checkout", "main"], root);
+    let repo = Repository::open(root).unwrap();
+    let old_main = repo.revparse_single("main").unwrap().id();
+    fs::write(root.join("sub/nested.txt"), "nested edited").unwrap();
+    fs::write(root.join("file.txt"), "edited").unwrap();
+
+    kin_cmd()
+        .current_dir(root.join("sub"))
+        .args(["commit", "-m", "edit nested", "--", "nested.txt"])
+        .assert()
+        .success();
+
+    let (parent, paths) = tip_parent_and_paths(root, "main");
+    assert_eq!(parent, old_main);
+    assert_eq!(paths, vec!["sub/nested.txt"]);
+    let main = repo.revparse_single("main").unwrap().id();
+    assert_eq!(tip_parent_and_paths(root, "feature").0, main);
+    assert_eq!(fs::read_to_string(root.join("file.txt")).unwrap(), "edited");
+    assert_eq!(
+        git_stdout(root, &["status", "--porcelain"]),
+        " M file.txt\n"
+    );
+    assert!(git_stdout(root, &["stash", "list"]).is_empty());
+    assert_no_rebase_in_progress(root);
+}

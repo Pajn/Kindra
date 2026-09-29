@@ -4035,3 +4035,65 @@ fn sync_skips_every_stack_branch_deleted_on_the_remote() {
     assert_eq!(tip(&repo, "origin/feature-c"), teammate);
     assert_eq!(tip(&repo, "origin/unrelated"), unrelated_before);
 }
+
+/// Git exports `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` to hooks, and
+/// wrappers set them. `kin sync` fetches into and rebases the repository it
+/// discovered, whatever repository the environment names.
+#[test]
+fn sync_fetches_and_rebases_the_discovered_repository_when_git_env_names_another() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let remote = tempdir().unwrap();
+    run_ok(
+        "git",
+        &["init", "--bare", "--initial-branch=main"],
+        remote.path(),
+    );
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        dir.path(),
+    );
+    let base_id = make_commit(&repo, "refs/heads/main", "base.txt", "base", "base", &[]);
+    let base = repo.find_commit(base_id).unwrap();
+    run_ok("git", &["push", "-u", "origin", "main"], dir.path());
+    make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "feature.txt",
+        "feature",
+        "feature a",
+        &[&base],
+    );
+    run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
+    let remote_main = common::push_remote_commit(remote.path(), "main", "remote.txt");
+    fs::write(dir.path().join("untracked.txt"), "untracked").unwrap();
+    let foreign = common::ForeignRepository::new();
+
+    foreign
+        .kin_cmd()
+        .args(["sync", "--no-delete"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(
+        repo.revparse_single("origin/main").unwrap().id(),
+        remote_main
+    );
+    let feature = repo
+        .revparse_single("feature-a")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    assert_eq!(feature.parent_id(0).unwrap(), remote_main);
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-a"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("untracked.txt")).unwrap(),
+        "untracked"
+    );
+    common::assert_no_rebase_in_progress(dir.path());
+    common::assert_no_kindra_operation(dir.path());
+    foreign.assert_untouched();
+}

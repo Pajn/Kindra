@@ -26,6 +26,52 @@ fn worktree_review_creates_and_reuses_fixed_path() {
     assert_eq!(current_branch(&review_path), "main");
 }
 
+/// Git exports `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` to hooks, and
+/// wrappers set them. The worktree commands inspect and switch the discovered
+/// repository's worktrees, each through its own Git directory and work tree,
+/// whatever the environment names.
+#[test]
+fn worktree_commands_act_on_the_discovered_repository_when_git_env_names_another() {
+    let dir = setup_repo();
+    let review_path = dir.path().join(".git/kindra-worktrees/review");
+    kin_cmd()
+        .args(["wt", "review", "feature-a"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    let foreign = common::ForeignRepository::new();
+
+    foreign
+        .kin_cmd()
+        .args(["wt", "review", "main"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(current_branch(&review_path), "main");
+    assert!(!review_path.join("feature.txt").exists());
+
+    fs::write(review_path.join("file.txt"), "dirty").unwrap();
+    let output = foreign
+        .kin_cmd()
+        .args(["wt", "list"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let review = fs::canonicalize(&review_path).unwrap();
+    assert!(
+        stdout.lines().any(|line| {
+            let cols = line.split_whitespace().collect::<Vec<_>>();
+            cols.len() >= 4
+                && cols[..3] == ["review", "main", "dirty"]
+                && cols[3..].join(" ") == review.display().to_string()
+        }),
+        "kin wt list should show the dirty review worktree on main:\n{stdout}"
+    );
+    foreign.assert_untouched();
+}
+
 #[test]
 fn worktree_review_respects_dirty_state_unless_forced() {
     let dir = setup_repo();

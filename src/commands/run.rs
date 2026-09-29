@@ -189,7 +189,11 @@ fn run_locked(repo: &git2::Repository, args: &RunArgs) -> Result<()> {
 pub(crate) fn abort_run(repo: &Repository) -> Result<()> {
     let mut run_state = load_run_state(repo)?;
     mark_aborted(repo, &mut run_state, None)?;
-    checkout_original_checkout(&run_state.original_branch, &run_state.original_head_id)?;
+    checkout_original_checkout(
+        repo,
+        &run_state.original_branch,
+        &run_state.original_head_id,
+    )?;
     restore_run_stash(repo, &mut run_state);
     clear_run_state(repo)?;
     println!("Run operation aborted (state cleared).");
@@ -241,7 +245,7 @@ fn restore_run_stash(repo: &Repository, run_state: &mut RunState) {
     if crate::set_aside::restore(repo, &set_aside, crate::set_aside::Phase::NonResumable)
         == crate::set_aside::Outcome::Restored
     {
-        crate::set_aside::drop_restored(&set_aside);
+        crate::set_aside::drop_restored(repo, &set_aside);
     }
 }
 
@@ -302,7 +306,7 @@ fn execute_run(repo: &Repository, run_state: &mut RunState) -> Result<()> {
         let branch = run_state.target_branches[run_state.current_index].clone();
         println!("\n=== Running on {} ===", branch);
 
-        if let Err(err) = run_git_checkout(&branch) {
+        if let Err(err) = run_git_checkout(repo, &branch) {
             eprintln!("Failed to checkout branch {}: {}", branch, err);
             record_branch_failure(run_state, &branch);
             failure_count += 1;
@@ -371,9 +375,11 @@ fn execute_run(repo: &Repository, run_state: &mut RunState) -> Result<()> {
         }
     }
 
-    if let Err(restore_err) =
-        checkout_original_checkout(&run_state.original_branch, &run_state.original_head_id)
-    {
+    if let Err(restore_err) = checkout_original_checkout(
+        repo,
+        &run_state.original_branch,
+        &run_state.original_head_id,
+    ) {
         // Record why the restore failed so `kin status` can show it and `kin
         // abort` can recover the stranded autostash, instead of leaving RunState
         // stuck InProgress with no reason. Mirrors fail_and_restore's error path.
@@ -412,7 +418,11 @@ fn fail_and_restore(repo: &Repository, run_state: &mut RunState, state_error: &s
     // checkout + autostash and clear state, so stopping at the first failure
     // does not leave a blocking operation. Only a genuine failure to restore the
     // checkout keeps state, so `kin abort` can recover the stranded autostash.
-    match checkout_original_checkout(&run_state.original_branch, &run_state.original_head_id) {
+    match checkout_original_checkout(
+        repo,
+        &run_state.original_branch,
+        &run_state.original_head_id,
+    ) {
         Ok(()) => {
             restore_run_stash(repo, run_state);
             clear_run_state(repo)?;
@@ -440,14 +450,15 @@ fn clear_branch_failure(run_state: &mut RunState, branch: &str) {
 }
 
 fn checkout_original_checkout(
+    repo: &Repository,
     original_branch: &Option<String>,
     original_head_id: &str,
 ) -> Result<()> {
     if let Some(branch) = original_branch {
-        run_git_checkout(branch)
+        run_git_checkout(repo, branch)
             .with_context(|| format!("Failed to checkout original branch '{}'.", branch))
     } else {
-        run_git_checkout(original_head_id).with_context(|| {
+        run_git_checkout(repo, original_head_id).with_context(|| {
             format!(
                 "Failed to checkout original detached HEAD '{}'.",
                 original_head_id
@@ -456,8 +467,11 @@ fn checkout_original_checkout(
     }
 }
 
-fn run_git_checkout(target: &str) -> Result<()> {
-    let status = Command::new("git").arg("checkout").arg(target).status()?;
+fn run_git_checkout(repo: &Repository, target: &str) -> Result<()> {
+    let status = crate::repository::git_command(repo)
+        .arg("checkout")
+        .arg(target)
+        .status()?;
     if !status.success() {
         return Err(anyhow!(
             "git checkout '{}' exited with non-zero status",

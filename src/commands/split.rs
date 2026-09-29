@@ -605,7 +605,7 @@ fn check_changes(
     }
     let names: Vec<String> = touched.iter().map(|(_, name)| name.clone()).collect();
     if let Some((branch, held)) =
-        crate::rebase_utils::first_held_elsewhere(&names).map_err(failure)?
+        crate::rebase_utils::first_held_elsewhere(repo, &names).map_err(failure)?
     {
         let what = touched
             .iter()

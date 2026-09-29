@@ -2,7 +2,6 @@ use crate::commands::find_upstream;
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
 use git2::{BranchType, Repository};
-use std::process::Command;
 
 #[derive(Args)]
 pub struct RenameArgs {
@@ -111,7 +110,7 @@ fn rename_branch(repo: &Repository, old_name: &str, new_name: &str) -> Result<()
     // worktrees are derived from git's own worktree list plus config paths, so
     // both follow the rename automatically with nothing of ours to rewrite. (git
     // repoints a checked-out branch's worktree HEAD as part of `branch -m`.)
-    let output = Command::new("git")
+    let output = crate::repository::git_command(repo)
         .arg("branch")
         .arg("-m")
         .arg(old_name)

@@ -10,7 +10,6 @@ use clap::Args;
 use git2::{Oid, Repository};
 use slog::Drain;
 use std::collections::HashMap;
-use std::process::Command;
 
 #[derive(Args)]
 pub struct AbsorbArgs {
@@ -196,7 +195,7 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         }
     }
     if !guarded_branches.is_empty() {
-        check_worktrees(&guarded_branches, args.force)?;
+        check_worktrees(repo, &guarded_branches, args.force)?;
     }
 
     // Snapshot for undo before the absorb engine commits anything, so `kin undo`
@@ -209,7 +208,7 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         // them back so a partial absorb doesn't linger at HEAD.
         let repo = crate::open_repo()?;
         if repo.revparse_single("HEAD")?.id() != head_before {
-            return Err(rollback_fixups(head_before, err));
+            return Err(rollback_fixups(&repo, head_before, err));
         }
         return Err(err);
     }
@@ -301,7 +300,7 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         }
         Ok(None) => {}
         Err(err) => {
-            return Err(rollback_fixups(head_before, err));
+            return Err(rollback_fixups(&repo, head_before, err));
         }
     }
     if let Err(err) = save_state(&repo, &state) {
@@ -309,7 +308,7 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         // stash; roll the fixups back and pop it rather than stranding the
         // user's changes.
         set_aside::unwind(&repo, &mut state.set_asides);
-        return Err(rollback_fixups(head_before, err));
+        return Err(rollback_fixups(&repo, head_before, err));
     }
 
     // Fold the fixup commits. `--update-refs` moves every branch tip inside the
@@ -324,7 +323,7 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
     // A spawn error means no rebase started at all, so it takes the same
     // rollback path as a pre-start rejection below rather than `?`-returning
     // past the cleanup with the fixups and saved state left behind.
-    let status = Command::new("git")
+    let status = crate::repository::git_command(&repo)
         .env("GIT_SEQUENCE_EDITOR", sequence_editor)
         .env("GIT_EDITOR", "true")
         .arg("rebase")
@@ -368,6 +367,7 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         if set_aside::unwind(&repo, &mut state.set_asides) == set_aside::Outcome::Restored {
             let _ = clear_state(&repo);
             return Err(rollback_fixups(
+                &repo,
                 head_before,
                 anyhow!("{err:#} The absorb was rolled back."),
             ));
@@ -378,6 +378,7 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
                 "{err:#} Your set-aside changes could not be restored (see the warning above), so the absorb was not rolled back. Clear the way, then run 'kin abort' to roll it back and restore them."
             ),
             Err(save_err) => rollback_fixups(
+                &repo,
                 head_before,
                 anyhow!(
                     "{err:#} The absorb was rolled back, but your set-aside changes could not be restored (see the warning above) and saving the state failed ({save_err:#}); they remain in the stash list ('git stash list')."
@@ -398,9 +399,9 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
 /// and the failure leaves the repository as it was before the absorb. If the
 /// reset itself fails, that is surfaced on the returned error instead of
 /// guessing.
-fn rollback_fixups(head_before: Oid, err: anyhow::Error) -> anyhow::Error {
+fn rollback_fixups(repo: &Repository, head_before: Oid, err: anyhow::Error) -> anyhow::Error {
     let reset_ok = matches!(
-        Command::new("git")
+        crate::repository::git_command(repo)
             .args(["reset", "--soft", &head_before.to_string()])
             .status(),
         Ok(status) if status.success()
