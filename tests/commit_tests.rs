@@ -4916,7 +4916,7 @@ fn test_commit_fixup_failed_rollback_and_recovery_save_give_manual_recovery_step
     let stash_oid = git_stdout(dir.path(), &["stash", "list", "-1", "--format=%H"]);
     assert!(
         stderr.contains(&stash_message)
-            && stderr.contains(&format!("git stash apply {}", stash_oid.trim())),
+            && stderr.contains(&format!("git stash apply --index {}", stash_oid.trim())),
         "the error must name the stash entry and how to apply it, got:\n{stderr}"
     );
     assert!(

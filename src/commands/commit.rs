@@ -1746,17 +1746,14 @@ fn manual_recovery_steps(state: &RebaseState, target_old_head_id: Oid) -> String
         ));
     }
     for set_aside in state.set_asides.newest_first() {
-        let index = if set_aside.restore == set_aside::Restore::WithIndex {
-            "--index "
-        } else {
-            ""
-        };
+        // The rollback restores as `Phase::Unwind` does, which always brings
+        // the staged state back with `--index`; repeating it by hand must too.
         let apply = match &set_aside.oid {
-            Some(oid) => format!("'git stash apply {index}{oid}'"),
-            None => format!("'git stash apply {index}<entry>' (find it with 'git stash list')"),
+            Some(oid) => format!("'git stash apply --index {oid}'"),
+            None => "'git stash apply --index <entry>' (find it with 'git stash list')".to_string(),
         };
         steps.push(format!(
-            "restore the changes set aside in stash entry '{}' with {apply}, then drop that entry",
+            "clean up any partial application, then restore the changes set aside in stash entry '{}' with {apply}; drop that entry only after the changes are restored",
             set_aside.stash
         ));
     }
