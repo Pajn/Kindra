@@ -1417,20 +1417,129 @@ fn sync_respects_git_rebase_autostash_config() {
     let mut cmd = kin_cmd();
     cmd.arg("sync").current_dir(dir.path()).assert().failure();
 
-    // Verify autostash worked: rebase started (proving git config is respected)
+    // Git's `rebase.autostash` permits setting the dirty tree aside, so the
+    // rebase started. Kindra, not Git, holds what it set aside: the journal
+    // records it and `kin abort` restores it.
     assert!(
         dir.path().join(".git/rebase-merge").exists()
             || dir.path().join(".git/rebase-apply").exists(),
-        "git config rebase.autostash should allow sync to start rebasing with autostash"
+        "git config rebase.autostash should allow sync to start rebasing"
+    );
+    assert_eq!(
+        load_state(&repo)
+            .unwrap()
+            .set_asides
+            .changes()
+            .map(|s| s.kind),
+        Some(Kind::WholeTree),
+        "the journal must record the set-aside"
     );
 
-    // Clean up: abort the rebase so the test leaves a clean state
-    run_ok("git", &["rebase", "--abort"], dir.path());
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
     assert_eq!(
         fs::read_to_string(dir.path().join("file.txt")).unwrap(),
         "base\nfeature\ndirty\n",
         "dirty changes should be preserved after abort"
     );
+}
+
+/// `main <- feature-a`, where main and feature-a change the same line of
+/// `file.txt`, with feature-a (the top of its stack) checked out, the tracked
+/// `other.txt` edited and the untracked `scratch.txt` added.
+fn dirty_top_branch_behind_conflicting_main() -> TempDir {
+    let dir = tempdir().unwrap();
+    repo_init(dir.path());
+    for (file, content) in [("file.txt", "base\n"), ("other.txt", "other\n")] {
+        fs::write(dir.path().join(file), content).unwrap();
+    }
+    run_ok("git", &["add", "."], dir.path());
+    run_ok("git", &["commit", "-m", "base"], dir.path());
+    run_ok("git", &["checkout", "-b", "feature-a"], dir.path());
+    fs::write(dir.path().join("file.txt"), "feature\n").unwrap();
+    run_ok("git", &["commit", "-am", "feature a"], dir.path());
+    run_ok("git", &["checkout", "main"], dir.path());
+    fs::write(dir.path().join("file.txt"), "main\n").unwrap();
+    run_ok("git", &["commit", "-am", "main change"], dir.path());
+    run_ok("git", &["checkout", "feature-a"], dir.path());
+    fs::write(dir.path().join("other.txt"), "dirty\n").unwrap();
+    fs::write(dir.path().join("scratch.txt"), "untracked\n").unwrap();
+    dir
+}
+
+/// A linear sync from the top of its stack sets the dirty tree aside itself,
+/// untracked files included, and records it in the journal, so `kin abort`
+/// restores it.
+#[test]
+fn sync_from_the_top_branch_sets_dirty_changes_aside_for_abort() {
+    check_top_branch_sync_set_aside(true);
+}
+
+/// Finishing that sync with `kin continue` restores the set-aside changes.
+#[test]
+fn sync_from_the_top_branch_restores_set_aside_changes_on_continue() {
+    check_top_branch_sync_set_aside(false);
+}
+
+fn check_top_branch_sync_set_aside(abort: bool) {
+    let dir = dirty_top_branch_behind_conflicting_main();
+    let repo = Repository::open(dir.path()).unwrap();
+    let feature_a = repo.revparse_single("feature-a").unwrap().id();
+    kin_cmd()
+        .args(["sync", "--autostash"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Resolve conflicts"));
+
+    assert_eq!(
+        load_state(&repo)
+            .unwrap()
+            .set_asides
+            .changes()
+            .map(|s| s.kind),
+        Some(Kind::WholeTree),
+        "the journal must record the set-aside"
+    );
+    assert!(
+        !dir.path().join("scratch.txt").exists(),
+        "untracked files are set aside too"
+    );
+
+    if abort {
+        kin_cmd()
+            .arg("abort")
+            .current_dir(dir.path())
+            .assert()
+            .success();
+        assert_eq!(repo.revparse_single("feature-a").unwrap().id(), feature_a);
+    } else {
+        fs::write(dir.path().join("file.txt"), "resolved\n").unwrap();
+        run_ok("git", &["add", "file.txt"], dir.path());
+        kin_cmd()
+            .arg("continue")
+            .current_dir(dir.path())
+            .assert()
+            .success();
+        let main = repo.revparse_single("main").unwrap().id();
+        let rebased = repo.revparse_single("feature-a").unwrap().id();
+        assert!(repo.graph_descendant_of(rebased, main).unwrap());
+    }
+
+    assert_eq!(repo.head().unwrap().shorthand(), Some("feature-a"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("other.txt")).unwrap(),
+        "dirty\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "untracked\n"
+    );
+    assert!(repo.find_reference("refs/stash").is_err());
+    assert!(!rebase_state_file(dir.path()).exists());
 }
 
 #[test]
@@ -1642,7 +1751,10 @@ fn sync_errors_when_git_too_old_for_update_refs() {
     run_ok("git", &["cherry-pick", &a_id.to_string()], dir.path());
     run_ok("git", &["checkout", "-f", "feature-b"], dir.path());
 
-    let git_wrapper = dir.path().join("git");
+    // Outside the working tree: operations set its untracked files aside.
+    let mock_bin = dir.path().join(".git/mock-bin");
+    fs::create_dir_all(&mock_bin).unwrap();
+    let git_wrapper = mock_bin.join("git");
     let real_git = which::which("git").unwrap();
     fs::write(
         &git_wrapper,
@@ -1657,7 +1769,7 @@ fn sync_errors_when_git_too_old_for_update_refs() {
     fs::set_permissions(&git_wrapper, perms).unwrap();
 
     let old_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", dir.path().display(), old_path);
+    let new_path = format!("{}:{}", mock_bin.display(), old_path);
 
     let mut cmd = kin_cmd();
     cmd.arg("sync")
@@ -1718,7 +1830,10 @@ fn sync_on_main_errors_when_git_too_old_for_reapply_cherry_picks() {
     );
     run_ok("git", &["push", "origin", "main"], remote_worktree.path());
 
-    let git_wrapper = dir.path().join("git");
+    // Outside the working tree: operations set its untracked files aside.
+    let mock_bin = dir.path().join(".git/mock-bin");
+    fs::create_dir_all(&mock_bin).unwrap();
+    let git_wrapper = mock_bin.join("git");
     let real_git = which::which("git").unwrap();
     fs::write(
         &git_wrapper,
@@ -1733,7 +1848,7 @@ fn sync_on_main_errors_when_git_too_old_for_reapply_cherry_picks() {
     fs::set_permissions(&git_wrapper, perms).unwrap();
 
     let old_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", dir.path().display(), old_path);
+    let new_path = format!("{}:{}", mock_bin.display(), old_path);
 
     let mut cmd = kin_cmd();
     cmd.arg("sync")
@@ -1788,7 +1903,10 @@ fn sync_checkout_error_includes_branch_name() {
 
     run_ok("git", &["checkout", "-f", "feature-a"], dir.path());
 
-    let git_wrapper = dir.path().join("git");
+    // Outside the working tree: operations set its untracked files aside.
+    let mock_bin = dir.path().join(".git/mock-bin");
+    fs::create_dir_all(&mock_bin).unwrap();
+    let git_wrapper = mock_bin.join("git");
     let real_git = which::which("git").unwrap();
     fs::write(
         &git_wrapper,
@@ -1803,7 +1921,7 @@ fn sync_checkout_error_includes_branch_name() {
     fs::set_permissions(&git_wrapper, perms).unwrap();
 
     let old_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", dir.path().display(), old_path);
+    let new_path = format!("{}:{}", mock_bin.display(), old_path);
 
     let mut cmd = kin_cmd();
     cmd.arg("sync")
@@ -2141,6 +2259,10 @@ fn sync_refuses_dirty_working_tree_with_no_autostash() {
     assert!(!rebase_state_file(dir.path()).exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
+    // Nothing was set aside and nothing was recorded for `kin undo`.
+    assert!(repo.find_reference("refs/stash").is_err());
+    assert!(!dir.path().join(".git/kindra_oplog.json").exists());
+    assert!(!dir.path().join(".git/kindra_oplog_pending.json").exists());
 }
 
 #[test]
@@ -3487,6 +3609,83 @@ fn sync_on_the_trunk_fetches_only_the_trunk() {
     let repo = Repository::open(dir.path()).unwrap();
     assert_eq!(tip(&repo, "main"), trunk);
     assert_eq!(tip(&repo, "origin/unrelated"), unrelated_before);
+}
+
+/// Sync on the trunk sets a dirty tree aside itself, untracked files included,
+/// and records it in the journal, so `kin abort` restores it.
+#[test]
+fn sync_on_the_trunk_sets_dirty_changes_aside_for_abort() {
+    check_trunk_sync_set_aside(true);
+}
+
+/// Finishing that sync with `kin continue` restores the set-aside changes.
+#[test]
+fn sync_on_the_trunk_restores_set_aside_changes_on_continue() {
+    check_trunk_sync_set_aside(false);
+}
+
+fn check_trunk_sync_set_aside(abort: bool) {
+    let (dir, remote) = remote_backed_repo();
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    let trunk = common::push_remote_commit(remote.path(), "main", "trunk-1.txt");
+    // A local trunk commit adding the same file conflicts with the remote's.
+    fs::write(dir.path().join("trunk-1.txt"), "local\n").unwrap();
+    run_ok("git", &["add", "trunk-1.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "local"], dir.path());
+    let repo = Repository::open(dir.path()).unwrap();
+    let local = tip(&repo, "main");
+    fs::write(dir.path().join("base.txt"), "dirty\n").unwrap();
+    fs::write(dir.path().join("scratch.txt"), "untracked\n").unwrap();
+
+    kin_cmd()
+        .args(["sync", "--autostash"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Resolve conflicts"));
+    assert_eq!(
+        load_state(&repo)
+            .unwrap()
+            .set_asides
+            .changes()
+            .map(|s| s.kind),
+        Some(Kind::WholeTree),
+        "the journal must record the set-aside"
+    );
+    assert!(
+        !dir.path().join("scratch.txt").exists(),
+        "untracked files are set aside too"
+    );
+
+    if abort {
+        kin_cmd()
+            .arg("abort")
+            .current_dir(dir.path())
+            .assert()
+            .success();
+        assert_eq!(tip(&repo, "main"), local);
+    } else {
+        fs::write(dir.path().join("trunk-1.txt"), "resolved\n").unwrap();
+        run_ok("git", &["add", "trunk-1.txt"], dir.path());
+        kin_cmd()
+            .arg("continue")
+            .current_dir(dir.path())
+            .assert()
+            .success();
+        assert!(repo.graph_descendant_of(tip(&repo, "main"), trunk).unwrap());
+    }
+
+    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("base.txt")).unwrap(),
+        "dirty\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "untracked\n"
+    );
+    assert!(repo.find_reference("refs/stash").is_err());
+    assert!(!rebase_state_file(dir.path()).exists());
 }
 
 #[test]

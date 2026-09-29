@@ -356,7 +356,8 @@ pub fn autostash_override(autostash: bool, no_autostash: bool) -> Option<bool> {
 
 /// Resolve the effective autostash setting for a rebase-style command and then
 /// enforce the clean-or-autostash contract up front, returning the resolved
-/// flag. Combines the [`autostash_override`] → [`resolve_rebase_autostash`] →
+/// flag: the permission to set uncommitted tracked changes aside. It is never
+/// passed to Git. Combines the [`autostash_override`] → [`resolve_rebase_autostash`] →
 /// [`crate::rebase_utils::ensure_rebase_working_tree`] sequence every rebase
 /// command shares, so a dirty tree with `--no-autostash` fails fast and
 /// identically everywhere.

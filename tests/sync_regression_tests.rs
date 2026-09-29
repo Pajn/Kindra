@@ -799,12 +799,64 @@ fn check_sync_autostash_conflict_recovery(abort: bool) {
     assert!(repo.find_reference("refs/stash").is_err());
 }
 
+/// An untracked file at a path the stack's tip tracks would block checking
+/// out the tip, but it is set aside with the tracked edits, so the sync gets
+/// as far as its conflict and `kin abort` restores both.
 #[test]
+fn sync_sets_untracked_files_aside_so_they_do_not_block_the_tip_checkout() {
+    let dir = sync_recovery_repo(true);
+    fs::write(dir.path().join("shared.txt"), "dirty\n").unwrap();
+    fs::write(dir.path().join("upper.txt"), "untracked\n").unwrap();
+    kin_cmd()
+        .args(["sync", "--autostash"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Resolve conflicts"));
+    let repo = Repository::open(dir.path()).unwrap();
+    assert!(
+        kindra::rebase_utils::load_state(&repo)
+            .unwrap()
+            .set_asides
+            .changes()
+            .is_some()
+    );
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(repo.head().unwrap().shorthand(), Some("lower"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
+        "dirty\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("upper.txt")).unwrap(),
+        "untracked\n"
+    );
+    assert!(!rebase_state_file(dir.path()).exists());
+    assert!(repo.find_reference("refs/stash").is_err());
+}
+
+/// When checking out the stack's tip fails after the tree was set aside, the
+/// journal still records the set-aside and `kin abort` restores it.
+#[test]
+#[cfg(unix)]
 fn sync_autostash_can_abort_after_tip_checkout_is_blocked() {
     let dir = sync_recovery_repo(true);
     fs::write(dir.path().join("shared.txt"), "dirty\n").unwrap();
-    // An untracked file blocks checkout even after tracked edits are stashed.
-    fs::write(dir.path().join("upper.txt"), "untracked\n").unwrap();
+    fs::write(dir.path().join("scratch.txt"), "untracked\n").unwrap();
+    // The first checkout fails (Git reports a failing post-checkout hook as a
+    // failed checkout); later ones, such as abort's, succeed.
+    let hook = dir.path().join(".git/hooks/post-checkout");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(
+        &hook,
+        "#!/bin/sh\nmarker=\"$(git rev-parse --git-dir)/checkout-failed\"\n[ -e \"$marker\" ] && exit 0\ntouch \"$marker\"\nexit 1\n",
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", hook.to_str().unwrap()], dir.path());
     kin_cmd()
         .args(["sync", "--autostash"])
         .current_dir(dir.path())
@@ -830,7 +882,7 @@ fn sync_autostash_can_abort_after_tip_checkout_is_blocked() {
         "dirty\n"
     );
     assert_eq!(
-        fs::read_to_string(dir.path().join("upper.txt")).unwrap(),
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
         "untracked\n"
     );
     assert!(!rebase_state_file(dir.path()).exists());

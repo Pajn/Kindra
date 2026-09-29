@@ -29,7 +29,7 @@ pub struct RunArgs {
     #[serde(default, skip)]
     pub tree: bool,
 
-    /// Stash uncommitted changes for the duration of the run and restore them
+    /// Set uncommitted tracked changes aside for the duration of the run and restore them
     /// when it finishes (defaults to the rebase.autostash config)
     #[arg(long, overrides_with = "no_autostash")]
     #[serde(default, skip)]

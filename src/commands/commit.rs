@@ -1,4 +1,4 @@
-use crate::commands::{find_upstream, resolve_rebase_autostash};
+use crate::commands::find_upstream;
 use crate::rebase_utils::{
     RebaseState, check_worktrees, checkout_branch, clear_state, git_rebase_in_progress,
     local_branch_tips_in_range, record_branch_tips_in_range, run_rebase_loop, save_state,
@@ -102,7 +102,6 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
     let upstream_obj = repo.revparse_single(&upstream_name)?;
     let upstream_id = upstream_obj.id();
     let head_id = head.peel_to_commit()?.id();
-    let autostash = resolve_rebase_autostash(repo, parsed.autostash)?;
     let on_flag = parsed.on_target.is_some();
 
     // `-b`/`--new-branch` commits onto a freshly created branch rather than an
@@ -117,7 +116,6 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
             upstream_id,
             head_id,
             &parsed,
-            autostash,
         );
     }
 
@@ -461,17 +459,19 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
             suppress_editor: false,
             abort_only: false,
             unstage_on_restore: switching_branches,
-            autostash,
+            legacy_autostash: false,
             cleanup_merged_branches: Vec::new(),
             cleanup_checkout_fallback: None,
         };
 
-        // Deliberate exception to the uniform clean-or-autostash contract: when
-        // committing onto another branch (`--on`), keep the *staged* changes (what
-        // we're committing there) while setting the *unstaged* ones aside via
-        // `git stash --keep-index --include-untracked`. Take it only now — after
-        // the fallible planning above — so a failure there can't strand the user's
-        // changes, and record it in the saved state right away.
+        // `kin commit` always sets the unstaged changes aside when it rewrites
+        // or switches branches; the autostash flags are no-ops for it. When
+        // committing onto another branch (`--on`), keep the *staged* changes
+        // (what we're committing there) while setting the *unstaged* ones aside
+        // via `git stash --keep-index --include-untracked`. Take it only now —
+        // after the fallible planning above — so a failure there can't strand
+        // the user's changes, and record it in the saved state right away. The
+        // in-place paths take theirs once the commit exists (below).
         if switching_branches {
             state.set_asides.extend(stash_non_staged_changes(repo)?);
         }
@@ -501,12 +501,20 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
             .args(&parsed.git_commit_args)
             .status()?;
         if !status.success() {
-            if pre_commit_state_required {
+            if switching_branches {
+                // The changes were set aside and the target checked out, so
+                // the journal is what `kin abort` needs to bring them back.
                 return Err(anyhow!(
                     "git commit failed. Resolve and run 'kin continue', or run 'kin abort'."
                 ));
             }
-            return Err(anyhow!("git commit failed"));
+            // In place, nothing has changed yet: nothing was set aside (that
+            // happens once the commit exists) and no branch moved. Like a
+            // rebase that never started, leave no journal to continue.
+            if pre_commit_state_required {
+                clear_state(repo)?;
+            }
+            return Err(anyhow!("git commit failed; nothing was changed."));
         }
 
         if !switching_branches && !needs_autosquash && !moving_onto_ancestor {
@@ -537,6 +545,11 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
                         "Failed to save the post-commit checkpoint and restore '{target_branch}': {rollback_err}. Your commit is {committed_tip}; dependent branches have not been restacked."
                     ))),
                 };
+            }
+            // The dependents are restacked in place, on a clean tree: set the
+            // unstaged changes aside now that the staged ones are committed.
+            if will_rebase {
+                set_aside_after_commit(repo, &mut state, target_old_head_id)?;
             }
         }
 
@@ -606,14 +619,10 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
             // merges.
             .arg("--no-autosquash")
             .arg("--no-rebase-merges")
-            .arg("--update-refs");
-            // Pass the resolved choice either way so git's own
-            // `rebase.autostash` cannot override it.
-            cmd.arg(if autostash {
-                "--autostash"
-            } else {
-                "--no-autostash"
-            });
+            .arg("--update-refs")
+            // The unstaged changes are set aside above; `rebase.autostash`
+            // must not have Git set anything aside itself.
+            .arg("--no-autostash");
             cmd.arg(ancestor_target);
 
             let failure = match cmd.status() {
@@ -656,39 +665,14 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
         }
 
         if needs_autosquash {
-            if autosquash_state_required {
-                // Take the pre-rebase stash only *after* the fixup commit: the
-                // staged content we're folding in is now committed, so a
-                // `--keep-index` stash captures genuinely unstaged leftovers rather
-                // than re-capturing (and later re-applying) the fixup content. If
-                // stashing fails, undo the fixup commit we just created so the
-                // failure can't strand a `fixup!` commit without a recoverable
-                // state.
-                match stash_non_staged_changes(repo) {
-                    Ok(changes) => state.set_asides.extend(changes),
-                    Err(err) => {
-                        // Roll back the fixup commit we just created. If the reset
-                        // itself fails, surface that explicitly — a stray `fixup!`
-                        // commit is now stranded at HEAD and the user must remove it.
-                        match Command::new("git")
-                            .args(["reset", "--soft", "HEAD^"])
-                            .status()
-                        {
-                            Ok(status) if status.success() => return Err(err),
-                            _ => {
-                                return Err(err.context(
-                                    "Additionally, failed to roll back the fixup commit; a stray 'fixup!' commit remains at HEAD. Remove it with 'git reset --soft HEAD^'.",
-                                ));
-                            }
-                        }
-                    }
-                };
-                if let Err(err) = save_state(repo, &state) {
-                    // Persisting failed; pop the stash back rather than leaving
-                    // the user's unstaged changes stranded.
-                    set_aside::unwind(repo, &mut state.set_asides);
-                    return Err(err);
-                }
+            // An in-place fold (with or without dependents to restack after it)
+            // sets the unstaged changes aside only *after* the fixup commit: the
+            // staged content we're folding in is now committed, so a
+            // `--keep-index` stash captures genuinely unstaged leftovers rather
+            // than re-capturing (and later re-applying) the fixup content. The
+            // checkout path set them aside before switching branches.
+            if !switching_branches {
+                set_aside_after_commit(repo, &mut state, target_old_head_id)?;
             }
 
             let fixup_commit = repo.find_commit(Oid::from_str(&fixup_commit_id)?)?;
@@ -701,14 +685,10 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
             cmd.env("GIT_SEQUENCE_EDITOR", "true")
                 .arg("rebase")
                 .arg("-i")
-                .arg("--autosquash");
-            // Pass the resolved choice either way so git's own
-            // `rebase.autostash` cannot override it.
-            cmd.arg(if autostash {
-                "--autostash"
-            } else {
-                "--no-autostash"
-            });
+                .arg("--autosquash")
+                // Everything is set aside by Kindra; `rebase.autostash` must not
+                // have Git set anything aside itself.
+                .arg("--no-autostash");
             // Always move the branch tips inside the rewritten range with the fold
             // rather than relying on the ambient `rebase.updateRefs` git config
             // (off by default): this moves an inline fixup's below-HEAD ancestor
@@ -794,7 +774,6 @@ fn commit_on_new_branch(
     upstream_id: Oid,
     head_id: Oid,
     parsed: &ParsedCommitArgs,
-    autostash: bool,
 ) -> Result<()> {
     // Creating a branch for an empty commit is never the intent, so require
     // content up front unless `-a`/`-p`/a pathspec will supply it — mirroring the
@@ -936,7 +915,7 @@ fn commit_on_new_branch(
         suppress_editor: false,
         abort_only: false,
         unstage_on_restore: false,
-        autostash,
+        legacy_autostash: false,
         cleanup_merged_branches: Vec::new(),
         cleanup_checkout_fallback: None,
     };
@@ -1069,7 +1048,6 @@ struct ParsedCommitArgs {
     interactive: bool,
     fixup_target: Option<String>,
     force: bool,
-    autostash: Option<bool>,
     // `-b`/`--new-branch`: `Some(Some(name))` is an explicit name, `Some(None)`
     // means derive one by slugifying the commit message.
     new_branch: Option<Option<String>>,
@@ -1186,14 +1164,9 @@ fn parse_commit_args(args: &[String]) -> Result<ParsedCommitArgs> {
             continue;
         }
 
-        if arg == "--autostash" {
-            parsed.autostash = Some(true);
-            idx += 1;
-            continue;
-        }
-
-        if arg == "--no-autostash" {
-            parsed.autostash = Some(false);
+        // Accepted for symmetry with the other commands, but no-ops: kin commit
+        // always sets aside the unstaged changes it has to move out of the way.
+        if arg == "--autostash" || arg == "--no-autostash" {
             idx += 1;
             continue;
         }
@@ -1658,9 +1631,24 @@ fn option_takes_value(arg: &str) -> bool {
     )
 }
 
+/// Set the unstaged changes aside for a rebase in place, once the commit
+/// exists so the set-aside holds only what is left unstaged, record it in the
+/// journal and save the journal. If either fails, the commit is rolled back as
+/// for a rebase that never started.
+fn set_aside_after_commit(
+    repo: &Repository,
+    state: &mut RebaseState,
+    target_old_head_id: Oid,
+) -> Result<()> {
+    let recorded = stash_non_staged_changes(repo).and_then(|changes| {
+        state.set_asides.extend(changes);
+        save_state(repo, state)
+    });
+    recorded.map_err(|err| unwind_unstarted_rebase(repo, state, target_old_head_id, err))
+}
+
 /// Undo the commit of a fixup or `--on` move whose rebase git refused before
-/// starting (e.g. a rejecting `pre-rebase` hook, or unstaged changes without
-/// autostash).
+/// starting (e.g. a rejecting `pre-rebase` hook).
 ///
 /// Nothing was rewritten, so the saved state must not survive: `kin continue`
 /// would restack the dependents onto the raw `fixup!` commit, or onto the
@@ -1730,13 +1718,60 @@ fn unwind_unstarted_rebase(
         Ok(Outcome::NotRestored { .. }) => anyhow!(
             "{err:#} The commit was rolled back, but your set-aside changes could not be restored (see the warning above). Clear the way, then run 'kin abort' to restore them."
         ),
-        Err(unwind_err) => {
-            let _ = save_state(repo, state);
-            anyhow!(
+        Err(unwind_err) => match save_state(repo, state) {
+            Ok(()) => anyhow!(
                 "{err:#} Rolling back the commit did not complete ({unwind_err:#}); run 'kin abort' to restore the original state."
-            )
-        }
+            ),
+            // Without a saved journal that lists what is still set aside,
+            // `kin abort` cannot be relied on: say how to recover by hand.
+            Err(save_err) => anyhow!(
+                "{err:#} Rolling back the commit did not complete ({unwind_err:#}), and saving the recovery state also failed ({save_err:#}), so 'kin abort' may not be able to finish it. Recover by hand:{}",
+                manual_recovery_steps(state, target_old_head_id)
+            ),
+        },
     }
+}
+
+/// How to finish rolling back a commit by hand when no journal records what
+/// is left to undo, in the order [`unwind_unstarted_rebase`] undoes it: in
+/// place, every set-aside not yet restored (newest first, based on the new
+/// commit) and then the commit to take back off; after a branch switch, the
+/// branch tip to put back and then the set-asides, on the caller branch.
+fn manual_recovery_steps(state: &RebaseState, target_old_head_id: Oid) -> String {
+    let mut steps = Vec::new();
+    if let Some(caller) = &state.caller_branch {
+        steps.push(format!(
+            "'{}' should point at {target_old_head_id} again: find its tip from before the commit with 'git reflog show refs/heads/{}' and reset it there, then check out '{caller}'",
+            state.original_branch, state.original_branch
+        ));
+    }
+    for set_aside in state.set_asides.newest_first() {
+        // The rollback restores as `Phase::Unwind` does, which always brings
+        // the staged state back with `--index`; repeating it by hand must too.
+        let apply = match &set_aside.oid {
+            Some(oid) => format!("'git stash apply --index {oid}'"),
+            None => "'git stash apply --index <entry>' (find it with 'git stash list')".to_string(),
+        };
+        steps.push(format!(
+            "clean up any partial application, then restore the changes set aside in stash entry '{}' with {apply}; drop that entry only after the changes are restored",
+            set_aside.stash
+        ));
+    }
+    if state.caller_branch.is_none()
+        && head_commit_id().is_ok_and(|head| head != target_old_head_id)
+    {
+        steps.push(format!(
+            "take the new commit back off with 'git reset --soft {target_old_head_id}' (its changes return to the index)"
+        ));
+    }
+    if steps.is_empty() {
+        return " nothing is left to undo; remove the saved state with 'kin abort --clear-state' if it remains.".to_string();
+    }
+    steps
+        .iter()
+        .enumerate()
+        .map(|(n, step)| format!(" {}. {step}.", n + 1))
+        .collect()
 }
 
 fn run_git(args: &[&str]) -> Result<()> {

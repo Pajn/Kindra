@@ -9,6 +9,14 @@ use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
 
+/// A directory for a test's mock `git`, its logs and trigger files, inside the
+/// Git directory: operations set untracked files in the working tree aside.
+fn mock_bin(worktree: &Path) -> std::path::PathBuf {
+    let bin = worktree.join(".git").join("mock-bin");
+    fs::create_dir_all(&bin).unwrap();
+    bin
+}
+
 fn setup_repo() -> (tempfile::TempDir, Repository) {
     let dir = tempdir().unwrap();
     let repo = repo_init(dir.path());
@@ -148,7 +156,7 @@ fn test_move_restore_checkout_failure() {
 
     let git_path = which::which("git").expect("git not found");
 
-    let git_mock = dir.path().join("git");
+    let git_mock = mock_bin(dir.path()).join("git");
     fs::write(
         &git_mock,
         format!(
@@ -176,7 +184,7 @@ exec {} "$@"
     cmd.env("TERM", "xterm");
 
     let old_path = std::env::var_os("PATH").unwrap_or_default();
-    let mut new_path = dir.path().to_path_buf().into_os_string();
+    let mut new_path = mock_bin(dir.path()).into_os_string();
     new_path.push(":");
     new_path.push(old_path);
 
@@ -327,8 +335,8 @@ fn test_move_manual_git_continue_then_kin_continue_resumes_next_branch() {
     )
     .unwrap();
 
-    let log_path = dir.path().join("git_calls.log");
-    let git_wrapper = dir.path().join("git");
+    let log_path = mock_bin(dir.path()).join("git_calls.log");
+    let git_wrapper = mock_bin(dir.path()).join("git");
     let real_git = which::which("git").unwrap();
 
     #[cfg(unix)]
@@ -349,7 +357,7 @@ fn test_move_manual_git_continue_then_kin_continue_resumes_next_branch() {
     }
 
     let old_path = std::env::var_os("PATH").unwrap_or_default();
-    let mut new_path = dir.path().to_path_buf().into_os_string();
+    let mut new_path = mock_bin(dir.path()).into_os_string();
     new_path.push(":");
     new_path.push(old_path);
 
@@ -1343,9 +1351,9 @@ fn test_move_onto_descendant_prestart_failure_retries_first_reordered_branch() {
     .unwrap();
 
     let git_path = which::which("git").expect("git not found");
-    let git_wrapper = dir.path().join("git");
-    let log_path = dir.path().join("git.log");
-    let fail_rebase_path = dir.path().join("fail_rebase");
+    let git_wrapper = mock_bin(dir.path()).join("git");
+    let log_path = mock_bin(dir.path()).join("git.log");
+    let fail_rebase_path = mock_bin(dir.path()).join("fail_rebase");
     fs::write(&log_path, "").unwrap();
     fs::write(&fail_rebase_path, "").unwrap();
     fs::write(
@@ -1377,7 +1385,7 @@ exec "{}" "$@"
     }
 
     let old_path = std::env::var_os("PATH").unwrap_or_default();
-    let mut new_path = dir.path().to_path_buf().into_os_string();
+    let mut new_path = mock_bin(dir.path()).into_os_string();
     new_path.push(":");
     new_path.push(old_path);
 
@@ -1552,7 +1560,7 @@ fn test_move_abort_preserves_state_on_rebase_abort_failure() {
 
     // 3. Mock git to fail ONLY on rebase --abort
     let git_path = which::which("git").expect("git not found");
-    let git_mock = dir.path().join("git");
+    let git_mock = mock_bin(dir.path()).join("git");
     fs::write(
         &git_mock,
         format!(
@@ -1577,7 +1585,7 @@ exec {} "$@"
     }
 
     let old_path = std::env::var_os("PATH").unwrap_or_default();
-    let mut new_path = dir.path().to_path_buf().into_os_string();
+    let mut new_path = mock_bin(dir.path()).into_os_string();
     new_path.push(":");
     new_path.push(old_path);
 
@@ -1694,8 +1702,8 @@ fn test_move_conflict_and_continue_no_re_rebase() {
     .unwrap();
 
     // Create a fake git that logs calls to a file
-    let log_path = dir.path().join("git_calls.log");
-    let git_wrapper = dir.path().join("git");
+    let log_path = mock_bin(dir.path()).join("git_calls.log");
+    let git_wrapper = mock_bin(dir.path()).join("git");
     let real_git = which::which("git").unwrap();
 
     #[cfg(unix)]
@@ -1716,7 +1724,7 @@ fn test_move_conflict_and_continue_no_re_rebase() {
     }
 
     let old_path = std::env::var_os("PATH").unwrap_or_default();
-    let mut new_path = dir.path().to_path_buf().into_os_string();
+    let mut new_path = mock_bin(dir.path()).into_os_string();
     new_path.push(":");
     new_path.push(old_path);
 
@@ -1860,7 +1868,7 @@ fn test_move_respects_git_rebase_autostash_config() {
 }
 
 #[test]
-fn test_move_repo_config_enables_autostash_and_persists_in_state() {
+fn test_move_repo_config_permits_the_set_aside_the_journal_records() {
     let dir = tempdir().unwrap();
     let repo = repo_init(dir.path());
 
@@ -1917,11 +1925,15 @@ fn test_move_repo_config_enables_autostash_and_persists_in_state() {
     let state = kindra::rebase_utils::load_state(&repo).unwrap();
     assert!(
         state.set_asides.changes().is_some(),
-        "operation must own the autostash"
+        "operation must own the set-aside"
     );
+    // The journal records what was set aside, not a permission for the
+    // rebase loop or Git to act on later.
+    let saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(rebase_state_file(dir.path())).unwrap()).unwrap();
     assert!(
-        !state.autostash,
-        "Git must not restore edits on each branch"
+        saved["journal"].get("autostash").is_none(),
+        "a new journal must not save autostash: {saved}"
     );
 }
 
@@ -1997,7 +2009,7 @@ fn test_move_fails_immediately_does_not_skip_branch() {
 
     // Mock git to fail rebase if a file exists
     let git_path = which::which("git").expect("git not found");
-    let git_mock = dir.path().join("git");
+    let git_mock = mock_bin(dir.path()).join("git");
     fs::write(
         &git_mock,
         format!(
@@ -2008,7 +2020,7 @@ if [ "$1" = "rebase" ] && [ "$2" = "--no-ff" ] && [ -f "{}/fail_rebase" ]; then
 fi
 exec {} "$@"
 "#,
-            dir.path().to_str().unwrap(),
+            mock_bin(dir.path()).to_str().unwrap(),
             git_path.to_str().unwrap()
         ),
     )
@@ -2023,12 +2035,12 @@ exec {} "$@"
     }
 
     let old_path = std::env::var_os("PATH").unwrap_or_default();
-    let mut new_path = dir.path().to_path_buf().into_os_string();
+    let mut new_path = mock_bin(dir.path()).into_os_string();
     new_path.push(":");
     new_path.push(old_path);
 
     // Create the failure trigger file
-    fs::write(dir.path().join("fail_rebase"), "").unwrap();
+    fs::write(mock_bin(dir.path()).join("fail_rebase"), "").unwrap();
 
     let mut cmd = kin_cmd();
     cmd.arg("move")
@@ -2054,7 +2066,7 @@ exec {} "$@"
     );
 
     // Remove the failure trigger
-    fs::remove_file(dir.path().join("fail_rebase")).unwrap();
+    fs::remove_file(mock_bin(dir.path()).join("fail_rebase")).unwrap();
 
     // Continue move
     let mut cmd_cont = kin_cmd();
@@ -2330,6 +2342,113 @@ fn move_refuses_dirty_working_tree_with_no_autostash() {
     assert!(!rebase_state_file(dir.path()).exists());
     assert!(!dir.path().join(".git/rebase-merge").exists());
     assert!(!dir.path().join(".git/rebase-apply").exists());
+    // Nothing was set aside and nothing was recorded for `kin undo`.
+    assert!(repo.find_reference("refs/stash").is_err());
+    assert!(!dir.path().join(".git/kindra_oplog.json").exists());
+    assert!(!dir.path().join(".git/kindra_oplog_pending.json").exists());
+}
+
+/// `main <- feature-a <- feature-b`, where feature-b tracks `notes.txt`, with
+/// feature-a checked out and an untracked `notes.txt` in the working tree:
+/// replaying feature-b checks it out, which the untracked file would block.
+fn untracked_file_tracked_by_a_child() -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    repo_init(dir.path());
+    fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+    run_ok("git", &["add", "base.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "base"], dir.path());
+    run_ok("git", &["checkout", "-b", "target"], dir.path());
+    fs::write(dir.path().join("target.txt"), "target\n").unwrap();
+    run_ok("git", &["add", "target.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "target"], dir.path());
+    run_ok("git", &["checkout", "-b", "feature-a", "main"], dir.path());
+    fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+    run_ok("git", &["add", "a.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "a"], dir.path());
+    run_ok("git", &["checkout", "-b", "feature-b"], dir.path());
+    fs::write(dir.path().join("notes.txt"), "b's notes\n").unwrap();
+    run_ok("git", &["add", "notes.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "b"], dir.path());
+    run_ok("git", &["checkout", "feature-a"], dir.path());
+    fs::write(dir.path().join("notes.txt"), "my notes\n").unwrap();
+    dir
+}
+
+/// Untracked files need no permission: with `--no-autostash` and only an
+/// untracked file, `move` proceeds. The file is set aside with the operation,
+/// so it cannot block a checkout, and comes back at the end.
+#[test]
+fn move_with_no_autostash_sets_only_untracked_files_aside() {
+    let dir = untracked_file_tracked_by_a_child();
+    kin_cmd()
+        .args(["move", "--onto", "target", "--no-autostash"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let target = repo.revparse_single("target").unwrap().id();
+    let a = repo.revparse_single("feature-a").unwrap().id();
+    let b = repo.revparse_single("feature-b").unwrap().id();
+    assert!(repo.graph_descendant_of(a, target).unwrap());
+    assert!(repo.graph_descendant_of(b, a).unwrap());
+    assert_eq!(common::current_branch(dir.path()), "feature-a");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+        "my notes\n"
+    );
+    assert!(repo.find_reference("refs/stash").is_err());
+    assert!(!rebase_state_file(dir.path()).exists());
+}
+
+/// A pre-rebase hook that fails unless `scratch.txt` is out of the working
+/// tree, which proves an untracked file was set aside before the rebases.
+#[cfg(unix)]
+fn require_scratch_set_aside_before_rebasing(dir: &Path) {
+    let hook = dir.join(".git/hooks/pre-rebase");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(&hook, "#!/bin/sh\ntest ! -e scratch.txt\n").unwrap();
+    run_ok("chmod", &["+x", hook.to_str().unwrap()], dir);
+}
+
+/// `move` sets an untracked file aside for its rebases and restores it.
+#[test]
+#[cfg(unix)]
+fn move_sets_untracked_files_aside_and_restores_them() {
+    let dir = tempdir().unwrap();
+    repo_init(dir.path());
+    fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+    run_ok("git", &["add", "base.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "base"], dir.path());
+    run_ok("git", &["branch", "target"], dir.path());
+    run_ok("git", &["checkout", "-b", "feature"], dir.path());
+    fs::write(dir.path().join("feature.txt"), "feature\n").unwrap();
+    run_ok("git", &["add", "feature.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "feature"], dir.path());
+    run_ok("git", &["checkout", "target"], dir.path());
+    fs::write(dir.path().join("target.txt"), "target\n").unwrap();
+    run_ok("git", &["add", "target.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "target"], dir.path());
+    run_ok("git", &["checkout", "feature"], dir.path());
+    fs::write(dir.path().join("scratch.txt"), "untracked\n").unwrap();
+    require_scratch_set_aside_before_rebasing(dir.path());
+
+    kin_cmd()
+        .args(["move", "--onto", "target"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let target = repo.revparse_single("target").unwrap().id();
+    let feature = repo.revparse_single("feature").unwrap().id();
+    assert!(repo.graph_descendant_of(feature, target).unwrap());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "untracked\n"
+    );
+    assert!(repo.find_reference("refs/stash").is_err());
+    assert!(!rebase_state_file(dir.path()).exists());
 }
 
 fn dirty_parent_with_child() -> tempfile::TempDir {
@@ -2391,6 +2510,58 @@ fn move_autostash_restores_edits_only_on_caller() {
             .content(),
         b"child version\n"
     );
+}
+
+/// A journal saved by an older Kindra may still ask the rebase loop to set the
+/// tree aside (`autostash: true` and nothing set aside yet). `kin continue`
+/// does so before its first rebase, as those releases did, and restores the
+/// changes on the branch the operation returns to.
+#[test]
+fn continue_sets_the_tree_aside_for_an_older_journal_that_asks_for_it() {
+    let dir = dirty_parent_with_child();
+    let repo = Repository::open(dir.path()).unwrap();
+    // An empty commit on feature-a: the index holds the staged edit.
+    let parent_commit = repo
+        .find_commit(repo.revparse_single("feature-a").unwrap().id())
+        .unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    repo.commit(
+        Some("refs/heads/target"),
+        &sig,
+        &sig,
+        "target",
+        &parent_commit.tree().unwrap(),
+        &[&parent_commit],
+    )
+    .unwrap();
+    let parent = parent_commit.id().to_string();
+    let child = repo.revparse_single("feature-b").unwrap().id().to_string();
+    let state = RebaseState {
+        remaining_branches: vec!["feature-b".to_string()],
+        parent_id_map: HashMap::from([("feature-b".to_string(), parent.clone())]),
+        parent_name_map: HashMap::from([("feature-b".to_string(), "target".to_string())]),
+        original_tip_map: HashMap::from([
+            ("feature-a".to_string(), parent),
+            ("feature-b".to_string(), child),
+        ]),
+        legacy_autostash: true,
+        ..rebase_state(Operation::Move, "feature-a", "target")
+    };
+    save_state(&repo, &state).unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(rebase_state_file(dir.path())).unwrap()).unwrap();
+    assert_eq!(saved["journal"]["autostash"], serde_json::Value::Bool(true));
+
+    kin_cmd()
+        .current_dir(dir.path())
+        .arg("continue")
+        .assert()
+        .success();
+
+    assert_parent_edits_restored(dir.path());
+    let target = repo.revparse_single("target").unwrap().id();
+    let rebased = repo.revparse_single("feature-b").unwrap().id();
+    assert!(repo.graph_descendant_of(rebased, target).unwrap());
 }
 
 #[test]

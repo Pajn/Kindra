@@ -36,7 +36,7 @@ One unit of work in a journal, such as replaying a branch onto a new base, autos
 
 **Set-aside**:
 Working-tree changes an operation moves out of the way and restores afterwards: the whole tree, only unstaged changes, or staged changes carried to another branch.
-_Avoid_: autostash (Git's mechanism, one way to set aside)
+_Avoid_: autostash (Git's mechanism, which Kindra does not use; the `--autostash` flags only permit setting tracked changes aside)
 
 **Reconcile**:
 Bringing a paused operation's recorded progress in line with the repository after the user has acted with Git directly.

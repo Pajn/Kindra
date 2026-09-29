@@ -135,12 +135,18 @@ pub struct RebaseState {
     /// Whether to run `git reset` when returning to the original branch.
     #[serde(default)]
     pub unstage_on_restore: bool,
-    /// Whether the operation may set tracked changes aside: the rebase loop
-    /// sets them aside as a whole tree before its first rebase (and clears
-    /// this), or, when something is already set aside, lets `git rebase`
-    /// autostash.
-    #[serde(default)]
-    pub autostash: bool,
+    /// Saved as `autostash` by Kindra releases that let the rebase loop set
+    /// the tree aside later: when set and nothing is set aside yet, the loop
+    /// sets the tracked changes aside as a whole tree before its first rebase
+    /// and clears it. Operations now take their set-asides before saving the
+    /// journal, so this Kindra never sets it and saves it only while an older
+    /// journal still holds it; Git's own autostash is never used.
+    #[serde(
+        default,
+        rename = "autostash",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub legacy_autostash: bool,
     /// Branches to clean up after a sync rebase finishes.
     #[serde(default)]
     pub cleanup_merged_branches: Vec<String>,
@@ -217,7 +223,10 @@ pub fn load_state(repo: &Repository) -> Result<RebaseState> {
 ///
 /// - 1: the first envelope.
 /// - 2: an unstaged-only set-aside may record `restore: UnstagedDelta`, which
-///   version 1 does not know.
+///   version 1 does not know. Later version 2 journals record every
+///   set-aside when it is taken and omit `autostash`; a reader of version 2
+///   takes its absence as `false`, which is what it means for them (nothing
+///   left for the rebase loop to set aside), so this needed no new version.
 pub const JOURNAL_VERSION: u64 = 2;
 
 /// Parse a saved journal. One saved in a newer format, or that does not parse
@@ -836,8 +845,9 @@ fn branches_checked_out_elsewhere() -> Result<HashMap<String, HeldBy>> {
 }
 
 /// True if the working tree has tracked changes that a rebase or checkout would
-/// disturb. Untracked and ignored files are intentionally ignored, matching
-/// `git rebase`'s own contract (they neither block a rebase nor get autostashed).
+/// disturb, which an operation sets aside only with the autostash permission.
+/// Untracked and ignored files are not counted: untracked files are set aside
+/// without asking, and ignored files are left alone.
 pub fn working_tree_dirty(repo: &Repository) -> Result<bool> {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(false).include_ignored(false);
@@ -856,8 +866,9 @@ pub fn dirty_working_tree_error() -> anyhow::Error {
 }
 
 /// Pre-flight for rebase commands (sync, move, reorder, restack). Surfaces
-/// Kindra's uniform message when the tree is dirty and autostash is off.
-/// When enabled, stashing is deferred until the operation is ready to start.
+/// Kindra's uniform message when the tree has tracked changes and autostash
+/// (the permission to set them aside) is off. When permitted, the set-aside is
+/// taken once the operation is ready to start.
 pub fn ensure_rebase_working_tree(repo: &Repository, autostash: bool) -> Result<()> {
     if !autostash && working_tree_dirty(repo)? {
         return Err(dirty_working_tree_error());
@@ -1006,23 +1017,56 @@ pub fn override_plan(repo: &Repository, state: &RebaseState) -> Result<crate::ov
     Ok(plan)
 }
 
+/// Set the working tree aside for the whole of `state`'s operation, as
+/// [`set_aside::take_whole_tree`] does with the permission `allowed`, record
+/// it in the journal and save the journal. The changes are restored on the
+/// branch the operation returns to when it completes or is aborted, never on
+/// a branch it replays. If saving fails, they are restored at once.
+pub fn set_aside_working_tree(
+    repo: &Repository,
+    state: &mut RebaseState,
+    allowed: bool,
+) -> Result<()> {
+    if let Some(taken) = set_aside::take_whole_tree(repo, allowed)? {
+        state.set_asides.push(taken);
+    }
+    if let Err(err) = save_state(repo, state) {
+        set_aside::unwind(repo, &mut state.set_asides);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Begin an operation that replays branches (move, restack, reorder, tree
+/// sync) before handing `state` to [`run_rebase_loop`]: set the working tree
+/// aside for it with the permission `allowed` and save the journal. Nothing
+/// is saved when this fails.
+pub fn begin_replay(repo: &Repository, state: &mut RebaseState, allowed: bool) -> Result<()> {
+    ensure_git_supports_update_refs()?;
+    crate::overrides::prepare(repo, &override_plan(repo, state)?)?;
+    if state.remaining_branches.is_empty() {
+        return save_state(repo, state);
+    }
+    set_aside_working_tree(repo, state, allowed)
+}
+
 pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> {
     ensure_git_supports_update_refs()?;
     crate::overrides::prepare(repo, &override_plan(repo, &state)?)?;
 
-    // The caller can have uncommitted edits on the parent. Git's per-rebase
-    // autostash would restore those edits on a child, where they may conflict
-    // even though they apply cleanly on the caller. Own the stash across the
-    // entire restack so completion and abort restore it on the saved branch.
+    // A journal saved by an older Kindra may still ask the loop to set the
+    // tracked changes aside before its first rebase. Own them across the
+    // entire restack, as every operation now does from the start, so
+    // completion and abort restore them on the saved branch.
     if !state.remaining_branches.is_empty()
-        && state.autostash
+        && state.legacy_autostash
         && state.set_asides.changes().is_none()
     {
         let taken = set_aside::take_tracked(repo, true, set_aside::Restore::WithIndex)?;
         if let Some(taken) = taken {
             state.set_asides.push(taken);
         }
-        state.autostash = false;
+        state.legacy_autostash = false;
         if let Err(err) = save_state(repo, &state) {
             set_aside::unwind(repo, &mut state.set_asides);
             return Err(err);
@@ -1063,13 +1107,11 @@ pub fn run_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> 
         if state.replay().is_sync() {
             rebase.args(["--reapply-cherry-picks", "--empty=keep"]);
         }
+        // Kindra owns every set-aside: Git's autostash (or `rebase.autostash`)
+        // would restore the changes on each replayed branch instead.
         let status = rebase
             .arg("--no-ff")
-            .arg(if state.autostash {
-                "--autostash"
-            } else {
-                "--no-autostash"
-            })
+            .arg("--no-autostash")
             .arg("--update-refs")
             .arg("--onto")
             .arg(&new_base)
@@ -1233,7 +1275,7 @@ mod tests {
                 "stash_apply_index":false,"carry_stash_ref":null}}"#
         ))
         .unwrap();
-        assert!(state.autostash);
+        assert!(state.legacy_autostash);
         assert_eq!(
             state.set_asides,
             SetAsides::from(vec![SetAside {
@@ -1243,6 +1285,22 @@ mod tests {
                 restore: Restore::Plain,
             }])
         );
+    }
+
+    /// A journal records what was set aside, not a permission to set things
+    /// aside later: `autostash` is saved only while an older journal still
+    /// asks the rebase loop to set the tree aside. Its absence reads as
+    /// `false`, which is what it means to every Kindra that reads it.
+    #[test]
+    fn autostash_is_saved_only_while_an_older_journal_still_asks_for_it() {
+        let mut state = saved(&format!("{{{LEGACY_FIELDS}}}"));
+        assert!(!state.legacy_autostash);
+        let journal = serde_json::to_value(&state).unwrap();
+        assert!(journal.get("autostash").is_none(), "{journal}");
+
+        state.legacy_autostash = true;
+        let journal = serde_json::to_value(&state).unwrap();
+        assert_eq!(journal["autostash"], serde_json::Value::Bool(true));
     }
 
     #[test]

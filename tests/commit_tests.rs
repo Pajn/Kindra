@@ -4656,23 +4656,222 @@ fn test_commit_fixup_autosquash_conflict_with_dependents_can_continue() {
 
 #[test]
 #[cfg(unix)]
-fn test_commit_fixup_with_dependents_pre_start_unstaged_refusal_rolls_back() {
-    // Without autostash, git refuses to start over the unstaged edit.
+fn test_commit_fixup_with_dependents_no_autostash_pre_start_rejection_rolls_back() {
+    // `--no-autostash` does not stop kin commit from setting the unstaged edit
+    // aside; the pre-rebase hook refuses, and the rollback restores the edit.
     check_fixup_with_dependents_pre_start_failure("--no-autostash", "false", true);
-}
-
-#[test]
-fn test_commit_fixup_no_autostash_overrides_git_rebase_autostash() {
-    // `--no-autostash` must reach git: with git's own `rebase.autostash` on
-    // and no hook, git would otherwise stash the edit and fold anyway.
-    check_fixup_with_dependents_pre_start_failure("--no-autostash", "true", false);
 }
 
 #[test]
 #[cfg(unix)]
 fn test_commit_fixup_with_dependents_pre_start_hook_rejection_rolls_back() {
-    // With autostash, git stashes the edit, then the pre-rebase hook refuses.
+    // With autostash, the edit is set aside, then the pre-rebase hook refuses.
     check_fixup_with_dependents_pre_start_failure("--autostash", "false", true);
+}
+
+/// The autostash flags are no-ops for `kin commit`: with dependents to
+/// restack it always sets the unstaged changes aside itself, and never hands
+/// Git's own `rebase.autostash` a say. `--no-autostash` with `rebase.autostash`
+/// on still folds, and the unstaged edit and untracked file come back.
+#[test]
+fn test_commit_fixup_with_dependents_sets_unstaged_changes_aside_despite_no_autostash() {
+    let (dir, repo) = setup_repo();
+    let main_commit = repo
+        .find_commit(repo.revparse_single("main").unwrap().id())
+        .unwrap();
+    let a1_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a1.txt",
+        "a1",
+        "commit a1",
+        &[&main_commit],
+    );
+    let a1 = repo.find_commit(a1_id).unwrap();
+    let a2_id = make_commit(
+        &repo,
+        "refs/heads/feature-a",
+        "a2.txt",
+        "a2",
+        "commit a2",
+        &[&a1],
+    );
+    let a2 = repo.find_commit(a2_id).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/feature-b",
+        "b.txt",
+        "b",
+        "commit b",
+        &[&a2],
+    );
+    repo.set_head("refs/heads/feature-a").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    fs::write(dir.path().join("a1.txt"), "fixed a1").unwrap();
+    run_ok("git", &["add", "a1.txt"], dir.path());
+    fs::write(dir.path().join("a2.txt"), "unstaged a2").unwrap();
+    fs::write(dir.path().join("scratch.txt"), "WIP").unwrap();
+    run_ok("git", &["config", "rebase.autostash", "true"], dir.path());
+
+    kin_cmd()
+        .arg("commit")
+        .arg("--fixup")
+        .arg(a1_id.to_string())
+        .arg("--no-autostash")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let feature_a = repo.revparse_single("feature-a").unwrap().id();
+    let feature_b = repo
+        .revparse_single("feature-b")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    assert_eq!(feature_b.parent_id(0).unwrap(), feature_a);
+    assert_eq!(
+        git_stdout(dir.path(), &["show", "feature-a~1:a1.txt"]),
+        "fixed a1"
+    );
+    assert_eq!(current_branch(dir.path()), "feature-a");
+    assert_has_unstaged_file(dir.path(), "a2.txt");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a2.txt")).unwrap(),
+        "unstaged a2"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "WIP"
+    );
+    assert!(git_stdout(dir.path(), &["stash", "list"]).trim().is_empty());
+    assert!(!rebase_state_file(dir.path()).exists());
+}
+
+/// `main <- feature-a (a1, a2) <- feature-b`, where a1 and a2 change the same
+/// line of `shared.txt`, with feature-a checked out, a fixup of a1 staged,
+/// the tracked `notes.txt` edited and the untracked `scratch.txt` added.
+/// Returns the directory and a1.
+fn conflicting_fixup_with_dependents() -> (tempfile::TempDir, String) {
+    let dir = tempdir().unwrap();
+    repo_init(dir.path());
+    fs::write(dir.path().join("shared.txt"), "base\n").unwrap();
+    fs::write(dir.path().join("notes.txt"), "notes\n").unwrap();
+    run_ok("git", &["add", "."], dir.path());
+    run_ok("git", &["commit", "-m", "base"], dir.path());
+    run_ok("git", &["checkout", "-b", "feature-a"], dir.path());
+    fs::write(dir.path().join("shared.txt"), "a1\n").unwrap();
+    run_ok("git", &["commit", "-am", "a1"], dir.path());
+    let a1 = git_stdout(dir.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    fs::write(dir.path().join("shared.txt"), "a2\n").unwrap();
+    run_ok("git", &["commit", "-am", "a2"], dir.path());
+    run_ok("git", &["checkout", "-b", "feature-b"], dir.path());
+    fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+    run_ok("git", &["add", "b.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "b"], dir.path());
+    run_ok("git", &["checkout", "feature-a"], dir.path());
+    fs::write(dir.path().join("shared.txt"), "fix\n").unwrap();
+    run_ok("git", &["add", "shared.txt"], dir.path());
+    fs::write(dir.path().join("notes.txt"), "unstaged notes\n").unwrap();
+    fs::write(dir.path().join("scratch.txt"), "untracked\n").unwrap();
+    (dir, a1)
+}
+
+/// A fixup whose target has dependents records the unstaged changes it sets
+/// aside in the journal, so `kin abort` restores them.
+#[test]
+fn test_commit_fixup_with_dependents_journal_records_unstaged_set_aside_for_abort() {
+    check_fixup_with_dependents_set_aside(true);
+}
+
+/// Finishing that fixup with `kin continue` restores them too.
+#[test]
+fn test_commit_fixup_with_dependents_restores_unstaged_set_aside_on_continue() {
+    check_fixup_with_dependents_set_aside(false);
+}
+
+fn check_fixup_with_dependents_set_aside(abort: bool) {
+    let (dir, a1) = conflicting_fixup_with_dependents();
+    let tip = |branch: &str| {
+        git_stdout(dir.path(), &["rev-parse", branch])
+            .trim()
+            .to_string()
+    };
+    let (feature_a, feature_b) = (tip("feature-a"), tip("feature-b"));
+    let output = kin_cmd()
+        .args(["commit", "--fixup", &a1])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("Resolve conflicts"), "{stderr}");
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let state = kindra::rebase_utils::load_state(&repo).unwrap();
+    assert_eq!(
+        state.set_asides.changes().map(|s| s.kind),
+        Some(Kind::UnstagedOnly),
+        "the journal must record the unstaged changes it set aside"
+    );
+    assert!(!dir.path().join("scratch.txt").exists());
+
+    if abort {
+        kin_cmd()
+            .arg("abort")
+            .current_dir(dir.path())
+            .assert()
+            .success();
+        assert_eq!(tip("feature-a"), feature_a);
+        assert_eq!(tip("feature-b"), feature_b);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
+            "fix\n"
+        );
+    } else {
+        let mut resumed = false;
+        for _ in 0..5 {
+            fs::write(dir.path().join("shared.txt"), "resolved\n").unwrap();
+            run_ok("git", &["add", "shared.txt"], dir.path());
+            if kin_cmd()
+                .arg("continue")
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+            {
+                resumed = true;
+                break;
+            }
+        }
+        assert!(resumed, "kin continue should finish the fixup");
+        let rebased_b = repo
+            .revparse_single("feature-b")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(
+            rebased_b.parent_id(0).unwrap().to_string(),
+            tip("feature-a")
+        );
+    }
+
+    assert_eq!(current_branch(dir.path()), "feature-a");
+    assert_has_unstaged_file(dir.path(), "notes.txt");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+        "unstaged notes\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "untracked\n"
+    );
+    assert!(git_stdout(dir.path(), &["stash", "list"]).trim().is_empty());
+    assert!(!rebase_state_file(dir.path()).exists());
 }
 
 /// When rolling back a fold that never started cannot finish, the saved state
@@ -4682,7 +4881,7 @@ fn test_commit_fixup_with_dependents_pre_start_hook_rejection_rolls_back() {
 #[cfg(unix)]
 fn test_commit_fixup_failed_rollback_keeps_the_unrestored_stash_in_state() {
     // A held lock on the branch ref also blocks the reset.
-    let (dir, stash_ref, stderr) = fixup_rollback_with_unrestorable_stash(true);
+    let (dir, stash_ref, stderr) = fixup_rollback_with_unrestorable_stash(true, false);
     assert!(
         stderr.contains("Rolling back the commit did not complete")
             && stderr.contains("your set-aside changes could not be restored"),
@@ -4694,6 +4893,36 @@ fn test_commit_fixup_failed_rollback_keeps_the_unrestored_stash_in_state() {
         "state points at {stash_ref}, which is not in the stash list:\n{stashes}"
     );
     assert_continue_refuses_rollback_state(dir.path());
+}
+
+/// When the rollback cannot finish and saving the recovery state fails too,
+/// `kin abort` cannot be relied on: the error names both failures and says how
+/// to recover by hand, naming the commit to reset to and the stash entry that
+/// holds the set-aside changes.
+#[test]
+#[cfg(unix)]
+fn test_commit_fixup_failed_rollback_and_recovery_save_give_manual_recovery_steps() {
+    let (dir, stash_message, stderr) = fixup_rollback_with_unrestorable_stash(true, true);
+    assert!(
+        stderr.contains("Rolling back the commit did not complete")
+            && stderr.contains("Injected state write failure"),
+        "the error must name both failures, got:\n{stderr}"
+    );
+    let before_fixup = git_stdout(dir.path(), &["rev-parse", "HEAD^"]);
+    assert!(
+        stderr.contains(&format!("git reset --soft {}", before_fixup.trim())),
+        "the error must say how to take the commit back off, got:\n{stderr}"
+    );
+    let stash_oid = git_stdout(dir.path(), &["stash", "list", "-1", "--format=%H"]);
+    assert!(
+        stderr.contains(&stash_message)
+            && stderr.contains(&format!("git stash apply --index {}", stash_oid.trim())),
+        "the error must name the stash entry and how to apply it, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("run 'kin abort' to restore the original state"),
+        "a journal that may not be saved cannot be relied on, got:\n{stderr}"
+    );
 }
 
 /// A rolled-back commit has nothing left to continue: `kin continue` must
@@ -4720,7 +4949,7 @@ fn assert_continue_refuses_rollback_state(dir: &Path) {
 #[test]
 #[cfg(unix)]
 fn test_commit_fixup_rollback_keeps_state_until_set_aside_changes_are_restored() {
-    let (dir, _, _) = fixup_rollback_with_unrestorable_stash(false);
+    let (dir, _, _) = fixup_rollback_with_unrestorable_stash(false, false);
     // The rollback itself went through: the fixup commit is gone again.
     assert_eq!(
         git_stdout(dir.path(), &["log", "-1", "--format=%s"]).trim(),
@@ -4746,10 +4975,13 @@ fn test_commit_fixup_rollback_keeps_state_until_set_aside_changes_are_restored()
 /// Runs `kin commit --fixup` on a branch without dependents while a
 /// pre-rebase hook refuses the rebase and edits the stashed file, so the
 /// set-aside changes cannot be restored during rollback. With
-/// `lock_branch_ref`, the hook also blocks the reset. Returns the stash entry
+/// `lock_branch_ref`, the hook also blocks the reset. With
+/// `fail_recovery_save`, the hook also makes every later journal write fail,
+/// so the rollback cannot record its recovery state. Returns the stash entry
 /// the saved state points at and the command's error output.
 fn fixup_rollback_with_unrestorable_stash(
     lock_branch_ref: bool,
+    fail_recovery_save: bool,
 ) -> (tempfile::TempDir, String, String) {
     let (dir, repo) = setup_repo();
     let main_id = repo.revparse_single("main").unwrap().id();
@@ -4785,9 +5017,19 @@ fn fixup_rollback_with_unrestorable_stash(
     } else {
         ""
     };
+    // The journal recording the set-aside is saved before the rebase starts;
+    // the hook makes every write after that fail.
+    let fail_save = if fail_recovery_save {
+        format!(
+            "printf '%s' \"$(git rev-parse --absolute-git-dir)/{}\" > \"$KIN_TEST_FAIL_STATE_WRITE\"\n",
+            StateFile::Rebase.file_name()
+        )
+    } else {
+        String::new()
+    };
     fs::write(
         dir.path().join(".git/hooks/pre-rebase"),
-        format!("#!/bin/sh\nprintf 'hook edit' > a2.txt\n{lock}exit 1\n"),
+        format!("#!/bin/sh\nprintf 'hook edit' > a2.txt\n{lock}{fail_save}exit 1\n"),
     )
     .unwrap();
     run_ok("chmod", &["+x", ".git/hooks/pre-rebase"], dir.path());
@@ -4798,14 +5040,20 @@ fn fixup_rollback_with_unrestorable_stash(
         .arg(a1_id.to_string())
         .arg("--autostash")
         .current_dir(dir.path())
+        .env(
+            "KIN_TEST_FAIL_STATE_WRITE",
+            repo.path().join("fail-state-write"),
+        )
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "the fold should have failed");
-    assert!(
-        stderr.contains("run 'kin abort'"),
-        "expected the failure to point at kin abort, got:\n{stderr}"
-    );
+    if !fail_recovery_save {
+        assert!(
+            stderr.contains("run 'kin abort'"),
+            "expected the failure to point at kin abort, got:\n{stderr}"
+        );
+    }
     fs::remove_file(dir.path().join(".git/hooks/pre-rebase")).unwrap();
     if lock_branch_ref {
         fs::remove_file(dir.path().join(".git/refs/heads/feature-a.lock")).unwrap();
@@ -6793,6 +7041,76 @@ fn assert_checkpoint_write_failure_restores_tip(amend: bool) {
         retry.arg("--amend");
     }
     retry.assert().success();
+}
+
+/// When `git commit` itself fails (here a rejecting pre-commit hook) on a
+/// branch with dependents, nothing has changed yet: nothing was set aside and
+/// no branch moved. Kindra leaves no journal behind, so there is nothing to
+/// continue or abort; the changes are exactly as they were, and running the
+/// commit again once the hook passes restacks the dependents and restores the
+/// unstaged changes.
+#[cfg(unix)]
+#[test]
+fn test_commit_with_dependents_rejected_by_git_commit_leaves_nothing_to_recover() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, repo) = setup_repo();
+    let main_before = repo.revparse_single("main").unwrap().id();
+    let feature_before = repo.revparse_single("feature").unwrap().id();
+    stage(dir.path(), "new.txt", "committed content\n");
+    fs::write(dir.path().join("file.txt"), "unstaged content\n").unwrap();
+    fs::write(dir.path().join("scratch.txt"), "untracked\n").unwrap();
+    let hook = repo.path().join("hooks/pre-commit");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = kin_commit(dir.path())
+        .args(["-m", "rejected"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        !rebase_state_file(dir.path()).exists(),
+        "a commit that never happened must leave no journal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.revparse_single("main").unwrap().id(), main_before);
+    assert_eq!(
+        repo.revparse_single("feature").unwrap().id(),
+        feature_before
+    );
+    assert_eq!(current_branch(dir.path()), "main");
+    assert_eq!(
+        git_stdout(dir.path(), &["show", ":new.txt"]),
+        "committed content\n"
+    );
+    assert_has_unstaged_file(dir.path(), "file.txt");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "untracked\n"
+    );
+    assert!(git_stdout(dir.path(), &["stash", "list"]).trim().is_empty());
+
+    fs::remove_file(&hook).unwrap();
+    kin_commit(dir.path())
+        .args(["-m", "accepted"])
+        .assert()
+        .success();
+    let main = repo.revparse_single("main").unwrap().id();
+    let feature = repo.revparse_single("feature").unwrap().id();
+    assert_ne!(main, main_before);
+    assert!(repo.graph_descendant_of(feature, main).unwrap());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "unstaged content\n"
+    );
+    assert_has_unstaged_file(dir.path(), "file.txt");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "untracked\n"
+    );
+    assert!(git_stdout(dir.path(), &["stash", "list"]).trim().is_empty());
+    assert!(!rebase_state_file(dir.path()).exists());
 }
 
 #[test]

@@ -1,7 +1,6 @@
 {
   "journal": {
     "abort_only": false,
-    "autostash": true,
     "caller_branch": null,
     "cleanup_checkout_fallback": null,
     "cleanup_merged_branches": [],

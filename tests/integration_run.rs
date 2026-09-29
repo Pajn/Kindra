@@ -255,6 +255,37 @@ fn run_autostash_sets_aside_changes_and_restores_them() {
     assert!(!state_file(dir.path(), StateFile::Run).exists());
 }
 
+/// `kin run` sets aside only tracked changes, unlike the operations that
+/// rewrite branches: commands it runs keep local untracked files such as
+/// `.env` in place.
+#[test]
+fn run_autostash_keeps_untracked_files_in_place_while_commands_run() {
+    let dir = setup_run_repo();
+    let log_path = dir.path().join("run.log");
+    fs::write(dir.path().join("base.txt"), "dirty").unwrap();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();
+
+    kin_cmd()
+        .arg("run")
+        .arg("--command")
+        .arg("cat .env >> run.log")
+        .arg("--autostash")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    assert_eq!(read_lines(&log_path), vec!["SECRET=1", "SECRET=1"]);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("base.txt")).unwrap(),
+        "dirty"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".env")).unwrap(),
+        "SECRET=1\n"
+    );
+    assert!(git_stdout(dir.path(), &["stash", "list"]).trim().is_empty());
+}
+
 #[test]
 fn run_autostash_restored_on_failure() {
     let dir = setup_run_repo();
