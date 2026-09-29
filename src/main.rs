@@ -225,6 +225,11 @@ impl Drop for TerminalRestorer {
 }
 
 fn main() {
+    // SAFETY: nothing has run yet, so no other thread exists to read or write
+    // the environment.
+    unsafe {
+        repository::forget_inherited_repository();
+    }
     std::process::exit(real_main());
 }
 

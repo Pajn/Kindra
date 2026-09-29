@@ -72,6 +72,37 @@ fn run_happy_path_traverses_stack() {
     assert!(!state_file(dir.path(), StateFile::Run).exists());
 }
 
+/// Git exports `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` to hooks, and
+/// wrappers set them. The command `kin run` starts must not inherit them: it
+/// finds the repository from its working directory, like a Git command run
+/// there, so its `git` calls reach the branch Kindra checked out.
+#[cfg(unix)]
+#[test]
+fn run_command_does_not_inherit_git_env_naming_another_repository() {
+    let dir = setup_run_repo();
+    let log = tempfile::tempdir().unwrap();
+    let log_path = log.path().join("run.log");
+    let foreign = common::ForeignRepository::new();
+
+    foreign
+        .kin_cmd()
+        .arg("run")
+        .arg("--command")
+        .arg(
+            r#"printf '%s %s %s %s\n' "${GIT_DIR-unset}" "${GIT_WORK_TREE-unset}" "${GIT_INDEX_FILE-unset}" "$(git branch --show-current)" >> "$RUN_LOG""#,
+        )
+        .env("RUN_LOG", &log_path)
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    assert_eq!(
+        read_lines(&log_path),
+        vec!["unset unset unset feature-a", "unset unset unset feature-b"]
+    );
+    foreign.assert_untouched();
+}
+
 #[test]
 fn run_continue_on_failure_processes_later_branches() {
     let dir = setup_run_repo();

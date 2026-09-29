@@ -7689,13 +7689,15 @@ fi"#,
 // `[hooks] after_pr`
 //
 // A stateful mock `gh` remembers the PRs it created (in `$MOCK_GH_STATE/prs`)
-// and serves them from `gh pr list`, so a second `kin pr` sees them as existing.
+// and serves them from `gh pr list`, so a second `kin pr` sees them as existing;
+// it records the Git repository variables it was given in `$MOCK_GH_STATE/git-env`.
 // Hooks record their stdin, environment and working directory under `$HOOK_OUT`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const AFTER_PR_GH_MOCK: &str = r#"#!/bin/bash
 state="$MOCK_GH_STATE"
 echo "$*" >> "$state/calls"
+echo "${GIT_DIR-unset} ${GIT_WORK_TREE-unset} ${GIT_INDEX_FILE-unset}" >> "$state/git-env"
 if [[ "$1" == "auth" ]]; then exit 0; fi
 if [[ "$1" == "pr" && "$2" == "list" ]]; then
     printf '['
@@ -7952,6 +7954,38 @@ fn after_pr_hook_receives_stack_payload() {
         fs::canonicalize(fx.root()).unwrap().to_str().unwrap(),
         "hooks run from the worktree root, not the invocation directory"
     );
+}
+
+/// Git exports `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` to hooks, and
+/// wrappers set them. `gh` and the `after_pr` hooks must not inherit them:
+/// they find the repository from their working directory, as Git would there.
+#[test]
+fn after_pr_hook_and_gh_do_not_inherit_git_env_naming_another_repository() {
+    let fx = AfterPrFixture::new(false);
+    write_repo_config(
+        fx.root(),
+        r#"[hooks]
+after_pr = ['echo "${GIT_DIR-unset} ${GIT_WORK_TREE-unset} ${GIT_INDEX_FILE-unset}" > "$HOOK_OUT/git-env"']
+"#,
+    );
+    let foreign = common::ForeignRepository::new();
+
+    let mut cmd = fx.kin_cmd(fx.root(), &["pr", "--title", "T", "--body-from-commits"]);
+    foreign.name_in(&mut cmd);
+    assert_success(&cmd.output().unwrap());
+
+    assert_eq!(
+        fs::read_to_string(fx.out().join("git-env")).unwrap(),
+        "unset unset unset\n"
+    );
+    let gh_env = fs::read_to_string(fx.tools.path().join("git-env")).unwrap();
+    assert!(!gh_env.is_empty());
+    assert!(
+        gh_env.lines().all(|line| line == "unset unset unset"),
+        "{gh_env}"
+    );
+    assert_eq!(fx.remote_tip("feature-b"), Some(fx.rev("feature-b")));
+    foreign.assert_untouched();
 }
 
 #[test]
