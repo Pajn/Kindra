@@ -464,14 +464,25 @@ fn apply_split(
     let head = head_change(repo, &changes, &new_branch_map)?;
 
     // 2. Change every ref at once.
-    match check_changes(repo, &changes).and_then(|()| commit_changes(repo, &changes, &head)) {
+    match check_changes(repo, &changes, &head).and_then(|()| commit_changes(repo, &changes, &head))
+    {
         Ok(()) => {}
         Err(SplitFailure::NothingChanged(err)) => {
             return Err(anyhow!("{err:#} No branch was changed."));
         }
+        // Record whatever was written for `kin undo` now, through a freshly
+        // opened repository: after a failed write, `repo`'s cached refs can
+        // disagree with the disk (a packed branch whose delete failed looks
+        // deleted). The guard in `split_locked` then finds nothing to settle.
         Err(SplitFailure::Partial(err)) => {
+            match Repository::open(repo.path()) {
+                Ok(fresh) => crate::oplog::finalize(&fresh)?,
+                Err(open_err) => {
+                    eprintln!("Warning: could not record the split for 'kin undo': {open_err}")
+                }
+            }
             return Err(anyhow!(
-                "{err:#} Some branches may have changed; 'kin undo' reverts the ones that did."
+                "{err:#} Some branches may have changed; the split is recorded, so 'kin undo' restores them."
             ));
         }
     }
@@ -546,8 +557,13 @@ fn head_change(
 
 /// Refuse the changes Git would refuse, before any ref is locked: a new
 /// branch whose name clashes with another ref's path (`foo/bar` next to
-/// `foo`), or deleting a branch another worktree holds.
-fn check_changes(repo: &Repository, changes: &[BranchChange]) -> Result<(), SplitFailure> {
+/// `foo`), or moving, deleting or attaching HEAD to a branch another worktree
+/// holds.
+fn check_changes(
+    repo: &Repository,
+    changes: &[BranchChange],
+    head: &Option<HeadChange>,
+) -> Result<(), SplitFailure> {
     let failure = SplitFailure::NothingChanged;
     let mut existing = Vec::new();
     for reference in repo.references().map_err(|e| failure(e.into()))? {
@@ -574,17 +590,28 @@ fn check_changes(repo: &Repository, changes: &[BranchChange]) -> Result<(), Spli
         }
     }
 
-    let deleted: Vec<String> = changes
+    // Another worktree's branch must not move under it, go away, or gain a
+    // second worktree. This worktree's own branch is not held elsewhere.
+    let mut touched: Vec<(&str, String)> = changes
         .iter()
-        .filter(|change| matches!(change, BranchChange::Delete { .. }))
-        .map(|change| change.name().to_string())
+        .filter_map(|change| match change {
+            BranchChange::Set { from: None, .. } => None,
+            BranchChange::Set { .. } => Some(("update branch", change.name().to_string())),
+            BranchChange::Delete { .. } => Some(("delete branch", change.name().to_string())),
+        })
         .collect();
+    if let Some(HeadChange::Attach(name)) = head {
+        touched.push(("attach HEAD to branch", name.clone()));
+    }
+    let names: Vec<String> = touched.iter().map(|(_, name)| name.clone()).collect();
     if let Some((branch, held)) =
-        crate::rebase_utils::first_held_elsewhere(&deleted).map_err(failure)?
+        crate::rebase_utils::first_held_elsewhere(&names).map_err(failure)?
     {
-        return Err(failure(anyhow!(
-            "Cannot delete branch '{branch}': it is {held}."
-        )));
+        let what = touched
+            .iter()
+            .find(|(_, name)| *name == branch)
+            .map_or("change branch", |(what, _)| *what);
+        return Err(failure(anyhow!("Cannot {what} '{branch}': it is {held}.")));
     }
     Ok(())
 }
@@ -703,9 +730,15 @@ fn forget_deleted_branch(repo: &Repository, name: &str) {
                 keys.push(key.to_string());
             }
         })?;
+        // A key's values can be spread over several sections of the same
+        // name; one `remove_multivar` removes them all.
+        keys.sort();
         keys.dedup();
         for key in keys {
-            config.remove_multivar(&key, ".*")?;
+            match config.remove_multivar(&key, ".*") {
+                Err(err) if err.code() != ErrorCode::NotFound => return Err(err.into()),
+                _ => {}
+            }
         }
         Ok(())
     })();

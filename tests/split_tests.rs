@@ -1284,6 +1284,205 @@ fn split_refuses_to_delete_a_branch_checked_out_in_another_worktree() {
     assert_eq!(refs_snapshot(dir.path()), before);
 }
 
+/// Check `branch` out in a new linked worktree, kept until the returned
+/// directory is dropped.
+fn check_out_elsewhere(dir: &std::path::Path, branch: &str) -> tempfile::TempDir {
+    let other = tempdir().unwrap();
+    let path = other.path().join("other");
+    common::run_ok(
+        "git",
+        &["worktree", "add", path.to_str().unwrap(), branch],
+        dir,
+    );
+    other
+}
+
+/// Moving a branch another worktree has checked out would change that
+/// worktree's HEAD commit underneath it, so split refuses before changing
+/// anything.
+#[test]
+fn split_refuses_to_move_a_branch_checked_out_in_another_worktree() {
+    let (dir, repo) = setup_repo();
+    let commit_1 = repo
+        .revparse_single("HEAD~2")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    repo.branch("elsewhere", &commit_1, false).unwrap();
+    let tip = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature-x", &tip, false).unwrap();
+    repo.set_head("refs/heads/feature-x").unwrap();
+    let _other = check_out_elsewhere(dir.path(), "elsewhere");
+    let before = refs_snapshot(dir.path());
+    let editor = git_dir_editor(
+        &repo,
+        "perl -i -pe 's/.*branch elsewhere.*\\n?//g' \"$file\"\n\
+         perl -i -pe 's/(commit 2)/$1\\nbranch elsewhere/' \"$file\"\n",
+    );
+
+    let output = kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Cannot update branch 'elsewhere': it is checked out in"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("No branch was changed."), "{stderr}");
+    assert_eq!(refs_snapshot(dir.path()), before);
+}
+
+/// A detached HEAD attaches to a branch at its commit, but not to one another
+/// worktree has checked out: Git never has two worktrees on one branch.
+#[test]
+fn split_refuses_to_attach_head_to_a_branch_checked_out_in_another_worktree() {
+    let (dir, repo) = setup_repo();
+    assert!(repo.head_detached().unwrap());
+    let tip = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("held", &tip, false).unwrap();
+    let _other = check_out_elsewhere(dir.path(), "held");
+    let before = refs_snapshot(dir.path());
+    let editor = git_dir_editor(
+        &repo,
+        "perl -i -pe 's/(commit 1)/$1\\nbranch part-1/' \"$file\"\n",
+    );
+
+    let output = kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Cannot attach HEAD to branch 'held': it is checked out in"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("No branch was changed."), "{stderr}");
+    assert_eq!(refs_snapshot(dir.path()), before);
+    assert!(repo.head_detached().unwrap());
+}
+
+/// Every ref is locked before any is written, but writing can still fail part
+/// way: deleting a packed branch rewrites `packed-refs`, whose lock another
+/// Git process may hold. The refs written by then stay changed, the split is
+/// recorded, and `kin undo` puts them back.
+///
+/// libgit2 writes a transaction's refs in the order of its hash map, so the
+/// split creates many branches to have some written before the delete fails.
+#[test]
+fn split_that_fails_while_writing_refs_can_be_undone() {
+    let (dir, repo) = setup_repo();
+    let tip = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature-x", &tip, false).unwrap();
+    repo.set_head("refs/heads/feature-x").unwrap();
+    let commit_1 = repo
+        .revparse_single("HEAD~2")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    repo.branch("packed", &commit_1, false).unwrap();
+    common::run_ok("git", &["pack-refs", "--all"], dir.path());
+    let branches = |dir: &std::path::Path| {
+        git_out(
+            dir,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+            ],
+        )
+    };
+    let before = branches(dir.path());
+    let editor = git_dir_editor(
+        &repo,
+        "perl -i -pe 's/.*branch packed.*\\n?//g' \"$file\"\n\
+         perl -i -pe 's/(commit 1)$/$1 . join(\"\", map { \"\\nbranch new-$_\" } 1..20)/e' \"$file\"\n",
+    );
+    let packed_lock = repo.path().join("packed-refs.lock");
+    fs::write(&packed_lock, "").unwrap();
+
+    let output = kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .output()
+        .unwrap();
+    fs::remove_file(&packed_lock).unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "Some branches may have changed; the split is recorded, so 'kin undo' restores them."
+        ),
+        "{stderr}"
+    );
+    let after = branches(dir.path());
+    assert!(
+        after.contains("refs/heads/new-") && after.contains("refs/heads/packed "),
+        "some new branches should have been written before the delete failed:\n{after}"
+    );
+
+    kin_cmd()
+        .arg("undo")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(branches(dir.path()), before);
+}
+
+/// A deleted branch's configuration goes with it, however its values are
+/// spread over the config file: a key can have several values, and a section
+/// can appear more than once.
+#[test]
+fn split_forgets_every_config_value_of_a_deleted_branch() {
+    let (dir, repo) = setup_repo();
+    let commit_1 = repo
+        .revparse_single("HEAD~2")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    repo.branch("part-1", &commit_1, false).unwrap();
+    let config_path = repo.path().join("config");
+    let mut config = fs::read_to_string(&config_path).unwrap();
+    config.push_str(
+        "[branch \"part-1\"]\n\tremote = origin\n\tmerge = refs/heads/a\n\tmerge = refs/heads/b\n\
+         [branch \"other\"]\n\tremote = origin\n\
+         [branch \"part-1\"]\n\tremote = upstream\n\tdescription = kept apart\n",
+    );
+    fs::write(&config_path, config).unwrap();
+    let editor = git_dir_editor(
+        &repo,
+        "perl -i -pe 's/.*branch part-1.*\\n?//g' \"$file\"\n",
+    );
+
+    let output = kin_cmd()
+        .arg("split")
+        .current_dir(dir.path())
+        .env("GIT_EDITOR", &editor)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("Warning"), "{stderr}");
+    assert_eq!(
+        git_out(dir.path(), &["config", "--list", "--local"])
+            .lines()
+            .filter(|line| line.starts_with("branch."))
+            .collect::<Vec<_>>(),
+        vec!["branch.other.remote=origin"]
+    );
+}
+
 /// A bare `branch` row (no name) is auto-named by slugifying the commit it sits
 /// on. Here the row under "commit 2" produces a branch named `commit-2`.
 #[test]

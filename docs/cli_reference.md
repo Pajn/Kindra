@@ -1012,7 +1012,7 @@ It generates a list of commits and branches. You can move the `branch <name>` li
 
 Split changes only branch refs. HEAD stays at its commit: it stays on its branch while that branch still points there, attaches to a branch that points there once the split is done, or else is left detached. The index and working tree are never touched, so a split works with uncommitted changes of any kind and leaves them exactly as they are. `--autostash` and `--no-autostash` are still accepted but have no effect.
 
-The branch and HEAD changes are made in one transaction that locks every ref before writing any. A split that cannot make one of its changes fails before anything changes: a new name clashes with an existing branch (`foo/bar` next to `foo`), a branch to delete is checked out in another worktree, or another Git process holds a ref's lock. A split is recorded for [`kin undo`](#undo--history).
+The branch and HEAD changes are made in one transaction that locks every ref before writing any. A split that fails its checks or cannot lock a ref changes nothing: a new name clashes with an existing branch (`foo/bar` next to `foo`), a branch to move or delete, or for HEAD to attach to, is checked out in another worktree, or another Git process holds a ref's lock. If writing the locked refs then fails part-way, some branches may have changed; the split is recorded all the same, and [`kin undo`](#undo--history) restores them, as it undoes a split that succeeded.
 
 **When to use it:** Use this when you've made a long series of commits on a single branch and want to "split" them into multiple separate, dependent branches for easier review.
 
