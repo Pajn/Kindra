@@ -1,5 +1,5 @@
 use crate::commands::find_upstream;
-use crate::rebase_utils::{Operation, RebaseState, Replay, begin_replay, run_rebase_loop};
+use crate::rebase_utils::{Operation, RebaseState, begin_replay, run_rebase_loop};
 use anyhow::{Result, anyhow};
 use clap::Args;
 use std::collections::{HashMap, HashSet};
@@ -109,7 +109,7 @@ fn reorder_locked(repo: &git2::Repository, args: &ReorderArgs) -> Result<()> {
 
         let state = RebaseState {
             operation: Operation::Reorder,
-            replay: Some(Replay::Branches),
+            rebase_options: Default::default(),
             original_branch: current_branch_name,
             target_branch: upstream_name,
             caller_branch: None,

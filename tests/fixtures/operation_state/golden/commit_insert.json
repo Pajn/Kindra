@@ -24,14 +24,19 @@
       "feature-b": "inserted"
     },
     "preserve_content_on_abort": false,
+    "rebase_options": {
+      "fast_forward": false,
+      "keep_cherry_picks": false,
+      "keep_other_refs": false,
+      "no_restart": false
+    },
     "remaining_branches": [
       "feature-b"
     ],
-    "replay": "Branches",
     "set_asides": [],
     "suppress_editor": false,
     "target_branch": "inserted",
     "unstage_on_restore": false
   },
-  "version": 2
+  "version": 3
 }

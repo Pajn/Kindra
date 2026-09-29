@@ -5,11 +5,7 @@
     "cleanup_checkout_fallback": "main",
     "cleanup_merged_branches": [],
     "in_progress_branch": "feature-b",
-    "new_base_map": {
-      "feature-a": "main",
-      "feature-b": "feature-a",
-      "feature-c": "feature-a"
-    },
+    "new_base_map": {},
     "operation": "Sync",
     "original_branch": "feature-a",
     "original_commit_count_map": {},
@@ -34,20 +30,15 @@
       "feature-c": "feature-a"
     },
     "preserve_content_on_abort": false,
-    "rebase_options": {
-      "fast_forward": false,
-      "keep_cherry_picks": true,
-      "keep_other_refs": false,
-      "no_restart": false
-    },
     "remaining_branches": [
       "feature-b",
       "feature-c"
     ],
+    "replay": "SyncTree",
     "set_asides": [],
     "suppress_editor": false,
     "target_branch": "main",
     "unstage_on_restore": false
   },
-  "version": 3
+  "version": 2
 }

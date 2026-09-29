@@ -1,5 +1,5 @@
 use crate::commands::find_upstream;
-use crate::rebase_utils::{Operation, RebaseState, Replay, begin_replay, run_rebase_loop};
+use crate::rebase_utils::{Operation, RebaseState, begin_replay, run_rebase_loop};
 use crate::stack::{
     collect_descendants, get_stack_branches_from_merge_base, plan_descendant_reorder,
     visualize_stack,
@@ -222,7 +222,7 @@ fn start_move_locked(repo: &Repository, args: &MoveArgs) -> Result<()> {
 
     let mut state = RebaseState {
         operation: Operation::Move,
-        replay: Some(Replay::Branches),
+        rebase_options: Default::default(),
         original_branch: current_branch_name,
         target_branch: selected_target_name.clone(),
         caller_branch: None,
