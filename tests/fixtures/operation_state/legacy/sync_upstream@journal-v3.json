@@ -1,0 +1,38 @@
+{
+  "journal": {
+    "abort_only": false,
+    "caller_branch": null,
+    "cleanup_checkout_fallback": "main",
+    "cleanup_merged_branches": [],
+    "in_progress_branch": "main",
+    "new_base_map": {},
+    "operation": "Sync",
+    "original_branch": "main",
+    "original_commit_count_map": {},
+    "original_tip_map": {
+      "main": "<main@before>"
+    },
+    "owned_tip_map": {
+      "main": "<main@before>"
+    },
+    "parent_id_map": {
+      "main": "<commit: base>"
+    },
+    "parent_name_map": {},
+    "preserve_content_on_abort": false,
+    "rebase_options": {
+      "fast_forward": true,
+      "keep_cherry_picks": true,
+      "keep_other_refs": true,
+      "no_restart": true
+    },
+    "remaining_branches": [
+      "main"
+    ],
+    "set_asides": [],
+    "suppress_editor": false,
+    "target_branch": "origin/main",
+    "unstage_on_restore": false
+  },
+  "version": 3
+}
