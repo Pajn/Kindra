@@ -474,9 +474,9 @@ pub fn open_prs_for_branches<S: AsRef<str>>(
     let heads: Vec<&str> = heads.into_iter().collect();
 
     // Newest first, as `gh pr list` orders them, so the same PR wins a tie.
-    let connection = |head: &str, after: &str| {
+    let connection = |head: &str, first: usize, after: &str| {
         format!(
-            "pullRequests(headRefName: ${head}, states: OPEN, first: {OPEN_PRS_PER_HEAD}{after}, \
+            "pullRequests(headRefName: ${head}, states: OPEN, first: {first}{after}, \
              orderBy: {{field: CREATED_AT, direction: DESC}}) {{ {OPEN_PR_FIELDS} }}"
         )
     };
@@ -509,7 +509,10 @@ pub fn open_prs_for_branches<S: AsRef<str>>(
         for (alias, head) in aliases.iter().zip(chunk) {
             // Branch names travel as variables, never inside the query text.
             declarations.push_str(&format!(", ${alias}: String!"));
-            selections.push_str(&format!("{alias}: {} ", connection(alias, "")));
+            selections.push_str(&format!(
+                "{alias}: {} ",
+                connection(alias, OPEN_PRS_PER_HEAD, "")
+            ));
             variables.push((alias.as_str(), *head));
         }
         let mut aliased = fetch(&declarations, &selections, &variables)?;
@@ -537,7 +540,7 @@ pub fn open_prs_for_branches<S: AsRef<str>>(
                 }
                 let mut more = fetch(
                     ", $h0: String!, $after: String!",
-                    &format!("h0: {}", connection("h0", ", after: $after")),
+                    &format!("h0: {}", connection("h0", 100, ", after: $after")),
                     &[("h0", head), ("after", &cursor)],
                 )?;
                 previous_cursor = Some(cursor);

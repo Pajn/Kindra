@@ -8549,5 +8549,15 @@ fn pr_flatten_pages_a_head_until_a_pr_from_this_repository_turns_up() {
     assert!(!stdout.contains("#99"), "{stdout}");
     let queries = logged_calls(&calls, "api graphql");
     assert_eq!(queries.len(), 2, "{queries:#?}");
+    assert!(
+        queries[0].contains("states: OPEN, first: 10, orderBy:"),
+        "{}",
+        queries[0]
+    );
+    assert!(
+        queries[1].contains("states: OPEN, first: 100, after: $after"),
+        "{}",
+        queries[1]
+    );
     assert!(queries[1].contains("-f h0=feature-a"), "{}", queries[1]);
 }
