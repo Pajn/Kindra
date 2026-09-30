@@ -1,0 +1,52 @@
+{
+  "journal": {
+    "abort_only": false,
+    "caller_branch": null,
+    "cleanup_checkout_fallback": null,
+    "cleanup_merged_branches": [],
+    "cursor": {
+      "started": true,
+      "step": 0
+    },
+    "new_base_map": {},
+    "operation": "Commit",
+    "original_branch": "inserted",
+    "original_commit_count_map": {},
+    "original_tip_map": {
+      "feature-b": "<feature-b@before>",
+      "inserted": "<inserted@paused>"
+    },
+    "owned_tip_map": {
+      "feature-b": "<feature-b@before>",
+      "inserted": "<inserted@paused>"
+    },
+    "parent_id_map": {
+      "feature-b": "<feature-a@before>"
+    },
+    "parent_name_map": {
+      "feature-b": "inserted"
+    },
+    "preserve_content_on_abort": false,
+    "rebase_options": {
+      "fast_forward": false,
+      "keep_cherry_picks": false,
+      "keep_other_refs": false,
+      "no_restart": false
+    },
+    "set_asides": [],
+    "steps": [
+      {
+        "branch": "feature-b",
+        "kind": "Replay"
+      },
+      {
+        "checkout": "inserted",
+        "kind": "Complete"
+      }
+    ],
+    "suppress_editor": false,
+    "target_branch": "inserted",
+    "unstage_on_restore": false
+  },
+  "version": 4
+}
