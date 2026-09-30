@@ -7,7 +7,7 @@ use crate::stack::{
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Repository};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn checkout(
     subcommand: &Option<CheckoutSubcommand>,
@@ -168,30 +168,159 @@ pub fn checkout(
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct HydrationStep {
+/// One step of a checkout hydration's plan, in the spirit of the rebase
+/// journal's steps (ADR 0001).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind")]
+enum HydrationStep {
+    /// Create the local `branch` at the recorded commit `tip`, tracking
+    /// `remote_ref`, the remote-tracking branch `tip` was read from when the
+    /// plan was made. A retry never reads `remote_ref` again, so a fetch in
+    /// between cannot change what is created. A branch that already exists at
+    /// `tip` counts as created: creation may have succeeded just before the
+    /// cursor was saved.
+    CreateBranch {
+        branch: String,
+        remote_ref: String,
+        tip: String,
+    },
+    /// Check out `branch` and remove the journal. Always the last step.
+    Checkout { branch: String },
+}
+
+/// How far a hydration has got: every step before `step` is done.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HydrationCursor {
+    step: usize,
+}
+
+/// A checkout hydration's journal: the branches it creates, in order, the
+/// checkout that finishes it, and the position reached. Branches that already
+/// existed locally when the plan was made are left alone and are not steps.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+struct HydrationJournal {
+    /// The GitHub repository whose PRs the stack was discovered from.
+    repository: String,
+    steps: Vec<HydrationStep>,
+    cursor: HydrationCursor,
+}
+
+/// The format of the hydration journal this Kindra saves in
+/// `kindra_checkout_state.json`.
+///
+/// The file holds `{"version": N, "journal": {...}}`, like the rebase journal
+/// (`rebase_utils::JOURNAL_VERSION`), but versioned on its own. Kindra 1.1 and
+/// earlier saved a flat journal (`branch`, `repository` and `steps`, each step
+/// with a `completed` flag); they cannot parse the envelope and so refuse to
+/// continue it rather than misread it. Every Kindra reads every older format
+/// and refuses a newer one with advice; bump the version whenever an older
+/// Kindra would misread what this one saves.
+///
+/// - 1: the first envelope. The journal records its plan as `steps` (the
+///   branches to create, then the checkout) and its progress as a `cursor`.
+///   A flat journal is converted when loaded (see [`LegacyHydration`]).
+const HYDRATION_JOURNAL_VERSION: u64 = 1;
+
+/// A hydration journal saved by Kindra 1.1 or earlier.
+#[derive(Deserialize)]
+struct LegacyHydration {
+    branch: String,
+    repository: String,
+    steps: Vec<LegacyHydrationStep>,
+}
+
+#[derive(Deserialize)]
+struct LegacyHydrationStep {
     branch: String,
     remote_ref: Option<String>,
     tip: String,
     completed: bool,
 }
 
-#[derive(Serialize, Deserialize)]
-struct HydrationState {
-    branch: String,
-    repository: String,
-    steps: Vec<HydrationStep>,
+impl LegacyHydration {
+    /// The plan as that Kindra ran it: it skipped every completed step (a
+    /// branch that already existed, or one it had created) and created the
+    /// rest in order before checking out `branch`. A step left to create
+    /// always recorded where it came from.
+    fn convert(self) -> Result<HydrationJournal> {
+        let mut steps = Vec::new();
+        for step in self.steps.into_iter().filter(|step| !step.completed) {
+            let remote_ref = step.remote_ref.ok_or_else(|| {
+                anyhow!(
+                    "branch '{}' is left to create but records no remote-tracking branch",
+                    step.branch
+                )
+            })?;
+            steps.push(HydrationStep::CreateBranch {
+                branch: step.branch,
+                remote_ref,
+                tip: step.tip,
+            });
+        }
+        steps.push(HydrationStep::Checkout {
+            branch: self.branch,
+        });
+        Ok(HydrationJournal {
+            repository: self.repository,
+            steps,
+            cursor: HydrationCursor::default(),
+        })
+    }
 }
 
 pub(crate) fn hydration_state_path(repo: &Repository) -> PathBuf {
     crate::operation_state::PersistedOperation::Hydration.path(repo)
 }
 
-fn save_hydration(repo: &Repository, state: &HydrationState) -> Result<()> {
+fn save_hydration(repo: &Repository, journal: &HydrationJournal) -> Result<()> {
     crate::state_io::write_atomic(
         &hydration_state_path(repo),
-        &serde_json::to_string_pretty(state)?,
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "version": HYDRATION_JOURNAL_VERSION,
+            "journal": journal,
+        }))?,
     )
+}
+
+fn load_hydration(repo: &Repository) -> Result<HydrationJournal> {
+    let path = hydration_state_path(repo);
+    parse_hydration(&path, &std::fs::read_to_string(&path)?)
+}
+
+/// Parse a saved hydration journal. One saved in a newer format, or that does
+/// not parse, is reported with how to get past it. `kin abort` never reads
+/// the journal, so it always stops a hydration.
+fn parse_hydration(path: &Path, json: &str) -> Result<HydrationJournal> {
+    let unreadable = |err: &dyn std::fmt::Display| {
+        anyhow!(
+            "Could not read the checkout hydration saved in {}: {err}. If a newer version of kin \
+             saved it, finish it with that version, or run 'kin abort' to stop hydration.",
+            path.display()
+        )
+    };
+    let mut saved: serde_json::Value =
+        serde_json::from_str(json).map_err(|err| unreadable(&err))?;
+    match saved.get("version").map(serde_json::Value::as_u64) {
+        None => serde_json::from_value::<LegacyHydration>(saved)
+            .map_err(|err| unreadable(&err))?
+            .convert()
+            .map_err(|err| unreadable(&err)),
+        Some(Some(version)) if version <= HYDRATION_JOURNAL_VERSION => {
+            match saved.get_mut("journal").map(serde_json::Value::take) {
+                Some(journal @ serde_json::Value::Object(_)) => {
+                    serde_json::from_value(journal).map_err(|err| unreadable(&err))
+                }
+                _ => Err(unreadable(&"it has a version but no journal")),
+            }
+        }
+        Some(_) => Err(anyhow!(
+            "The checkout hydration saved in {} was saved by a newer version of kin (journal \
+             version {}; this kin reads up to version {HYDRATION_JOURNAL_VERSION}). Finish it \
+             with that version, or run 'kin abort' to stop hydration.",
+            path.display(),
+            saved["version"]
+        )),
+    }
 }
 
 fn checkout_branch_with_pr_hydration(repo: &Repository, branch: &str) -> Result<()> {
@@ -204,38 +333,34 @@ fn checkout_branch_with_pr_hydration(repo: &Repository, branch: &str) -> Result<
         discover_pr_connected_stack(repo, branch, upstream_name.as_deref(), &prs)?;
     let mut steps = Vec::new();
     for name in creation_order {
-        let local = repo.find_branch(&name, BranchType::Local).ok();
-        let remote_ref = if local.is_some() {
-            None
-        } else {
-            Some(resolve_remote_tracking_ref(repo, &name, &repository)?.ok_or_else(|| anyhow!(
-                "No remote-tracking branch found for discovered stack branch '{}' in PR repository '{}'.", name, repository
-            ))?)
-        };
-        let tip = if let Some(local) = &local {
-            local.get().peel_to_commit()?.id()
-        } else {
-            repo.find_branch(remote_ref.as_ref().unwrap(), BranchType::Remote)?
-                .get()
-                .peel_to_commit()?
-                .id()
-        };
-        steps.push(HydrationStep {
+        // An existing local branch keeps its commits and its upstream.
+        if repo.find_branch(&name, BranchType::Local).is_ok() {
+            continue;
+        }
+        let remote_ref = resolve_remote_tracking_ref(repo, &name, &repository)?.ok_or_else(|| anyhow!(
+            "No remote-tracking branch found for discovered stack branch '{}' in PR repository '{}'.", name, repository
+        ))?;
+        let tip = repo
+            .find_branch(&remote_ref, BranchType::Remote)?
+            .get()
+            .peel_to_commit()?
+            .id();
+        steps.push(HydrationStep::CreateBranch {
             branch: name,
             remote_ref,
             tip: tip.to_string(),
-            completed: local.is_some(),
         });
     }
-    let state = HydrationState {
-        branch,
+    steps.push(HydrationStep::Checkout { branch });
+    let journal = HydrationJournal {
         repository,
         steps,
+        cursor: HydrationCursor::default(),
     };
     // Persist every source OID before creating any refs. A restart never fetches
     // again or silently switches to a different remote/commit halfway through.
-    save_hydration(repo, &state)?;
-    continue_hydration(repo)
+    save_hydration(repo, &journal)?;
+    run_hydration(repo, journal)
 }
 
 pub(crate) fn continue_hydration(repo: &Repository) -> Result<()> {
@@ -243,24 +368,44 @@ pub(crate) fn continue_hydration(repo: &Repository) -> Result<()> {
     if native != crate::operation_state::NativeOperation::None {
         return Err(anyhow!("{} Then run 'kin continue'.", native.advice()));
     }
-    let mut state: HydrationState =
-        serde_json::from_str(&std::fs::read_to_string(hydration_state_path(repo))?)?;
-    for i in 0..state.steps.len() {
-        if state.steps[i].completed {
-            continue;
+    run_hydration(repo, load_hydration(repo)?)
+}
+
+/// Run the journal's steps from its cursor, saving the cursor after each
+/// branch it creates. A failed step leaves the cursor on it for `kin continue`.
+fn run_hydration(repo: &Repository, mut journal: HydrationJournal) -> Result<()> {
+    loop {
+        let step = journal
+            .steps
+            .get(journal.cursor.step)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "The saved checkout hydration has no checkout step left to run. Run 'kin abort' to stop hydration."
+                )
+            })?;
+        match step {
+            HydrationStep::CreateBranch {
+                branch,
+                remote_ref,
+                tip,
+            } => {
+                ensure_local_branch_for_checkout(repo, &branch, &remote_ref, &tip)
+                    .context("Checkout hydration stopped. Fix the error and run 'kin continue', or 'kin abort' to stop hydration")?;
+                journal.cursor.step += 1;
+                save_hydration(repo, &journal)?;
+            }
+            HydrationStep::Checkout { branch } => {
+                let mut plan = crate::overrides::Plan::default();
+                crate::overrides::prepare(repo, plan.checkout_rev(repo, &branch))?;
+                git_checkout(repo, &branch).context(
+                    "Checkout hydration stopped. Run 'kin continue' to retry checkout or 'kin abort'",
+                )?;
+                std::fs::remove_file(hydration_state_path(repo))?;
+                return Ok(());
+            }
         }
-        ensure_local_branch_for_checkout(repo, &state.steps[i])
-            .context("Checkout hydration stopped. Fix the error and run 'kin continue', or 'kin abort' to stop hydration")?;
-        state.steps[i].completed = true;
-        save_hydration(repo, &state)?;
     }
-    let mut plan = crate::overrides::Plan::default();
-    crate::overrides::prepare(repo, plan.checkout_rev(repo, &state.branch))?;
-    git_checkout(repo, &state.branch).context(
-        "Checkout hydration stopped. Run 'kin continue' to retry checkout or 'kin abort'",
-    )?;
-    std::fs::remove_file(hydration_state_path(repo))?;
-    Ok(())
 }
 
 pub(crate) fn abort_hydration(repo: &Repository) -> Result<()> {
@@ -287,25 +432,30 @@ fn fetch_all_remotes(repo: &Repository) -> Result<()> {
     Ok(())
 }
 
-fn ensure_local_branch_for_checkout(repo: &Repository, step: &HydrationStep) -> Result<()> {
-    let tip = git2::Oid::from_str(&step.tip)?;
-    let mut branch = match repo.find_branch(&step.branch, BranchType::Local) {
+fn ensure_local_branch_for_checkout(
+    repo: &Repository,
+    name: &str,
+    remote_ref: &str,
+    tip: &str,
+) -> Result<()> {
+    let tip = git2::Oid::from_str(tip)?;
+    let mut branch = match repo.find_branch(name, BranchType::Local) {
         Ok(branch) => {
             // Creation may have succeeded just before a checkpoint failed.
             if branch.get().target() != Some(tip) {
                 return Err(anyhow!(
                     "Branch '{}' changed since hydration was planned; refusing to overwrite it",
-                    step.branch
+                    name
                 ));
             }
             branch
         }
         Err(err) if err.code() == git2::ErrorCode::NotFound => {
-            repo.branch(&step.branch, &repo.find_commit(tip)?, false)?
+            repo.branch(name, &repo.find_commit(tip)?, false)?
         }
         Err(err) => return Err(err.into()),
     };
-    branch.set_upstream(step.remote_ref.as_deref())?;
+    branch.set_upstream(Some(remote_ref))?;
     Ok(())
 }
 
@@ -437,4 +587,89 @@ fn find_first_parent_branches_via_git_log(
     }
 
     Ok(Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(json: &str) -> Result<HydrationJournal> {
+        parse_hydration(Path::new("kindra_checkout_state.json"), json)
+    }
+
+    fn create(branch: &str, tip: &str) -> HydrationStep {
+        HydrationStep::CreateBranch {
+            branch: branch.to_string(),
+            remote_ref: format!("origin/{branch}"),
+            tip: tip.to_string(),
+        }
+    }
+
+    /// Kindra 1.1 skipped completed steps wherever they were: a branch that
+    /// existed when it planned is completed from the start.
+    #[test]
+    fn a_flat_journal_keeps_only_the_steps_left_to_run() {
+        let journal = parsed(
+            r#"{"branch":"c","repository":"github.com/test/project","steps":[
+                {"branch":"a","remote_ref":null,"tip":"1111","completed":true},
+                {"branch":"b","remote_ref":"origin/b","tip":"2222","completed":true},
+                {"branch":"c","remote_ref":"origin/c","tip":"3333","completed":false},
+                {"branch":"d","remote_ref":"origin/d","tip":"4444","completed":false}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            journal,
+            HydrationJournal {
+                repository: "github.com/test/project".to_string(),
+                steps: vec![
+                    create("c", "3333"),
+                    create("d", "4444"),
+                    HydrationStep::Checkout {
+                        branch: "c".to_string()
+                    },
+                ],
+                cursor: HydrationCursor { step: 0 },
+            }
+        );
+    }
+
+    #[test]
+    fn a_saved_journal_reads_back() {
+        let journal = HydrationJournal {
+            repository: "github.com/test/project".to_string(),
+            steps: vec![
+                create("a", "1111"),
+                HydrationStep::Checkout {
+                    branch: "a".to_string(),
+                },
+            ],
+            cursor: HydrationCursor { step: 1 },
+        };
+        let json = serde_json::json!({
+            "version": HYDRATION_JOURNAL_VERSION,
+            "journal": journal,
+        });
+        assert_eq!(parsed(&json.to_string()).unwrap(), journal);
+    }
+
+    #[test]
+    fn a_version_without_a_journal_is_malformed() {
+        let err = parsed(r#"{"version":1,"branch":"a","repository":"r","steps":[]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("it has a version but no journal"), "{err}");
+        assert!(err.contains("kin abort"), "{err}");
+    }
+
+    #[test]
+    fn a_journal_with_a_newer_version_is_refused_with_advice() {
+        assert_eq!(HYDRATION_JOURNAL_VERSION, 1);
+        for version in ["2", r#""1""#] {
+            let err = parsed(&format!(r#"{{"version":{version},"journal":{{}}}}"#))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("newer version of kin"), "{err}");
+            assert!(err.contains("kin abort"), "{err}");
+        }
+    }
 }

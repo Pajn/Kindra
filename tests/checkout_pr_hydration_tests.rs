@@ -599,19 +599,27 @@ fn checkout_checkpoints_partial_hydration_and_continues() {
     let path = state_file(dir.path(), StateFile::Checkout);
     let state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(state["branch"], "child");
-    let steps = state["steps"].as_array().unwrap();
+    // Parent is created and the cursor has moved past it; child is next.
+    let journal = &state["journal"];
+    let steps = journal["steps"].as_array().unwrap();
+    let kinds: Vec<_> = steps
+        .iter()
+        .map(|step| {
+            (
+                step["kind"].as_str().unwrap(),
+                step["branch"].as_str().unwrap(),
+            )
+        })
+        .collect();
     assert_eq!(
-        steps
-            .iter()
-            .find(|step| step["branch"] == "parent")
-            .unwrap()["completed"],
-        true
+        kinds,
+        [
+            ("CreateBranch", "parent"),
+            ("CreateBranch", "child"),
+            ("Checkout", "child")
+        ]
     );
-    assert_eq!(
-        steps.iter().find(|step| step["branch"] == "child").unwrap()["completed"],
-        false
-    );
+    assert_eq!(journal["cursor"]["step"], 1);
     kin_cmd()
         .arg("status")
         .current_dir(dir.path())
@@ -726,11 +734,8 @@ fn checkout_continue_retries_uncheckpointed_creation_without_overwriting_edits()
         let mut state: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         // Simulate a crash after creating parent but before its checkpoint.
-        for step in state["steps"].as_array_mut().unwrap() {
-            if step["branch"] == "parent" {
-                step["completed"] = false.into();
-            }
-        }
+        assert_eq!(state["journal"]["steps"][0]["branch"], "parent");
+        state["journal"]["cursor"]["step"] = 0.into();
         fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
         fs::remove_file(lock).unwrap();
         if changed {
@@ -756,6 +761,99 @@ fn checkout_continue_retries_uncheckpointed_creation_without_overwriting_edits()
             assert!(!path.exists());
         }
     }
+}
+
+/// `main <- a <- b <- c`, all pushed, with `a` still local and `b` and `c`
+/// only on the remote. `c`'s ref is locked, so `kin co c` creates `b`, then
+/// stops on `c`. Returns the repository and `c`'s commit.
+fn hydration_paused_on_third_branch() -> (tempfile::TempDir, String) {
+    let dir = tempdir().unwrap();
+    repo_init(dir.path());
+    write_file(&dir.path().join("file.txt"), "main\n");
+    commit_all(dir.path(), "initial");
+    for branch in ["a", "b", "c"] {
+        run_ok("git", &["checkout", "-b", branch], dir.path());
+        write_file(&dir.path().join(format!("{branch}.txt")), "x\n");
+        commit_all(dir.path(), branch);
+    }
+    let c_tip = rev_parse(dir.path(), "c");
+    create_bare_remote(dir.path());
+    run_ok(
+        "git",
+        &["push", "origin", "main", "a", "b", "c"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "main"], dir.path());
+    run_ok("git", &["branch", "-D", "b", "c"], dir.path());
+    write_gh_mock(
+        dir.path(),
+        r#"#!/bin/sh
+if [ "$1" = "auth" ] && [ "$2" = "token" ]; then exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  printf '%s' '[{"number":1,"headRefName":"a","baseRefName":"main"},{"number":2,"headRefName":"b","baseRefName":"a"},{"number":3,"headRefName":"c","baseRefName":"b"}]'
+  exit 0
+fi
+exit 1
+"#,
+    );
+    fs::write(dir.path().join(".git/refs/heads/c.lock"), "locked").unwrap();
+    kin_cmd()
+        .args(["co", "c"])
+        .current_dir(dir.path())
+        .env("PATH", mocked_path(dir.path()))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Checkout hydration stopped"));
+    assert!(local_branch_exists(dir.path(), "b"));
+    assert!(!local_branch_exists(dir.path(), "c"));
+    fs::remove_file(dir.path().join(".git/refs/heads/c.lock")).unwrap();
+    // The remote moves on and is fetched before recovery.
+    run_ok("git", &["push", "-f", "origin", "main:c"], dir.path());
+    run_ok("git", &["fetch", "origin"], dir.path());
+    (dir, c_tip)
+}
+
+#[test]
+fn continue_after_a_hydration_stopped_midway_resumes_from_the_failed_branch() {
+    let (dir, c_tip) = hydration_paused_on_third_branch();
+    // Work on the branch hydration already created: continue must not redo it.
+    run_ok("git", &["branch", "-f", "b", "a"], dir.path());
+    let a_before = rev_parse(dir.path(), "a");
+    kin_cmd()
+        .arg("continue")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(current_branch(dir.path()), "c");
+    // Created at the commit recorded when hydration was planned, tracking the
+    // remote branch it came from.
+    assert_eq!(rev_parse(dir.path(), "c"), c_tip);
+    assert_ne!(rev_parse(dir.path(), "c@{upstream}"), c_tip);
+    assert_eq!(
+        rev_parse(dir.path(), "c@{upstream}"),
+        rev_parse(dir.path(), "origin/c")
+    );
+    assert_eq!(rev_parse(dir.path(), "b"), a_before);
+    assert_eq!(rev_parse(dir.path(), "a"), a_before);
+    assert!(!state_file(dir.path(), StateFile::Checkout).exists());
+}
+
+#[test]
+fn abort_after_a_hydration_stopped_midway_keeps_the_branches_it_created() {
+    let (dir, _) = hydration_paused_on_third_branch();
+    let b_tip = rev_parse(dir.path(), "b");
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "Already-created branches were retained",
+        ));
+    assert_eq!(current_branch(dir.path()), "main");
+    assert_eq!(rev_parse(dir.path(), "b"), b_tip);
+    assert!(!local_branch_exists(dir.path(), "c"));
+    assert!(!state_file(dir.path(), StateFile::Checkout).exists());
 }
 
 #[test]
