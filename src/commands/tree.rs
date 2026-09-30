@@ -304,11 +304,15 @@ fn populate_branch_details(
     show_remote: bool,
     show_pr: bool,
 ) -> Result<()> {
-    // Fetch every open PR once instead of one `gh pr view` per branch. Tolerate
-    // failures (e.g. gh missing/unauthenticated) so `tree` still renders, but warn
-    // so the user knows PR columns are missing rather than empty.
+    // Fetch the open PRs of the shown branches at once instead of one
+    // `gh pr view` per branch. Tolerate failures (e.g. gh missing or
+    // unauthenticated) so `tree` still renders, but warn so the user knows PR
+    // columns are missing rather than empty.
     let pr_map = if show_pr {
-        match gh::list_open_prs() {
+        let names = tree.keys().map(String::as_str).collect::<Vec<_>>();
+        match gh::PrRepository::resolve()
+            .and_then(|repository| gh::open_prs_for_branches(&repository, &names))
+        {
             Ok(map) => map,
             Err(err) => {
                 eprintln!(

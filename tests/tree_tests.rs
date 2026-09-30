@@ -670,10 +670,11 @@ fn test_tree_complex_fork_topology() {
     );
 }
 
-/// `kin tree --pr` must fetch all stack PRs with a single `gh pr list` call
-/// rather than one `gh pr view` per branch.
+/// `kin tree --pr` must fetch the shown branches' PRs with a single query by
+/// head branch, rather than one `gh pr view` per branch or a listing of every
+/// open PR in the repository.
 #[test]
-fn test_tree_pr_uses_single_gh_list_call() {
+fn test_tree_pr_uses_single_query_for_shown_branches() {
     let (dir, repo) = setup_simple_stack();
 
     // Look at the whole stack from the tip so both branches are included.
@@ -685,8 +686,8 @@ fn test_tree_pr_uses_single_gh_list_call() {
     let gh_mock = dir.path().join("gh");
     std::fs::write(
         &gh_mock,
-        r#"#!/bin/bash
-echo "$1 $2" >> "$GH_CALLS"
+        common::logged_gh_script(
+            r#"
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
     echo '[{"number":10,"headRefName":"feature-a","baseRefName":"main","isDraft":false,"author":{"login":"me"}},{"number":11,"headRefName":"feature-b","baseRefName":"feature-a","isDraft":true,"author":{"login":"me"}}]'
     exit 0
@@ -694,6 +695,7 @@ fi
 echo "unexpected gh command: $@" >&2
 exit 1
 "#,
+        ),
     )
     .unwrap();
     common::run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
@@ -732,25 +734,14 @@ exit 1
     );
 
     let calls = std::fs::read_to_string(&calls_path).unwrap_or_default();
-    assert!(
-        calls.contains("pr list"),
-        "expected a single `gh pr list`, calls were:\n{}",
-        calls
-    );
-    assert!(
-        !calls.contains("pr view"),
-        "expected no per-branch `gh pr view`, calls were:\n{}",
-        calls
-    );
-    assert_eq!(
-        calls.matches("pr list").count(),
-        1,
-        "expected exactly one `gh pr list`, calls were:\n{}",
-        calls
-    );
+    let count = |needle: &str| calls.lines().filter(|l| *l == needle).count();
+    assert_eq!(count("repo view"), 1, "calls were:\n{calls}");
+    assert_eq!(count("api graphql"), 1, "calls were:\n{calls}");
+    assert_eq!(count("pr list"), 0, "calls were:\n{calls}");
+    assert_eq!(count("pr view"), 0, "calls were:\n{calls}");
 }
 
-/// A team review request (no `login`) must not fail the whole `gh pr list` parse;
+/// A team review request (no `login`) must not fail the whole open-PR parse;
 /// the PR should still surface in `tree --pr`.
 #[test]
 fn test_tree_pr_tolerates_team_review_requests() {
@@ -760,7 +751,7 @@ fn test_tree_pr_tolerates_team_review_requests() {
         .unwrap();
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then

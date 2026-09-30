@@ -89,7 +89,7 @@ pub struct PrReviewThread {
     pub comments: Vec<PrReviewComment>,
 }
 
-/// A fully-detailed open PR as returned by a single `gh pr list` call. Carries
+/// A fully-detailed open PR as one snapshot query returns it. Carries
 /// enough to serve both existence/base checks and editable-metadata needs, so the
 /// whole `kin pr` flow can share one snapshot instead of querying per branch.
 #[derive(Debug, Clone)]
@@ -121,39 +121,69 @@ impl OpenPr {
     }
 }
 
-/// Fetch every open PR in the repository in a single `gh pr list` call, keyed by
-/// head branch name. This replaces N per-branch `gh pr view` subprocesses with one.
-pub fn list_open_prs() -> Result<HashMap<String, OpenPr>> {
-    list_open_prs_in_repository(None)
+/// The repository gh's PR commands act on, resolved the way `gh pr list` and
+/// `gh pr create` resolve it (`GH_REPO`, the default chosen with
+/// `gh repo set-default`, or the remotes), so a query pinned to it sees the same
+/// pull requests. Resolve it once per command and pass it to every query.
+#[derive(Debug, Clone)]
+pub struct PrRepository {
+    url: String,
+    host: String,
+    owner: String,
+    name: String,
+}
+
+impl PrRepository {
+    /// Ask `gh repo view` which repository gh's PR commands would use here.
+    pub fn resolve() -> Result<Self> {
+        #[derive(Deserialize)]
+        struct RepoView {
+            url: String,
+        }
+        let output = Command::new("gh")
+            .args(["repo", "view", "--json", "url"])
+            .output()
+            .context("Failed to identify the PR repository")?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "Could not identify PR repository: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let view: RepoView =
+            serde_json::from_slice(&output.stdout).context("Invalid PR repository identity")?;
+        let (host, owner, name) = repository_parts(&view.url)
+            .ok_or_else(|| anyhow!("Could not identify PR repository from its URL"))?;
+        Ok(Self {
+            url: view.url,
+            host,
+            owner,
+            name,
+        })
+    }
+
+    /// Canonical host/owner/repository, as [`repository_identity`] renders it.
+    pub fn identity(&self) -> String {
+        format!("{}/{}/{}", self.host, self.owner, self.name).to_ascii_lowercase()
+    }
 }
 
 /// Resolve gh's selected repository once and pin the PR query to that identity.
 /// Remote selection must use this same repository, not an assumed origin.
 pub fn checkout_pr_snapshot() -> Result<(String, HashMap<String, OpenPr>)> {
-    #[derive(Deserialize)]
-    struct RepoView {
-        url: String,
-    }
-    let output = Command::new("gh")
-        .args(["repo", "view", "--json", "url"])
-        .output()
-        .context("Failed to identify the PR repository")?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "Could not identify PR repository: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let view: RepoView =
-        serde_json::from_slice(&output.stdout).context("Invalid PR repository identity")?;
-    let identity = repository_identity(&view.url)
-        .ok_or_else(|| anyhow!("Could not identify PR repository from its URL"))?;
-    Ok((identity, list_open_prs_in_repository(Some(&view.url))?))
+    let repository = PrRepository::resolve()?;
+    Ok((repository.identity(), list_open_prs(&repository)?))
 }
 
 /// Canonical host/owner/repository for HTTPS, SSH URL and scp-style Git URLs.
 /// Unrecognized URLs fail closed rather than guessing which repository they name.
 pub(crate) fn repository_identity(url: &str) -> Option<String> {
+    let (host, owner, name) = repository_parts(url)?;
+    Some(format!("{host}/{owner}/{name}").to_ascii_lowercase())
+}
+
+/// Host, owner and repository name of a repository URL, as written.
+fn repository_parts(url: &str) -> Option<(String, String, String)> {
     let (host, path) = if let Some(rest) = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
@@ -179,30 +209,71 @@ pub(crate) fn repository_identity(url: &str) -> Option<String> {
     {
         return None;
     }
-    Some(format!("{host}/{path}").to_ascii_lowercase())
+    Some((host.to_string(), parts[0].to_string(), parts[1].to_string()))
 }
 
-fn list_open_prs_in_repository(repository: Option<&str>) -> Result<HashMap<String, OpenPr>> {
-    #[derive(Deserialize)]
-    struct User {
-        login: String,
+#[derive(Deserialize)]
+struct PrAuthor {
+    login: String,
+}
+
+/// A requested reviewer can be a user (has `login`) or a team (no `login`).
+/// Keep `login` optional so a team reviewer does not fail the whole parse.
+#[derive(Deserialize)]
+struct PrReviewer {
+    #[serde(default)]
+    login: Option<String>,
+}
+
+/// GraphQL nests the reviewer under `requestedReviewer`; `gh pr list --json`
+/// reports it flattened, with `login` beside `__typename`.
+#[derive(Deserialize)]
+struct PrReviewRequest {
+    #[serde(rename = "requestedReviewer", default)]
+    requested_reviewer: Option<PrReviewer>,
+    #[serde(default)]
+    login: Option<String>,
+}
+
+impl PrReviewRequest {
+    fn login(self) -> Option<String> {
+        self.requested_reviewer
+            .and_then(|reviewer| reviewer.login)
+            .or(self.login)
     }
-    #[derive(Deserialize)]
-    struct Label {
-        name: String,
+}
+
+#[derive(Deserialize)]
+struct PrLabel {
+    name: String,
+}
+
+/// Add `pr` under its head branch name. Two open PRs can share a head branch
+/// name when one of them comes from a fork, and callers look branches up by
+/// name alone. A stack branch pushes to this repository, so prefer the PR
+/// whose head is here; let a fork's PR claim the name only when nothing in
+/// this repository does. Among equals the first one added wins, so add them
+/// newest first, as `gh pr list` returns them. Without this the last one
+/// parsed would win, and `pr edit` or `pr merge` could act on a contributor's
+/// PR.
+fn insert_open_pr(map: &mut HashMap<String, OpenPr>, head_ref_name: String, pr: OpenPr) {
+    match map.entry(head_ref_name) {
+        std::collections::hash_map::Entry::Occupied(mut existing) => {
+            if existing.get().is_cross_repository && !pr.is_cross_repository {
+                existing.insert(pr);
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(pr);
+        }
     }
-    // A requested reviewer can be a user (has `login`) or a team (no `login`).
-    // Keep `login` optional so a team reviewer does not fail the whole parse.
-    #[derive(Deserialize)]
-    struct Reviewer {
-        #[serde(default)]
-        login: Option<String>,
-    }
-    #[derive(Deserialize)]
-    struct ReviewRequest {
-        #[serde(rename = "requestedReviewer", default)]
-        requested_reviewer: Option<Reviewer>,
-    }
+}
+
+/// Fetch every open PR in `repository` in a single `gh pr list` call, keyed by
+/// head branch name. In a repository with hundreds of open PRs this is slow, so
+/// use it only where any PR may matter; when the branches are known, use
+/// [`open_prs_for_branches`].
+pub fn list_open_prs(repository: &PrRepository) -> Result<HashMap<String, OpenPr>> {
     #[derive(Deserialize)]
     struct PrListItem {
         number: u64,
@@ -215,7 +286,7 @@ fn list_open_prs_in_repository(repository: Option<&str>) -> Result<HashMap<Strin
         #[serde(rename = "isDraft", default)]
         is_draft: bool,
         #[serde(default)]
-        author: Option<User>,
+        author: Option<PrAuthor>,
         #[serde(default)]
         title: String,
         #[serde(default)]
@@ -223,13 +294,13 @@ fn list_open_prs_in_repository(repository: Option<&str>) -> Result<HashMap<Strin
         #[serde(default)]
         url: String,
         #[serde(default)]
-        labels: Vec<Label>,
+        labels: Vec<PrLabel>,
         #[serde(rename = "reviewRequests", default)]
-        review_requests: Vec<ReviewRequest>,
+        review_requests: Vec<PrReviewRequest>,
     }
 
-    let mut command = Command::new("gh");
-    command.args([
+    let output = Command::new("gh")
+        .args([
             "pr",
             "list",
             "--state",
@@ -238,11 +309,11 @@ fn list_open_prs_in_repository(repository: Option<&str>) -> Result<HashMap<Strin
             "500",
             "--json",
             "number,headRefName,isCrossRepository,baseRefName,isDraft,author,title,body,url,labels,reviewRequests",
-        ]);
-    if let Some(repository) = repository {
-        command.args(["--repo", repository]);
-    }
-    let output = command.output().context("Failed to run `gh pr list`")?;
+            "--repo",
+            &repository.url,
+        ])
+        .output()
+        .context("Failed to run `gh pr list`")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -257,12 +328,6 @@ fn list_open_prs_in_repository(repository: Option<&str>) -> Result<HashMap<Strin
         if item.head_ref_name.is_empty() {
             continue;
         }
-        let labels = item.labels.into_iter().map(|l| l.name).collect();
-        let reviewers = item
-            .review_requests
-            .into_iter()
-            .filter_map(|r| r.requested_reviewer.and_then(|reviewer| reviewer.login))
-            .collect();
         let pr = OpenPr {
             number: item.number,
             base_branch: item.base_ref_name,
@@ -272,28 +337,254 @@ fn list_open_prs_in_repository(repository: Option<&str>) -> Result<HashMap<Strin
             title: item.title,
             body: item.body,
             url: item.url,
-            labels,
-            reviewers,
+            labels: item.labels.into_iter().map(|l| l.name).collect(),
+            reviewers: item
+                .review_requests
+                .into_iter()
+                .filter_map(PrReviewRequest::login)
+                .collect(),
         };
-        // Two open PRs can share a head branch name when one of them comes from
-        // a fork, and callers look branches up by name alone. A stack branch
-        // pushes to this repository, so prefer the PR whose head is here; let a
-        // fork's PR claim the name only when nothing in this repository does.
-        // Without this the last one parsed would win, and `pr edit` or
-        // `pr merge` could act on a contributor's PR.
-        match map.entry(item.head_ref_name.clone()) {
-            std::collections::hash_map::Entry::Occupied(mut existing) => {
-                if existing.get().is_cross_repository && !pr.is_cross_repository {
-                    existing.insert(pr);
+        insert_open_pr(&mut map, item.head_ref_name, pr);
+    }
+
+    Ok(map)
+}
+
+/// How many head branches one [`open_prs_for_branches`] request asks about.
+/// Bounds the query text and GitHub's per-query node budget on a large stack.
+pub const OPEN_PRS_HEAD_BATCH: usize = 50;
+
+/// How many open PRs to fetch per head branch in one page. Several open PRs
+/// share a head name only when forks use it too (or one branch targets several
+/// bases), so one page almost always holds them all. When it does not and no
+/// PR from this repository is among them yet, that branch is paged further.
+const OPEN_PRS_PER_HEAD: usize = 10;
+
+/// Fields of one open PR, selected the way `gh pr list --json` reports them.
+const OPEN_PR_FIELDS: &str = "pageInfo { hasNextPage endCursor } nodes { number headRefName \
+isCrossRepository baseRefName isDraft author { login } title body url \
+labels(first: 100) { nodes { name } } \
+reviewRequests(first: 100) { nodes { requestedReviewer { ... on User { login } } } } }";
+
+#[derive(Default, Deserialize)]
+struct OpenPrPageInfo {
+    #[serde(rename = "hasNextPage", default)]
+    has_next_page: bool,
+    #[serde(rename = "endCursor", default)]
+    end_cursor: Option<String>,
+}
+#[derive(Deserialize)]
+struct Nodes<T> {
+    #[serde(default = "Vec::new")]
+    nodes: Vec<T>,
+}
+#[derive(Deserialize)]
+struct PrNode {
+    number: u64,
+    #[serde(rename = "headRefName", default)]
+    head_ref_name: String,
+    #[serde(rename = "isCrossRepository", default)]
+    is_cross_repository: bool,
+    #[serde(rename = "baseRefName", default)]
+    base_ref_name: String,
+    #[serde(rename = "isDraft", default)]
+    is_draft: bool,
+    #[serde(default)]
+    author: Option<PrAuthor>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    labels: Option<Nodes<PrLabel>>,
+    #[serde(rename = "reviewRequests", default)]
+    review_requests: Option<Nodes<PrReviewRequest>>,
+}
+/// One page of the open PRs with a given head branch name.
+#[derive(Deserialize)]
+struct PrConnection {
+    #[serde(rename = "pageInfo", default)]
+    page_info: OpenPrPageInfo,
+    #[serde(default)]
+    nodes: Vec<PrNode>,
+}
+
+/// Add the PRs of `nodes` whose head is exactly `head` to `map`.
+fn add_open_pr_nodes(map: &mut HashMap<String, OpenPr>, head: &str, nodes: Vec<PrNode>) {
+    for node in nodes {
+        // Match exactly, as a lookup by branch name in `gh pr list` does.
+        if node.head_ref_name != head {
+            continue;
+        }
+        let pr = OpenPr {
+            number: node.number,
+            base_branch: node.base_ref_name,
+            is_cross_repository: node.is_cross_repository,
+            is_draft: node.is_draft,
+            author_login: node.author.map(|author| author.login),
+            title: node.title,
+            body: node.body,
+            url: node.url,
+            labels: node
+                .labels
+                .map(|labels| labels.nodes.into_iter().map(|l| l.name).collect())
+                .unwrap_or_default(),
+            reviewers: node
+                .review_requests
+                .map(|requests| {
+                    requests
+                        .nodes
+                        .into_iter()
+                        .filter_map(PrReviewRequest::login)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        insert_open_pr(map, node.head_ref_name, pr);
+    }
+}
+
+/// Fetch the open PRs whose head is one of `branches` in `repository`, keyed by
+/// head branch name, with the same semantics as [`list_open_prs`]: a PR from
+/// this repository wins over a fork's PR with the same head name, and a team
+/// reviewer (no login) is left out.
+///
+/// Asks only about the named branches, one alias per branch in a single
+/// `gh api graphql` request per [`OPEN_PRS_HEAD_BATCH`] branches, instead of
+/// listing every open PR in the repository, which in a busy repository returns
+/// hundreds of PRs and takes seconds. An empty set of branches asks nothing.
+pub fn open_prs_for_branches<S: AsRef<str>>(
+    repository: &PrRepository,
+    branches: &[S],
+) -> Result<HashMap<String, OpenPr>> {
+    #[derive(Deserialize)]
+    struct HeadsData {
+        /// Aliases are generated per branch, so the selection comes back as a
+        /// map rather than a fixed set of fields.
+        repository: Option<HashMap<String, Option<PrConnection>>>,
+    }
+
+    let heads: BTreeSet<&str> = branches
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|name| !name.is_empty())
+        .collect();
+    let heads: Vec<&str> = heads.into_iter().collect();
+
+    // Newest first, as `gh pr list` orders them, so the same PR wins a tie.
+    let connection = |head: &str, after: &str| {
+        format!(
+            "pullRequests(headRefName: ${head}, states: OPEN, first: {OPEN_PRS_PER_HEAD}{after}, \
+             orderBy: {{field: CREATED_AT, direction: DESC}}) {{ {OPEN_PR_FIELDS} }}"
+        )
+    };
+    let fetch = |declarations: &str, selections: &str, variables: &[(&str, &str)]| {
+        let query = format!(
+            "query($owner: String!, $name: String!{declarations}) {{ \
+             repository(owner: $owner, name: $name) {{ {selections} }} }}"
+        );
+        let mut fields = vec![
+            ("owner", repository.owner.as_str()),
+            ("name", repository.name.as_str()),
+        ];
+        fields.extend_from_slice(variables);
+        let data: HeadsData =
+            run_graphql(&repository.host, &query, &fields).context("Failed to fetch open PRs")?;
+        data.repository
+            .ok_or_else(|| anyhow!("Repository not found in graphql response"))
+    };
+
+    let mut map = HashMap::new();
+    let settled = |map: &HashMap<String, OpenPr>, head: &str| {
+        map.get(head).is_some_and(|pr| !pr.is_cross_repository)
+    };
+
+    for chunk in heads.chunks(OPEN_PRS_HEAD_BATCH) {
+        let mut declarations = String::new();
+        let mut selections = String::new();
+        let mut variables = Vec::with_capacity(chunk.len());
+        let aliases: Vec<String> = (0..chunk.len()).map(|index| format!("h{index}")).collect();
+        for (alias, head) in aliases.iter().zip(chunk) {
+            // Branch names travel as variables, never inside the query text.
+            declarations.push_str(&format!(", ${alias}: String!"));
+            selections.push_str(&format!("{alias}: {} ", connection(alias, "")));
+            variables.push((alias.as_str(), *head));
+        }
+        let mut aliased = fetch(&declarations, &selections, &variables)?;
+
+        for (alias, head) in aliases.iter().zip(chunk) {
+            let Some(mut page) = aliased.remove(alias).flatten() else {
+                continue;
+            };
+            loop {
+                let next = page.page_info;
+                add_open_pr_nodes(&mut map, head, page.nodes);
+                // Later pages hold only older PRs, which cannot displace a PR
+                // from this repository already found.
+                if !next.has_next_page || settled(&map, head) {
+                    break;
                 }
-            }
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(pr);
+                let cursor = next
+                    .end_cursor
+                    .ok_or_else(|| anyhow!("Missing cursor while paginating open PRs"))?;
+                let mut more = fetch(
+                    ", $h0: String!, $after: String!",
+                    &format!("h0: {}", connection("h0", ", after: $after")),
+                    &[("h0", head), ("after", &cursor)],
+                )?;
+                match more.remove("h0").flatten() {
+                    Some(following) => page = following,
+                    None => break,
+                }
             }
         }
     }
 
     Ok(map)
+}
+
+/// Run a `gh api graphql` query against `host` and return its `data`. Every
+/// variable is a string, so each is passed raw (`-f`): a branch name that looks
+/// like a number or `true` must not be coerced into another JSON type. Fails on
+/// a non-zero exit and on any GraphQL `errors` in the response.
+fn run_graphql<T: serde::de::DeserializeOwned>(
+    host: &str,
+    query: &str,
+    variables: &[(&str, &str)],
+) -> Result<T> {
+    #[derive(Deserialize)]
+    struct GraphQlError {
+        message: String,
+    }
+    #[derive(Deserialize)]
+    struct Response<T> {
+        data: Option<T>,
+        #[serde(default)]
+        errors: Vec<GraphQlError>,
+    }
+
+    let mut command = Command::new("gh");
+    command.args(["api", "graphql", "--hostname", host]);
+    command.args(["-f", &format!("query={query}")]);
+    for (key, value) in variables {
+        command.args(["-f", &format!("{key}={value}")]);
+    }
+    let output = command.output().context("Failed to run `gh api graphql`")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("`gh api graphql` failed: {}", stderr.trim()));
+    }
+    let response: Response<T> =
+        serde_json::from_slice(&output.stdout).context("Failed to parse graphql output")?;
+    if !response.errors.is_empty() {
+        let messages: Vec<_> = response.errors.into_iter().map(|e| e.message).collect();
+        return Err(anyhow!("GraphQL error: {}", messages.join("; ")));
+    }
+    response
+        .data
+        .ok_or_else(|| anyhow!("graphql response carried no data"))
 }
 
 pub fn current_user_login() -> Result<String> {
@@ -1581,5 +1872,93 @@ pub fn open_url(url: &str) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("Failed to open URL in browser: {}", url))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(json: &str) -> PrConnection {
+        serde_json::from_str(json).unwrap()
+    }
+
+    const LOCAL: &str = r#"{"number":42,"headRefName":"feature","isCrossRepository":false,"baseRefName":"main","isDraft":true,"author":{"login":"me"},"title":"Local","body":"Body","url":"https://github.com/o/r/pull/42","labels":{"nodes":[{"name":"bug"}]},"reviewRequests":{"nodes":[{"requestedReviewer":{"login":"alice"}},{"requestedReviewer":{}}]}}"#;
+    const FORK: &str = r#"{"number":99,"headRefName":"feature","isCrossRepository":true,"baseRefName":"main","isDraft":false,"author":{"login":"contributor"},"title":"Fork","body":"","url":"https://github.com/o/r/pull/99","labels":{"nodes":[]},"reviewRequests":{"nodes":[]}}"#;
+
+    #[test]
+    fn open_pr_nodes_keep_user_reviewers_labels_and_draft() {
+        let mut map = HashMap::new();
+        add_open_pr_nodes(
+            &mut map,
+            "feature",
+            page(&format!(r#"{{"nodes":[{LOCAL}]}}"#)).nodes,
+        );
+        let pr = &map["feature"];
+        assert_eq!(pr.number, 42);
+        assert!(pr.is_draft);
+        assert_eq!(pr.author_login.as_deref(), Some("me"));
+        assert_eq!(pr.labels, ["bug"]);
+        // The team reviewer has no login and is left out.
+        assert_eq!(pr.reviewers, ["alice"]);
+    }
+
+    #[test]
+    fn open_pr_nodes_prefer_this_repository_over_a_fork() {
+        for nodes in [format!("[{FORK},{LOCAL}]"), format!("[{LOCAL},{FORK}]")] {
+            let mut map = HashMap::new();
+            add_open_pr_nodes(
+                &mut map,
+                "feature",
+                page(&format!(r#"{{"nodes":{nodes}}}"#)).nodes,
+            );
+            assert_eq!(map["feature"].number, 42, "nodes: {nodes}");
+        }
+        let mut map = HashMap::new();
+        add_open_pr_nodes(
+            &mut map,
+            "feature",
+            page(&format!(r#"{{"nodes":[{FORK}]}}"#)).nodes,
+        );
+        assert_eq!(
+            map["feature"].number, 99,
+            "a fork PR claims a name nothing else has"
+        );
+    }
+
+    #[test]
+    fn open_pr_nodes_match_the_head_exactly() {
+        let mut map = HashMap::new();
+        add_open_pr_nodes(
+            &mut map,
+            "Feature",
+            page(&format!(r#"{{"nodes":[{LOCAL}]}}"#)).nodes,
+        );
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn listed_review_requests_read_flattened_and_nested_logins() {
+        let requests: Vec<PrReviewRequest> = serde_json::from_str(
+            r#"[{"__typename":"User","login":"bob"},{"requestedReviewer":{"login":"alice"}},{"__typename":"Team","name":"t","slug":"t"}]"#,
+        )
+        .unwrap();
+        let logins: Vec<_> = requests
+            .into_iter()
+            .filter_map(PrReviewRequest::login)
+            .collect();
+        assert_eq!(logins, ["bob", "alice"]);
+    }
+
+    #[test]
+    fn repository_parts_keep_case_and_identity_lowercases() {
+        assert_eq!(
+            repository_parts("https://github.example.com/Owner/Repo"),
+            Some(("github.example.com".into(), "Owner".into(), "Repo".into()))
+        );
+        assert_eq!(
+            repository_identity("git@github.com:Owner/Repo.git").as_deref(),
+            Some("github.com/owner/repo")
+        );
     }
 }
