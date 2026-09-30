@@ -175,6 +175,7 @@ fn restack_locked(repo: &git2::Repository, args: &RestackArgs) -> Result<()> {
         legacy_autostash: false,
         cleanup_merged_branches: Vec::new(),
         cleanup_checkout_fallback: None,
+        created_branch: None,
     };
 
     crate::rebase_utils::check_worktrees(repo, &remaining, false)?;

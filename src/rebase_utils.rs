@@ -355,6 +355,23 @@ pub struct RebaseState {
     /// out when the operation completes; `target_branch` when unset.
     #[serde(default)]
     pub cleanup_checkout_fallback: Option<String>,
+    /// The branch the command created before it saved the journal, and the
+    /// branch it was created from (`kin commit -b --insert`). `kin abort`
+    /// returns to `from` instead of the caller or original branch and
+    /// deletes the created branch once its tip is back at `from`'s, so the
+    /// commits it held come back as staged changes (with
+    /// `preserve_content_on_abort`). Journals before version 5 never record
+    /// it, and abort leaves the branch they created in place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_branch: Option<CreatedBranch>,
+}
+
+/// A branch an operation created off another one; see
+/// [`RebaseState::created_branch`].
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CreatedBranch {
+    pub name: String,
+    pub from: String,
 }
 
 impl set_aside::Journal for RebaseState {
@@ -482,7 +499,11 @@ pub fn load_state(repo: &Repository) -> Result<RebaseState> {
 ///   version 3 reader requires `remaining_branches`, so it could not parse a
 ///   version 4 journal even without the version check. Older journals are
 ///   converted when loaded (see [`LegacyProgress`]).
-pub const JOURNAL_VERSION: u64 = 4;
+/// - 5: `created_branch` names a branch the command created, which `kin
+///   abort` deletes after returning to the branch it was created from. A
+///   version 4 reader ignores it and would end the abort on the created
+///   branch, with the commit the abort undoes still on it.
+pub const JOURNAL_VERSION: u64 = 5;
 
 /// Parse a saved journal. One saved in a newer format, or that does not parse
 /// (for example because a newer Kindra saved an operation this one does not
@@ -2017,8 +2038,8 @@ mod tests {
 
     #[test]
     fn a_journal_with_a_newer_version_is_refused_with_advice() {
-        assert_eq!(JOURNAL_VERSION, 4);
-        for version in ["5", "6", r#""4""#] {
+        assert_eq!(JOURNAL_VERSION, 5);
+        for version in ["6", "7", r#""5""#] {
             let err = loaded(&format!(r#"{{"version":{version},"journal":{{}}}}"#))
                 .err()
                 .unwrap()

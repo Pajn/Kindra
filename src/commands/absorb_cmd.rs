@@ -300,6 +300,7 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         legacy_autostash: false,
         cleanup_merged_branches: Vec::new(),
         cleanup_checkout_fallback: None,
+        created_branch: None,
     };
 
     // The absorb engine consumed the staged changes it could place; anything

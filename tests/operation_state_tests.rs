@@ -64,8 +64,11 @@
 //!   shared rebase loop. Version 4 drops `remaining_branches` and
 //!   `in_progress_branch`: the journal records its plan as `steps`, among
 //!   them the fold and move rebases of commit and absorb, and its progress
-//!   as a `cursor`. The `@journal-v2` and `@journal-v3` fixtures are version
-//!   2 and 3 journals, saved by builds after 1.1.0 that no release shipped.
+//!   as a `cursor`. Version 5 adds `created_branch`, the branch `kin commit
+//!   -b --insert` created, which `kin abort` deletes after returning to the
+//!   branch it was created from. The `@journal-v2`, `@journal-v3` and
+//!   `@journal-v4` fixtures are version 2, 3 and 4 journals, saved by builds
+//!   after 1.1.0 that no release shipped.
 //!
 //! Checkout hydration keeps its own journal, `kindra_checkout_state.json`,
 //! with its own version (the `hydration` tests below):
@@ -968,6 +971,18 @@ fn commit_insert_journal_and_status() {
     ));
 }
 
+/// Aborting an insert undoes the whole command: the branch it created is
+/// deleted, the branch it ran on is checked out, and the commit's change is
+/// staged again.
+#[test]
+fn commit_insert_aborts_to_where_it_started() {
+    let paused = paused_commit_insert();
+    paused.abort();
+    paused.assert_restored();
+    assert_eq!(paused.repo.porcelain(), "M  shared.txt\n");
+    assert_eq!(paused.repo.stash_list(), "");
+}
+
 #[test]
 fn absorb_journal_and_status() {
     let mut paused = paused_absorb();
@@ -1013,7 +1028,7 @@ fn journal_is_saved_in_an_envelope_older_kindra_cannot_parse() {
     let mut keys: Vec<_> = saved.as_object().unwrap().keys().cloned().collect();
     keys.sort();
     assert_eq!(keys, ["journal", "version"]);
-    assert_eq!(saved["version"], Value::from(4));
+    assert_eq!(saved["version"], Value::from(5));
     assert!(saved["journal"]["operation"].is_string());
 }
 
@@ -1078,8 +1093,8 @@ fn journal_from_a_newer_kindra_is_refused_with_advice() {
 fn journal_with_a_newer_version_is_refused_with_advice() {
     let paused = paused_commit_fixup();
     let mut journal = paused.repo.state_json();
-    assert_eq!(journal["version"], Value::from(4));
-    journal["version"] = Value::from(5);
+    assert_eq!(journal["version"], Value::from(5));
+    journal["version"] = Value::from(6);
     let saved = serde_json::to_string_pretty(&journal).unwrap();
     fs::write(paused.repo.state_path(), &saved).unwrap();
 
@@ -1088,7 +1103,7 @@ fn journal_with_a_newer_version_is_refused_with_advice() {
         assert!(!output.status.success(), "{}", describe(&output));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("newer version of kin"), "{stderr}");
-        assert!(stderr.contains("journal version 5"), "{stderr}");
+        assert!(stderr.contains("journal version 6"), "{stderr}");
         assert!(stderr.contains("kin abort --clear-state"), "{stderr}");
         assert_eq!(fs::read_to_string(paused.repo.state_path()).unwrap(), saved);
         assert!(paused.repo.rebase_in_progress());
@@ -2192,6 +2207,79 @@ fn legacy_absorb_unnamed_fork_journal_v3_continues_and_deletes_its_anchors() {
             stacked: &[("main", "feature-a"), ("main", "feature-b")],
             porcelain: "",
             folded: Some("feature-a"),
+        },
+    );
+}
+
+/// Version 5 only adds `created_branch`, which only an insert records, and an
+/// insert's rollback that goes with it. Every other version 4 journal is
+/// today's but for its version, so the tests of today's journals cover it.
+#[test]
+fn legacy_journal_v4_differs_from_today_only_for_an_insert() {
+    for case in [
+        "absorb",
+        "absorb_unnamed_fork",
+        "commit_fixup",
+        "commit_fixup_autostash",
+        "commit_fixup_dependents",
+        "commit_on_ancestor",
+        "commit_restack",
+        "move",
+        "reorder",
+        "restack",
+        "sync_linear",
+        "sync_linear_dirty",
+        "sync_tree",
+        "sync_upstream",
+    ] {
+        let read = |kind: &str, name: &str| -> Value {
+            let path = fixture_path(kind, name);
+            serde_json::from_str(&fs::read_to_string(&path).unwrap())
+                .unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+        };
+        let mut legacy = read("legacy", &format!("{case}@journal-v4"));
+        assert_eq!(legacy["version"], Value::from(4), "{case}");
+        legacy["version"] = Value::from(5);
+        assert_eq!(
+            canonical(&legacy),
+            canonical(&read("golden", case)),
+            "{case}"
+        );
+    }
+}
+
+/// A version 4 insert recorded neither the branch it was created from nor
+/// that it created the new one, so `kin abort` undoes only the restack, as it
+/// did then: the new branch keeps the commit and is checked out.
+#[test]
+fn legacy_commit_insert_journal_v4_aborts() {
+    assert_legacy_commit_aborts(
+        paused_commit_insert,
+        "commit_insert@journal-v4",
+        &format!("Commit in progress on inserted\nRemaining branches: feature-b\n{NATIVE_REBASE}"),
+        AbortOutcome {
+            tips: &[
+                ("feature-a", "<feature-a@before>"),
+                ("feature-b", "<feature-b@before>"),
+                ("inserted", "<inserted@paused>"),
+                ("main", "<main@before>"),
+            ],
+            ends_on: "inserted",
+            porcelain: "",
+        },
+    );
+}
+
+#[test]
+fn legacy_commit_insert_journal_v4_continues() {
+    assert_legacy_commit_continues(
+        paused_commit_insert,
+        "commit_insert@journal-v4",
+        ContinueOutcome {
+            ends_on: "inserted",
+            stacked: &[("feature-a", "inserted"), ("inserted", "feature-b")],
+            porcelain: "",
+            folded: None,
         },
     );
 }

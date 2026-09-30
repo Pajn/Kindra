@@ -1,6 +1,7 @@
 use crate::operation_state::{KindraOperation, NativeOperation};
 use crate::rebase_utils::{
-    checkout_branch, git_rebase_in_progress, load_state, owned_tip_state_matches, unstage_all,
+    CreatedBranch, checkout_branch, git_rebase_in_progress, load_state, owned_tip_state_matches,
+    unstage_all,
 };
 use crate::repository::git_command;
 use crate::set_aside::{self, Phase};
@@ -114,10 +115,15 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
         }
 
         if kindra_owns_current_state {
-            let restore_branch = parsed_state
-                .caller_branch
-                .clone()
-                .unwrap_or_else(|| parsed_state.original_branch.clone());
+            // A branch the command created is undone too: return to the
+            // branch it was created from.
+            let restore_branch = match &parsed_state.created_branch {
+                Some(created) => created.from.clone(),
+                None => parsed_state
+                    .caller_branch
+                    .clone()
+                    .unwrap_or_else(|| parsed_state.original_branch.clone()),
+            };
 
             if parsed_state.preserve_content_on_abort {
                 // Content the operation already committed (absorb's fixup or
@@ -141,6 +147,10 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
 
             if parsed_state.unstage_on_restore {
                 unstage_all(repo)?;
+            }
+
+            if let Some(created) = &parsed_state.created_branch {
+                delete_created_branch(repo, created);
             }
         }
 
@@ -223,6 +233,37 @@ impl Drop for AbortOplogSettle<'_> {
             SettleAction::Discard => crate::oplog::discard(self.repo),
             SettleAction::Finalize => crate::oplog::finalize(self.repo),
         };
+    }
+}
+
+/// Delete the branch the operation created, now that its tip is back where it
+/// was created. One that points anywhere else holds commits of its own, so it
+/// is kept. Everything else is already restored, so a branch that cannot be
+/// deleted is only reported.
+fn delete_created_branch(repo: &git2::Repository, created: &CreatedBranch) {
+    let tip = |name: &str| {
+        repo.find_branch(name, git2::BranchType::Local)
+            .ok()
+            .and_then(|branch| branch.get().target())
+    };
+    let Some(created_tip) = tip(&created.name) else {
+        return;
+    };
+    if Some(created_tip) != tip(&created.from) {
+        println!(
+            "Kept branch '{}': it no longer points where it was created from '{}'.",
+            created.name, created.from
+        );
+        return;
+    }
+    let deleted = repo
+        .find_branch(&created.name, git2::BranchType::Local)
+        .and_then(|mut branch| branch.delete());
+    if let Err(err) = deleted {
+        eprintln!(
+            "Could not delete branch '{}' ({err}); remove it with 'git branch -D {}'.",
+            created.name, created.name
+        );
     }
 }
 
