@@ -75,6 +75,116 @@ pub struct RebaseOptions {
     pub no_restart: bool,
 }
 
+/// One unit of work in a journal's plan (ADR 0001). The command that starts
+/// an operation plans every step up front; [`run_rebase_loop`] runs them in
+/// order from the journal's [`Cursor`], saving the cursor after each.
+///
+/// The steps that rewrite branches name the branch whose native rebase they
+/// run, which is how an active `git rebase` is matched to the journal.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind")]
+pub enum Step {
+    /// Replay `branch`'s own commits (after its recorded old parent in
+    /// `parent_id_map`) onto its new base, with the journal's
+    /// [`RebaseOptions`]. The new base is the branch's `new_base_map` entry;
+    /// otherwise `target_branch` for the original branch, and its parent's
+    /// name or old parent for the rest.
+    Replay { branch: String },
+    /// Fold the `fixup!` and `squash!` commits above `base` (the root when
+    /// `None`) into the commits they name, with an interactive autosquash
+    /// rebase of `branch`, which is checked out, that moves every branch tip in
+    /// the range along (`--update-refs`).
+    Autosquash {
+        branch: String,
+        base: Option<String>,
+        /// Anchor the unnamed fork points recorded in `new_base_map` with
+        /// `update-ref` instructions after each autosquash group (absorb).
+        #[serde(default)]
+        anchor_forks: bool,
+        /// Pass `--no-rebase-merges`, so a `rebase.rebaseMerges` config never
+        /// turns the todo into labels and merges.
+        #[serde(default)]
+        no_rebase_merges: bool,
+    },
+    /// Move the commit at the tip of `branch`, which is checked out, down onto
+    /// the ancestor branch `onto`, whose ref it claims; every branch between
+    /// them moves along (`kin commit --on` an ancestor).
+    MoveCommit { branch: String, onto: String },
+    /// A rebase of `branch` other than a replay (a fold, or a commit's move
+    /// onto an ancestor) that a journal saved before steps were recorded
+    /// left stopped. It is only ever finished, never started.
+    StoppedRebase { branch: String },
+    /// Finish the operation: check out `checkout` (when the rebases leave
+    /// another branch checked out), restore what was set aside, unstage when
+    /// `unstage_on_restore` says so, remove the journal, delete the
+    /// `cleanup_merged_branches` and record the operation for `kin undo`.
+    /// Every part before the journal is removed can run again, so a failure
+    /// there leaves the cursor on this step for `kin continue`.
+    Complete { checkout: Option<String> },
+}
+
+impl Step {
+    /// The branch whose native rebase this step runs, if it runs one.
+    fn rebased_branch(&self) -> Option<&str> {
+        match self {
+            Step::Replay { branch }
+            | Step::Autosquash { branch, .. }
+            | Step::MoveCommit { branch, .. }
+            | Step::StoppedRebase { branch } => Some(branch),
+            Step::Complete { .. } => None,
+        }
+    }
+}
+
+/// The plan of an operation that replays `branches` in order and then
+/// finishes, checking out `checkout`.
+pub fn replay_plan(branches: &[String], checkout: Option<&str>) -> Vec<Step> {
+    branches
+        .iter()
+        .map(|branch| Step::Replay {
+            branch: branch.clone(),
+        })
+        .chain(std::iter::once(Step::Complete {
+            checkout: checkout.map(str::to_string),
+        }))
+        .collect()
+}
+
+/// How far a journal's plan has got: every step before `step` is done.
+/// `started` says the step at `step` has begun, so its native rebase may be
+/// stopped: `kin continue` lets Git finish it and then checks that it did.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cursor {
+    pub step: usize,
+    pub started: bool,
+}
+
+/// A step's `git rebase` refused to start, so it rewrote nothing. Returned
+/// (inside an [`anyhow::Error`]) by [`run_rebase_loop`] for the fold and
+/// move steps, whose command then unwinds what it did before them.
+#[derive(Debug)]
+pub struct RebaseNotStarted(pub anyhow::Error);
+
+impl std::fmt::Display for RebaseNotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for RebaseNotStarted {}
+
+impl RebaseNotStarted {
+    /// Why the rebase of a step never started, if that is how `result`, from
+    /// [`run_rebase_loop`], failed; any other failure is returned as it is.
+    pub fn reason(result: Result<()>) -> Result<Option<anyhow::Error>> {
+        match result.map_err(|err| err.downcast::<RebaseNotStarted>()) {
+            Ok(()) => Ok(None),
+            Err(Ok(RebaseNotStarted(reason))) => Ok(Some(reason)),
+            Err(Err(err)) => Err(err),
+        }
+    }
+}
+
 /// What a journal saved before [`JOURNAL_VERSION`] 3 recorded in `replay`
 /// about how its rebases run. Loading converts it into the [`RebaseOptions`]
 /// and bases that version 3 records instead.
@@ -129,7 +239,10 @@ impl LegacyReplay {
                 // Every branch lands on its planned parent, the original one
                 // included, which a replay of branches would put on
                 // `target_branch` instead.
-                for branch in &state.remaining_branches {
+                for step in &state.steps {
+                    let Step::Replay { branch } = step else {
+                        continue;
+                    };
                     let base = state
                         .parent_name_map
                         .get(branch)
@@ -172,10 +285,13 @@ pub struct RebaseState {
     /// Branch to restore at the end (set for commit --on from another branch).
     #[serde(default)]
     pub caller_branch: Option<String>,
-    /// List of branches remaining to be moved
-    pub remaining_branches: Vec<String>,
-    /// The branch currently being rebased
-    pub in_progress_branch: Option<String>,
+    /// The operation's plan, in order. Journals saved before version 4
+    /// recorded `remaining_branches` and `in_progress_branch` instead; loading
+    /// converts them (see [`LegacyProgress`]).
+    pub steps: Vec<Step>,
+    /// How far the plan has got.
+    #[serde(default)]
+    pub cursor: Cursor,
     /// branch_name -> original_parent_id_str
     #[serde(default)]
     pub parent_id_map: HashMap<String, String>,
@@ -251,6 +367,55 @@ impl set_aside::Journal for RebaseState {
     }
 }
 
+impl RebaseState {
+    /// The branches still to replay, the one in progress first.
+    pub fn remaining_branches(&self) -> Vec<&str> {
+        self.pending_steps()
+            .filter_map(|step| match step {
+                Step::Replay { branch } => Some(branch.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The step at the cursor and those after it.
+    fn pending_steps(&self) -> impl Iterator<Item = &Step> {
+        self.steps.iter().skip(self.cursor.step)
+    }
+
+    fn current_step(&self) -> Option<&Step> {
+        self.steps.get(self.cursor.step)
+    }
+
+    /// The branch whose native rebase the step at the cursor started.
+    fn started_branch(&self) -> Option<&str> {
+        self.cursor
+            .started
+            .then(|| self.current_step().and_then(Step::rebased_branch))
+            .flatten()
+    }
+
+    /// Whether any step from the cursor on rewrites a branch.
+    fn rebases_remain(&self) -> bool {
+        self.pending_steps()
+            .any(|step| step.rebased_branch().is_some())
+    }
+
+    /// Whether a replay is still to run.
+    fn replays_remain(&self) -> bool {
+        self.pending_steps()
+            .any(|step| matches!(step, Step::Replay { .. }))
+    }
+
+    /// Mark the step at the cursor done.
+    fn advance(&mut self) {
+        self.cursor = Cursor {
+            step: self.cursor.step + 1,
+            started: false,
+        };
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReconcileMode {
     Continue,
@@ -311,7 +476,13 @@ pub fn load_state(repo: &Repository) -> Result<RebaseState> {
 ///   takes a journal without `replay` as a flat one and derives how it
 ///   replays from its label, not from what it records. Journals of versions 1
 ///   and 2, and flat ones, are converted when loaded (see [`LegacyReplay`]).
-pub const JOURNAL_VERSION: u64 = 3;
+/// - 4: `remaining_branches` and `in_progress_branch` are gone. The journal
+///   records its plan in `steps`, including the fold and move rebases that ran
+///   outside the rebase loop before, and how far it has got in `cursor`. A
+///   version 3 reader requires `remaining_branches`, so it could not parse a
+///   version 4 journal even without the version check. Older journals are
+///   converted when loaded (see [`LegacyProgress`]).
+pub const JOURNAL_VERSION: u64 = 4;
 
 /// Parse a saved journal. One saved in a newer format, or that does not parse
 /// (for example because a newer Kindra saved an operation this one does not
@@ -351,6 +522,11 @@ fn parse_state(path: &Path, json: &str) -> Result<RebaseState> {
             ));
         }
     };
+    let mut journal = journal;
+    // Before version 4 the journal recorded what was left, not a plan.
+    if version < 4 {
+        LegacyProgress::convert(&mut journal).map_err(|err| unreadable(&err))?;
+    }
     // Before version 3 the journal said how it replays in `replay`, or only
     // through its label.
     let replay = if version < 3 {
@@ -365,6 +541,68 @@ fn parse_state(path: &Path, json: &str) -> Result<RebaseState> {
         replay.apply(&mut state);
     }
     Ok(state)
+}
+
+/// What a journal saved before version 4 recorded about its progress: the
+/// branches left to replay and the branch whose rebase had started.
+#[derive(Deserialize)]
+struct LegacyProgress {
+    remaining_branches: Vec<String>,
+    #[serde(default)]
+    caller_branch: Option<String>,
+    original_branch: String,
+    in_progress_branch: Option<String>,
+}
+
+impl LegacyProgress {
+    /// Rewrite the progress fields of a journal saved before version 4 into
+    /// `steps` and a `cursor`, the way the rebase loop read them then:
+    ///
+    /// - a started rebase of a branch that is not left to replay (a commit's
+    ///   or absorb's fold, or a commit's move onto an ancestor) is a
+    ///   [`Step::StoppedRebase`], started, ahead of the replays;
+    /// - each remaining branch is a [`Step::Replay`], the first one started
+    ///   when it was the branch in progress;
+    /// - the operation then finished by checking out the caller branch, or the
+    ///   original one ([`Step::Complete`]).
+    fn convert(journal: &mut serde_json::Value) -> serde_json::Result<()> {
+        // A journal without the envelope that already records steps was
+        // written in today's shape (no release did that), so it is read as it
+        // is.
+        if journal.get("steps").is_some() && journal.get("remaining_branches").is_none() {
+            return Ok(());
+        }
+        let legacy: LegacyProgress = serde_json::from_value(journal.clone())?;
+        let Some(fields) = journal.as_object_mut() else {
+            return Ok(());
+        };
+        fields.remove("remaining_branches");
+        fields.remove("in_progress_branch");
+
+        let mut steps = Vec::new();
+        let mut started = false;
+        if let Some(branch) = &legacy.in_progress_branch {
+            if legacy.remaining_branches.first() == Some(branch) {
+                started = true;
+            } else if !legacy.remaining_branches.contains(branch) {
+                steps.push(Step::StoppedRebase {
+                    branch: branch.clone(),
+                });
+                started = true;
+            }
+        }
+        let checkout = legacy
+            .caller_branch
+            .as_deref()
+            .unwrap_or(&legacy.original_branch);
+        steps.extend(replay_plan(&legacy.remaining_branches, Some(checkout)));
+        fields.insert("steps".to_string(), serde_json::to_value(steps)?);
+        fields.insert(
+            "cursor".to_string(),
+            serde_json::to_value(Cursor { step: 0, started })?,
+        );
+        Ok(())
+    }
 }
 
 /// The set-aside fields of a journal saved by Kindra 1.1 or earlier.
@@ -463,24 +701,32 @@ pub fn reconcile_saved_rebase_state(
         return Ok(Some(state));
     }
 
+    // Advance past the steps the user already finished with Git. A replay
+    // counts as done only once the graph shows it; a fold or move is never
+    // started again, so continuing takes it as finished once no rebase is
+    // stopped. Only `kin continue` goes past those, so they keep the
+    // operation paused until it runs.
     let mut changed = false;
-    while let Some(current_name) = state.remaining_branches.first().cloned() {
-        if !branch_rebase_completed(repo, &state, &current_name)? {
-            break;
+    while let Some(step) = state.current_step() {
+        match step {
+            Step::Replay { branch } => {
+                if !branch_rebase_completed(repo, &state, branch)? {
+                    break;
+                }
+                if mode == ReconcileMode::Continue {
+                    println!("Branch {} already rebased.", branch);
+                }
+            }
+            Step::Autosquash { .. } | Step::MoveCommit { .. } | Step::StoppedRebase { .. }
+                if mode == ReconcileMode::Continue => {}
+            _ => break,
         }
-
-        if mode == ReconcileMode::Continue {
-            println!("Branch {} already rebased.", current_name);
-        }
-        state.remaining_branches.remove(0);
-        if state.in_progress_branch.as_ref() == Some(&current_name) {
-            state.in_progress_branch = None;
-        }
+        state.advance();
         changed = true;
     }
 
-    if state.remaining_branches.is_empty()
-        && state.in_progress_branch.is_none()
+    if !state.rebases_remain()
+        && !state.cursor.started
         && mode == ReconcileMode::Passive
         && can_passively_clear_completed_state(repo, &state)?
     {
@@ -594,12 +840,14 @@ fn tracked_branch_names(state: &RebaseState) -> HashSet<String> {
     let mut branch_names = HashSet::new();
 
     branch_names.extend(state.original_tip_map.keys().cloned());
-    branch_names.extend(state.remaining_branches.iter().cloned());
+    branch_names.extend(
+        state
+            .pending_steps()
+            .filter_map(Step::rebased_branch)
+            .map(str::to_string),
+    );
     branch_names.insert(state.original_branch.clone());
     if let Some(branch) = &state.caller_branch {
-        branch_names.insert(branch.clone());
-    }
-    if let Some(branch) = &state.in_progress_branch {
         branch_names.insert(branch.clone());
     }
 
@@ -715,7 +963,7 @@ fn branch_rebase_completed(
 
 fn active_git_rebase_matches_state(repo: &Repository, state: &RebaseState) -> Result<bool> {
     if let Some(active_branch) = active_git_rebase_branch(repo)? {
-        return Ok(state.in_progress_branch.as_deref() == Some(active_branch.as_str()));
+        return Ok(state.started_branch() == Some(active_branch.as_str()));
     }
 
     owned_tip_state_matches(repo, state)
@@ -1112,7 +1360,7 @@ pub fn override_plan(repo: &Repository, state: &RebaseState) -> Result<crate::ov
     {
         plan.checkout_rev(repo, name);
     }
-    for name in &state.remaining_branches {
+    for name in state.remaining_branches() {
         let (old_parent, new_base) = branch_rebase_target(state, name)?;
         plan.checkout_rev(repo, &new_base)
             .replay_revs(repo, &old_parent, name);
@@ -1147,7 +1395,7 @@ pub fn set_aside_working_tree(
 pub fn begin_replay(repo: &Repository, state: &mut RebaseState, allowed: bool) -> Result<()> {
     ensure_git_supports(state.rebase_options)?;
     crate::overrides::prepare(repo, &override_plan(repo, state)?)?;
-    if state.remaining_branches.is_empty() {
+    if !state.replays_remain() {
         return save_state(repo, state);
     }
     set_aside_working_tree(repo, state, allowed)
@@ -1164,160 +1412,310 @@ fn ensure_git_supports(options: RebaseOptions) -> Result<()> {
     }
 }
 
-/// Replay each of `state`'s remaining branches onto its new base, then finish
-/// the operation: return to the caller (or original) branch, restore what was
-/// set aside, clear the journal, delete the merged branches it recorded and
-/// record the operation for `kin undo`. A rebase that stops on a conflict
-/// saves the journal and returns an error for `kin continue` or `kin abort`.
+/// Run `state`'s plan from its cursor: each step in turn, saving the cursor
+/// after each, until the [`Step::Complete`] step finishes the operation. A
+/// rebase that stops on a conflict saves the journal and returns an error for
+/// `kin continue` or `kin abort`. A fold or move whose rebase refuses to start
+/// returns [`RebaseNotStarted`], leaving the step not started, so the command
+/// that planned it can unwind what it did before.
 ///
 /// The command that starts an operation calls this; `kin continue` calls
 /// [`resume_rebase_loop`].
-pub fn run_rebase_loop(repo: &Repository, state: RebaseState) -> Result<()> {
-    replay_branches(repo, state, false)
+pub fn run_rebase_loop(repo: &Repository, state: &mut RebaseState) -> Result<()> {
+    run_steps(repo, state, false)
 }
 
 /// [`run_rebase_loop`] for `kin continue`, once the stopped rebase, if any,
-/// has finished. A journal whose rebases run only when the operation starts
-/// ([`RebaseOptions::no_restart`]) is refused here if one of them is still
-/// incomplete.
-pub fn resume_rebase_loop(repo: &Repository, state: RebaseState) -> Result<()> {
-    replay_branches(repo, state, true)
+/// has finished: the step it belongs to is done. A fold or move is never
+/// started here; one the operation had not started is passed over, as before
+/// steps were recorded. A journal whose rebases run only when the operation
+/// starts ([`RebaseOptions::no_restart`]) is refused here if one of them is
+/// still incomplete.
+pub fn resume_rebase_loop(repo: &Repository, mut state: RebaseState) -> Result<()> {
+    run_steps(repo, &mut state, true)
 }
 
-fn replay_branches(repo: &Repository, mut state: RebaseState, resumed: bool) -> Result<()> {
+fn run_steps(repo: &Repository, state: &mut RebaseState, resumed: bool) -> Result<()> {
     ensure_git_supports(state.rebase_options)?;
-    crate::overrides::prepare(repo, &override_plan(repo, &state)?)?;
+    crate::overrides::prepare(repo, &override_plan(repo, state)?)?;
 
     // A journal saved by an older Kindra may still ask the loop to set the
     // tracked changes aside before its first rebase. Own them across the
     // entire restack, as every operation now does from the start, so
     // completion and abort restore them on the saved branch.
-    if !state.remaining_branches.is_empty()
-        && state.legacy_autostash
-        && state.set_asides.changes().is_none()
-    {
+    if state.replays_remain() && state.legacy_autostash && state.set_asides.changes().is_none() {
         let taken = set_aside::take_tracked(repo, true, set_aside::Restore::WithIndex)?;
         if let Some(taken) = taken {
             state.set_asides.push(taken);
         }
         state.legacy_autostash = false;
-        if let Err(err) = save_state(repo, &state) {
+        if let Err(err) = save_state(repo, state) {
             set_aside::unwind(repo, &mut state.set_asides);
             return Err(err);
         }
     }
 
-    let mut started_any = false;
-    while !state.remaining_branches.is_empty() {
-        let current_name = state.remaining_branches[0].clone();
-
-        // Check if we are resuming a rebase that was already in progress
-        let is_resuming = state.in_progress_branch.as_ref() == Some(&current_name);
-
-        let (old_parent_id_str, new_base) = branch_rebase_target(&state, &current_name)?;
-
-        // Check if the branch is already rebased (e.g. by a previous --update-refs)
-        let is_done = branch_rebase_completed(repo, &state, &current_name)?;
-
-        if is_done && (is_resuming || started_any) && !git_rebase_in_progress(repo) {
-            println!("Branch {} already rebased.", current_name);
-            state.remaining_branches.remove(0);
-            if is_resuming {
-                state.in_progress_branch = None;
-                started_any = true;
-            }
-            save_state(repo, &state)?;
-            continue;
-        }
-
-        let options = state.rebase_options;
-        if resumed && options.no_restart {
-            let operation = state.operation;
+    // Whether a replay ran (or was resumed) in this invocation: from then on a
+    // branch the graph shows already rebased, for example by an earlier
+    // replay's `--update-refs`, is taken as done rather than replayed again.
+    let mut replayed_any = false;
+    loop {
+        let Some(step) = state.current_step().cloned() else {
             return Err(anyhow!(
-                "{} did not complete: '{}' is not rebased onto '{}'. If the Git rebase was aborted manually, run 'kin abort' to clear the saved {} state or rerun 'kin {}'.",
-                operation.title(),
-                current_name,
-                new_base,
-                operation.command(),
-                operation.command()
+                "The saved operation has no step left to run. Run 'kin abort' to clear it."
             ));
-        }
-
-        if !is_resuming {
-            state.in_progress_branch = Some(current_name.clone());
-            save_state(repo, &state)?;
-        }
-
-        println!("Rebasing {}...", current_name);
-        let mut rebase = git_command(repo);
-        rebase.arg("rebase");
-        if options.keep_cherry_picks {
-            rebase.args(["--reapply-cherry-picks", "--empty=keep"]);
-        }
-        if !options.fast_forward {
-            rebase.arg("--no-ff");
-        }
-        // Kindra owns every set-aside: Git's autostash (or `rebase.autostash`)
-        // would restore the changes on each replayed branch instead.
-        rebase.arg("--no-autostash");
-        if !options.keep_other_refs {
-            rebase.arg("--update-refs");
-        }
-        let status = rebase
-            .arg("--onto")
-            .arg(&new_base)
-            .arg(&old_parent_id_str)
-            .arg(&current_name)
-            .status()?;
-
-        if status.success() {
-            state.remaining_branches.remove(0);
-            state.in_progress_branch = None;
-            started_any = true;
-            save_state(repo, &state)?;
-        } else {
-            // Check if a rebase is in progress (meaning it started but hit conflicts)
-            if git_rebase_in_progress(repo) {
-                // Persist that this branch is in progress, but do NOT remove it from remaining_branches
-                save_state(repo, &state)?;
-                return Err(anyhow!(
-                    "Rebase failed for branch {}. Resolve conflicts and run 'kin continue'.",
-                    current_name
-                ));
-            } else {
-                state.in_progress_branch = None;
-                save_state(repo, &state)?;
-                if options.no_restart {
-                    let command = state.operation.command();
-                    return Err(anyhow!(
-                        "git rebase failed before {command} could enter an in-progress state. Run 'kin abort' to clear the saved state, then run 'kin {command}' again (or otherwise fix the rebase)."
-                    ));
+        };
+        match step {
+            Step::Replay { branch } => {
+                replay_step(repo, state, &branch, resumed, &mut replayed_any)?;
+            }
+            Step::Autosquash { .. } | Step::MoveCommit { .. } | Step::StoppedRebase { .. } => {
+                // A started one has finished: `kin continue` resumes only once
+                // no rebase is stopped (or the user gave it up with Git). One
+                // not started runs only when the operation starts.
+                if !state.cursor.started && !resumed {
+                    in_place_step(repo, state, &step)?;
                 }
-                return Err(anyhow!(
-                    "Rebase failed for branch {}. It seems to have failed before starting (e.g., dirty working tree). Fix the issue and run 'kin continue'.",
-                    current_name
-                ));
+                state.advance();
+                save_state(repo, state)?;
+            }
+            Step::Complete { checkout } => {
+                return complete_step(repo, state, checkout.as_deref());
             }
         }
     }
+}
 
-    let restore_branch = state
-        .caller_branch
-        .clone()
-        .unwrap_or_else(|| state.original_branch.clone());
-    println!(
-        "Operation completed. Checking out original branch {}...",
-        restore_branch
-    );
-    checkout_branch(repo, &restore_branch).map_err(|e| {
-        anyhow!(
-            "Failed to checkout back to original branch '{}'. State file preserved. {}",
-            restore_branch,
-            e
-        )
-    })?;
+/// Run the [`Step::Replay`] of `branch`, or take it as done when the graph
+/// shows it already is and it was resumed or a replay before it ran.
+fn replay_step(
+    repo: &Repository,
+    state: &mut RebaseState,
+    branch: &str,
+    resumed: bool,
+    replayed_any: &mut bool,
+) -> Result<()> {
+    let is_resuming = state.cursor.started;
+    let (old_parent_id_str, new_base) = branch_rebase_target(state, branch)?;
 
-    set_aside::restore_all(repo, &mut state, set_aside::Phase::Completion)?;
+    // Check if the branch is already rebased (e.g. by a previous --update-refs)
+    let is_done = branch_rebase_completed(repo, state, branch)?;
+
+    if is_done && (is_resuming || *replayed_any) && !git_rebase_in_progress(repo) {
+        println!("Branch {} already rebased.", branch);
+        if is_resuming {
+            *replayed_any = true;
+        }
+        state.advance();
+        return save_state(repo, state);
+    }
+
+    let options = state.rebase_options;
+    if resumed && options.no_restart {
+        let operation = state.operation;
+        return Err(anyhow!(
+            "{} did not complete: '{}' is not rebased onto '{}'. If the Git rebase was aborted manually, run 'kin abort' to clear the saved {} state or rerun 'kin {}'.",
+            operation.title(),
+            branch,
+            new_base,
+            operation.command(),
+            operation.command()
+        ));
+    }
+
+    if !is_resuming {
+        state.cursor.started = true;
+        save_state(repo, state)?;
+    }
+
+    println!("Rebasing {}...", branch);
+    let mut rebase = git_command(repo);
+    rebase.arg("rebase");
+    if options.keep_cherry_picks {
+        rebase.args(["--reapply-cherry-picks", "--empty=keep"]);
+    }
+    if !options.fast_forward {
+        rebase.arg("--no-ff");
+    }
+    // Kindra owns every set-aside: Git's autostash (or `rebase.autostash`)
+    // would restore the changes on each replayed branch instead.
+    rebase.arg("--no-autostash");
+    if !options.keep_other_refs {
+        rebase.arg("--update-refs");
+    }
+    let status = rebase
+        .arg("--onto")
+        .arg(&new_base)
+        .arg(&old_parent_id_str)
+        .arg(branch)
+        .status()?;
+
+    if status.success() {
+        state.advance();
+        *replayed_any = true;
+        return save_state(repo, state);
+    }
+    // A rebase in progress started but hit conflicts: the step stays started.
+    if git_rebase_in_progress(repo) {
+        save_state(repo, state)?;
+        return Err(anyhow!(
+            "Rebase failed for branch {}. Resolve conflicts and run 'kin continue'.",
+            branch
+        ));
+    }
+    state.cursor.started = false;
+    save_state(repo, state)?;
+    if options.no_restart {
+        let command = state.operation.command();
+        return Err(anyhow!(
+            "git rebase failed before {command} could enter an in-progress state. Run 'kin abort' to clear the saved state, then run 'kin {command}' again (or otherwise fix the rebase)."
+        ));
+    }
+    Err(anyhow!(
+        "Rebase failed for branch {}. It seems to have failed before starting (e.g., dirty working tree). Fix the issue and run 'kin continue'.",
+        branch
+    ))
+}
+
+/// Start a fold or move `step`, which rewrites the checked-out branch in
+/// place, and return once its rebase completed. The journal is saved with the
+/// step started before the rebase is attempted, so a conflict (or a crash)
+/// leaves it for `kin continue` to finish. A rebase that never started
+/// returns [`RebaseNotStarted`] with the step marked not started in `state`
+/// only: the saved journal still says started, so the caller must clear it,
+/// or save it marked `abort_only`, before returning.
+fn in_place_step(repo: &Repository, state: &mut RebaseState, step: &Step) -> Result<()> {
+    state.cursor.started = true;
+    save_state(repo, state)?;
+
+    let (attempt, conflict) = match step {
+        Step::Autosquash {
+            base,
+            anchor_forks,
+            no_rebase_merges,
+            ..
+        } => (
+            autosquash(repo, state, base.as_deref(), *anchor_forks, *no_rebase_merges),
+            "git rebase --autosquash failed. Resolve conflicts and run 'kin continue', or run 'kin abort'.".to_string(),
+        ),
+        Step::MoveCommit { branch, onto } => (
+            move_commit(repo, branch, onto),
+            format!(
+                "Moving the commit onto '{onto}' hit conflicts. Resolve them and run 'kin continue', or run 'kin abort' to undo the commit and get the changes back staged."
+            ),
+        ),
+        _ => return Ok(()),
+    };
+    let Err(err) = attempt else {
+        return Ok(());
+    };
+    if git_rebase_in_progress(repo) {
+        save_state(repo, state)?;
+        return Err(anyhow!(conflict));
+    }
+    state.cursor.started = false;
+    Err(RebaseNotStarted(err).into())
+}
+
+/// Run the rebase of a [`Step::Autosquash`]. The error says why it failed;
+/// whether it stopped or never started is for the caller to tell.
+fn autosquash(
+    repo: &Repository,
+    state: &RebaseState,
+    base: Option<&str>,
+    anchor_forks: bool,
+    no_rebase_merges: bool,
+) -> Result<()> {
+    let sequence_editor = if anchor_forks {
+        crate::rebase_todo::absorb_sequence_editor_command()?
+    } else {
+        "true".to_string()
+    };
+    let mut cmd = git_command(repo);
+    cmd.env("GIT_SEQUENCE_EDITOR", sequence_editor);
+    if state.suppress_editor {
+        // squash! folds must never open a commit-message editor; `kin
+        // continue` does the same when it resumes one.
+        cmd.env("GIT_EDITOR", "true");
+    }
+    cmd.arg("rebase")
+        .arg("-i")
+        .arg("--autosquash")
+        // Everything is set aside by Kindra; `rebase.autostash` must not have
+        // Git set anything aside itself.
+        .arg("--no-autostash");
+    if no_rebase_merges {
+        cmd.arg("--no-rebase-merges");
+    }
+    // Always move the branch tips inside the rewritten range with the fold,
+    // rather than rely on the ambient `rebase.updateRefs` config: this moves
+    // the ancestor branches below HEAD and any sibling sharing a folded
+    // commit. Branches stacked above the range are replayed by later steps.
+    cmd.arg("--update-refs").arg(base.unwrap_or("--root"));
+    // A spawn error means no rebase started at all.
+    match cmd.status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(anyhow!("git rebase --autosquash failed before starting.")),
+        Err(err) => Err(anyhow::Error::from(err).context("failed to run git rebase --autosquash.")),
+    }
+}
+
+/// Run the rebase of a [`Step::MoveCommit`]: replay `onto..branch` with the
+/// commit at `branch`'s tip moved to the bottom, claiming `onto`'s ref.
+fn move_commit(repo: &Repository, branch: &str, onto: &str) -> Result<()> {
+    let commit = repo.revparse_single(&format!("refs/heads/{branch}"))?.id();
+    println!("Moving the new commit onto '{}'...", onto);
+    let mut cmd = git_command(repo);
+    cmd.env(
+        "GIT_SEQUENCE_EDITOR",
+        crate::rebase_todo::sequence_editor_command(
+            &commit.to_string(),
+            &format!("refs/heads/{onto}"),
+        )?,
+    )
+    .arg("rebase")
+    .arg("-i")
+    // The replay must move exactly the one commit and change nothing else, so
+    // neutralize the ambient config that would otherwise edit the todo
+    // underneath us: `rebase.autosquash` would fold any `fixup!`/`squash!`
+    // commit already in the range, and `rebase.rebaseMerges` would rewrite the
+    // todo into labels and merges.
+    .arg("--no-autosquash")
+    .arg("--no-rebase-merges")
+    .arg("--update-refs")
+    // The unstaged changes are set aside; `rebase.autostash` must not have Git
+    // set anything aside itself.
+    .arg("--no-autostash")
+    .arg(onto);
+    match cmd.status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(anyhow!(
+            "Moving the commit onto '{}' failed before the rebase started.",
+            onto
+        )),
+        Err(err) => Err(anyhow::Error::from(err).context(format!(
+            "failed to run the rebase moving the commit onto '{onto}'."
+        ))),
+    }
+}
+
+/// Run a [`Step::Complete`] that checks out `checkout`.
+fn complete_step(repo: &Repository, state: &mut RebaseState, checkout: Option<&str>) -> Result<()> {
+    if let Some(restore_branch) = checkout {
+        println!(
+            "Operation completed. Checking out original branch {}...",
+            restore_branch
+        );
+        checkout_branch(repo, restore_branch).map_err(|e| {
+            anyhow!(
+                "Failed to checkout back to original branch '{}'. State file preserved. {}",
+                restore_branch,
+                e
+            )
+        })?;
+    }
+
+    set_aside::restore_all(repo, state, set_aside::Phase::Completion)?;
 
     if state.unstage_on_restore {
         unstage_all(repo)?;
@@ -1484,7 +1882,8 @@ fn parse_git_semver(version_output: &str) -> Option<(u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        JOURNAL_VERSION, Operation, RebaseOptions, RebaseState, parse_git_semver, parse_state,
+        Cursor, JOURNAL_VERSION, Operation, RebaseOptions, RebaseState, Step, parse_git_semver,
+        parse_state,
     };
     use crate::set_aside::{Kind, Restore, SetAside, SetAsides};
     use std::collections::HashMap;
@@ -1498,8 +1897,14 @@ mod tests {
         parse_state(Path::new("journal.json"), json)
     }
 
+    /// A paused commit's fold, as a journal before version 4 recorded it.
     const LEGACY_FIELDS: &str = r#""operation":"Commit","original_branch":"a",
         "target_branch":"a","remaining_branches":[],"in_progress_branch":"a""#;
+
+    /// The same, as this Kindra records it.
+    const CURRENT_FIELDS: &str = r#""operation":"Commit","original_branch":"a",
+        "target_branch":"a","steps":[{"kind":"Autosquash","branch":"a","base":null},
+        {"kind":"Complete","checkout":null}],"cursor":{"step":0,"started":true}"#;
 
     #[test]
     fn a_legacy_journal_with_autostash_keeps_it_and_its_unstaged_changes() {
@@ -1526,7 +1931,7 @@ mod tests {
     /// `false`, which is what it means to every Kindra that reads it.
     #[test]
     fn autostash_is_saved_only_while_an_older_journal_still_asks_for_it() {
-        let mut state = saved(&format!("{{{LEGACY_FIELDS}}}"));
+        let mut state = saved(&format!("{{{CURRENT_FIELDS}}}"));
         assert!(!state.legacy_autostash);
         let journal = serde_json::to_value(&state).unwrap();
         assert!(journal.get("autostash").is_none(), "{journal}");
@@ -1559,11 +1964,14 @@ mod tests {
     #[test]
     fn a_versioned_journal_ignores_fields_it_no_longer_has() {
         let state = loaded(&format!(
-            r#"{{"version":{JOURNAL_VERSION},"journal":{{{LEGACY_FIELDS},
-                "stash_ref":"kin-commit-on-1-2"}}}}"#
+            r#"{{"version":{JOURNAL_VERSION},"journal":{{{CURRENT_FIELDS},
+                "stash_ref":"kin-commit-on-1-2","remaining_branches":["b"],
+                "in_progress_branch":"b"}}}}"#
         ))
         .unwrap();
         assert!(state.set_asides.is_empty());
+        assert!(state.remaining_branches().is_empty());
+        assert_eq!(state.steps.len(), 2);
     }
 
     /// Every version up to this Kindra's reads the same way; a version 1
@@ -1571,8 +1979,13 @@ mod tests {
     #[test]
     fn a_journal_of_an_older_or_the_current_version_is_read() {
         for version in 1..=JOURNAL_VERSION {
+            let fields = if version < 4 {
+                LEGACY_FIELDS
+            } else {
+                CURRENT_FIELDS
+            };
             let state = loaded(&format!(
-                r#"{{"version":{version},"journal":{{{LEGACY_FIELDS},"set_asides":[
+                r#"{{"version":{version},"journal":{{{fields},"set_asides":[
                     {{"kind":"UnstagedOnly","stash":"kin-commit-on-1-2","oid":"abc",
                       "restore":"Plain"}}]}}}}"#
             ))
@@ -1604,8 +2017,8 @@ mod tests {
 
     #[test]
     fn a_journal_with_a_newer_version_is_refused_with_advice() {
-        assert_eq!(JOURNAL_VERSION, 3);
-        for version in ["4", "5", r#""3""#] {
+        assert_eq!(JOURNAL_VERSION, 4);
+        for version in ["5", "6", r#""4""#] {
             let err = loaded(&format!(r#"{{"version":{version},"journal":{{}}}}"#))
                 .err()
                 .unwrap()
@@ -1753,6 +2166,185 @@ mod tests {
                 "no_restart": false,
             })
         );
+    }
+
+    fn replay(branch: &str) -> Step {
+        Step::Replay {
+            branch: branch.to_string(),
+        }
+    }
+
+    fn complete(checkout: &str) -> Step {
+        Step::Complete {
+            checkout: Some(checkout.to_string()),
+        }
+    }
+
+    /// A journal of every version before 4, in the envelope it was saved in
+    /// (none for a flat one), with `progress` as its progress fields.
+    fn legacy_journals(progress: &str) -> Vec<(String, RebaseState)> {
+        let fields = format!(
+            r#""operation":"Move","original_branch":"a","target_branch":"main",
+                "parent_id_map":{{"a":"1111","b":"2222"}},{progress}"#
+        );
+        let mut journals = vec![("flat".to_string(), format!("{{{fields}}}"))];
+        for version in 1..4 {
+            journals.push((
+                format!("version {version}"),
+                format!(r#"{{"version":{version},"journal":{{{fields}}}}}"#),
+            ));
+        }
+        journals
+            .into_iter()
+            .map(|(name, json)| {
+                let state = loaded(&json).unwrap_or_else(|err| panic!("{name}: {err}"));
+                (name, state)
+            })
+            .collect()
+    }
+
+    /// Before version 4 a journal recorded the branches left to replay and
+    /// the branch in progress. The first remaining branch being the one in
+    /// progress means its replay started; the rest follow, and the operation
+    /// finishes on the original branch.
+    #[test]
+    fn a_journal_before_version_4_replaying_a_branch_converts_to_a_started_replay() {
+        for (name, state) in legacy_journals(
+            r#""remaining_branches":["a","b"],"in_progress_branch":"a",
+               "caller_branch":null"#,
+        ) {
+            assert_eq!(
+                state.steps,
+                [replay("a"), replay("b"), complete("a")],
+                "{name}"
+            );
+            assert_eq!(
+                state.cursor,
+                Cursor {
+                    step: 0,
+                    started: true
+                },
+                "{name}"
+            );
+            assert_eq!(state.remaining_branches(), ["a", "b"], "{name}");
+            let journal = serde_json::to_value(&state).unwrap();
+            assert!(journal.get("remaining_branches").is_none(), "{name}");
+            assert!(journal.get("in_progress_branch").is_none(), "{name}");
+        }
+    }
+
+    /// With no branch in progress, nothing has started, and a journal with a
+    /// caller branch finishes there.
+    #[test]
+    fn a_journal_before_version_4_between_replays_converts_to_an_unstarted_replay() {
+        for (name, state) in legacy_journals(
+            r#""remaining_branches":["b"],"in_progress_branch":null,
+               "caller_branch":"c""#,
+        ) {
+            assert_eq!(state.steps, [replay("b"), complete("c")], "{name}");
+            assert_eq!(state.cursor, Cursor::default(), "{name}");
+        }
+    }
+
+    /// A branch in progress that is not left to replay was being rewritten in
+    /// place: a commit's or absorb's fold, or a commit's move onto an
+    /// ancestor. It becomes a stopped rebase ahead of the replays, which
+    /// `kin continue` finishes but never starts.
+    #[test]
+    fn a_journal_before_version_4_rewriting_in_place_converts_to_a_stopped_rebase() {
+        for (name, state) in
+            legacy_journals(r#""remaining_branches":["b"],"in_progress_branch":"a""#)
+        {
+            assert_eq!(
+                state.steps,
+                [
+                    Step::StoppedRebase {
+                        branch: "a".to_string()
+                    },
+                    replay("b"),
+                    complete("a"),
+                ],
+                "{name}"
+            );
+            assert_eq!(
+                state.cursor,
+                Cursor {
+                    step: 0,
+                    started: true
+                },
+                "{name}"
+            );
+            assert_eq!(state.started_branch(), Some("a"), "{name}");
+            assert_eq!(state.remaining_branches(), ["b"], "{name}");
+        }
+    }
+
+    /// Nothing left to replay and nothing in progress: only finishing is left.
+    #[test]
+    fn a_finished_journal_before_version_4_converts_to_its_completion() {
+        for (name, state) in legacy_journals(r#""remaining_branches":[],"in_progress_branch":null"#)
+        {
+            assert_eq!(state.steps, [complete("a")], "{name}");
+            assert!(!state.rebases_remain(), "{name}");
+        }
+    }
+
+    /// A journal before version 4 without `remaining_branches` never parsed,
+    /// and still does not; one of version 4 needs `steps`.
+    #[test]
+    fn a_journal_without_its_progress_is_unreadable() {
+        let fields = r#""operation":"Move","original_branch":"a","target_branch":"main""#;
+        for json in [
+            format!("{{{fields}}}"),
+            format!(r#"{{"version":3,"journal":{{{fields}}}}}"#),
+            format!(r#"{{"version":4,"journal":{{{fields},"remaining_branches":[]}}}}"#),
+        ] {
+            let err = loaded(&json).err().unwrap().to_string();
+            assert!(err.contains("Could not read the paused operation"), "{err}");
+        }
+    }
+
+    /// Steps and the cursor round-trip in the shape documented in the journal.
+    #[test]
+    fn steps_and_the_cursor_are_saved_by_kind() {
+        let state = RebaseState {
+            steps: vec![
+                Step::Autosquash {
+                    branch: "a".to_string(),
+                    base: Some("1111".to_string()),
+                    anchor_forks: true,
+                    no_rebase_merges: true,
+                },
+                Step::MoveCommit {
+                    branch: "a".to_string(),
+                    onto: "b".to_string(),
+                },
+                replay("c"),
+                Step::Complete { checkout: None },
+            ],
+            cursor: Cursor {
+                step: 2,
+                started: true,
+            },
+            ..saved(&format!("{{{CURRENT_FIELDS}}}"))
+        };
+        let journal = serde_json::to_value(&state).unwrap();
+        assert_eq!(
+            journal["steps"],
+            serde_json::json!([
+                {"kind": "Autosquash", "branch": "a", "base": "1111", "anchor_forks": true,
+                 "no_rebase_merges": true},
+                {"kind": "MoveCommit", "branch": "a", "onto": "b"},
+                {"kind": "Replay", "branch": "c"},
+                {"kind": "Complete", "checkout": null},
+            ])
+        );
+        assert_eq!(
+            journal["cursor"],
+            serde_json::json!({"step": 2, "started": true})
+        );
+        assert_eq!(saved(&journal.to_string()).steps, state.steps);
+        assert_eq!(state.started_branch(), Some("c"));
     }
 
     #[test]

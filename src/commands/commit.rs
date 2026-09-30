@@ -1,8 +1,8 @@
 use crate::commands::find_upstream;
 use crate::rebase_utils::{
-    RebaseState, check_worktrees, checkout_branch, clear_state, git_rebase_in_progress,
-    has_staged_changes, local_branch_tips_in_range, record_branch_tips_in_range, run_rebase_loop,
-    save_state,
+    RebaseNotStarted, RebaseState, Step, check_worktrees, checkout_branch, clear_state,
+    has_staged_changes, local_branch_tips_in_range, record_branch_tips_in_range, replay_plan,
+    run_rebase_loop, save_state,
 };
 use crate::repository::git_command;
 use crate::set_aside::{self, Outcome, Phase, SetAside};
@@ -304,11 +304,6 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
 
     let will_rebase = should_rebase && target_has_dependents && !remaining_branches.is_empty();
     let needs_autosquash = is_fixup;
-    let autosquash_state_required = needs_autosquash && !switching_branches && !will_rebase;
-    // The move rebase always needs saved state (it stashes and rewrites branch
-    // tips); this is the flag for the case where no dependent restack follows, so
-    // the tail work the rebase loop would otherwise do falls to us.
-    let move_state_required = moving_onto_ancestor && !will_rebase;
 
     // The check_worktrees call must run before the code path that performs the commit and
     // mutates target_branch so failures don't leave state unpersisted.
@@ -426,9 +421,46 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
             )?;
         }
 
+        // The plan: fold the fixup, or move the new commit onto the ancestor,
+        // in place on the branch the commit lands on; then restack the
+        // dependents; then finish, back on the caller branch when the commit
+        // switched branches. An in-place rewrite alone never leaves the branch
+        // it started on, so it finishes without a checkout.
+        let mut steps = Vec::new();
+        if let Some(ancestor_target) = &ancestor_on_target {
+            steps.push(Step::MoveCommit {
+                branch: current_branch_name.clone(),
+                onto: ancestor_target.clone(),
+            });
+        }
+        if needs_autosquash {
+            let fixup_commit = repo.find_commit(Oid::from_str(&fixup_commit_id)?)?;
+            steps.push(Step::Autosquash {
+                branch: target_branch.clone(),
+                base: autosquash_base(&fixup_commit)?.map(|base| base.to_string()),
+                anchor_forks: false,
+                no_rebase_merges: false,
+            });
+        }
+        let replays = if will_rebase {
+            remaining_branches
+        } else {
+            Vec::new()
+        };
+        let checkout = if switching_branches {
+            Some(current_branch_name.as_str())
+        } else if pre_commit_state_required {
+            Some(target_branch.as_str())
+        } else {
+            None
+        };
+        steps.extend(replay_plan(&replays, checkout));
+
         let mut state = RebaseState {
             operation: crate::rebase_utils::Operation::Commit,
             rebase_options: Default::default(),
+            steps,
+            cursor: Default::default(),
             original_branch: target_branch.clone(),
             // The branch the commit lands on. Moving onto an ancestor rewrites
             // the current branch in place, but the commit goes to the ancestor.
@@ -440,12 +472,6 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
             } else {
                 None
             },
-            remaining_branches: if will_rebase {
-                remaining_branches
-            } else {
-                Vec::new()
-            },
-            in_progress_branch: None,
             parent_id_map,
             parent_name_map,
             new_base_map: HashMap::new(),
@@ -600,153 +626,34 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
                     "The commit was created on this branch but the move could not be started; it is still at HEAD.",
                 ));
             }
-
-            println!("Moving the new commit onto '{}'...", ancestor_target);
-            let mut cmd = git_command(repo);
-            cmd.env(
-                "GIT_SEQUENCE_EDITOR",
-                crate::rebase_todo::sequence_editor_command(
-                    &moved_commit_id.to_string(),
-                    &format!("refs/heads/{}", ancestor_target),
-                )?,
-            )
-            .arg("rebase")
-            .arg("-i")
-            // The replay must move exactly the one commit and change nothing
-            // else, so neutralize the ambient config that would otherwise edit
-            // the todo underneath us: `rebase.autosquash` would fold any
-            // `fixup!`/`squash!` commit already in the range, and
-            // `rebase.rebaseMerges` would rewrite the todo into labels and
-            // merges.
-            .arg("--no-autosquash")
-            .arg("--no-rebase-merges")
-            .arg("--update-refs")
-            // The unstaged changes are set aside above; `rebase.autostash`
-            // must not have Git set anything aside itself.
-            .arg("--no-autostash");
-            cmd.arg(ancestor_target);
-
-            let failure = match cmd.status() {
-                Ok(status) if status.success() => None,
-                Ok(_) => Some(anyhow!(
-                    "Moving the commit onto '{}' failed before the rebase started.",
-                    ancestor_target
-                )),
-                Err(err) => Some(anyhow::Error::from(err).context(format!(
-                    "failed to run the rebase moving the commit onto '{ancestor_target}'."
-                ))),
-            };
-            if let Some(err) = failure {
-                if git_rebase_in_progress(repo) {
-                    // Record which branch is mid-rebase so `kin continue` matches
-                    // the saved state, exactly as the autosquash path does.
-                    state.in_progress_branch = Some(current_branch_name.clone());
-                    save_state(repo, &state)?;
-                    return Err(anyhow!(
-                        "Moving the commit onto '{}' hit conflicts. Resolve them and run 'kin continue', or run 'kin abort' to undo the commit and get the changes back staged.",
-                        ancestor_target
-                    ));
-                }
-                // Nothing moved, so `kin continue` must not find state to
-                // finish: it would restack the dependents onto the commit
-                // left on this branch and report the move as completed.
-                return Err(unwind_unstarted_rebase(
-                    repo,
-                    &mut state,
-                    target_old_head_id,
-                    err,
-                ));
-            }
-
-            if move_state_required {
-                set_aside::restore_all(repo, &mut state, Phase::Completion)?;
-                clear_state(repo)?;
-                return Ok(());
-            }
         }
 
-        if needs_autosquash {
-            // An in-place fold (with or without dependents to restack after it)
-            // sets the unstaged changes aside only *after* the fixup commit: the
-            // staged content we're folding in is now committed, so a
-            // `--keep-index` stash captures genuinely unstaged leftovers rather
-            // than re-capturing (and later re-applying) the fixup content. The
-            // checkout path set them aside before switching branches.
-            if !switching_branches {
-                set_aside_after_commit(repo, &mut state, target_old_head_id)?;
-            }
-
-            let fixup_commit = repo.find_commit(Oid::from_str(&fixup_commit_id)?)?;
-            let autosquash_base_arg = match autosquash_base(&fixup_commit)? {
-                Some(base) => base.to_string(),
-                None => "--root".to_string(),
-            };
-
-            let mut cmd = git_command(repo);
-            cmd.env("GIT_SEQUENCE_EDITOR", "true")
-                .arg("rebase")
-                .arg("-i")
-                .arg("--autosquash")
-                // Everything is set aside by Kindra; `rebase.autostash` must not
-                // have Git set anything aside itself.
-                .arg("--no-autostash");
-            // Always move the branch tips inside the rewritten range with the fold
-            // rather than relying on the ambient `rebase.updateRefs` git config
-            // (off by default): this moves an inline fixup's below-HEAD ancestor
-            // branches and any sibling branch sharing the folded commit (e.g. a
-            // shared-head interactive pick). Branches stacked *above* the range are
-            // restacked afterwards by the rebase loop, which skips any this moved.
-            // (Support for `--update-refs` is verified up front in the validation
-            // path above, before any state is mutated.)
-            cmd.arg("--update-refs");
-            cmd.arg(&autosquash_base_arg);
-
-            // A spawn error means no rebase started at all, so it takes the same
-            // unwind as a pre-start rejection rather than `?`-returning past it
-            // with the fixup commit and saved state left behind.
-            let failure = match cmd.status() {
-                Ok(status) if status.success() => None,
-                Ok(_) => Some(anyhow!("git rebase --autosquash failed before starting.")),
-                Err(err) => {
-                    Some(anyhow::Error::from(err).context("failed to run git rebase --autosquash."))
-                }
-            };
-
-            if let Some(err) = failure {
-                if git_rebase_in_progress(repo) {
-                    // The autosquash rebase paused on a conflict. Record which
-                    // branch is mid-rebase so `kin continue` matches the saved
-                    // state — required whether or not the target has dependents
-                    // (a missing in_progress_branch makes `kin continue` refuse).
-                    state.in_progress_branch = Some(target_branch.clone());
-                    save_state(repo, &state)?;
-                    return Err(anyhow!(
-                        "git rebase --autosquash failed. Resolve conflicts and run 'kin continue', or run 'kin abort'."
-                    ));
-                }
-                return Err(unwind_unstarted_rebase(
-                    repo,
-                    &mut state,
-                    target_old_head_id,
-                    err,
-                ));
-            }
-
-            if autosquash_state_required {
-                set_aside::restore_all(repo, &mut state, Phase::Completion)?;
-                clear_state(repo)?;
-            }
-        }
-
-        if !pre_commit_state_required {
-            return Ok(());
+        // An in-place fold (with or without dependents to restack after it)
+        // sets the unstaged changes aside only *after* the fixup commit: the
+        // staged content we're folding in is now committed, so a
+        // `--keep-index` stash captures genuinely unstaged leftovers rather
+        // than re-capturing (and later re-applying) the fixup content. The
+        // checkout path set them aside before switching branches.
+        if needs_autosquash && !switching_branches {
+            set_aside_after_commit(repo, &mut state, target_old_head_id)?;
         }
 
         // Refresh repo state after commit
         let repo = crate::open_repo()?;
-        let _new_target_head_id = repo.revparse_single(&target_branch)?.id();
 
-        run_rebase_loop(&repo, state)
+        // Run the plan. A fold or move whose rebase never started rewrote
+        // nothing, so `kin continue` must not find state to finish: it would
+        // restack the dependents onto the raw `fixup!` commit, or onto the
+        // commit left on this branch, and report the operation as completed.
+        match RebaseNotStarted::reason(run_rebase_loop(&repo, &mut state))? {
+            None => Ok(()),
+            Some(err) => Err(unwind_unstarted_rebase(
+                &repo,
+                &mut state,
+                target_old_head_id,
+                err,
+            )),
+        }
     } else {
         // Run the actual git commit
         let status = git_command(repo)
@@ -903,8 +810,11 @@ fn commit_on_new_branch(
         target_branch: branch_name.clone(),
         // End on the new branch, not the branch we started on.
         caller_branch: None,
-        remaining_branches: children.iter().map(|c| c.name.clone()).collect(),
-        in_progress_branch: None,
+        steps: replay_plan(
+            &children.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+            Some(&branch_name),
+        ),
+        cursor: Default::default(),
         parent_id_map,
         parent_name_map,
         new_base_map: HashMap::new(),
@@ -934,7 +844,7 @@ fn commit_on_new_branch(
     println!(
         "Created branch '{branch_name}' and inserting it into the stack; restacking dependents..."
     );
-    run_rebase_loop(repo, state)
+    run_rebase_loop(repo, &mut state)
 }
 
 /// Resolve the branch name for `-b`/`--new-branch`: an explicit name is validated

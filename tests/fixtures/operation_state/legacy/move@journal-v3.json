@@ -4,27 +4,28 @@
     "caller_branch": null,
     "cleanup_checkout_fallback": null,
     "cleanup_merged_branches": [],
-    "cursor": {
-      "started": true,
-      "step": 0
-    },
+    "in_progress_branch": "feature-a",
     "new_base_map": {},
-    "operation": "Commit",
-    "original_branch": "inserted",
-    "original_commit_count_map": {},
+    "operation": "Move",
+    "original_branch": "feature-a",
+    "original_commit_count_map": {
+      "feature-a": 1,
+      "feature-b": 1
+    },
     "original_tip_map": {
-      "feature-b": "<feature-b@before>",
-      "inserted": "<inserted@paused>"
+      "feature-a": "<feature-a@before>",
+      "feature-b": "<feature-b@before>"
     },
     "owned_tip_map": {
-      "feature-b": "<feature-b@before>",
-      "inserted": "<inserted@paused>"
+      "feature-a": "<feature-a@before>",
+      "feature-b": "<feature-b@before>"
     },
     "parent_id_map": {
+      "feature-a": "<main@before>",
       "feature-b": "<feature-a@before>"
     },
     "parent_name_map": {
-      "feature-b": "inserted"
+      "feature-b": "feature-a"
     },
     "preserve_content_on_abort": false,
     "rebase_options": {
@@ -33,20 +34,14 @@
       "keep_other_refs": false,
       "no_restart": false
     },
-    "set_asides": [],
-    "steps": [
-      {
-        "branch": "feature-b",
-        "kind": "Replay"
-      },
-      {
-        "checkout": "inserted",
-        "kind": "Complete"
-      }
+    "remaining_branches": [
+      "feature-a",
+      "feature-b"
     ],
+    "set_asides": [],
     "suppress_editor": false,
-    "target_branch": "inserted",
+    "target_branch": "other",
     "unstage_on_restore": false
   },
-  "version": 4
+  "version": 3
 }

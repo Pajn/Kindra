@@ -1,5 +1,5 @@
 use crate::commands::find_upstream;
-use crate::rebase_utils::{Operation, RebaseState, begin_replay, run_rebase_loop};
+use crate::rebase_utils::{Operation, RebaseState, begin_replay, replay_plan, run_rebase_loop};
 use anyhow::{Result, anyhow};
 use clap::Args;
 use std::collections::{HashMap, HashSet};
@@ -110,11 +110,11 @@ fn reorder_locked(repo: &git2::Repository, args: &ReorderArgs) -> Result<()> {
         let state = RebaseState {
             operation: Operation::Reorder,
             rebase_options: Default::default(),
+            steps: replay_plan(&plan.remaining_branches, Some(&current_branch_name)),
+            cursor: Default::default(),
             original_branch: current_branch_name,
             target_branch: upstream_name,
             caller_branch: None,
-            remaining_branches: plan.remaining_branches,
-            in_progress_branch: None,
             parent_id_map: plan.parent_id_map,
             parent_name_map: current_parent_map,
             new_base_map: plan.new_base_map,
@@ -147,7 +147,7 @@ fn reorder_locked(repo: &git2::Repository, args: &ReorderArgs) -> Result<()> {
     let _snapshot = crate::oplog::begin(repo, "reorder")?;
     begin_replay(repo, &mut state, autostash)?;
     draft.discard();
-    run_rebase_loop(repo, state)
+    run_rebase_loop(repo, &mut state)
 }
 
 fn edit_parent_map(

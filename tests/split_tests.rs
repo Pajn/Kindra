@@ -2,7 +2,7 @@ mod common;
 
 use common::{kin_cmd, make_commit, rebase_state, rebase_state_file, repo_init};
 use git2::{Repository, Signature};
-use kindra::rebase_utils::{Operation, RebaseState, save_state};
+use kindra::rebase_utils::{Cursor, Operation, RebaseState, replay_plan, save_state};
 use std::fs;
 use tempfile::tempdir;
 
@@ -711,8 +711,11 @@ fn test_split_refuses_when_kindra_operation_in_progress() {
     // reconciliation cannot prove the branch is done, so the state is treated as
     // active and any mutating command must refuse.
     let state = RebaseState {
-        remaining_branches: vec!["feature-b".to_string()],
-        in_progress_branch: Some("feature-b".to_string()),
+        steps: replay_plan(&["feature-b".to_string()], Some("feature-b")),
+        cursor: Cursor {
+            step: 0,
+            started: true,
+        },
         ..rebase_state(Operation::Move, "feature-b", "main")
     };
     save_state(&repo, &state).unwrap();

@@ -5,7 +5,7 @@ use common::{
     run_ok, state_file,
 };
 use git2::{BranchType, Repository};
-use kindra::rebase_utils::{Operation, RebaseState, save_state};
+use kindra::rebase_utils::{Cursor, Operation, RebaseState, replay_plan, save_state};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -578,8 +578,14 @@ fn reorder_abort_restores_extra_local_refs_moved_by_update_refs() {
     let alias_tip_before = branch_tip(&repo, "feature-bookmark");
 
     let mut state = RebaseState {
-        remaining_branches: vec!["feature-a".to_string(), "feature-b".to_string()],
-        in_progress_branch: Some("feature-a".to_string()),
+        steps: replay_plan(
+            &["feature-a".to_string(), "feature-b".to_string()],
+            Some("feature-a"),
+        ),
+        cursor: Cursor {
+            step: 0,
+            started: true,
+        },
         parent_id_map: HashMap::from([
             ("feature-a".to_string(), main_id.to_string()),
             ("feature-b".to_string(), feature_a_tip_id.to_string()),
@@ -625,10 +631,12 @@ fn reorder_abort_restores_extra_local_refs_moved_by_update_refs() {
             .unwrap()
     );
 
-    state.remaining_branches = vec!["feature-b".to_string()];
-    state.in_progress_branch = None;
+    state.cursor = Cursor {
+        step: 1,
+        started: false,
+    };
     save_state(&repo, &state).unwrap();
-    state.in_progress_branch = Some("feature-b".to_string());
+    state.cursor.started = true;
     save_state(&repo, &state).unwrap();
 
     run_ok("git", &["checkout", "-f", "feature-b"], dir.path());

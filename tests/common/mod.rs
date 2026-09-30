@@ -771,13 +771,14 @@ pub const MINIMAL_REBASE_STATE_JSON: &str = r#"{
   "operation": "Move",
   "original_branch": "",
   "target_branch": "",
-  "remaining_branches": [],
-  "in_progress_branch": null
+  "steps": []
 }"#;
 
 /// A `RebaseState` for tests, deserialized from [`MINIMAL_REBASE_STATE_JSON`]
-/// so tests keep compiling when the state gains a field. Set the fields a test
-/// cares about with struct update syntax:
+/// so tests keep compiling when the state gains a field. Its plan only
+/// finishes, on `original_branch`; a test that needs replays sets `steps`
+/// (see `kindra::rebase_utils::replay_plan`) and, for one already started,
+/// `cursor`. Set the fields a test cares about with struct update syntax:
 ///
 /// ```ignore
 /// let state = RebaseState {
@@ -796,6 +797,7 @@ pub fn rebase_state(
     state.operation = operation;
     state.original_branch = original_branch.to_string();
     state.target_branch = target_branch.to_string();
+    state.steps = kindra::rebase_utils::replay_plan(&[], Some(original_branch));
     state
 }
 

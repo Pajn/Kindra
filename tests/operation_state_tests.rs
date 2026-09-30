@@ -61,8 +61,11 @@
 //!   still asks the rebase loop to set the tree aside. Version 3 drops
 //!   `replay`: `rebase_options` says how each rebase runs, a tree sync
 //!   records its planned parents in `new_base_map`, and sync finishes in the
-//!   shared rebase loop. The `@journal-v2` fixtures are version 2 journals,
-//!   saved by builds after 1.1.0 that no release shipped.
+//!   shared rebase loop. Version 4 drops `remaining_branches` and
+//!   `in_progress_branch`: the journal records its plan as `steps`, among
+//!   them the fold and move rebases of commit and absorb, and its progress
+//!   as a `cursor`. The `@journal-v2` and `@journal-v3` fixtures are version
+//!   2 and 3 journals, saved by builds after 1.1.0 that no release shipped.
 
 mod common;
 
@@ -992,7 +995,7 @@ fn journal_is_saved_in_an_envelope_older_kindra_cannot_parse() {
     let mut keys: Vec<_> = saved.as_object().unwrap().keys().cloned().collect();
     keys.sort();
     assert_eq!(keys, ["journal", "version"]);
-    assert_eq!(saved["version"], Value::from(3));
+    assert_eq!(saved["version"], Value::from(4));
     assert!(saved["journal"]["operation"].is_string());
 }
 
@@ -1057,8 +1060,8 @@ fn journal_from_a_newer_kindra_is_refused_with_advice() {
 fn journal_with_a_newer_version_is_refused_with_advice() {
     let paused = paused_commit_fixup();
     let mut journal = paused.repo.state_json();
-    assert_eq!(journal["version"], Value::from(3));
-    journal["version"] = Value::from(4);
+    assert_eq!(journal["version"], Value::from(4));
+    journal["version"] = Value::from(5);
     let saved = serde_json::to_string_pretty(&journal).unwrap();
     fs::write(paused.repo.state_path(), &saved).unwrap();
 
@@ -1067,7 +1070,7 @@ fn journal_with_a_newer_version_is_refused_with_advice() {
         assert!(!output.status.success(), "{}", describe(&output));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("newer version of kin"), "{stderr}");
-        assert!(stderr.contains("journal version 4"), "{stderr}");
+        assert!(stderr.contains("journal version 5"), "{stderr}");
         assert!(stderr.contains("kin abort --clear-state"), "{stderr}");
         assert_eq!(fs::read_to_string(paused.repo.state_path()).unwrap(), saved);
         assert!(paused.repo.rebase_in_progress());
@@ -1081,10 +1084,12 @@ fn journal_with_a_newer_version_is_refused_with_advice() {
 }
 
 /// A journal saved in version 1 of the envelope, which holds nothing version 2
-/// added, still resumes to completion.
+/// added, still resumes to completion. Version 1 recorded its progress as
+/// version 3 did, so the frozen version 3 journal stands in for it.
 #[test]
 fn journal_of_an_older_version_still_continues() {
-    let paused = paused_absorb();
+    let mut paused = paused_absorb();
+    paused.install_legacy("absorb@journal-v3");
     let mut journal = paused.repo.state_json();
     assert_eq!(journal["version"], Value::from(3));
     journal["version"] = Value::from(1);
@@ -1724,4 +1729,863 @@ fn legacy_absorb_unnamed_fork_1_1_0_aborts_and_deletes_its_anchors() {
             porcelain: "M  code.txt\n",
         },
     );
+}
+
+// Version 3 journals, saved before the journal recorded steps, record the
+// branches left to replay and the branch in progress. Loading turns them into
+// steps and a cursor; every one of them still continues and aborts.
+
+fn restack_v3_status() -> String {
+    format!("Restack in progress on feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}")
+}
+
+#[test]
+fn legacy_move_journal_v3_aborts() {
+    assert_legacy_replay_aborts(paused_move, "move@journal-v3", &move_status());
+}
+
+#[test]
+fn legacy_move_journal_v3_continues() {
+    assert_legacy_replay_continues(
+        paused_move,
+        "move@journal-v3",
+        "feature-a",
+        &[("other", "feature-a"), ("feature-a", "feature-b")],
+    );
+}
+
+#[test]
+fn legacy_restack_journal_v3_aborts() {
+    assert_legacy_replay_aborts(paused_restack, "restack@journal-v3", &restack_v3_status());
+}
+
+#[test]
+fn legacy_restack_journal_v3_continues() {
+    assert_legacy_replay_continues(
+        paused_restack,
+        "restack@journal-v3",
+        "feature-a",
+        &[("feature-a", "feature-b")],
+    );
+}
+
+#[test]
+fn legacy_reorder_journal_v3_aborts() {
+    assert_legacy_replay_aborts(paused_reorder, "reorder@journal-v3", &reorder_status());
+}
+
+#[test]
+fn legacy_reorder_journal_v3_continues() {
+    let paused = assert_legacy_replay_continues(
+        paused_reorder,
+        "reorder@journal-v3",
+        "feature-a",
+        &[("main", "feature-b"), ("feature-b", "feature-a")],
+    );
+    assert_eq!(paused.repo.rev("feature-b^"), paused.repo.rev("main"));
+}
+
+#[test]
+fn legacy_sync_linear_journal_v3_aborts() {
+    assert_legacy_replay_aborts(
+        paused_sync_linear,
+        "sync_linear@journal-v3",
+        &sync_linear_status(),
+    );
+}
+
+#[test]
+fn legacy_sync_linear_journal_v3_continues() {
+    assert_legacy_replay_continues(
+        paused_sync_linear,
+        "sync_linear@journal-v3",
+        "feature-b",
+        &[("main", "feature-a"), ("feature-a", "feature-b")],
+    );
+}
+
+/// A version 3 linear sync, like a version 2 one, ran its one rebase only
+/// when it started.
+#[test]
+fn legacy_sync_linear_journal_v3_refuses_to_restart_an_abandoned_rebase() {
+    let paused = paused_with_legacy(paused_sync_linear, "sync_linear@journal-v3");
+    paused.repo.git(&["rebase", "--abort"]);
+    let tips = paused.repo.tips();
+
+    let output = paused.repo.kin(&["continue"]);
+    assert!(!output.status.success(), "{}", describe(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Sync did not complete: 'feature-b' is not rebased onto 'main'"),
+        "{stderr}"
+    );
+    assert!(paused.repo.state_path().exists());
+    assert_eq!(paused.repo.tips(), tips);
+
+    paused.abort();
+    paused.assert_restored();
+}
+
+#[test]
+fn legacy_sync_linear_dirty_journal_v3_restores_its_set_aside() {
+    for abort in [false, true] {
+        let paused = paused_with_legacy(paused_sync_linear_dirty, "sync_linear_dirty@journal-v3");
+        if abort {
+            paused.abort();
+            paused.assert_restored();
+        } else {
+            paused.continue_to_completion();
+            assert_eq!(paused.repo.current_branch(), "feature-b");
+            assert!(paused.repo.is_ancestor("main", "feature-a"));
+            assert!(paused.repo.is_ancestor("feature-a", "feature-b"));
+        }
+        assert_eq!(
+            paused.repo.porcelain(),
+            " M b.txt\n?? untracked.txt\n",
+            "abort: {abort}"
+        );
+        assert_eq!(paused.repo.stash_list(), "");
+    }
+}
+
+#[test]
+fn legacy_sync_upstream_journal_v3_aborts() {
+    assert_legacy_replay_aborts(
+        paused_sync_upstream,
+        "sync_upstream@journal-v3",
+        &sync_upstream_status(),
+    );
+}
+
+#[test]
+fn legacy_sync_upstream_journal_v3_continues() {
+    assert_legacy_replay_continues(
+        paused_sync_upstream,
+        "sync_upstream@journal-v3",
+        "main",
+        &[("origin/main", "main")],
+    );
+}
+
+#[test]
+fn legacy_sync_tree_journal_v3_aborts() {
+    assert_legacy_replay_aborts(
+        paused_sync_tree,
+        "sync_tree@journal-v3",
+        &sync_tree_status(),
+    );
+}
+
+#[test]
+fn legacy_sync_tree_journal_v3_continues() {
+    let paused = assert_legacy_replay_continues(
+        paused_sync_tree,
+        "sync_tree@journal-v3",
+        "feature-a",
+        &[
+            ("main", "feature-a"),
+            ("feature-a", "feature-b"),
+            ("feature-a", "feature-c"),
+        ],
+    );
+    assert_eq!(paused.repo.rev("feature-a^"), paused.repo.rev("main"));
+    assert_eq!(paused.repo.rev("feature-b^"), paused.repo.rev("feature-a"));
+    assert_eq!(paused.repo.rev("feature-c^"), paused.repo.rev("feature-a"));
+}
+
+#[test]
+fn legacy_commit_restack_journal_v3_aborts() {
+    assert_legacy_commit_aborts(
+        paused_commit_restack,
+        "commit_restack@journal-v3",
+        &format!("Commit in progress on feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"),
+        COMMIT_RESTACK_ABORTED,
+    );
+}
+
+/// What `kin continue` leaves behind for a paused commit or absorb, besides
+/// no journal, no rebase, no absorb anchors and an empty stash list: the
+/// branch checked out, each `(ancestor, branch)` pair stacked in order,
+/// `git status --porcelain`, and no `fixup!` or `squash!` commit left
+/// between `main` and `folded`, if given.
+struct ContinueOutcome<'a> {
+    ends_on: &'a str,
+    stacked: &'a [(&'a str, &'a str)],
+    porcelain: &'a str,
+    folded: Option<&'a str>,
+}
+
+fn assert_legacy_commit_continues(
+    scenario: fn() -> Paused,
+    fixture: &str,
+    expected: ContinueOutcome,
+) {
+    let paused = paused_with_legacy(scenario, fixture);
+    paused.continue_to_completion();
+    assert_eq!(paused.repo.current_branch(), expected.ends_on);
+    for (ancestor, branch) in expected.stacked {
+        assert!(
+            paused.repo.is_ancestor(ancestor, branch),
+            "{branch} is not stacked on {ancestor}"
+        );
+    }
+    assert_eq!(paused.repo.porcelain(), expected.porcelain);
+    if let Some(branch) = expected.folded {
+        let subjects = paused
+            .repo
+            .git_stdout(&["log", "--format=%s", &format!("main..{branch}")]);
+        assert!(
+            !subjects.contains("fixup!") && !subjects.contains("squash!"),
+            "{subjects}"
+        );
+    }
+    assert_eq!(paused.repo.stash_list(), "");
+    let refs = paused.repo.kindra_refs();
+    assert!(!refs.contains("refs/kindra/absorb/"), "{refs}");
+}
+
+#[test]
+fn legacy_commit_restack_journal_v3_continues() {
+    assert_legacy_commit_continues(
+        paused_commit_restack,
+        "commit_restack@journal-v3",
+        ContinueOutcome {
+            ends_on: "feature-a",
+            stacked: &[("feature-a", "feature-b")],
+            porcelain: "",
+            folded: None,
+        },
+    );
+}
+
+/// Version 3 recorded the ancestor the commit moves onto as the target.
+#[test]
+fn legacy_commit_on_ancestor_journal_v3_aborts() {
+    assert_legacy_commit_aborts(
+        paused_commit_on_ancestor,
+        "commit_on_ancestor@journal-v3",
+        &format!("Commit in progress on feature-a\nRemaining branches: \n{NATIVE_REBASE}"),
+        AbortOutcome {
+            tips: &[
+                ("feature-a", "<feature-a@before>"),
+                ("feature-b", "<feature-b@before>"),
+                ("main", "<main@before>"),
+            ],
+            ends_on: "feature-b",
+            porcelain: "M  shared.txt\n?? unstaged.txt\n",
+        },
+    );
+}
+
+#[test]
+fn legacy_commit_on_ancestor_journal_v3_continues() {
+    assert_legacy_commit_continues(
+        paused_commit_on_ancestor,
+        "commit_on_ancestor@journal-v3",
+        ContinueOutcome {
+            ends_on: "feature-b",
+            stacked: &[("main", "feature-a"), ("feature-a", "feature-b")],
+            porcelain: "?? unstaged.txt\n",
+            folded: None,
+        },
+    );
+}
+
+const COMMIT_FIXUP_ABORTED: AbortOutcome = AbortOutcome {
+    tips: &[
+        ("feature-a", "<feature-a@before>"),
+        ("main", "<main@before>"),
+    ],
+    ends_on: "feature-a",
+    porcelain: "M  shared.txt\n?? unstaged.txt\n",
+};
+
+const COMMIT_FIXUP_CONTINUED: ContinueOutcome = ContinueOutcome {
+    ends_on: "feature-a",
+    stacked: &[("main", "feature-a")],
+    porcelain: "?? unstaged.txt\n",
+    folded: Some("feature-a"),
+};
+
+#[test]
+fn legacy_commit_fixup_journal_v3_aborts() {
+    assert_legacy_commit_aborts(
+        paused_commit_fixup,
+        "commit_fixup@journal-v3",
+        &format!("Commit in progress on feature-a\nRemaining branches: \n{NATIVE_REBASE}"),
+        COMMIT_FIXUP_ABORTED,
+    );
+}
+
+#[test]
+fn legacy_commit_fixup_journal_v3_continues() {
+    assert_legacy_commit_continues(
+        paused_commit_fixup,
+        "commit_fixup@journal-v3",
+        COMMIT_FIXUP_CONTINUED,
+    );
+}
+
+#[test]
+fn legacy_commit_fixup_autostash_journal_v3_aborts() {
+    assert_legacy_commit_aborts(
+        paused_commit_fixup_autostash,
+        "commit_fixup_autostash@journal-v3",
+        &format!("Commit in progress on feature-a\nRemaining branches: \n{NATIVE_REBASE}"),
+        COMMIT_FIXUP_ABORTED,
+    );
+}
+
+#[test]
+fn legacy_commit_fixup_autostash_journal_v3_continues() {
+    assert_legacy_commit_continues(
+        paused_commit_fixup_autostash,
+        "commit_fixup_autostash@journal-v3",
+        COMMIT_FIXUP_CONTINUED,
+    );
+}
+
+#[test]
+fn legacy_commit_fixup_dependents_journal_v3_aborts() {
+    assert_legacy_commit_aborts(
+        paused_commit_fixup_dependents,
+        "commit_fixup_dependents@journal-v3",
+        &format!("Commit in progress on feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}"),
+        AbortOutcome {
+            tips: &[
+                ("feature-a", "<feature-a@before>"),
+                ("feature-b", "<feature-b@before>"),
+                ("main", "<main@before>"),
+            ],
+            ends_on: "feature-a",
+            porcelain: "M  shared.txt\n?? unstaged.txt\n",
+        },
+    );
+}
+
+#[test]
+fn legacy_commit_fixup_dependents_journal_v3_continues() {
+    assert_legacy_commit_continues(
+        paused_commit_fixup_dependents,
+        "commit_fixup_dependents@journal-v3",
+        ContinueOutcome {
+            ends_on: "feature-a",
+            stacked: &[("main", "feature-a"), ("feature-a", "feature-b")],
+            porcelain: "?? unstaged.txt\n",
+            folded: Some("feature-a"),
+        },
+    );
+}
+
+#[test]
+fn legacy_commit_insert_journal_v3_aborts() {
+    assert_legacy_commit_aborts(
+        paused_commit_insert,
+        "commit_insert@journal-v3",
+        &format!("Commit in progress on inserted\nRemaining branches: feature-b\n{NATIVE_REBASE}"),
+        AbortOutcome {
+            tips: &[
+                ("feature-a", "<feature-a@before>"),
+                ("feature-b", "<feature-b@before>"),
+                ("inserted", "<inserted@paused>"),
+                ("main", "<main@before>"),
+            ],
+            ends_on: "inserted",
+            porcelain: "",
+        },
+    );
+}
+
+#[test]
+fn legacy_commit_insert_journal_v3_continues() {
+    assert_legacy_commit_continues(
+        paused_commit_insert,
+        "commit_insert@journal-v3",
+        ContinueOutcome {
+            ends_on: "inserted",
+            stacked: &[("feature-a", "inserted"), ("inserted", "feature-b")],
+            porcelain: "",
+            folded: None,
+        },
+    );
+}
+
+fn absorb_v3_status() -> String {
+    format!("Absorb in progress on feature-a\nRemaining branches: feature-b\n{NATIVE_REBASE}")
+}
+
+#[test]
+fn legacy_absorb_journal_v3_aborts() {
+    assert_legacy_commit_aborts(
+        paused_absorb,
+        "absorb@journal-v3",
+        &absorb_v3_status(),
+        AbortOutcome {
+            tips: &[
+                ("feature-a", "<feature-a@before>"),
+                ("feature-b", "<feature-b@before>"),
+                ("main", "<main@before>"),
+            ],
+            ends_on: "feature-a",
+            porcelain: "M  code.txt\n?? untracked.txt\n",
+        },
+    );
+}
+
+#[test]
+fn legacy_absorb_journal_v3_continues() {
+    assert_legacy_commit_continues(
+        paused_absorb,
+        "absorb@journal-v3",
+        ContinueOutcome {
+            ends_on: "feature-a",
+            stacked: &[("main", "feature-a"), ("feature-a", "feature-b")],
+            porcelain: "?? untracked.txt\n",
+            folded: Some("feature-a"),
+        },
+    );
+}
+
+#[test]
+fn legacy_absorb_unnamed_fork_journal_v3_aborts_and_deletes_its_anchors() {
+    assert_legacy_commit_aborts(
+        paused_absorb_unnamed_fork,
+        "absorb_unnamed_fork@journal-v3",
+        &absorb_v3_status(),
+        AbortOutcome {
+            tips: &[
+                ("feature-a", "<feature-a@before>"),
+                ("feature-b", "<feature-b@before>"),
+                ("main", "<main@before>"),
+            ],
+            ends_on: "feature-a",
+            porcelain: "M  code.txt\n",
+        },
+    );
+}
+
+#[test]
+fn legacy_absorb_unnamed_fork_journal_v3_continues_and_deletes_its_anchors() {
+    assert_legacy_commit_continues(
+        paused_absorb_unnamed_fork,
+        "absorb_unnamed_fork@journal-v3",
+        ContinueOutcome {
+            ends_on: "feature-a",
+            stacked: &[("main", "feature-a"), ("main", "feature-b")],
+            porcelain: "",
+            folded: Some("feature-a"),
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Steps and the cursor
+// ---------------------------------------------------------------------------
+
+/// Stage every conflicted file as `resolved`.
+fn resolve_conflicts(repo: &Repo) {
+    let unmerged = repo.git_stdout(&["diff", "--name-only", "--diff-filter=U"]);
+    assert!(!unmerged.is_empty(), "nothing to resolve");
+    for file in unmerged.lines() {
+        repo.stage(file, "resolved\n");
+    }
+}
+
+/// Finish the stopped rebase with Git alone, resolving each conflict with
+/// `resolved`, as a user who never runs `kin continue` for it would.
+fn finish_rebase_with_git(repo: &Repo) {
+    for _ in 0..8 {
+        resolve_conflicts(repo);
+        let output = git_command(repo.path())
+            .args(["rebase", "--continue"])
+            .env("GIT_EDITOR", "true")
+            .output()
+            .unwrap();
+        if !repo.rebase_in_progress() {
+            assert!(output.status.success(), "{}", describe(&output));
+            return;
+        }
+    }
+    panic!("the rebase did not finish");
+}
+
+/// `main <- feature-a <- {feature-b, feature-c}`, where feature-a adds
+/// `a.txt`, feature-b changes `shared.txt` and feature-c adds `c.txt`.
+fn forked_stack() -> Repo {
+    let repo = Repo::new();
+    repo.branch("feature-a");
+    repo.commit("a.txt", "a\n", "a");
+    repo.branch("feature-b");
+    repo.commit("shared.txt", "b\n", "b");
+    repo.switch("feature-a");
+    repo.branch("feature-c");
+    repo.commit("c.txt", "c\n", "c");
+    repo.switch("feature-a");
+    repo
+}
+
+/// `kin move --onto other` of [`forked_stack`] from feature-a, where `other`
+/// changes the line feature-b changes: the replay of feature-a completes, the
+/// second one, of feature-b, stops, and feature-c's is still to come.
+fn paused_move_at_a_middle_step() -> Paused {
+    let repo = forked_stack();
+    repo.switch("main");
+    repo.branch("other");
+    repo.commit("shared.txt", "other\n", "other");
+    repo.switch("feature-a");
+    Paused::start(repo, &["move", "--onto", "other"])
+}
+
+/// `kin restack` from feature-a after amending it, in `main <- feature-a <-
+/// feature-b <- feature-c <- feature-d`, where feature-c changes the line the
+/// amend rewrote: the replay of feature-b completes, the second one, of
+/// feature-c, stops, and feature-d's is still to come.
+fn paused_restack_at_a_middle_step() -> Paused {
+    let repo = Repo::new();
+    repo.branch("feature-a");
+    repo.commit("shared.txt", "a1\n", "a");
+    repo.branch("feature-b");
+    repo.commit("b.txt", "b\n", "b");
+    repo.branch("feature-c");
+    repo.commit("shared.txt", "c\n", "c");
+    repo.branch("feature-d");
+    repo.commit("d.txt", "d\n", "d");
+    repo.switch("feature-a");
+    repo.stage("shared.txt", "a2\n");
+    repo.git(&["commit", "-q", "--amend", "--no-edit"]);
+    Paused::start(repo, &["restack"])
+}
+
+/// An operation paused on the replay of `stopped`, after the replay of `done`
+/// and before the replay of `later`. Once it completes, each of them sits
+/// directly on the branch named with it.
+struct MiddleStep {
+    scenario: fn() -> Paused,
+    ends_on: &'static str,
+    done: (&'static str, &'static str),
+    stopped: (&'static str, &'static str),
+    later: (&'static str, &'static str),
+}
+
+const MOVE_AT_A_MIDDLE_STEP: MiddleStep = MiddleStep {
+    scenario: paused_move_at_a_middle_step,
+    ends_on: "feature-a",
+    done: ("feature-a", "other"),
+    stopped: ("feature-b", "feature-a"),
+    later: ("feature-c", "feature-a"),
+};
+
+const RESTACK_AT_A_MIDDLE_STEP: MiddleStep = MiddleStep {
+    scenario: paused_restack_at_a_middle_step,
+    ends_on: "feature-a",
+    done: ("feature-b", "feature-a"),
+    stopped: ("feature-c", "feature-b"),
+    later: ("feature-d", "feature-c"),
+};
+
+/// [`paused_sync_tree`]: feature-a is replayed onto main, feature-b stops,
+/// feature-c follows.
+const SYNC_TREE_AT_A_MIDDLE_STEP: MiddleStep = MiddleStep {
+    scenario: paused_sync_tree,
+    ends_on: "feature-a",
+    done: ("feature-a", "main"),
+    stopped: ("feature-b", "feature-a"),
+    later: ("feature-c", "feature-a"),
+};
+
+impl MiddleStep {
+    /// Pause the operation and check the journal: the replays of `done`,
+    /// `stopped` and `later` in that order, then completion, with the cursor
+    /// on the started replay of `stopped`.
+    fn pause(&self) -> Paused {
+        let paused = (self.scenario)();
+        let journal = &paused.repo.state_json()["journal"];
+        let replays: Vec<_> = journal["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|step| step["kind"] == "Replay")
+            .map(|step| step["branch"].as_str().unwrap().to_string())
+            .collect();
+        let at = replays.iter().position(|b| b == self.stopped.0).unwrap();
+        assert_eq!(
+            replays[at - 1..=at + 1],
+            [self.done.0, self.stopped.0, self.later.0],
+            "{journal}"
+        );
+        assert_eq!(journal["cursor"]["started"], Value::Bool(true), "{journal}");
+        assert_eq!(
+            journal["steps"][journal["cursor"]["step"].as_u64().unwrap() as usize]["branch"],
+            Value::from(self.stopped.0),
+            "{journal}"
+        );
+        assert!(paused.repo.is_ancestor(self.done.1, self.done.0));
+        paused
+    }
+
+    /// Check the operation completed with every branch in place, `done`
+    /// still at `done_tip`.
+    fn assert_completed(&self, paused: &Paused, done_tip: &str) {
+        assert!(!paused.repo.state_path().exists());
+        assert!(!paused.repo.rebase_in_progress());
+        assert_eq!(paused.repo.current_branch(), self.ends_on);
+        assert_eq!(
+            paused.repo.rev(self.done.0),
+            done_tip,
+            "a done step ran again"
+        );
+        for (branch, parent) in [self.done, self.stopped, self.later] {
+            assert_eq!(
+                paused.repo.rev(&format!("{branch}^")),
+                paused.repo.rev(parent),
+                "{branch} is not directly on {parent}"
+            );
+        }
+        assert_eq!(paused.repo.porcelain(), "");
+        assert_eq!(paused.repo.stash_list(), "");
+    }
+
+    /// Assert `kin continue` succeeded without replaying `done` again, and
+    /// with `later` replayed.
+    fn assert_continued(&self, output: &Output) {
+        assert!(output.status.success(), "{}", describe(output));
+        let out = stdout(output);
+        assert!(
+            !out.contains(&format!("Rebasing {}...", self.done.0)),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("Rebasing {}...", self.later.0)),
+            "{out}"
+        );
+    }
+}
+
+/// Continuing a paused operation finishes the stopped step, runs the steps
+/// after it, and leaves the ones before it alone.
+fn assert_continues_from_a_middle_step(step: MiddleStep) {
+    let paused = step.pause();
+    let done_tip = paused.repo.rev(step.done.0);
+    resolve_conflicts(&paused.repo);
+    let output = paused.repo.kin(&["continue"]);
+    step.assert_continued(&output);
+    assert!(
+        !stdout(&output).contains(&format!("Rebasing {}...", step.stopped.0)),
+        "the stopped replay was started again\n{}",
+        describe(&output)
+    );
+    step.assert_completed(&paused, &done_tip);
+}
+
+/// Aborting it puts back every branch, including those the steps before the
+/// stopped one rewrote.
+fn assert_aborts_from_a_middle_step(step: MiddleStep) {
+    let paused = step.pause();
+    let output = paused.abort();
+    assert!(
+        stdout(&output).contains("Operation aborted (state cleared)."),
+        "{}",
+        describe(&output)
+    );
+    paused.assert_restored();
+    assert_eq!(paused.repo.porcelain(), "");
+}
+
+/// Finishing the stopped rebase with Git first leaves `kin continue` to take
+/// that step as done, from the graph, and to run the rest.
+fn assert_continues_after_git_rebase_continue(step: MiddleStep) {
+    let paused = step.pause();
+    let done_tip = paused.repo.rev(step.done.0);
+    finish_rebase_with_git(&paused.repo);
+    assert!(!paused.repo.rebase_in_progress());
+    let stopped_tip = paused.repo.rev(step.stopped.0);
+
+    let output = paused.repo.kin(&["continue"]);
+    step.assert_continued(&output);
+    assert!(
+        stdout(&output).contains(&format!("Branch {} already rebased.", step.stopped.0)),
+        "{}",
+        describe(&output)
+    );
+    assert_eq!(paused.repo.rev(step.stopped.0), stopped_tip);
+    step.assert_completed(&paused, &done_tip);
+}
+
+/// Giving the stopped rebase up with Git leaves its step started: `kin
+/// continue` replays that branch again, which stops on the same conflict,
+/// and the operation then completes as usual.
+fn assert_continues_after_git_rebase_abort(step: MiddleStep) {
+    let paused = step.pause();
+    let done_tip = paused.repo.rev(step.done.0);
+    let cursor = paused.repo.state_json()["journal"]["cursor"].clone();
+    paused.repo.git(&["rebase", "--abort"]);
+
+    let output = paused.repo.kin(&["continue"]);
+    assert!(!output.status.success(), "{}", describe(&output));
+    let out = stdout(&output);
+    assert!(
+        out.contains(&format!("Rebasing {}...", step.stopped.0)),
+        "{out}"
+    );
+    assert!(
+        !out.contains(&format!("Rebasing {}...", step.done.0)),
+        "{out}"
+    );
+    assert!(paused.repo.rebase_in_progress());
+    assert_eq!(paused.repo.state_json()["journal"]["cursor"], cursor);
+
+    paused.continue_to_completion();
+    step.assert_completed(&paused, &done_tip);
+}
+
+/// Aborting after giving the stopped rebase up with Git still puts every
+/// branch back.
+fn assert_aborts_after_git_rebase_abort(step: MiddleStep) {
+    let paused = step.pause();
+    paused.repo.git(&["rebase", "--abort"]);
+    paused.abort();
+    paused.assert_restored();
+    assert_eq!(paused.repo.porcelain(), "");
+}
+
+#[test]
+fn move_paused_at_a_middle_step_continues_from_it() {
+    assert_continues_from_a_middle_step(MOVE_AT_A_MIDDLE_STEP);
+}
+
+#[test]
+fn move_paused_at_a_middle_step_aborts() {
+    assert_aborts_from_a_middle_step(MOVE_AT_A_MIDDLE_STEP);
+}
+
+#[test]
+fn move_paused_at_a_middle_step_continues_after_git_rebase_continue() {
+    assert_continues_after_git_rebase_continue(MOVE_AT_A_MIDDLE_STEP);
+}
+
+#[test]
+fn move_paused_at_a_middle_step_continues_after_git_rebase_abort() {
+    assert_continues_after_git_rebase_abort(MOVE_AT_A_MIDDLE_STEP);
+}
+
+#[test]
+fn move_paused_at_a_middle_step_aborts_after_git_rebase_abort() {
+    assert_aborts_after_git_rebase_abort(MOVE_AT_A_MIDDLE_STEP);
+}
+
+#[test]
+fn restack_paused_at_a_middle_step_continues_from_it() {
+    assert_continues_from_a_middle_step(RESTACK_AT_A_MIDDLE_STEP);
+}
+
+#[test]
+fn restack_paused_at_a_middle_step_aborts() {
+    assert_aborts_from_a_middle_step(RESTACK_AT_A_MIDDLE_STEP);
+}
+
+#[test]
+fn restack_paused_at_a_middle_step_continues_after_git_rebase_continue() {
+    assert_continues_after_git_rebase_continue(RESTACK_AT_A_MIDDLE_STEP);
+}
+
+#[test]
+fn restack_paused_at_a_middle_step_continues_after_git_rebase_abort() {
+    assert_continues_after_git_rebase_abort(RESTACK_AT_A_MIDDLE_STEP);
+}
+
+#[test]
+fn restack_paused_at_a_middle_step_aborts_after_git_rebase_abort() {
+    assert_aborts_after_git_rebase_abort(RESTACK_AT_A_MIDDLE_STEP);
+}
+
+#[test]
+fn sync_tree_paused_at_a_middle_step_continues_from_it() {
+    assert_continues_from_a_middle_step(SYNC_TREE_AT_A_MIDDLE_STEP);
+}
+
+#[test]
+fn sync_tree_paused_at_a_middle_step_aborts() {
+    assert_aborts_from_a_middle_step(SYNC_TREE_AT_A_MIDDLE_STEP);
+}
+
+#[test]
+fn sync_tree_paused_at_a_middle_step_continues_after_git_rebase_continue() {
+    assert_continues_after_git_rebase_continue(SYNC_TREE_AT_A_MIDDLE_STEP);
+}
+
+#[test]
+fn sync_tree_paused_at_a_middle_step_continues_after_git_rebase_abort() {
+    assert_continues_after_git_rebase_abort(SYNC_TREE_AT_A_MIDDLE_STEP);
+}
+
+#[test]
+fn sync_tree_paused_at_a_middle_step_aborts_after_git_rebase_abort() {
+    assert_aborts_after_git_rebase_abort(SYNC_TREE_AT_A_MIDDLE_STEP);
+}
+
+/// A fold is a step of its own, ahead of the replays of the dependents. Once
+/// the user finishes it with Git, `kin continue` takes it as done and runs
+/// the replay after it.
+#[test]
+fn commit_fold_finished_with_git_rebase_continue_then_continues() {
+    let paused = paused_commit_fixup_dependents();
+    let journal = &paused.repo.state_json()["journal"];
+    assert_eq!(journal["steps"][0]["kind"], "Autosquash", "{journal}");
+    assert_eq!(journal["steps"][1]["kind"], "Replay", "{journal}");
+    assert_eq!(
+        journal["cursor"],
+        serde_json::json!({"step": 0, "started": true})
+    );
+
+    finish_rebase_with_git(&paused.repo);
+    let folded_tip = paused.repo.rev("feature-a");
+
+    let output = paused.repo.kin(&["continue"]);
+    assert!(output.status.success(), "{}", describe(&output));
+    assert!(
+        stdout(&output).contains("Rebasing feature-b..."),
+        "{}",
+        describe(&output)
+    );
+    assert_eq!(paused.repo.rev("feature-a"), folded_tip);
+    assert_eq!(paused.repo.rev("feature-b^"), folded_tip);
+    let subjects = paused
+        .repo
+        .git_stdout(&["log", "--format=%s", "main..feature-b"]);
+    assert!(!subjects.contains("fixup!"), "{subjects}");
+    assert_eq!(paused.repo.current_branch(), "feature-a");
+    assert_eq!(paused.repo.porcelain(), "?? unstaged.txt\n");
+    assert_eq!(paused.repo.stash_list(), "");
+    assert!(!paused.repo.state_path().exists());
+}
+
+/// A fold given up with Git is never started again: as before steps were
+/// recorded, `kin continue` replays the dependents onto the unfolded branch,
+/// with the fixup commit still in it, and restores what was set aside;
+/// `kin abort` puts everything back instead.
+#[test]
+fn commit_fold_given_up_with_git_rebase_abort_continues_or_aborts() {
+    for abort in [false, true] {
+        let paused = paused_commit_fixup_dependents();
+        paused.repo.git(&["rebase", "--abort"]);
+        if abort {
+            paused.abort();
+            paused.assert_restored();
+            assert_eq!(paused.repo.porcelain(), "M  shared.txt\n?? unstaged.txt\n");
+        } else {
+            let unfolded_tip = paused.repo.rev("feature-a");
+            let output = paused.repo.kin(&["continue"]);
+            assert!(output.status.success(), "{}", describe(&output));
+            assert_eq!(paused.repo.rev("feature-a"), unfolded_tip);
+            assert_eq!(paused.repo.rev("feature-b^"), unfolded_tip);
+            let subjects = paused
+                .repo
+                .git_stdout(&["log", "--format=%s", "main..feature-a"]);
+            assert!(subjects.contains("fixup! a1"), "{subjects}");
+            assert_eq!(paused.repo.current_branch(), "feature-a");
+            assert_eq!(paused.repo.porcelain(), "?? unstaged.txt\n");
+            assert!(!paused.repo.state_path().exists());
+        }
+        assert_eq!(paused.repo.stash_list(), "", "abort: {abort}");
+    }
 }

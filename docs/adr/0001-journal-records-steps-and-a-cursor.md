@@ -2,6 +2,8 @@
 
 Status: accepted
 
+Implemented in journal version 4 (`Step` and `Cursor` in `src/rebase_utils.rs`).
+
 An operation's journal stores the list of steps it will perform and the position reached, and `kin continue` resumes from that position. Today, progress is inferred from the commit graph: a branch counts as done when it already descends from its new base. That inference cannot describe steps that are not "replay this branch onto that base", such as autosquashing a range or moving one commit onto an ancestor. Those steps therefore run outside the restack loop, each with its own save, conflict handoff and rollback. Graph checks remain, but only to verify that a step the user finished with Git directly, for example with `git rebase --continue`, really completed.
 
 ## Consequences

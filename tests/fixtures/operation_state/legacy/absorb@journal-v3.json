@@ -4,13 +4,8 @@
     "caller_branch": null,
     "cleanup_checkout_fallback": null,
     "cleanup_merged_branches": [],
-    "cursor": {
-      "started": true,
-      "step": 1
-    },
-    "new_base_map": {
-      "feature-b": "refs/kindra/absorb/<absorb-namespace>/<commit: a: add code>"
-    },
+    "in_progress_branch": "feature-b",
+    "new_base_map": {},
     "operation": "Absorb",
     "original_branch": "feature-a",
     "original_commit_count_map": {},
@@ -24,9 +19,11 @@
     },
     "parent_id_map": {
       "feature-a": "<main@before>",
-      "feature-b": "<commit: a: add code>"
+      "feature-b": "<feature-a@before>"
     },
-    "parent_name_map": {},
+    "parent_name_map": {
+      "feature-b": "feature-a"
+    },
     "preserve_content_on_abort": true,
     "rebase_options": {
       "fast_forward": false,
@@ -34,27 +31,20 @@
       "keep_other_refs": false,
       "no_restart": false
     },
-    "set_asides": [],
-    "steps": [
+    "remaining_branches": [
+      "feature-b"
+    ],
+    "set_asides": [
       {
-        "anchor_forks": true,
-        "base": "<main@before>",
-        "branch": "feature-a",
-        "kind": "Autosquash",
-        "no_rebase_merges": true
-      },
-      {
-        "branch": "feature-b",
-        "kind": "Replay"
-      },
-      {
-        "checkout": "feature-a",
-        "kind": "Complete"
+        "kind": "WholeTree",
+        "oid": "<kin-absorb set-aside stash>",
+        "restore": "WithIndex",
+        "stash": "<kin-absorb set-aside>"
       }
     ],
     "suppress_editor": true,
     "target_branch": "feature-a",
     "unstage_on_restore": false
   },
-  "version": 4
+  "version": 3
 }

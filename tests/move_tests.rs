@@ -3,7 +3,7 @@ use common::{
     StateFile, kin_cmd, make_commit, rebase_state, rebase_state_file, repo_init, run_ok, state_file,
 };
 use git2::{Oid, Repository};
-use kindra::rebase_utils::{Operation, RebaseState, save_state};
+use kindra::rebase_utils::{Cursor, Operation, RebaseState, replay_plan, save_state};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -1402,10 +1402,14 @@ exec "{}" "$@"
         .assert()
         .failure();
 
-    let state_content = fs::read_to_string(rebase_state_file(dir.path())).unwrap();
-    assert!(
-        state_content.contains("\"in_progress_branch\": null"),
-        "Pre-start failure should clear in_progress_branch but got: {state_content}"
+    let state = kindra::rebase_utils::load_state(&repo).unwrap();
+    assert_eq!(
+        state.cursor,
+        Cursor {
+            step: 0,
+            started: false
+        },
+        "Pre-start failure should leave the replay not started"
     );
 
     let mut cmd_cont = kin_cmd();
@@ -2060,9 +2064,9 @@ exec {} "$@"
     assert!(state_path.exists(), "State file should exist");
     let state = kindra::rebase_utils::load_state(&Repository::open(dir.path()).unwrap()).unwrap();
     assert_eq!(
-        state.remaining_branches,
+        state.remaining_branches(),
         ["feature"],
-        "State should still contain 'feature' in remaining_branches"
+        "State should still have 'feature' left to replay"
     );
 
     // Remove the failure trigger
@@ -2537,7 +2541,7 @@ fn continue_sets_the_tree_aside_for_an_older_journal_that_asks_for_it() {
     let parent = parent_commit.id().to_string();
     let child = repo.revparse_single("feature-b").unwrap().id().to_string();
     let state = RebaseState {
-        remaining_branches: vec!["feature-b".to_string()],
+        steps: replay_plan(&["feature-b".to_string()], Some("feature-a")),
         parent_id_map: HashMap::from([("feature-b".to_string(), parent.clone())]),
         parent_name_map: HashMap::from([("feature-b".to_string(), "target".to_string())]),
         original_tip_map: HashMap::from([

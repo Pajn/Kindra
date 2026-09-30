@@ -4,7 +4,10 @@
     "caller_branch": null,
     "cleanup_checkout_fallback": "main",
     "cleanup_merged_branches": [],
-    "in_progress_branch": "main",
+    "cursor": {
+      "started": true,
+      "step": 0
+    },
     "new_base_map": {},
     "operation": "Sync",
     "original_branch": "main",
@@ -26,13 +29,20 @@
       "keep_other_refs": true,
       "no_restart": true
     },
-    "remaining_branches": [
-      "main"
-    ],
     "set_asides": [],
+    "steps": [
+      {
+        "branch": "main",
+        "kind": "Replay"
+      },
+      {
+        "checkout": "main",
+        "kind": "Complete"
+      }
+    ],
     "suppress_editor": false,
     "target_branch": "origin/main",
     "unstage_on_restore": false
   },
-  "version": 3
+  "version": 4
 }
