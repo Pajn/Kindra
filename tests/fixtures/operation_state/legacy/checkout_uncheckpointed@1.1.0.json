@@ -1,0 +1,30 @@
+{
+  "branch": "feature-c",
+  "repository": "github.com/test/project",
+  "steps": [
+    {
+      "branch": "main",
+      "remote_ref": null,
+      "tip": "<main@planned>",
+      "completed": true
+    },
+    {
+      "branch": "feature-a",
+      "remote_ref": null,
+      "tip": "<feature-a@planned>",
+      "completed": true
+    },
+    {
+      "branch": "feature-b",
+      "remote_ref": "origin/feature-b",
+      "tip": "<feature-b@planned>",
+      "completed": false
+    },
+    {
+      "branch": "feature-c",
+      "remote_ref": "origin/feature-c",
+      "tip": "<feature-c@planned>",
+      "completed": false
+    }
+  ]
+}

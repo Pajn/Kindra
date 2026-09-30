@@ -66,6 +66,14 @@
 //!   them the fold and move rebases of commit and absorb, and its progress
 //!   as a `cursor`. The `@journal-v2` and `@journal-v3` fixtures are version
 //!   2 and 3 journals, saved by builds after 1.1.0 that no release shipped.
+//!
+//! Checkout hydration keeps its own journal, `kindra_checkout_state.json`,
+//! with its own version (the `hydration` tests below):
+//!
+//! - 1.1.0 (the first release with hydration): a flat `branch`, `repository` and `steps`, each step
+//!   with a `completed` flag, including branches that already existed;
+//! - after 1.1.0: version 1, inside the same envelope, records `CreateBranch`
+//!   steps for the missing branches, a `Checkout` step and a `cursor`.
 
 mod common;
 
@@ -444,43 +452,14 @@ impl Paused {
     /// Compare the saved journal with its golden file, or rewrite the golden
     /// file when `KIN_UPDATE_GOLDEN` is set.
     fn assert_golden(&mut self, case: &str) {
-        let actual = canonical(&self.journal());
-        let path = fixture_path("golden", case);
-        if std::env::var_os("KIN_UPDATE_GOLDEN").is_some() {
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, &actual).unwrap();
-            return;
-        }
-        let expected = fs::read_to_string(&path).unwrap_or_else(|err| {
-            panic!(
-                "{}: {err}. Run with KIN_UPDATE_GOLDEN=1 to create it.",
-                path.display()
-            )
-        });
-        let expected = canonical(&serde_json::from_str(&expected).unwrap());
-        assert_eq!(
-            actual,
-            expected,
-            "the journal saved for '{case}' differs from {}. If the change is intended, rerun with KIN_UPDATE_GOLDEN=1 and review the diff.",
-            path.display()
-        );
+        assert_golden(case, &self.journal());
     }
 
     /// Replace the saved journal with the legacy fixture `name`. The fixture's
     /// symbolic names resolve to the values in the journal it replaces.
     fn install_legacy(&mut self, name: &str) {
         self.journal();
-        let path = fixture_path("legacy", name);
-        let fixture: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap())
-            .unwrap_or_else(|err| {
-                panic!("{}: {err}", path.display());
-            });
-        let journal = self.labels.denormalise(&fixture);
-        fs::write(
-            self.repo.state_path(),
-            serde_json::to_string_pretty(&journal).unwrap(),
-        )
-        .unwrap();
+        install_legacy(&self.labels, name, &self.repo.state_path());
     }
 
     fn assert_status(&self, expected: &str) {
@@ -488,7 +467,46 @@ impl Paused {
         assert!(output.status.success(), "{}", describe(&output));
         assert_eq!(stdout(&output), expected);
     }
+}
 
+/// Compare a saved journal, already normalised, with its golden file, or
+/// rewrite the golden file when `KIN_UPDATE_GOLDEN` is set.
+fn assert_golden(case: &str, journal: &Value) {
+    let actual = canonical(journal);
+    let path = fixture_path("golden", case);
+    if std::env::var_os("KIN_UPDATE_GOLDEN").is_some() {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &actual).unwrap();
+        return;
+    }
+    let expected = fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!(
+            "{}: {err}. Run with KIN_UPDATE_GOLDEN=1 to create it.",
+            path.display()
+        )
+    });
+    let expected = canonical(&serde_json::from_str(&expected).unwrap());
+    assert_eq!(
+        actual,
+        expected,
+        "the journal saved for '{case}' differs from {}. If the change is intended, rerun with KIN_UPDATE_GOLDEN=1 and review the diff.",
+        path.display()
+    );
+}
+
+/// Write the legacy fixture `name` to `state_path`, resolving its symbolic
+/// names with `labels`.
+fn install_legacy(labels: &Labels, name: &str, state_path: &Path) {
+    let path = fixture_path("legacy", name);
+    let fixture: Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap_or_else(|err| {
+            panic!("{}: {err}", path.display());
+        });
+    let journal = labels.denormalise(&fixture);
+    fs::write(state_path, serde_json::to_string_pretty(&journal).unwrap()).unwrap();
+}
+
+impl Paused {
     /// Resolve every conflict with `resolved` and `kin continue`, as often as
     /// the operation stops.
     fn continue_to_completion(&self) {
@@ -2587,5 +2605,256 @@ fn commit_fold_given_up_with_git_rebase_abort_continues_or_aborts() {
             assert!(!paused.repo.state_path().exists());
         }
         assert_eq!(paused.repo.stash_list(), "", "abort: {abort}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Checkout hydration
+// ---------------------------------------------------------------------------
+
+/// Named checkout keeps its own journal, `kindra_checkout_state.json`: the
+/// branches it creates, the checkout that finishes it and a cursor, inside
+/// its own `{"version": N, "journal": {...}}` envelope. Kindra 1.1 saved it
+/// flat, with a `completed` flag on every branch (`checkout@1.1.0`).
+#[cfg(unix)]
+mod hydration {
+    use super::*;
+
+    const STATUS: &str =
+        "Checkout hydration in progress. Run 'kin continue' to resume or 'kin abort' to stop.\n";
+
+    /// A named checkout of feature-c that stopped because feature-c could not
+    /// be created.
+    struct PausedHydration {
+        repo: Repo,
+        labels: Labels,
+    }
+
+    impl PausedHydration {
+        /// `main <- feature-a <- feature-b <- feature-c`, one PR each, pushed
+        /// to a remote that identifies as `github.com/test/project`. Only
+        /// main and feature-a are local, and feature-c's ref is locked, so
+        /// `kin co feature-c` skips feature-a, creates feature-b and stops.
+        /// The commits it plans are named `<branch@planned>`.
+        fn start() -> Self {
+            let mut repo = Repo::new();
+            for branch in ["feature-a", "feature-b", "feature-c"] {
+                repo.branch(branch);
+                repo.commit(&format!("{branch}.txt"), "x\n", branch);
+            }
+            let remote = TempDir::new().unwrap();
+            run_ok("git", &["init", "-q", "--bare"], remote.path());
+            let url = "https://github.com/test/project.git";
+            repo.git(&[
+                "config",
+                &format!("url.{}.insteadOf", remote.path().display()),
+                url,
+            ]);
+            repo.git(&["remote", "add", "origin", url]);
+            repo.git(&[
+                "push",
+                "-q",
+                "origin",
+                "main",
+                "feature-a",
+                "feature-b",
+                "feature-c",
+            ]);
+            repo._remote = Some(remote);
+            let mut labels = Labels::default();
+            labels.tips(&repo, "planned");
+            repo.switch("main");
+            repo.git(&["branch", "-q", "-D", "feature-b", "feature-c"]);
+
+            // gh is mocked from the Git directory, not the working tree.
+            let git_dir = git2::Repository::open(repo.path())
+                .unwrap()
+                .path()
+                .to_path_buf();
+            let bin = git_dir.join("mock-bin");
+            fs::create_dir(&bin).unwrap();
+            let gh = bin.join("gh");
+            fs::write(
+                &gh,
+                r#"#!/bin/sh
+if [ "$1" = "repo" ] && [ "$2" = "view" ]; then printf '{"url":"https://github.com/test/project"}'; exit 0; fi
+if [ "$1" = "auth" ] && [ "$2" = "token" ]; then exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  printf '%s' '[{"number":1,"headRefName":"feature-a","baseRefName":"main"},{"number":2,"headRefName":"feature-b","baseRefName":"feature-a"},{"number":3,"headRefName":"feature-c","baseRefName":"feature-b"}]'
+  exit 0
+fi
+exit 1
+"#,
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut path = vec![bin];
+            path.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+
+            let lock = git_dir.join("refs/heads/feature-c.lock");
+            fs::write(&lock, "locked").unwrap();
+            let output = kin_cmd()
+                .args(["co", "feature-c"])
+                .current_dir(repo.path())
+                .env("PATH", std::env::join_paths(path).unwrap())
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "{}", describe(&output));
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("Checkout hydration stopped"),
+                "{}",
+                describe(&output)
+            );
+            fs::remove_file(lock).unwrap();
+            let paused = Self { repo, labels };
+            assert!(paused.state_path().exists());
+            paused
+        }
+
+        fn state_path(&self) -> PathBuf {
+            common::state_file(self.repo.path(), StateFile::Checkout)
+        }
+
+        fn journal(&mut self) -> Value {
+            let raw: Value =
+                serde_json::from_str(&fs::read_to_string(self.state_path()).unwrap()).unwrap();
+            self.labels.normalise(&self.repo, &raw)
+        }
+
+        fn install_legacy(&mut self, name: &str) {
+            self.journal();
+            install_legacy(&self.labels, name, &self.state_path());
+        }
+
+        fn assert_status(&self) {
+            let output = self.repo.kin(&["status"]);
+            assert!(output.status.success(), "{}", describe(&output));
+            assert_eq!(stdout(&output), STATUS);
+        }
+
+        /// `kin continue` creates what is left at the planned commits and
+        /// checks out feature-c. The remote has moved on since, and feature-b,
+        /// already created, has been moved by the user: neither changes what
+        /// continue does.
+        fn assert_continues(&mut self) {
+            self.repo
+                .git(&["push", "-q", "-f", "origin", "main:feature-c"]);
+            self.repo.git(&["fetch", "-q", "origin"]);
+            self.repo.git(&["branch", "-f", "feature-b", "feature-a"]);
+            let output = self.repo.kin(&["continue"]);
+            assert!(output.status.success(), "{}", describe(&output));
+            assert_eq!(self.repo.current_branch(), "feature-c");
+            assert_eq!(
+                self.labels
+                    .normalise_str(&self.repo, &self.repo.rev("feature-c")),
+                "<feature-c@planned>"
+            );
+            assert_eq!(
+                self.repo.rev("feature-c@{upstream}"),
+                self.repo.rev("origin/feature-c")
+            );
+            assert_eq!(self.repo.rev("feature-b"), self.repo.rev("feature-a"));
+            assert!(!self.state_path().exists());
+        }
+
+        /// `kin abort` forgets the hydration and keeps feature-b, which it
+        /// created.
+        fn assert_aborts(&mut self) {
+            let output = self.repo.kin(&["abort"]);
+            assert!(output.status.success(), "{}", describe(&output));
+            assert!(
+                stdout(&output).contains("Already-created branches were retained"),
+                "{}",
+                describe(&output)
+            );
+            assert_eq!(self.repo.current_branch(), "main");
+            let tips = self
+                .repo
+                .tips()
+                .into_iter()
+                .map(|(branch, oid)| (branch, self.labels.normalise_str(&self.repo, &oid)))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                tips,
+                [
+                    ("feature-a".to_string(), "<feature-a@planned>".to_string()),
+                    ("feature-b".to_string(), "<feature-b@planned>".to_string()),
+                    ("main".to_string(), "<main@planned>".to_string()),
+                ]
+            );
+            assert!(!self.state_path().exists());
+        }
+    }
+
+    #[test]
+    fn golden_checkout() {
+        let mut paused = PausedHydration::start();
+        assert_golden("checkout", &paused.journal());
+    }
+
+    #[test]
+    fn checkout_continues() {
+        let mut paused = PausedHydration::start();
+        paused.assert_status();
+        paused.assert_continues();
+    }
+
+    #[test]
+    fn checkout_aborts() {
+        PausedHydration::start().assert_aborts();
+    }
+
+    #[test]
+    fn legacy_checkout_1_1_0_continues() {
+        let mut paused = PausedHydration::start();
+        paused.install_legacy("checkout@1.1.0");
+        paused.assert_status();
+        paused.assert_continues();
+    }
+
+    #[test]
+    fn legacy_checkout_1_1_0_aborts() {
+        let mut paused = PausedHydration::start();
+        paused.install_legacy("checkout@1.1.0");
+        paused.assert_status();
+        paused.assert_aborts();
+    }
+
+    /// Kindra 1.1 could stop after creating feature-b but before recording
+    /// it. Continue accepts the branch it finds at the planned commit.
+    #[test]
+    fn legacy_checkout_uncheckpointed_1_1_0_continues() {
+        let mut paused = PausedHydration::start();
+        paused.install_legacy("checkout_uncheckpointed@1.1.0");
+        let output = paused.repo.kin(&["continue"]);
+        assert!(output.status.success(), "{}", describe(&output));
+        assert_eq!(paused.repo.current_branch(), "feature-c");
+        assert_eq!(
+            paused
+                .labels
+                .normalise_str(&paused.repo, &paused.repo.rev("feature-b")),
+            "<feature-b@planned>"
+        );
+        assert!(!paused.state_path().exists());
+    }
+
+    /// A journal from a newer Kindra is refused by continue, with advice, and
+    /// left as it is; abort, which never reads it, still stops hydration.
+    #[test]
+    fn a_newer_checkout_journal_is_refused_but_aborts() {
+        let paused = PausedHydration::start();
+        let newer = r#"{"version":2,"journal":{}}"#;
+        fs::write(paused.state_path(), newer).unwrap();
+        let output = paused.repo.kin(&["continue"]);
+        assert!(!output.status.success(), "{}", describe(&output));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("newer version of kin"), "{stderr}");
+        assert_eq!(fs::read_to_string(paused.state_path()).unwrap(), newer);
+        let output = paused.repo.kin(&["abort"]);
+        assert!(output.status.success(), "{}", describe(&output));
+        assert!(!paused.state_path().exists());
     }
 }
