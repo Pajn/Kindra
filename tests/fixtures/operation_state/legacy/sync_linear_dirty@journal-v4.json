@@ -10,39 +10,48 @@
     },
     "new_base_map": {},
     "operation": "Sync",
-    "original_branch": "main",
+    "original_branch": "feature-b",
     "original_commit_count_map": {},
     "original_tip_map": {
-      "main": "<main@before>"
+      "feature-a": "<feature-a@before>",
+      "feature-b": "<feature-b@before>"
     },
     "owned_tip_map": {
-      "main": "<main@before>"
+      "feature-a": "<feature-a@before>",
+      "feature-b": "<feature-b@before>"
     },
     "parent_id_map": {
-      "main": "<commit: base>"
+      "feature-b": "<commit: base>"
     },
     "parent_name_map": {},
     "preserve_content_on_abort": false,
     "rebase_options": {
       "fast_forward": true,
       "keep_cherry_picks": true,
-      "keep_other_refs": true,
+      "keep_other_refs": false,
       "no_restart": true
     },
-    "set_asides": [],
+    "set_asides": [
+      {
+        "kind": "WholeTree",
+        "oid": "<kin-autostash set-aside stash>",
+        "restore": "WithIndex",
+        "stash": "<kin-autostash set-aside>"
+      }
+    ],
     "steps": [
       {
-        "branch": "main",
+        "branch": "feature-b",
         "kind": "Replay"
       },
       {
-        "checkout": "main",
+        "checkout": "feature-b",
         "kind": "Complete"
       }
     ],
     "suppress_editor": false,
-    "target_branch": "origin/main",
+    "target_branch": "main",
     "unstage_on_restore": false
   },
-  "version": 5
+  "version": 4
 }

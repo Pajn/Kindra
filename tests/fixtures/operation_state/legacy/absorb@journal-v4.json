@@ -6,14 +6,14 @@
     "cleanup_merged_branches": [],
     "cursor": {
       "started": true,
-      "step": 0
+      "step": 1
     },
     "new_base_map": {},
-    "operation": "Commit",
+    "operation": "Absorb",
     "original_branch": "feature-a",
     "original_commit_count_map": {},
     "original_tip_map": {
-      "feature-a": "<feature-a@paused>",
+      "feature-a": "<feature-a@before>",
       "feature-b": "<feature-b@before>"
     },
     "owned_tip_map": {
@@ -27,15 +27,29 @@
     "parent_name_map": {
       "feature-b": "feature-a"
     },
-    "preserve_content_on_abort": false,
+    "preserve_content_on_abort": true,
     "rebase_options": {
       "fast_forward": false,
       "keep_cherry_picks": false,
       "keep_other_refs": false,
       "no_restart": false
     },
-    "set_asides": [],
+    "set_asides": [
+      {
+        "kind": "WholeTree",
+        "oid": "<kin-absorb set-aside stash>",
+        "restore": "WithIndex",
+        "stash": "<kin-absorb set-aside>"
+      }
+    ],
     "steps": [
+      {
+        "anchor_forks": false,
+        "base": "<main@before>",
+        "branch": "feature-a",
+        "kind": "Autosquash",
+        "no_rebase_merges": true
+      },
       {
         "branch": "feature-b",
         "kind": "Replay"
@@ -45,9 +59,9 @@
         "kind": "Complete"
       }
     ],
-    "suppress_editor": false,
+    "suppress_editor": true,
     "target_branch": "feature-a",
     "unstage_on_restore": false
   },
-  "version": 5
+  "version": 4
 }

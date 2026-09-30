@@ -242,6 +242,7 @@ fn start_move_locked(repo: &Repository, args: &MoveArgs) -> Result<()> {
         legacy_autostash: false,
         cleanup_merged_branches: Vec::new(),
         cleanup_checkout_fallback: None,
+        created_branch: None,
     };
 
     // Snapshot for undo only now that all argument/target validation has passed

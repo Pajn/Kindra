@@ -1,6 +1,7 @@
 use crate::operation_state::{KindraOperation, NativeOperation};
 use crate::rebase_utils::{
-    checkout_branch, git_rebase_in_progress, load_state, owned_tip_state_matches, unstage_all,
+    CreatedBranch, RebaseState, checkout_branch, first_held_elsewhere, git_rebase_in_progress,
+    load_state, owned_tip_state_matches, save_state, unstage_all,
 };
 use crate::repository::git_command;
 use crate::set_aside::{self, Phase};
@@ -105,6 +106,19 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
         let git_rebase_active = git_rebase_in_progress(repo);
         let kindra_owns_current_state = owned_tip_state_matches(repo, &parsed_state)?;
 
+        // Returning to the branch a created branch came from is the last
+        // step of the rollback; when another worktree holds that branch, say
+        // so before anything moves.
+        if kindra_owns_current_state
+            && let Some(created) = &parsed_state.created_branch
+            && let Some((branch, held)) =
+                first_held_elsewhere(repo, std::slice::from_ref(&created.from))?
+        {
+            return Err(anyhow!(
+                "Cannot abort: '{branch}' is {held}, and 'kin abort' returns to it. Switch that worktree to another branch, then run 'kin abort' again."
+            ));
+        }
+
         if git_rebase_active && kindra_owns_current_state {
             println!("Aborting active git rebase...");
             let status = git_command(repo).arg("rebase").arg("--abort").status()?;
@@ -114,10 +128,15 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
         }
 
         if kindra_owns_current_state {
-            let restore_branch = parsed_state
-                .caller_branch
-                .clone()
-                .unwrap_or_else(|| parsed_state.original_branch.clone());
+            // A branch the command created is undone too: return to the
+            // branch it was created from.
+            let restore_branch = match &parsed_state.created_branch {
+                Some(created) => created.from.clone(),
+                None => parsed_state
+                    .caller_branch
+                    .clone()
+                    .unwrap_or_else(|| parsed_state.original_branch.clone()),
+            };
 
             if parsed_state.preserve_content_on_abort {
                 // Content the operation already committed (absorb's fixup or
@@ -131,16 +150,20 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
                 set_aside::restore_all(repo, &mut parsed_state, Phase::Abort)?;
                 restore_original_branch_tips(repo, &parsed_state.original_tip_map)?;
                 if restore_branch != parsed_state.original_branch {
-                    checkout_branch(repo, &restore_branch)?;
+                    checkout_after_restoring_tips(repo, &mut parsed_state, &restore_branch)?;
                 }
             } else {
                 restore_original_branch_tips(repo, &parsed_state.original_tip_map)?;
-                checkout_branch(repo, &restore_branch)?;
+                checkout_after_restoring_tips(repo, &mut parsed_state, &restore_branch)?;
                 set_aside::restore_all(repo, &mut parsed_state, Phase::Abort)?;
             }
 
             if parsed_state.unstage_on_restore {
                 unstage_all(repo)?;
+            }
+
+            if let Some(created) = &parsed_state.created_branch {
+                delete_created_branch(repo, created);
             }
         }
 
@@ -223,6 +246,61 @@ impl Drop for AbortOplogSettle<'_> {
             SettleAction::Discard => crate::oplog::discard(self.repo),
             SettleAction::Finalize => crate::oplog::finalize(self.repo),
         };
+    }
+}
+
+/// Check out `branch` once the branch tips are restored. The journal still
+/// records the tips the operation left, so if the checkout fails, save it
+/// again (recording the restored tips as the ones it owns) and only for
+/// `kin abort`: another abort then finds the repository as this one left it
+/// and finishes the rollback, where it would otherwise take the restored tips
+/// for someone else's changes and clear the journal without returning.
+fn checkout_after_restoring_tips(
+    repo: &git2::Repository,
+    state: &mut RebaseState,
+    branch: &str,
+) -> Result<()> {
+    let Err(err) = checkout_branch(repo, branch) else {
+        return Ok(());
+    };
+    state.abort_only = true;
+    if let Err(save_err) = save_state(repo, state) {
+        return Err(err.context(format!(
+            "The branches are restored, but checking out '{branch}' failed and saving that progress failed too ({save_err:#}). Check out '{branch}' yourself, then run 'kin abort --clear-state'."
+        )));
+    }
+    Err(err.context(format!(
+        "The branches are restored, but checking out '{branch}' failed. Fix what blocks it, then run 'kin abort' again to finish."
+    )))
+}
+
+/// Delete the branch the operation created, now that its tip is back where it
+/// was created. One that points anywhere else holds commits of its own, so it
+/// is kept. Everything else is already restored, so a branch that cannot be
+/// deleted is only reported.
+fn delete_created_branch(repo: &git2::Repository, created: &CreatedBranch) {
+    let Ok(mut branch) = repo.find_branch(&created.name, git2::BranchType::Local) else {
+        return;
+    };
+    let from_tip = repo
+        .find_branch(&created.from, git2::BranchType::Local)
+        .ok()
+        .and_then(|from| from.get().target());
+    if branch.get().target().is_none() || branch.get().target() != from_tip {
+        println!(
+            "Kept branch '{}': it no longer points where it was created from '{}'.",
+            created.name, created.from
+        );
+        return;
+    }
+    // Delete the reference that was just checked: libgit2 deletes it only
+    // while it still points at the tip read here, so a concurrent update
+    // makes the delete fail rather than drop the commits it brought.
+    if let Err(err) = branch.delete() {
+        eprintln!(
+            "Could not delete branch '{}' ({err}); remove it with 'git branch -D {}'.",
+            created.name, created.name
+        );
     }
 }
 

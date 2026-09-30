@@ -1,8 +1,8 @@
 use crate::commands::find_upstream;
 use crate::rebase_utils::{
-    RebaseNotStarted, RebaseState, Step, check_worktrees, checkout_branch, clear_state,
-    has_staged_changes, local_branch_tips_in_range, record_branch_tips_in_range, replay_plan,
-    run_rebase_loop, save_state,
+    CreatedBranch, RebaseNotStarted, RebaseState, Step, check_worktrees, checkout_branch,
+    clear_state, has_staged_changes, local_branch_tips_in_range, record_branch_tips_in_range,
+    replay_plan, run_rebase_loop, save_state,
 };
 use crate::repository::git_command;
 use crate::set_aside::{self, Outcome, Phase, SetAside};
@@ -489,6 +489,7 @@ fn commit_locked(repo: &git2::Repository, mut parsed: ParsedCommitArgs) -> Resul
             legacy_autostash: false,
             cleanup_merged_branches: Vec::new(),
             cleanup_checkout_fallback: None,
+            created_branch: None,
         };
 
         // `kin commit` always sets the unstaged changes aside when it rewrites
@@ -795,12 +796,15 @@ fn commit_on_new_branch(
     )
     .with_context(|| inserted_note.clone())?;
 
-    let new_branch_tip = repo
-        .revparse_single(&branch_name)
-        .with_context(|| inserted_note.clone())?
-        .id();
+    // `kin abort` undoes the whole command: the new branch goes back to where
+    // it was created, the current branch's tip, so the commit's content comes
+    // back staged (`preserve_content_on_abort`); then it checks the current
+    // branch out and deletes the new one (`created_branch`). The current
+    // branch's tip is recorded too, so that an abort after it moved leaves
+    // the refs alone rather than stage changes against a different tip.
     let mut original_tip_map = HashMap::new();
-    original_tip_map.insert(branch_name.clone(), new_branch_tip.to_string());
+    original_tip_map.insert(branch_name.clone(), head_id.to_string());
+    original_tip_map.insert(current_branch_name.to_string(), head_id.to_string());
     original_tip_map.extend(children.iter().map(|c| (c.name.clone(), c.id.to_string())));
 
     let mut state = RebaseState {
@@ -822,13 +826,17 @@ fn commit_on_new_branch(
         original_tip_map,
         owned_tip_map: HashMap::new(),
         set_asides: Default::default(),
-        preserve_content_on_abort: false,
+        preserve_content_on_abort: true,
         suppress_editor: false,
         abort_only: false,
         unstage_on_restore: false,
         legacy_autostash: false,
         cleanup_merged_branches: Vec::new(),
         cleanup_checkout_fallback: None,
+        created_branch: Some(CreatedBranch {
+            name: branch_name.clone(),
+            from: current_branch_name.to_string(),
+        }),
     };
 
     // Set aside unstaged changes so the child rebases run on a clean tree; the

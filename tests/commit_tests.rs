@@ -6590,9 +6590,10 @@ fn test_commit_new_branch_insert_with_no_children_just_commits() {
     );
 }
 
-/// Set up an `--insert` whose child restack conflicts, and stop mid-rebase.
-/// Returns feature-a's commit id (feature-b's original parent).
-fn setup_insert_conflict(dir: &Path, repo: &Repository) -> git2::Oid {
+/// Build the stack for a conflicting `--insert`: feature-a sets `shared.txt`
+/// and feature-b, on top of it, changes it again. Leaves feature-a checked out
+/// and returns the tips of feature-a and feature-b.
+fn insert_conflict_stack(repo: &Repository) -> (git2::Oid, git2::Oid) {
     let main_id = repo.revparse_single("main").unwrap().id();
     let main_commit = repo.find_commit(main_id).unwrap();
     let a_id = make_commit(
@@ -6604,7 +6605,7 @@ fn setup_insert_conflict(dir: &Path, repo: &Repository) -> git2::Oid {
         &[&main_commit],
     );
     let a_commit = repo.find_commit(a_id).unwrap();
-    make_commit(
+    let b_id = make_commit(
         repo,
         "refs/heads/feature-b",
         "shared.txt",
@@ -6612,10 +6613,13 @@ fn setup_insert_conflict(dir: &Path, repo: &Repository) -> git2::Oid {
         "commit b",
         &[&a_commit],
     );
-
     checkout(repo, "feature-a");
-    // The inserted commit rewrites shared.txt, so restacking feature-b onto it
-    // conflicts on that file.
+    (a_id, b_id)
+}
+
+/// Commit a change to `shared.txt` onto a new branch `mid` inserted below
+/// feature-b, whose restack onto it conflicts on that file, and stop mid-rebase.
+fn start_conflicting_insert(dir: &Path) {
     stage(dir, "shared.txt", "mid change\n");
     kin_commit(dir)
         .arg("-b")
@@ -6630,6 +6634,13 @@ fn setup_insert_conflict(dir: &Path, repo: &Repository) -> git2::Oid {
         rebase_state_file(dir).exists(),
         "a conflicting insert restack must leave resumable state"
     );
+}
+
+/// Set up an `--insert` whose child restack conflicts, and stop mid-rebase.
+/// Returns feature-a's commit id (feature-b's original parent).
+fn setup_insert_conflict(dir: &Path, repo: &Repository) -> git2::Oid {
+    let (a_id, _) = insert_conflict_stack(repo);
+    start_conflicting_insert(dir);
     a_id
 }
 
@@ -6661,12 +6672,15 @@ fn test_commit_new_branch_insert_conflict_recovers_with_continue() {
     assert_eq!(repo.head().unwrap().shorthand().unwrap(), "mid");
 }
 
-/// A conflict during the `--insert` restack is abortable: `kin abort` clears the
-/// state and restores the child to its pre-insert parent.
+/// A conflict during the `--insert` restack is abortable, and `kin abort` puts
+/// the repository back as it was before `kin commit`: the branch it ran on is
+/// checked out, the child is back at its old tip, the branch the command created
+/// is gone, and the change it committed is staged again, with the unstaged and
+/// untracked changes set aside around the restack back as they were.
 #[test]
 fn test_commit_new_branch_insert_conflict_recovers_with_abort() {
     let (dir, repo) = setup_repo();
-    let a_id = setup_insert_conflict(dir.path(), &repo);
+    let (a_id, b_id) = start_dirty_conflicting_insert(dir.path(), &repo);
 
     kin_cmd()
         .arg("abort")
@@ -6674,37 +6688,135 @@ fn test_commit_new_branch_insert_conflict_recovers_with_abort() {
         .assert()
         .success();
 
-    assert!(!rebase_state_file(dir.path()).exists());
-    let new_b = repo
-        .find_commit(repo.revparse_single("feature-b").unwrap().id())
-        .unwrap();
+    assert_insert_fully_aborted(dir.path(), &repo, a_id, b_id);
+}
+
+/// Pause a conflicting `--insert` with an unstaged edit and an untracked file
+/// in the tree. Returns the tips of feature-a and feature-b before it.
+fn start_dirty_conflicting_insert(dir: &Path, repo: &Repository) -> (git2::Oid, git2::Oid) {
+    let tips = insert_conflict_stack(repo);
+    fs::write(dir.join("file.txt"), "unstaged edit").unwrap();
+    fs::write(dir.join("untracked.txt"), "untracked").unwrap();
+    start_conflicting_insert(dir);
+    tips
+}
+
+/// Everything is as it was before the conflicting `--insert` from
+/// [`start_dirty_conflicting_insert`] ran.
+fn assert_insert_fully_aborted(dir: &Path, repo: &Repository, a_id: git2::Oid, b_id: git2::Oid) {
+    assert!(!rebase_state_file(dir).exists());
+    assert_no_rebase_in_progress(dir);
     assert_eq!(
-        new_b.parent_id(0).unwrap(),
-        a_id,
-        "abort must restore feature-b to its pre-insert parent"
+        current_branch(dir),
+        "feature-a",
+        "abort must return to the branch kin commit ran on"
+    );
+    assert_eq!(repo.revparse_single("feature-a").unwrap().id(), a_id);
+    assert_eq!(
+        repo.revparse_single("feature-b").unwrap().id(),
+        b_id,
+        "abort must restore feature-b to its pre-insert tip"
+    );
+    assert!(
+        repo.find_branch("mid", git2::BranchType::Local).is_err(),
+        "abort must remove the branch kin commit created"
+    );
+    assert_eq!(
+        git_stdout(dir, &["status", "--porcelain"]),
+        " M file.txt\nM  shared.txt\n?? untracked.txt\n",
+        "the committed change must come back staged, the rest as it was"
+    );
+    assert!(git_stdout(dir, &["diff", "--cached"]).contains("+mid change"));
+    assert_eq!(
+        fs::read_to_string(dir.join("file.txt")).unwrap(),
+        "unstaged edit"
+    );
+    assert_eq!(git_stdout(dir, &["stash", "list"]), "");
+}
+
+/// When another worktree checks out the branch an `--insert` ran on while it
+/// is paused, `kin abort` cannot return to it, so it refuses before changing
+/// anything; once that worktree lets go, a second abort undoes everything.
+#[test]
+fn test_commit_new_branch_insert_abort_waits_for_the_source_branch_held_elsewhere() {
+    let (dir, repo) = setup_repo();
+    let (a_id, b_id) = start_dirty_conflicting_insert(dir.path(), &repo);
+    let other = tempdir().unwrap();
+    let other_path = other.path().join("other");
+    let other_path = other_path.to_str().unwrap();
+    run_ok(
+        "git",
+        &["worktree", "add", other_path, "feature-a"],
+        dir.path(),
+    );
+    let refs = git_stdout(dir.path(), &["show-ref"]);
+
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("'feature-a' is checked out"));
+    assert!(rebase_state_file(dir.path()).exists());
+    assert!(repo.path().join("rebase-merge").exists());
+    assert_eq!(git_stdout(dir.path(), &["show-ref"]), refs);
+
+    run_ok("git", &["worktree", "remove", other_path], dir.path());
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_insert_fully_aborted(dir.path(), &repo, a_id, b_id);
+}
+
+/// When the branch an `--insert` ran on is taken by another worktree after
+/// abort has restored the branch tips, so that only the final checkout
+/// fails, the journal records that progress for `kin abort` alone: `kin
+/// continue` refuses it, and a second abort, once the branch is free,
+/// finishes the rollback instead of taking the restored tips for someone
+/// else's changes.
+#[cfg(unix)]
+#[test]
+fn test_commit_new_branch_insert_abort_retries_a_failed_return_checkout() {
+    let (dir, repo) = setup_repo();
+    let (a_id, b_id) = start_dirty_conflicting_insert(dir.path(), &repo);
+    let other = tempdir().unwrap();
+    let other_path = other.path().join("other");
+    let other_path = other_path.to_str().unwrap();
+    // Abort checks `mid` out before it restores the tips; take feature-a then.
+    install_post_checkout_hook(
+        dir.path(),
+        "mid",
+        &format!("git worktree add '{other_path}' feature-a >/dev/null 2>&1"),
     );
 
-    // Only the restack is rolled back: the inserted branch survives with the
-    // already-applied commit on top of feature-a, and we end up on it (it is
-    // the operation's original_branch).
-    assert_eq!(
-        repo.head().unwrap().shorthand().unwrap(),
-        "mid",
-        "abort must leave HEAD on the inserted branch"
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("The branches are restored"));
+    assert!(rebase_state_file(dir.path()).exists());
+    assert_eq!(repo.revparse_single("feature-b").unwrap().id(), b_id);
+    kin_cmd()
+        .arg("continue")
+        .current_dir(dir.path())
+        .assert()
+        .failure();
+
+    fs::remove_file(dir.path().join(".git/hooks/post-checkout")).unwrap();
+    run_ok(
+        "git",
+        &["worktree", "remove", "--force", other_path],
+        dir.path(),
     );
-    let mid = repo
-        .find_commit(repo.revparse_single("mid").unwrap().id())
-        .unwrap();
-    assert_eq!(
-        mid.summary().unwrap(),
-        "mid commit",
-        "the inserted branch must keep the applied commit"
-    );
-    assert_eq!(
-        mid.parent_id(0).unwrap(),
-        a_id,
-        "the inserted commit must remain on top of feature-a"
-    );
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_insert_fully_aborted(dir.path(), &repo, a_id, b_id);
 }
 
 /// Without `--insert`, a new branch is a sibling fork: existing children stay on

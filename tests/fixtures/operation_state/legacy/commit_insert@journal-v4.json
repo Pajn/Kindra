@@ -10,22 +10,21 @@
     },
     "new_base_map": {},
     "operation": "Commit",
-    "original_branch": "feature-a",
+    "original_branch": "inserted",
     "original_commit_count_map": {},
     "original_tip_map": {
-      "feature-a": "<feature-a@paused>",
-      "feature-b": "<feature-b@before>"
+      "feature-b": "<feature-b@before>",
+      "inserted": "<inserted@paused>"
     },
     "owned_tip_map": {
-      "feature-a": "<feature-a@paused>",
-      "feature-b": "<feature-b@before>"
+      "feature-b": "<feature-b@before>",
+      "inserted": "<inserted@paused>"
     },
     "parent_id_map": {
-      "feature-a": "<main@before>",
       "feature-b": "<feature-a@before>"
     },
     "parent_name_map": {
-      "feature-b": "feature-a"
+      "feature-b": "inserted"
     },
     "preserve_content_on_abort": false,
     "rebase_options": {
@@ -41,13 +40,13 @@
         "kind": "Replay"
       },
       {
-        "checkout": "feature-a",
+        "checkout": "inserted",
         "kind": "Complete"
       }
     ],
     "suppress_editor": false,
-    "target_branch": "feature-a",
+    "target_branch": "inserted",
     "unstage_on_restore": false
   },
-  "version": 5
+  "version": 4
 }

@@ -129,6 +129,7 @@ fn reorder_locked(repo: &git2::Repository, args: &ReorderArgs) -> Result<()> {
             legacy_autostash: false,
             cleanup_merged_branches: Vec::new(),
             cleanup_checkout_fallback: None,
+            created_branch: None,
         };
 
         Ok((state, autostash))

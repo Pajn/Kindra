@@ -217,6 +217,7 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
             legacy_autostash: false,
             cleanup_merged_branches: merged_branches.clone(),
             cleanup_checkout_fallback: Some(local_upstream.clone()),
+            created_branch: None,
         };
 
         // One rebase of the tip onto the trunk from the old base carries
@@ -295,6 +296,7 @@ fn sync_upstream_branch(
             legacy_autostash: false,
             cleanup_merged_branches: merged_branches.clone(),
             cleanup_checkout_fallback: Some(upstream_name.to_string()),
+            created_branch: None,
         };
 
         begin_replay(repo, &mut state, autostash)?;
@@ -677,6 +679,7 @@ fn sync_tree(
         legacy_autostash: false,
         cleanup_merged_branches: merged,
         cleanup_checkout_fallback: Some(local_upstream.to_string()),
+        created_branch: None,
     };
     begin_replay(repo, &mut state, autostash)?;
     run_rebase_loop(repo, &mut state)
