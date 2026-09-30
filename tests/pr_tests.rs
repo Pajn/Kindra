@@ -8479,6 +8479,39 @@ fn pr_flatten_surfaces_graphql_errors_and_changes_nothing() {
 }
 
 #[test]
+fn pr_flatten_rejects_an_open_pr_page_whose_cursor_does_not_advance() {
+    let (dir, repo) = setup_two_level_stack();
+    init_origin_and_push(dir.path(), &["main", "feature-a", "feature-b"]);
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+    let (bin, calls) = install_heads_gh_mock(
+        &repo,
+        ":",
+        Some(
+            r#"    # Bound a broken client's requests so the regression fails without hanging.
+    if [[ $(wc -l < "$GH_CALLS") -gt 4 ]]; then
+        echo 'pagination requested the same page again' >&2
+        exit 1
+    fi
+    echo '{"data":{"repository":{"h0":{"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"},"nodes":[{"number":99,"headRefName":"feature-a","isCrossRepository":true,"baseRefName":"other","url":"https://github.com/test/repo/pull/99"}]},"h1":{"pageInfo":{"hasNextPage":false},"nodes":[]}}}}'
+    exit 0"#,
+        ),
+    );
+
+    let output = kin_with_heads_gh_mock(dir.path(), &bin, &calls)
+        .args(["pr", "flatten"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Open PR pagination for 'feature-a' did not advance"),
+        "{stderr}"
+    );
+    assert_eq!(logged_calls(&calls, "api graphql").len(), 2);
+    assert!(logged_calls(&calls, "pr edit").is_empty());
+}
+
+#[test]
 fn pr_flatten_pages_a_head_until_a_pr_from_this_repository_turns_up() {
     let (dir, repo) = setup_two_level_stack();
     init_origin_and_push(dir.path(), &["main", "feature-a", "feature-b"]);

@@ -518,6 +518,7 @@ pub fn open_prs_for_branches<S: AsRef<str>>(
             let Some(mut page) = aliased.remove(alias).flatten() else {
                 continue;
             };
+            let mut previous_cursor: Option<String> = None;
             loop {
                 let next = page.page_info;
                 add_open_pr_nodes(&mut map, head, page.nodes);
@@ -529,11 +530,17 @@ pub fn open_prs_for_branches<S: AsRef<str>>(
                 let cursor = next
                     .end_cursor
                     .ok_or_else(|| anyhow!("Missing cursor while paginating open PRs"))?;
+                if previous_cursor.as_deref() == Some(cursor.as_str()) {
+                    return Err(anyhow!(
+                        "Open PR pagination for '{head}' did not advance past cursor {cursor}"
+                    ));
+                }
                 let mut more = fetch(
                     ", $h0: String!, $after: String!",
                     &format!("h0: {}", connection("h0", ", after: $after")),
                     &[("h0", head), ("after", &cursor)],
                 )?;
+                previous_cursor = Some(cursor);
                 match more.remove("h0").flatten() {
                     Some(following) => page = following,
                     None => break,
