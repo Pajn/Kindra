@@ -173,12 +173,15 @@ fn pr_create_or_update(
     // while nothing has changed yet.
     let after_pr = crate::hooks::after_pr_commands(&repo)?;
 
-    // A single `gh pr list` snapshot serves scope filtering, the flatten-need
-    // check, and per-branch processing — instead of ~4 `gh pr view` subprocesses
-    // per branch. It is only re-fetched when a flatten mutates PR bases below.
-    let mut open_prs = gh::list_open_prs()?;
-
     let (upstream_name, all_stack_branches) = discover_stack_branches(&repo)?;
+
+    // One snapshot of the stack's open PRs serves scope filtering, the
+    // flatten-need check, and per-branch processing — instead of ~4 `gh pr view`
+    // subprocesses per branch. It asks only about the stack's branches, not
+    // every open PR in the repository, and is only re-fetched when a flatten
+    // mutates PR bases below.
+    let gh_repository = gh::PrRepository::resolve()?;
+    let mut open_prs = open_prs_for_stack(&gh_repository, &all_stack_branches)?;
     let scoped_stack_branches =
         filter_stack_branches_for_pr_scope(&open_prs, all_stack_branches.clone(), include_all)?;
 
@@ -193,7 +196,7 @@ fn pr_create_or_update(
         if flattened {
             // Flatten retargeted PR bases on GitHub, so the pre-flatten snapshot is
             // stale for base comparisons. Refresh it before processing.
-            open_prs = gh::list_open_prs()?;
+            open_prs = open_prs_for_stack(&gh_repository, &scoped_stack_branches)?;
         }
     }
 
@@ -250,7 +253,11 @@ fn pr_create_or_update(
     // snapshot may be stale by now (base updates, freshly created PRs, or an
     // upstream edit during this run); syncing from it could clobber a newer body.
     // Rebuild each processed PR from the fresh list, keyed by branch name.
-    let latest_prs = gh::list_open_prs()?;
+    let processed_branch_names = processed_prs
+        .iter()
+        .map(|stack_pr| stack_pr.branch_name.as_str())
+        .collect::<Vec<_>>();
+    let latest_prs = gh::open_prs_for_branches(&gh_repository, &processed_branch_names)?;
     for stack_pr in &mut processed_prs {
         if let Some(fresh) = latest_prs.get(&stack_pr.branch_name) {
             stack_pr.pr = fresh.to_editable();
@@ -689,7 +696,8 @@ fn pr_flatten() -> Result<()> {
         return Ok(());
     }
 
-    let open_prs = gh::list_open_prs()?;
+    let open_prs =
+        open_prs_for_stack_with_upstream(&gh::PrRepository::resolve()?, &branches_with_upstream)?;
     flatten_stack_prs_to_upstream(&open_prs, &branches_with_upstream, &upstream_name)?;
 
     if !after_pr.is_empty() {
@@ -858,9 +866,10 @@ fn pr_status() -> Result<()> {
         return Ok(());
     }
 
-    // One `gh pr list` snapshot for the whole stack, instead of a `gh pr view`
+    // One snapshot of the stack's open PRs, instead of a `gh pr view`
     // subprocess per branch.
-    let open_prs = gh::list_open_prs()?;
+    let open_prs =
+        open_prs_for_stack_with_upstream(&gh::PrRepository::resolve()?, &branches_with_upstream)?;
     let prs: Vec<(String, gh::EditablePr)> = branches_with_upstream
         .iter()
         .filter_map(|(sb, _remote_upstream)| {
@@ -943,8 +952,10 @@ pub(crate) fn parse_github_owner_repo_from_pr_url(url: &str) -> Option<(String, 
 pub(crate) fn collect_open_stack_prs(
     branches_with_upstream: &[(StackBranch, String)],
 ) -> Result<Vec<StackPr>> {
-    // One `gh pr list` snapshot rather than a `gh pr view` subprocess per branch.
-    let open_prs = gh::list_open_prs()?;
+    // One snapshot of the stack's open PRs rather than a `gh pr view`
+    // subprocess per branch.
+    let open_prs =
+        open_prs_for_stack_with_upstream(&gh::PrRepository::resolve()?, branches_with_upstream)?;
     Ok(branches_with_upstream
         .iter()
         .filter_map(|(sb, _remote_upstream)| {
@@ -954,6 +965,31 @@ pub(crate) fn collect_open_stack_prs(
             })
         })
         .collect())
+}
+
+/// The open PRs whose head is one of `branches`, keyed by branch name.
+fn open_prs_for_stack(
+    repository: &gh::PrRepository,
+    branches: &[StackBranch],
+) -> Result<HashMap<String, gh::OpenPr>> {
+    let names = branches
+        .iter()
+        .map(|branch| branch.name.as_str())
+        .collect::<Vec<_>>();
+    gh::open_prs_for_branches(repository, &names)
+}
+
+/// The open PRs whose head is one of `branches_with_upstream`, keyed by branch
+/// name.
+fn open_prs_for_stack_with_upstream(
+    repository: &gh::PrRepository,
+    branches_with_upstream: &[(StackBranch, String)],
+) -> Result<HashMap<String, gh::OpenPr>> {
+    let names = branches_with_upstream
+        .iter()
+        .map(|(branch, _remote_upstream)| branch.name.as_str())
+        .collect::<Vec<_>>();
+    gh::open_prs_for_branches(repository, &names)
 }
 
 pub(crate) fn select_stack_pr<'a>(prs: &'a [StackPr], prompt: &str) -> Result<&'a StackPr> {

@@ -88,7 +88,7 @@ fn pr_after_branch_merged_into_main() {
     // Create mock gh that captures the base branch
     let gh_mock = dir.path().join("gh");
     let captured_base = dir.path().join("captured_base.txt");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         format!(
             r#"#!/bin/bash
@@ -218,7 +218,7 @@ fn pr_unmerged_branches_work() {
     // Create mock gh
     let gh_mock = dir.path().join("gh");
     let captured_base = dir.path().join("captured_base.txt");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         format!(
             r#"#!/bin/bash

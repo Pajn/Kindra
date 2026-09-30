@@ -147,6 +147,84 @@ pub fn git_command(cwd: &std::path::Path) -> std::process::Command {
     command
 }
 
+/// The repository URL [`GH_OPEN_PRS_BY_HEAD`] reports from `gh repo view`,
+/// matching the PR URLs the mocks return.
+#[allow(dead_code)]
+pub const MOCK_GH_REPOSITORY_URL: &str = "https://github.com/test/repo";
+
+/// Bash for a mock `gh` that answers what `kin` asks GitHub about the open PRs
+/// of named branches — `gh repo view` and the `gh api graphql` query by head
+/// branch — from the mock's own `gh pr list` answer, so a test states the
+/// repository's open PRs once, as a `pr list` handler. The query's `hN`
+/// variables name the branches; each alias gets the listed PRs with that head,
+/// in list order, shaped as GraphQL nodes. A failing `pr list` fails the query
+/// the same way. The mock sees that inner `pr list` with `MOCK_GH_INNER` set, so
+/// a mock that logs its calls can leave it out. Insert it with
+/// [`with_open_prs_by_head`].
+#[allow(dead_code)]
+pub const GH_OPEN_PRS_BY_HEAD: &str = r##"if [[ "$1" == "repo" && "$2" == "view" ]]; then echo '{"url":"https://github.com/test/repo"}'; exit 0; fi
+if [[ "$1" == "api" && "$2" == "graphql" && "$*" == *"pullRequests(headRefName:"* ]]; then
+    mock_open_prs=$(MOCK_GH_INNER=1 "$0" pr list --state open --limit 500 --json number,headRefName,isCrossRepository,baseRefName,isDraft,author,title,body,url,labels,reviewRequests) || exit $?
+    printf '%s' "$mock_open_prs" | perl -MJSON::PP -e '
+        my $list = JSON::PP->new->utf8->decode(do { local $/; <STDIN> });
+        my %heads;
+        for my $i (0 .. $#ARGV - 1) {
+            $heads{$1} = $2 if $ARGV[$i] eq "-f" && $ARGV[$i + 1] =~ /\A(h\d+)=(.*)\z/s;
+        }
+        my %repository;
+        for my $alias (keys %heads) {
+            my @nodes;
+            for my $pr (@$list) {
+                next unless ($pr->{headRefName} // "") eq $heads{$alias};
+                my %node = %$pr;
+                $node{labels} = { nodes => $pr->{labels} // [] };
+                $node{reviewRequests} = { nodes => [
+                    map { exists $_->{requestedReviewer} ? $_ : { requestedReviewer => $_ } }
+                        @{ $pr->{reviewRequests} // [] }
+                ] };
+                push @nodes, \%node;
+            }
+            $repository{$alias} = { pageInfo => { hasNextPage => JSON::PP::false }, nodes => \@nodes };
+        }
+        print JSON::PP->new->utf8->encode({ data => { repository => \%repository } });
+    ' -- "$@"
+    exit $?
+fi
+"##;
+
+/// `script` (a mock `gh` starting with a `#!` line) with [`GH_OPEN_PRS_BY_HEAD`]
+/// inserted right after that line.
+#[allow(dead_code)]
+pub fn with_open_prs_by_head(script: impl AsRef<str>) -> String {
+    let script = script.as_ref();
+    let (shebang, rest) = script
+        .split_once('\n')
+        .expect("a mock gh script starts with a #! line");
+    format!("{shebang}\n{GH_OPEN_PRS_BY_HEAD}{rest}")
+}
+
+/// A mock `gh` that appends `$1 $2` of every call it gets from `kin` to
+/// `$GH_CALLS`, answers open-PR queries by head branch from its `pr list`
+/// handler (see [`GH_OPEN_PRS_BY_HEAD`]), and otherwise runs `handlers`, which
+/// must provide that handler. The `pr list` those queries run internally is
+/// left out of the log.
+#[allow(dead_code)]
+pub fn logged_gh_script(handlers: &str) -> String {
+    format!(
+        "#!/bin/bash\n\
+         [[ -n \"$MOCK_GH_INNER\" ]] || echo \"$1 $2\" >> \"$GH_CALLS\"\n\
+         {GH_OPEN_PRS_BY_HEAD}{}",
+        handlers.trim_start_matches('\n')
+    )
+}
+
+/// Write the mock `gh` `script` to `path`, answering open-PR queries by head
+/// branch from its `pr list` handler (see [`with_open_prs_by_head`]).
+#[allow(dead_code)]
+pub fn write_gh_script(path: impl AsRef<Path>, script: impl AsRef<str>) -> std::io::Result<()> {
+    fs::write(path, with_open_prs_by_head(script))
+}
+
 #[allow(dead_code)]
 pub fn make_commit_at(
     repo: &Repository,

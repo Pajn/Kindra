@@ -230,7 +230,7 @@ fn single_commit_branch_title_prefill() {
 
     // Create mock gh
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -321,7 +321,7 @@ fn single_commit_body_prefill_in_editor() {
     // Create mock gh that captures the PR body
     let gh_pr_args = dir.path().join("gh_pr_args.txt");
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         format!(
             r#"#!/bin/bash
@@ -547,7 +547,7 @@ fn test_pr_label_flag() {
     // Create mock gh that captures the PR arguments
     let gh_pr_args = dir.path().join("gh_pr_args.txt");
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         format!(
             r#"#!/bin/bash
@@ -627,7 +627,7 @@ fn test_pr_draft_reviewer_body_from_commits_flags() {
 
     let gh_pr_args = dir.path().join("gh_pr_args.txt");
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         format!(
             r#"#!/bin/bash
@@ -716,7 +716,7 @@ fn test_pr_pushes_by_default() {
 
     // Create mock gh
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -815,7 +815,7 @@ fn test_pr_no_push_skips_preflight_push() {
     run_ok("git", &["checkout", "feature"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -998,7 +998,7 @@ fn pr_uses_origin_main_as_base_when_local_main_is_behind_after_sync() {
     // Create mock gh that captures the --base argument
     let gh_mock = dir.path().join("gh");
     let captured_base = dir.path().join("captured_base.txt");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         format!(
             r#"#!/bin/bash
@@ -1094,7 +1094,7 @@ fn pr_template_detected() {
 
     // Create mock gh
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -1198,7 +1198,7 @@ fn check_pr_stack_sections(branching: bool) {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -1390,7 +1390,7 @@ fn pr_stack_sync_continues_when_one_edit_fails() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -1507,7 +1507,7 @@ fn pr_stack_sync_skips_inaccessible_historical_pr_entries() {
     );
     let stale_body_for_bash = stale_body.replace('\n', "\\n").replace('"', "\\\"");
 
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         format!(
             r#"#!/bin/bash
@@ -1637,7 +1637,7 @@ fn pr_default_skips_stack_prs_authored_by_other_users() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -1748,7 +1748,7 @@ fn pr_all_includes_stack_prs_authored_by_other_users() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -1892,7 +1892,7 @@ fn multi_commit_branch_title_empty() {
 
     // Create mock gh
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -1997,7 +1997,7 @@ fn stacked_branch_shows_correct_commits() {
     // and handles all gh commands the test will encounter
     // Name it "gh" so it gets picked up when searching PATH
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 # Handle gh auth - pretend we're authenticated
@@ -2127,7 +2127,7 @@ fn slash_base_branch_uses_git_base_for_local_history() {
     );
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -2207,7 +2207,7 @@ fn pr_open_opens_single_pr_without_prompt() {
     run_ok("git", &["checkout", "feature"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -2277,7 +2277,7 @@ fn pr_open_with_multiple_prs_uses_selection() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -2362,7 +2362,7 @@ fn pr_edit_preserves_stack_block() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -2463,7 +2463,7 @@ fn pr_edit_cleans_duplicate_stack_blocks() {
         .replace("\n", "\\n")
         .replace("\"", "\\\"");
 
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         format!(
             r#"#!/bin/bash
@@ -2569,7 +2569,7 @@ fn pr_edit_migrates_legacy_stack_markers_without_duplicates() {
 
     let body_for_bash = body_with_legacy.replace('\n', "\\n").replace('"', "\\\"");
 
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         format!(
             r#"#!/bin/bash
@@ -2674,7 +2674,7 @@ fn pr_edit_single_open_pr_saves_with_prefilled_title() {
     run_ok("git", &["checkout", "feature"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -2757,7 +2757,7 @@ fn pr_edit_menu_can_edit_title_then_save() {
     run_ok("git", &["checkout", "feature"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -2830,7 +2830,7 @@ fn pr_edit_multiple_open_prs_uses_selection() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -2914,7 +2914,7 @@ fn pr_edit_reapplies_stack_section_for_multi_pr_stack() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -3027,7 +3027,7 @@ fn pr_edit_reorders_stack_section_using_live_stack_order() {
     );
     let stale_body_for_bash = stale_body.replace('\n', "\\n").replace('"', "\\\"");
 
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         format!(
             r#"#!/bin/bash
@@ -3133,7 +3133,7 @@ fn pr_status_shows_reviewers_comments_and_checks() {
     run_ok("git", &["checkout", "feature"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -3196,7 +3196,7 @@ fn pr_status_prefers_local_pr_over_fork_pr_with_same_branch_name() {
     let dir = setup_pushed_feature();
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -3270,8 +3270,8 @@ fn pr_status_batches_gh_calls_across_the_stack() {
     let gh_mock = dir.path().join("gh");
     std::fs::write(
         &gh_mock,
-        r#"#!/bin/bash
-echo "$1 $2" >> "$GH_CALLS"
+        common::logged_gh_script(
+            r#"
 if [[ "$1" == "auth" ]]; then
     exit 0
 fi
@@ -3286,6 +3286,7 @@ fi
 echo "mock gh: unexpected command: $@" >&2
 exit 1
 "#,
+        ),
     )
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
@@ -3313,13 +3314,19 @@ exit 1
     let calls = std::fs::read_to_string(&calls_path).unwrap();
     let count = |needle: &str| calls.lines().filter(|l| *l == needle).count();
 
-    // Every PR is read from one listing and one status query, so the number of
-    // GitHub round trips stays flat as the stack grows.
-    assert_eq!(count("pr list"), 1, "expected one `gh pr list`:\n{calls}");
+    // The stack's PRs are read with one query by head branch and their status
+    // with one more, so the number of GitHub round trips stays flat as the
+    // stack grows; listing every open PR in the repository is not needed.
+    assert_eq!(count("pr list"), 0, "expected no `gh pr list`:\n{calls}");
+    assert_eq!(
+        count("repo view"),
+        1,
+        "expected one repository lookup:\n{calls}"
+    );
     assert_eq!(
         count("api graphql"),
-        1,
-        "expected one batched status query:\n{calls}"
+        2,
+        "expected one open-PR query and one batched status query:\n{calls}"
     );
     assert_eq!(
         count("pr view"),
@@ -3364,7 +3371,7 @@ fn pr_status_lists_multiple_stack_prs() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -3442,7 +3449,7 @@ fn pr_review_renders_markdown_threads_and_replies() {
     run_ok("git", &["checkout", "feature"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -3519,7 +3526,7 @@ fn pr_review_fetches_paginated_threads_and_comments() {
     run_ok("git", &["checkout", "feature"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -3599,7 +3606,7 @@ fn pr_review_multiple_prs_uses_selection() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -3704,7 +3711,7 @@ fn pr_review_applies_reviewer_bot_outdated_and_resolved_filters() {
     run_ok("git", &["checkout", "feature"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -3785,7 +3792,7 @@ fn pr_review_writes_output_and_skips_osc52_copy_when_not_tty() {
     run_ok("git", &["checkout", "feature"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -3877,7 +3884,7 @@ fn pr_review_strips_html_comments_from_output() {
     run_ok("git", &["checkout", "feature"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -3950,7 +3957,7 @@ fn pr_merge_merges_ready_single_pr() {
     run_ok("git", &["checkout", "feature"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -4035,7 +4042,7 @@ fn pr_merge_multiple_prs_uses_selection() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -4154,7 +4161,7 @@ fn pr_merge_approved_plus_commented_allows_merge() {
     run_ok("git", &["checkout", "feature"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -4232,7 +4239,7 @@ fn pr_merge_retargets_child_pr_before_merging_parent() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -4351,7 +4358,7 @@ fn pr_merge_does_not_retarget_on_merge_failure() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -4466,7 +4473,7 @@ fn pr_merge_does_not_retarget_when_merge_is_queued() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -4585,7 +4592,7 @@ fn pr_merge_prompts_and_errors_when_issues_remain_but_merge_is_allowed() {
     run_ok("git", &["checkout", "feature"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -4672,7 +4679,7 @@ fn pr_merge_surfaces_gh_failure_details() {
     run_ok("git", &["checkout", "feature"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -4751,7 +4758,7 @@ fn pr_merge_errors_when_repo_rules_block_merging() {
     run_ok("git", &["checkout", "feature"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -4833,7 +4840,7 @@ fn pr_flatten_retargets_all_open_stack_prs_to_resolved_upstream_base() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -4954,7 +4961,7 @@ fn pr_flatten_uses_resolved_upstream_not_hardcoded_main() {
     );
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -5030,7 +5037,7 @@ fn pr_flatten_continues_on_partial_failures_and_exits_nonzero() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -5136,7 +5143,7 @@ fn pr_flatten_does_not_mutate_local_git_or_pr_body_metadata() {
         .unwrap();
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -5237,7 +5244,7 @@ fn pr_default_preflight_flattens_pushes_and_then_runs_normal_pr_logic() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -5332,7 +5339,7 @@ fn pr_default_preflight_skips_flatten_when_pr_bases_match() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -5414,7 +5421,7 @@ fn pr_no_push_skips_preflight_flatten() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -5499,7 +5506,7 @@ fn pr_preflight_flatten_failure_stops_before_push_and_pr_processing() {
     run_ok("git", &["checkout", "feature-b"], dir.path());
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -5797,7 +5804,7 @@ fn pr_command_excludes_upstream_branch() {
 
     // Create mock gh
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -5883,11 +5890,12 @@ exit 1
     );
 }
 
-/// `kin pr` must gather PR state with a small, constant number of `gh pr list`
-/// calls for the whole stack (one snapshot plus one pre-sync refresh) rather than
-/// one `gh pr view` per branch.
+/// `kin pr` must gather PR state with a small, constant number of queries for
+/// the whole stack (one snapshot plus one pre-sync refresh), asking only about
+/// the stack's branches, rather than one `gh pr view` per branch or a listing
+/// of every open PR in the repository.
 #[test]
-fn pr_uses_single_gh_pr_list_for_the_stack() {
+fn pr_queries_open_prs_by_stack_branch() {
     let (dir, _repo) = setup_two_level_stack();
 
     let remote_dir = dir.path().join("remote.git");
@@ -5909,8 +5917,8 @@ fn pr_uses_single_gh_pr_list_for_the_stack() {
     let gh_mock = dir.path().join("gh");
     std::fs::write(
         &gh_mock,
-        r#"#!/bin/bash
-echo "$1 $2" >> "$GH_CALLS"
+        common::logged_gh_script(
+            r#"
 if [[ "$1" == "auth" ]]; then
     exit 0
 fi
@@ -5932,6 +5940,7 @@ fi
 echo "mock gh: unexpected command: $@" >&2
 exit 1
 "#,
+        ),
     )
     .unwrap();
     run_ok("chmod", &["+x", gh_mock.to_str().unwrap()], dir.path());
@@ -5954,13 +5963,12 @@ exit 1
     assert!(output.status.success(), "kin pr failed: {:?}", output);
 
     let calls = std::fs::read_to_string(&calls_path).unwrap_or_default();
-    // A constant number of list calls (snapshot + pre-sync refresh), independent
-    // of branch count — never one `gh pr view` per branch.
-    let list_calls = calls.matches("pr list").count();
-    assert!(
-        (1..=2).contains(&list_calls),
-        "expected a constant 1-2 `gh pr list` calls for the whole stack, got {list_calls}, calls were:\n{calls}"
-    );
+    let count = |needle: &str| calls.lines().filter(|l| *l == needle).count();
+    // One repository lookup, then one query by head branch for the snapshot and
+    // one for the pre-sync refresh, independent of branch count.
+    assert_eq!(count("repo view"), 1, "calls were:\n{calls}");
+    assert_eq!(count("api graphql"), 2, "calls were:\n{calls}");
+    assert_eq!(count("pr list"), 0, "calls were:\n{calls}");
     assert!(
         !calls.contains("pr view"),
         "expected no per-branch `gh pr view`, calls were:\n{}",
@@ -5992,10 +6000,10 @@ fn pr_refreshes_metadata_before_syncing_descriptions() {
     let list_count = dir.path().join("list_count.txt");
     let edit_bodies = dir.path().join("edit_bodies.txt");
     let gh_mock = dir.path().join("gh");
-    // The first `gh pr list` (initial snapshot) returns an OLD body; the second
+    // The first snapshot (served from `gh pr list`) returns an OLD body; the second
     // (the pre-sync refresh) returns a NEWER body, simulating an edit made after
     // the snapshot was taken.
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -6128,7 +6136,7 @@ const GH_CREATE_CAPTURE: &str = r#"    while [[ $# -gt 0 ]]; do
 /// scaffolding plus the caller's `pr create` handler body appended. Keeps each
 /// test focused on the `pr create` behavior it exercises.
 fn gh_mock_with_create(create_handler: &str) -> String {
-    format!(
+    common::with_open_prs_by_head(format!(
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then exit 0; fi
 if [[ "$1" == "pr" && "$2" == "list" ]]; then echo '[]'; exit 0; fi
@@ -6138,7 +6146,7 @@ if [[ "$1" == "pr" && "$2" == "create" ]]; then
 fi
 echo "mock gh: unexpected: $@" >&2; exit 1
 "#
-    )
+    ))
 }
 
 #[test]
@@ -6440,7 +6448,7 @@ fn pr_edit_rerun_save_directly_recovers_stale_draft() {
     std::fs::write(&draft, "RECOVERED_EDIT_BODY").unwrap();
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then exit 0; fi
@@ -6529,7 +6537,7 @@ fn write_gh_mock(dir: &std::path::Path, handlers: &str) {
          exit 1\n"
     );
     let path = dir.join("gh");
-    std::fs::write(&path, script).unwrap();
+    common::write_gh_script(&path, script).unwrap();
     run_ok("chmod", &["+x", path.to_str().unwrap()], dir);
 }
 
@@ -7226,7 +7234,7 @@ fn pr_refuses_stack_branch_tracking_trunk_and_creates_no_pr() {
     // A gh mock that records every invocation, so we can prove no PR was created.
     let gh_log = dir.path().join("gh-calls.log");
     let gh_mock = dir.path().join("gh");
-    fs::write(
+    common::write_gh_script(
         &gh_mock,
         format!(
             r#"#!/bin/bash
@@ -7343,7 +7351,7 @@ fn pr_merge_does_not_delete_the_base_branch_on_the_remote() {
     );
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 if [[ "$1" == "auth" ]]; then
@@ -7505,7 +7513,7 @@ fn pr_commands_refuse_while_a_kindra_operation_is_paused() {
     common::write_paused_operation(&repo, "feature");
 
     let gh_mock = dir.path().join("gh");
-    std::fs::write(
+    common::write_gh_script(
         &gh_mock,
         r#"#!/bin/bash
 printf "%s\n" "$*" >> "$MOCK_GH_LOG"
@@ -7799,7 +7807,10 @@ impl AfterPrFixture {
         run_ok("git", &["add", "b2.txt"], dir.path());
         run_ok("git", &["commit", "-m", "feat: b2"], dir.path());
 
-        write_script(&tools.path().join("gh"), AFTER_PR_GH_MOCK);
+        write_script(
+            &tools.path().join("gh"),
+            &common::with_open_prs_by_head(AFTER_PR_GH_MOCK),
+        );
         write_script(&tools.path().join("record-hook"), RECORD_HOOK);
         fs::create_dir_all(tools.path().join("out")).unwrap();
 
@@ -8220,4 +8231,333 @@ fn after_pr_hook_runs_in_linked_worktree_with_shared_config() {
         fs::read_to_string(fx.out().join("run.cwd")).unwrap().trim(),
         fs::canonicalize(&linked).unwrap().to_str().unwrap()
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Open PRs by head branch: the stack's PRs come from one `gh api graphql`
+// request per batch of branches, not from a listing of every open PR.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Install a mock `gh` in the Git directory that logs each call's arguments to
+/// `$GH_CALLS` and answers the open-PR query by head branch: every `hN=<head>`
+/// variable gets the nodes `nodes_for_head` (bash run with the head in `$1`)
+/// prints. `graphql` replaces that answer when given. Returns the directory to
+/// put on PATH and the log path.
+fn install_heads_gh_mock(
+    repo: &Repository,
+    nodes_for_head: &str,
+    graphql: Option<&str>,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let bin = repo.path().join("mock-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let graphql = graphql.unwrap_or(
+        r#"    out=""
+    for arg in "$@"; do
+        case "$arg" in
+            h[0-9]*=*) ;;
+            *) continue ;;
+        esac
+        alias="${arg%%=*}"
+        out="$out${out:+,}\"$alias\":{\"pageInfo\":{\"hasNextPage\":false},\"nodes\":[$(mock_nodes "${arg#*=}")]}"
+    done
+    echo "{\"data\":{\"repository\":{$out}}}"
+    exit 0"#,
+    );
+    let script = format!(
+        r#"#!/bin/bash
+printf '%s\n' "$*" >> "$GH_CALLS"
+mock_nodes() {{
+{nodes_for_head}
+}}
+if [[ "$1" == "auth" ]]; then exit 0; fi
+if [[ "$1" == "repo" && "$2" == "view" ]]; then echo '{{"url":"https://github.com/test/repo"}}'; exit 0; fi
+if [[ "$1" == "api" && "$2" == "graphql" ]]; then
+{graphql}
+fi
+echo "mock gh: unexpected command: $*" >&2
+exit 1
+"#
+    );
+    let gh = bin.join("gh");
+    fs::write(&gh, script).unwrap();
+    run_ok("chmod", &["+x", gh.to_str().unwrap()], repo.path());
+    (bin, repo.path().join("gh-calls.log"))
+}
+
+fn kin_with_heads_gh_mock(
+    dir: &std::path::Path,
+    bin: &std::path::Path,
+    calls: &std::path::Path,
+) -> assert_cmd::Command {
+    let mut cmd = kin_cmd();
+    cmd.current_dir(dir)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("GH_CALLS", calls);
+    cmd
+}
+
+/// The logged `gh` calls whose arguments start with `prefix`.
+fn logged_calls(calls: &std::path::Path, prefix: &str) -> Vec<String> {
+    fs::read_to_string(calls)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn pr_flatten_reads_the_stacks_open_prs_by_head_branch() {
+    let (dir, repo) = setup_two_level_stack();
+    init_origin_and_push(dir.path(), &["main", "feature-a", "feature-b"]);
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    // feature-a has a newer fork PR with the same head name, listed first, and
+    // this repository's PR, which requests a team (no login) and a user.
+    // feature-b has no open PR.
+    let (bin, calls) = install_heads_gh_mock(
+        &repo,
+        r#"case "$1" in
+    feature-a)
+        printf '%s' '{"number":99,"headRefName":"feature-a","isCrossRepository":true,"baseRefName":"other","isDraft":false,"author":{"login":"contributor"},"title":"Fork","body":"","url":"https://github.com/test/repo/pull/99","labels":{"nodes":[]},"reviewRequests":{"nodes":[]}},'
+        printf '%s' '{"number":10,"headRefName":"feature-a","isCrossRepository":false,"baseRefName":"main","isDraft":true,"author":{"login":"me"},"title":"Local","body":"","url":"https://github.com/test/repo/pull/10","labels":{"nodes":[{"name":"bug"}]},"reviewRequests":{"nodes":[{"requestedReviewer":{}},{"requestedReviewer":{"login":"alice"}}]}}'
+        ;;
+esac"#,
+        None,
+    );
+
+    let output = kin_with_heads_gh_mock(dir.path(), &bin, &calls)
+        .args(["pr", "flatten"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "kin pr flatten failed.\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("PR #10 for 'feature-a' is already based on 'main'."),
+        "this repository's PR must win over the fork's:\n{stdout}"
+    );
+    assert!(!stdout.contains("#99"), "{stdout}");
+    assert!(
+        stdout.contains("No open PR found for 'feature-b'; skipping."),
+        "{stdout}"
+    );
+
+    assert_eq!(logged_calls(&calls, "repo view").len(), 1);
+    assert!(logged_calls(&calls, "pr list").is_empty());
+    let queries = logged_calls(&calls, "api graphql");
+    assert_eq!(queries.len(), 1, "{queries:#?}");
+    for expected in [
+        "--hostname github.com",
+        "-f owner=test",
+        "-f name=repo",
+        "-f h0=feature-a",
+        "-f h1=feature-b",
+    ] {
+        assert!(queries[0].contains(expected), "{expected}: {}", queries[0]);
+    }
+    assert!(
+        !queries[0].contains("h2"),
+        "only the stack's branches are asked about: {}",
+        queries[0]
+    );
+}
+
+#[test]
+fn pr_flatten_batches_open_pr_queries_beyond_the_batch_size() {
+    let batch = kindra::gh::OPEN_PRS_HEAD_BATCH;
+    let count = batch + 1;
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let mut parent = make_commit(
+        &repo,
+        "refs/heads/main",
+        "README.md",
+        "hello",
+        "initial",
+        &[],
+    );
+    let names: Vec<String> = (1..=count).map(|n| format!("b{n:03}")).collect();
+    for name in &names {
+        let commit = repo.find_commit(parent).unwrap();
+        parent = make_commit(
+            &repo,
+            &format!("refs/heads/{name}"),
+            &format!("{name}.txt"),
+            name,
+            &format!("feat: {name}"),
+            &[&commit],
+        );
+    }
+    let top = names.last().unwrap();
+    repo.set_head(&format!("refs/heads/{top}")).unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+    let mut refs = vec!["main"];
+    refs.extend(names.iter().map(String::as_str));
+    init_origin_and_push(dir.path(), &refs);
+
+    // Branch bNNN has PR #NNN, already based on main.
+    let (bin, calls) = install_heads_gh_mock(
+        &repo,
+        r#"number=$((10#${1#b}))
+printf '{"number":%d,"headRefName":"%s","isCrossRepository":false,"baseRefName":"main","isDraft":false,"author":{"login":"me"},"title":"T","body":"","url":"https://github.com/test/repo/pull/%d","labels":{"nodes":[]},"reviewRequests":{"nodes":[]}}' "$number" "$1" "$number""#,
+        None,
+    );
+
+    let output = kin_with_heads_gh_mock(dir.path(), &bin, &calls)
+        .args(["pr", "flatten"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "kin pr flatten failed.\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (index, name) in names.iter().enumerate() {
+        let expected = format!("PR #{} for '{name}' is already based on 'main'.", index + 1);
+        assert!(stdout.contains(&expected), "{expected}\n{stdout}");
+    }
+    assert!(
+        stdout.contains(&format!("already_on_base={count}")),
+        "{stdout}"
+    );
+
+    let queries = logged_calls(&calls, "api graphql");
+    assert_eq!(queries.len(), 2, "one request per batch: {queries:#?}");
+    let asked = |query: &str| query.matches(" -f h").count();
+    assert_eq!(asked(&queries[0]), batch);
+    assert_eq!(asked(&queries[1]), 1);
+    assert_eq!(logged_calls(&calls, "repo view").len(), 1);
+}
+
+#[test]
+fn pr_flatten_surfaces_graphql_errors_and_changes_nothing() {
+    let cases = [
+        (
+            // gh exits non-zero when the response carries errors.
+            r#"    echo '{"data":null,"errors":[{"type":"NOT_FOUND","message":"Could not resolve to a Repository with the name test/repo."}]}'
+    echo "GraphQL: Could not resolve to a Repository with the name test/repo. (repository)" >&2
+    exit 1"#,
+            "Could not resolve to a Repository",
+        ),
+        (
+            // Errors in a response gh did not fail on are errors too.
+            r#"    echo '{"data":{"repository":null},"errors":[{"message":"Something went wrong while executing your query."}]}'
+    exit 0"#,
+            "Something went wrong while executing your query.",
+        ),
+    ];
+    for (graphql, message) in cases {
+        let (dir, repo) = setup_two_level_stack();
+        init_origin_and_push(dir.path(), &["main", "feature-a", "feature-b"]);
+        run_ok("git", &["checkout", "feature-b"], dir.path());
+        let (bin, calls) = install_heads_gh_mock(&repo, ":", Some(graphql));
+
+        let output = kin_with_heads_gh_mock(dir.path(), &bin, &calls)
+            .args(["pr", "flatten"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let code = output.status.code().unwrap_or(-1);
+        assert!(
+            code != 0 && code != 101,
+            "kin pr flatten must fail cleanly, got {code}.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(stderr.contains(message), "{message}\n{stderr}");
+        assert!(!stdout.contains("Flattening"), "{stdout}");
+        assert!(logged_calls(&calls, "pr edit").is_empty());
+    }
+}
+
+#[test]
+fn pr_flatten_rejects_an_open_pr_page_whose_cursor_does_not_advance() {
+    let (dir, repo) = setup_two_level_stack();
+    init_origin_and_push(dir.path(), &["main", "feature-a", "feature-b"]);
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+    let (bin, calls) = install_heads_gh_mock(
+        &repo,
+        ":",
+        Some(
+            r#"    # Bound a broken client's requests so the regression fails without hanging.
+    if [[ $(wc -l < "$GH_CALLS") -gt 4 ]]; then
+        echo 'pagination requested the same page again' >&2
+        exit 1
+    fi
+    echo '{"data":{"repository":{"h0":{"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"},"nodes":[{"number":99,"headRefName":"feature-a","isCrossRepository":true,"baseRefName":"other","url":"https://github.com/test/repo/pull/99"}]},"h1":{"pageInfo":{"hasNextPage":false},"nodes":[]}}}}'
+    exit 0"#,
+        ),
+    );
+
+    let output = kin_with_heads_gh_mock(dir.path(), &bin, &calls)
+        .args(["pr", "flatten"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Open PR pagination for 'feature-a' did not advance"),
+        "{stderr}"
+    );
+    assert_eq!(logged_calls(&calls, "api graphql").len(), 2);
+    assert!(logged_calls(&calls, "pr edit").is_empty());
+}
+
+#[test]
+fn pr_flatten_pages_a_head_until_a_pr_from_this_repository_turns_up() {
+    let (dir, repo) = setup_two_level_stack();
+    init_origin_and_push(dir.path(), &["main", "feature-a", "feature-b"]);
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    // feature-a's first page holds only a fork's PR and says more follow; the
+    // next page holds this repository's PR.
+    let (bin, calls) = install_heads_gh_mock(
+        &repo,
+        ":",
+        Some(
+            r#"    if [[ "$*" == *"-f after=cursor-1"* ]]; then
+        echo '{"data":{"repository":{"h0":{"pageInfo":{"hasNextPage":false},"nodes":[{"number":10,"headRefName":"feature-a","isCrossRepository":false,"baseRefName":"main","url":"https://github.com/test/repo/pull/10"}]}}}}'
+        exit 0
+    fi
+    echo '{"data":{"repository":{"h0":{"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"},"nodes":[{"number":99,"headRefName":"feature-a","isCrossRepository":true,"baseRefName":"other","url":"https://github.com/test/repo/pull/99"}]},"h1":{"pageInfo":{"hasNextPage":false},"nodes":[]}}}}'
+    exit 0"#,
+        ),
+    );
+
+    let output = kin_with_heads_gh_mock(dir.path(), &bin, &calls)
+        .args(["pr", "flatten"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "kin pr flatten failed.\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("PR #10 for 'feature-a' is already based on 'main'."),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("#99"), "{stdout}");
+    let queries = logged_calls(&calls, "api graphql");
+    assert_eq!(queries.len(), 2, "{queries:#?}");
+    assert!(
+        queries[0].contains("states: OPEN, first: 10, orderBy:"),
+        "{}",
+        queries[0]
+    );
+    assert!(
+        queries[1].contains("states: OPEN, first: 100, after: $after"),
+        "{}",
+        queries[1]
+    );
+    assert!(queries[1].contains("-f h0=feature-a"), "{}", queries[1]);
 }
