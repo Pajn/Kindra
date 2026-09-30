@@ -1578,9 +1578,12 @@ fn replay_step(
 }
 
 /// Start a fold or move `step`, which rewrites the checked-out branch in
-/// place, and return once its rebase completed. A conflict saves the journal
-/// with the step started; a rebase that never started returns
-/// [`RebaseNotStarted`] with the step not started, and saves nothing.
+/// place, and return once its rebase completed. The journal is saved with the
+/// step started before the rebase is attempted, so a conflict (or a crash)
+/// leaves it for `kin continue` to finish. A rebase that never started
+/// returns [`RebaseNotStarted`] with the step marked not started in `state`
+/// only: the saved journal still says started, so the caller must clear it,
+/// or save it marked `abort_only`, before returning.
 fn in_place_step(repo: &Repository, state: &mut RebaseState, step: &Step) -> Result<()> {
     state.cursor.started = true;
     save_state(repo, state)?;

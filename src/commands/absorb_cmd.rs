@@ -344,12 +344,24 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
     // set-aside unless its changes are in the tree as conflicts: `kin abort`
     // then restores what is left and takes the fixups off the same way.
     if set_aside::unwind(&repo, &mut state.set_asides) == set_aside::Outcome::Restored {
-        let _ = clear_state(&repo);
-        return Err(rollback_fixups(
-            &repo,
-            head_before,
-            anyhow!("{err:#} The absorb was rolled back."),
-        ));
+        // The saved journal records the fold as started, so one left behind
+        // would let `kin continue` take it as finished. If it cannot be
+        // removed, it must at least say there is nothing to continue.
+        let err = match clear_state(&repo) {
+            Ok(()) => anyhow!("{err:#} The absorb was rolled back."),
+            Err(clear_err) => {
+                state.abort_only = true;
+                match save_state(&repo, &state) {
+                    Ok(()) => anyhow!(
+                        "{err:#} The absorb was rolled back, but removing its saved state failed ({clear_err:#}); run 'kin abort' to clear it."
+                    ),
+                    Err(save_err) => anyhow!(
+                        "{err:#} The absorb was rolled back, but removing its saved state failed ({clear_err:#}) and so did marking it as rolled back ({save_err:#}); run 'kin abort --clear-state' to discard it, not 'kin continue'."
+                    ),
+                }
+            }
+        };
+        return Err(rollback_fixups(&repo, head_before, err));
     }
     state.abort_only = true;
     Err(match save_state(&repo, &state) {

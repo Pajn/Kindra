@@ -555,6 +555,132 @@ fn test_absorb_rollback_keeps_state_until_set_aside_changes_are_restored() {
     assert!(!rebase_state_file(repo_path).exists());
 }
 
+/// The journal records the fold as started before its rebase is attempted.
+/// When the fold is refused and rolled back but that journal cannot be
+/// removed, it must be left marked as rolled back, so `kin continue` refuses
+/// it instead of taking the fold as finished and restacking the dependents
+/// onto commits that no longer exist.
+#[test]
+#[cfg(unix)]
+fn test_absorb_rollback_that_cannot_clear_its_state_leaves_it_abort_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+    let repo = repo_init(repo_path);
+    let main_oid = make_commit(&repo, "HEAD", "a.txt", "A", "main: base", &[]);
+    run_ok("git", &["branch", "-M", "main"], repo_path);
+    run_ok("git", &["checkout", "-b", "review"], repo_path);
+    let code_oid = make_commit(
+        &repo,
+        "HEAD",
+        "code.txt",
+        "line1\nline2\nline3\n",
+        "review: add code",
+        &[&repo.find_commit(main_oid).unwrap()],
+    );
+    make_commit(
+        &repo,
+        "HEAD",
+        "extra.txt",
+        "extra",
+        "review: add extra",
+        &[&repo.find_commit(code_oid).unwrap()],
+    );
+    // `side` forks from review's first commit, which no branch names, so the
+    // absorb anchors that fork point under refs/kindra/absorb/.
+    make_commit(
+        &repo,
+        "refs/heads/side",
+        "side.txt",
+        "side",
+        "side: work",
+        &[&repo.find_commit(code_oid).unwrap()],
+    );
+    run_ok("git", &["reset", "--hard", "-q"], repo_path);
+
+    // The hook creates the anchor the journal names and locks it, so clearing
+    // the journal cannot delete it, then refuses the fold.
+    let hook = repo_path.join(".git/hooks/pre-rebase");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\ngit_dir=$(git rev-parse --git-dir)\n\
+         anchor=$(grep -o 'refs/kindra/absorb/[^\"]*' \"$git_dir/kindra_rebase_state.json\" | head -n 1)\n\
+         git update-ref \"$anchor\" HEAD\ntouch \"$git_dir/$anchor.lock\"\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    std::fs::write(repo_path.join("code.txt"), "line1 FIXED\nline2\nline3\n").unwrap();
+    run_ok("git", &["add", "code.txt"], repo_path);
+    let review_before = tip(&repo, "review");
+    let side_before = tip(&repo, "side");
+
+    let output = kin_cmd()
+        .current_dir(repo_path)
+        .args(["absorb", "--force-author"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "rejected fold must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("rolled back"), "{stderr}");
+    assert!(stderr.contains("kin abort"), "{stderr}");
+    std::fs::remove_file(&hook).unwrap();
+
+    // The fixups are gone and the absorbed change is staged again.
+    assert_eq!(tip(&repo, "review"), review_before);
+    assert_eq!(tip(&repo, "side"), side_before);
+    assert_eq!(
+        git_output(repo_path, &["diff", "--cached", "--name-only"]).trim(),
+        "code.txt"
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(rebase_state_file(repo_path))
+            .expect("the journal could not be removed"),
+    )
+    .unwrap();
+    assert_eq!(
+        state["journal"]["abort_only"],
+        serde_json::Value::Bool(true)
+    );
+
+    let continued = kin_cmd()
+        .current_dir(repo_path)
+        .arg("continue")
+        .output()
+        .unwrap();
+    assert!(
+        !continued.status.success(),
+        "a rolled-back absorb cannot continue"
+    );
+    assert_eq!(tip(&repo, "side"), side_before, "continue restacked side");
+
+    let anchors = git_output(
+        repo_path,
+        &["for-each-ref", "--format=%(refname)", "refs/kindra/absorb/"],
+    );
+    let anchor = anchors.trim();
+    std::fs::remove_file(repo_path.join(format!(".git/{anchor}.lock"))).unwrap();
+    kin_cmd()
+        .current_dir(repo_path)
+        .arg("abort")
+        .assert()
+        .success();
+    assert!(!rebase_state_file(repo_path).exists());
+    assert_eq!(
+        git_output(
+            repo_path,
+            &["for-each-ref", "--format=%(refname)", "refs/kindra/absorb/"]
+        ),
+        ""
+    );
+    assert_eq!(tip(&repo, "review"), review_before);
+    assert_eq!(
+        git_output(repo_path, &["diff", "--cached", "--name-only"]).trim(),
+        "code.txt"
+    );
+}
+
 fn git_output(dir: &std::path::Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
         .args(args)
