@@ -4331,3 +4331,105 @@ fn paused_linear_sync_refuses_to_restart_a_rebase_aborted_with_git() {
     assert_eq!(branch_tips(path), before);
     assert_returned_to_caller(path, SyncShape::Linear);
 }
+
+/// A failed rebase can race with a fast-forward of the checked-out trunk.
+/// Abort must roll back its tree as well as its ref before restoring the stash.
+#[cfg(unix)]
+#[test]
+fn sync_abort_after_failed_rebase_rolls_back_fast_forwarded_trunk_tree() {
+    check_failed_sync_fast_forward_abort(true, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_abort_after_failed_rebase_with_only_untracked_changes_leaves_index_clean() {
+    check_failed_sync_fast_forward_abort(false, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_abort_after_failed_rebase_preserves_edits_staged_while_paused() {
+    check_failed_sync_fast_forward_abort(false, true);
+}
+
+#[cfg(unix)]
+fn check_failed_sync_fast_forward_abort(staged_before: bool, staged_after: bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, remote) = remote_backed_repo();
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    let repo = Repository::open(dir.path()).unwrap();
+    let original = tip(&repo, "main");
+    common::push_remote_commit(remote.path(), "main", "remote.txt");
+    if staged_before {
+        fs::write(dir.path().join("base.txt"), "staged local edit\n").unwrap();
+        run_ok("git", &["add", "base.txt"], dir.path());
+    }
+    fs::write(dir.path().join("scratch.txt"), "untracked local edit\n").unwrap();
+
+    let mock_bin = repo.path().join("mock-bin");
+    fs::create_dir_all(&mock_bin).unwrap();
+    let wrapper = mock_bin.join("git");
+    let real_git = which::which("git").unwrap();
+    fs::write(&wrapper, format!(
+        "#!/bin/sh\nif [ \"$1\" = rebase ]; then\n  : > \"$GIT_DIR/index.lock\"\n  \"{}\" \"$@\"\n  failed=$?\n  rm \"$GIT_DIR/index.lock\"\n  \"{}\" merge --ff-only origin/main || exit $?\n  exit \"$failed\"\nfi\nexec \"{}\" \"$@\"\n",
+        real_git.display(), real_git.display(), real_git.display(),
+    )).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    kin_cmd()
+        .args(["sync", "--autostash"])
+        .env(
+            "PATH",
+            format!("{}:{}", mock_bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed before sync"));
+    assert_ne!(tip(&repo, "main"), original);
+    assert!(rebase_state_file(dir.path()).exists());
+    if staged_after {
+        fs::write(dir.path().join("base.txt"), "staged local edit\n").unwrap();
+        run_ok("git", &["add", "base.txt"], dir.path());
+    }
+
+    kin_cmd()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(tip(&repo, "main"), original);
+    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+    assert!(
+        !dir.path().join("remote.txt").exists(),
+        "remote commits must not become staged changes"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("base.txt")).unwrap(),
+        if staged_before || staged_after {
+            "staged local edit\n"
+        } else {
+            "base"
+        }
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "untracked local edit\n"
+    );
+    let status = std::process::Command::new("git") // Test fixture inspects its repository directly.
+        .args(["status", "--porcelain"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert_eq!(
+        String::from_utf8(status.stdout).unwrap(),
+        if staged_before || staged_after {
+            "M  base.txt\n?? scratch.txt\n"
+        } else {
+            "?? scratch.txt\n"
+        }
+    );
+    assert!(!rebase_state_file(dir.path()).exists());
+    assert!(repo.find_reference("refs/stash").is_err());
+}
