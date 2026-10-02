@@ -153,6 +153,25 @@ fn abort_locked(repo: &git2::Repository, clear_state_only: bool) -> Result<()> {
                     checkout_after_restoring_tips(repo, &mut parsed_state, &restore_branch)?;
                 }
             } else {
+                // Fast-forward replays roll their tree back with their refs;
+                // in-place folds instead hand committed content back as edits.
+                // Keep HEAD at the tree currently checked out while restoring
+                // refs. Moving its attached branch first makes checkout see
+                // the old tree as current, leaving the operation's newer tree
+                // staged instead of rolling it back. Detaching changes no files
+                // or index entries; the checkout below preserves later edits.
+                let head = repo.head()?;
+                if parsed_state.rebase_options.fast_forward
+                    && let Some(branch) = head.shorthand()
+                    && !repo.head_detached()?
+                    && let Some(original) = parsed_state.original_tip_map.get(branch)
+                    && original != &head.peel_to_commit()?.id().to_string()
+                {
+                    let mut plan = crate::overrides::Plan::default();
+                    plan.checkout_rev(repo, original);
+                    crate::overrides::prepare(repo, &plan)?;
+                    repo.set_head_detached(head.peel_to_commit()?.id())?;
+                }
                 restore_original_branch_tips(repo, &parsed_state.original_tip_map)?;
                 checkout_after_restoring_tips(repo, &mut parsed_state, &restore_branch)?;
                 set_aside::restore_all(repo, &mut parsed_state, Phase::Abort)?;
