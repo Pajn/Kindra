@@ -1,0 +1,27 @@
+{
+  "journal": {
+    "cursor": {
+      "step": 1
+    },
+    "repository": "github.com/test/project",
+    "steps": [
+      {
+        "branch": "feature-b",
+        "kind": "CreateBranch",
+        "remote_ref": "origin/feature-b",
+        "tip": "<feature-b@planned>"
+      },
+      {
+        "branch": "feature-c",
+        "kind": "CreateBranch",
+        "remote_ref": "origin/feature-c",
+        "tip": "<feature-c@planned>"
+      },
+      {
+        "branch": "feature-c",
+        "kind": "Checkout"
+      }
+    ]
+  },
+  "version": 1
+}

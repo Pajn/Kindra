@@ -1,0 +1,70 @@
+{
+  "journal": {
+    "abort_only": false,
+    "caller_branch": "feature-a",
+    "cleanup_checkout_fallback": "main",
+    "cleanup_merged_branches": [],
+    "cursor": {
+      "started": true,
+      "step": 1
+    },
+    "new_base_map": {
+      "feature-a": "main",
+      "feature-b": "feature-a",
+      "feature-c": "feature-a"
+    },
+    "operation": "Sync",
+    "original_branch": "feature-a",
+    "original_commit_count_map": {},
+    "original_tip_map": {
+      "feature-a": "<feature-a@before>",
+      "feature-b": "<feature-b@before>",
+      "feature-c": "<feature-c@before>"
+    },
+    "owned_tip_map": {
+      "feature-a": "<feature-a@paused>",
+      "feature-b": "<feature-b@before>",
+      "feature-c": "<feature-c@before>"
+    },
+    "parent_id_map": {
+      "feature-a": "<commit: base>",
+      "feature-b": "<feature-a@before>",
+      "feature-c": "<feature-a@before>"
+    },
+    "parent_name_map": {
+      "feature-a": "main",
+      "feature-b": "feature-a",
+      "feature-c": "feature-a"
+    },
+    "preserve_content_on_abort": false,
+    "rebase_options": {
+      "fast_forward": false,
+      "keep_cherry_picks": true,
+      "keep_other_refs": false,
+      "no_restart": false
+    },
+    "set_asides": [],
+    "steps": [
+      {
+        "branch": "feature-a",
+        "kind": "Replay"
+      },
+      {
+        "branch": "feature-b",
+        "kind": "Replay"
+      },
+      {
+        "branch": "feature-c",
+        "kind": "Replay"
+      },
+      {
+        "checkout": "feature-a",
+        "kind": "Complete"
+      }
+    ],
+    "suppress_editor": false,
+    "target_branch": "main",
+    "unstage_on_restore": false
+  },
+  "version": 5
+}

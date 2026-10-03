@@ -50,7 +50,7 @@
 //! - 0.2.1 and 0.2.2: adds `stash_apply_index`, `preserve_content_on_abort` and
 //!   `suppress_editor` (absorb);
 //! - 1.0.0 and 1.1.0: adds `carry_stash_ref`; tree sync first ships;
-//! - after 1.1.0: adds `abort_only` and `replay`; restack and absorb save
+//! - 1.2.0: adds `abort_only` and `replay`; restack and absorb save
 //!   their own `operation` labels instead of `Move` and `Commit`; records
 //!   `stash_ref`, `stash_apply_index` and `carry_stash_ref` as `set_asides`;
 //!   and saves the journal inside a `{"version": 1, "journal": {...}}`
@@ -75,7 +75,7 @@
 //!
 //! - 1.1.0 (the first release with hydration): a flat `branch`, `repository` and `steps`, each step
 //!   with a `completed` flag, including branches that already existed;
-//! - after 1.1.0: version 1, inside the same envelope, records `CreateBranch`
+//! - 1.2.0: version 1, inside the same envelope, records `CreateBranch`
 //!   steps for the missing branches, a `Checkout` step and a `cursor`.
 
 mod common;
@@ -2284,6 +2284,55 @@ fn legacy_commit_insert_journal_v4_continues() {
     );
 }
 
+/// The first release with version 5 journals freezes the step plan, cursor,
+/// set-asides and insert ownership independently of future golden updates.
+#[test]
+fn legacy_move_1_2_0_aborts_and_continues() {
+    assert_legacy_replay_aborts(paused_move, "move@1.2.0", &move_status());
+    assert_legacy_replay_continues(
+        paused_move,
+        "move@1.2.0",
+        "feature-a",
+        &[("other", "feature-a"), ("feature-a", "feature-b")],
+    );
+}
+
+#[test]
+fn legacy_commit_insert_1_2_0_aborts_and_continues() {
+    let paused = paused_with_legacy(paused_commit_insert, "commit_insert@1.2.0");
+    paused.abort();
+    paused.assert_restored();
+    assert_eq!(paused.repo.porcelain(), "M  shared.txt\n");
+    assert_eq!(paused.repo.stash_list(), "");
+    assert_legacy_commit_continues(
+        paused_commit_insert,
+        "commit_insert@1.2.0",
+        ContinueOutcome {
+            ends_on: "inserted",
+            stacked: &[("feature-a", "inserted"), ("inserted", "feature-b")],
+            porcelain: "",
+            folded: None,
+        },
+    );
+}
+
+#[test]
+fn legacy_sync_linear_dirty_1_2_0_restores_its_set_aside() {
+    for abort in [false, true] {
+        let paused = paused_with_legacy(paused_sync_linear_dirty, "sync_linear_dirty@1.2.0");
+        paused.assert_status(&sync_linear_status());
+        if abort {
+            paused.abort();
+            paused.assert_restored();
+        } else {
+            paused.continue_to_completion();
+            assert_eq!(paused.repo.current_branch(), "feature-b");
+        }
+        assert_eq!(paused.repo.porcelain(), " M b.txt\n?? untracked.txt\n");
+        assert_eq!(paused.repo.stash_list(), "");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Steps and the cursor
 // ---------------------------------------------------------------------------
@@ -2907,6 +2956,22 @@ exit 1
     fn legacy_checkout_1_1_0_aborts() {
         let mut paused = PausedHydration::start();
         paused.install_legacy("checkout@1.1.0");
+        paused.assert_status();
+        paused.assert_aborts();
+    }
+
+    #[test]
+    fn legacy_checkout_1_2_0_continues() {
+        let mut paused = PausedHydration::start();
+        paused.install_legacy("checkout@1.2.0");
+        paused.assert_status();
+        paused.assert_continues();
+    }
+
+    #[test]
+    fn legacy_checkout_1_2_0_aborts() {
+        let mut paused = PausedHydration::start();
+        paused.install_legacy("checkout@1.2.0");
         paused.assert_status();
         paused.assert_aborts();
     }
