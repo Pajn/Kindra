@@ -76,15 +76,18 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
     })?;
     let local_upstream = upstream_name.clone();
     let (rebase_onto_name, fetch_remote) = resolve_sync_onto(repo, &upstream_name)?;
+    let mut prefetched_stack = None;
     if let Some(remote) = fetch_remote.as_deref() {
-        // The stack is discovered again after the fetch, against the fetched
-        // trunk. This earlier pass, against the trunk as last fetched, only
+        // If fetching changes the trunk or local branches, discover the stack
+        // again. This earlier pass, against the trunk as last fetched, only
         // picks the remote branches to refresh in the same fetch; a branch it
         // misses or adds costs a stale or an extra remote-tracking ref, never a
         // wrong rebase. If the stack can't be found this early (the trunk as
         // last fetched may share no history with HEAD), fetch everything.
-        let stack = if current_branch_name.as_deref() == Some(&upstream_name) {
-            Some(Vec::new())
+        let local_tips_before = crate::stack::local_branch_tips(repo)?;
+        let onto_before = repo.revparse_single(&rebase_onto_name).ok().map(|o| o.id());
+        let discovered = if current_branch_name.as_deref() == Some(&upstream_name) {
+            None
         } else {
             discover_stack(
                 repo,
@@ -93,9 +96,23 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
                 &rebase_onto_name,
             )
             .ok()
-            .map(|(_, stack)| stack)
         };
-        fetch_sync_remote(repo, remote, &rebase_onto_name, stack.as_deref())?;
+        let stack = if current_branch_name.as_deref() == Some(&upstream_name) {
+            Some(&[][..])
+        } else {
+            discovered.as_ref().map(|(_, stack)| stack.as_slice())
+        };
+        fetch_sync_remote(repo, remote, &rebase_onto_name, stack)?;
+        // Reuse discovery only while its graph inputs are unchanged. Custom
+        // fetch refspecs can update local branches too, so check their tips
+        // as well as the trunk before trusting the earlier result.
+        let onto_after = repo.revparse_single(&rebase_onto_name).ok().map(|o| o.id());
+        if onto_before.is_some()
+            && onto_before == onto_after
+            && local_tips_before == crate::stack::local_branch_tips(repo)?
+        {
+            prefetched_stack = discovered;
+        }
     }
 
     // Snapshot for undo only after the preflight (upstream discovery, remote
@@ -109,12 +126,15 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
         return sync_upstream_branch(repo, args, &upstream_name, &rebase_onto_name);
     }
 
-    let (merge_base, stack_branches) = discover_stack(
-        repo,
-        head_id,
-        current_branch_name.as_deref(),
-        &rebase_onto_name,
-    )?;
+    let (merge_base, stack_branches) = match prefetched_stack {
+        Some(stack) => stack,
+        None => discover_stack(
+            repo,
+            head_id,
+            current_branch_name.as_deref(),
+            &rebase_onto_name,
+        )?,
+    };
     let distinct_tips: std::collections::HashSet<_> = get_stack_tips(repo, &stack_branches)?
         .iter()
         .map(|name| repo.revparse_single(name).map(|o| o.id()))
