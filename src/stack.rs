@@ -703,8 +703,11 @@ pub fn collect_stack_component(
         .map(|branch| (branch.name.clone(), Vec::new()))
         .collect();
 
+    // Every candidate uses the same tips and base. Build their ancestry once,
+    // including unrelated trunk forks, instead of walking it once per branch.
+    let parent_ids = find_parents_in_stack(repo, &candidates, merge_base)?;
     for branch in &candidates {
-        let parent_id = find_parent_in_stack(repo, &branch.name, &candidates, merge_base)?;
+        let parent_id = parent_ids[&branch.name];
         if let Some(parent_branch) = candidates
             .iter()
             .find(|candidate| candidate.id == parent_id && candidate.name != branch.name)
@@ -1128,7 +1131,7 @@ pub fn find_merged_branch_in_replay(
 }
 
 /// Every local branch and its tip, sorted by name.
-fn local_branch_tips(repo: &Repository) -> Result<Vec<(String, Oid)>> {
+pub(crate) fn local_branch_tips(repo: &Repository) -> Result<Vec<(String, Oid)>> {
     let mut tips = Vec::new();
     for branch in repo.branches(Some(git2::BranchType::Local))? {
         let (branch, _) = branch?;

@@ -1,8 +1,8 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use git2::{Oid, Repository, Signature, build::CheckoutBuilder};
 use kindra::stack::{
-    collect_merged_local_branches, find_sync_boundary, get_stack_branches_from_merge_base,
-    get_stack_tips,
+    collect_merged_local_branches, collect_stack_component, find_sync_boundary,
+    get_stack_branches_from_merge_base, get_stack_tips,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -456,6 +456,28 @@ fn bench_sync_stack_discovery(c: &mut Criterion) {
     group.finish();
 }
 
+/// Component discovery should walk candidate ancestry once even with many
+/// unrelated local branches that also descend from the stack's merge base.
+fn bench_sync_stack_component(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sync_stack_component");
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(10);
+    for scenario in SCENARIOS {
+        let fixture = setup_repo(scenario);
+        let repo = Repository::open(fixture.path()).expect("failed to open repo");
+        let head = repo.revparse_single(TARGET_BRANCH).unwrap().id();
+        let upstream = repo.revparse_single("main").unwrap().id();
+        let base = repo.merge_base(head, upstream).unwrap();
+        group.bench_function(scenario.id, |b| {
+            b.iter(|| {
+                collect_stack_component(&repo, TARGET_BRANCH, base, upstream, "main")
+                    .expect("failed to discover component")
+            });
+        });
+    }
+    group.finish();
+}
+
 /// Benchmark find_sync_boundary
 fn bench_sync_find_boundary(c: &mut Criterion) {
     let mut group = c.benchmark_group("sync_find_boundary");
@@ -610,6 +632,7 @@ criterion_group!(
     benches,
     bench_sync_full,
     bench_sync_stack_discovery,
+    bench_sync_stack_component,
     bench_sync_find_boundary,
     bench_sync_find_boundary_representative,
     bench_sync_collect_merged

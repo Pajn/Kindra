@@ -88,3 +88,50 @@ fn ancestor_branch_sorts_before_descendants_that_fork_below_the_pairwise_base() 
         "z-base is an ancestor of every other tip and must sort first, got {order:?}"
     );
 }
+
+/// Component discovery shares parent ancestry across unrelated candidates, but
+/// must still connect cousins through a private parent and exclude trunk forks.
+#[test]
+fn stack_component_keeps_cousins_and_excludes_independent_trunk_forks() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let base = make_commit(&repo, "refs/heads/main", "base", "base", "base", &[]);
+    let root = repo.find_commit(base).unwrap();
+    let parent = make_commit(
+        &repo,
+        "refs/heads/parent",
+        "parent",
+        "parent",
+        "parent",
+        &[&root],
+    );
+    let private = repo.find_commit(parent).unwrap();
+    for name in ["left", "right"] {
+        make_commit(
+            &repo,
+            &format!("refs/heads/{name}"),
+            name,
+            name,
+            name,
+            &[&private],
+        );
+    }
+    for i in 0..20 {
+        let name = format!("independent-{i}");
+        make_commit(
+            &repo,
+            &format!("refs/heads/{name}"),
+            &name,
+            &name,
+            &name,
+            &[&root],
+        );
+    }
+    let component =
+        kindra::stack::collect_stack_component(&repo, "left", base, base, "main").unwrap();
+    let names = component
+        .iter()
+        .map(|branch| branch.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["parent", "left", "right"]);
+}

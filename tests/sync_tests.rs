@@ -4433,3 +4433,85 @@ fn check_failed_sync_fast_forward_abort(staged_before: bool, staged_after: bool)
     assert!(!rebase_state_file(dir.path()).exists());
     assert!(repo.find_reference("refs/stash").is_err());
 }
+
+#[test]
+fn sync_reuses_stack_discovery_only_when_fetched_graph_is_unchanged() {
+    for (advance_trunk, add_local_branch) in [(false, false), (true, false), (false, true)] {
+        let (dir, remote) = remote_backed_repo();
+        let repo = Repository::open(dir.path()).unwrap();
+        let base = repo.find_commit(tip(&repo, "main")).unwrap();
+        let feature = make_commit(
+            &repo,
+            "refs/heads/feature",
+            "feature.txt",
+            "feature",
+            "feature",
+            &[&base],
+        );
+        run_ok("git", &["checkout", "-f", "feature"], dir.path());
+        if advance_trunk {
+            common::push_remote_commit(remote.path(), "main", "trunk-new.txt");
+        }
+        if add_local_branch {
+            run_ok(
+                "git",
+                &["push", "origin", "feature:refs/heads/new-child"],
+                dir.path(),
+            );
+            // A negative refspec selects the full-fetch fallback; the custom
+            // destination creates a local branch without moving the trunk.
+            run_ok(
+                "git",
+                &[
+                    "config",
+                    "--add",
+                    "remote.origin.fetch",
+                    "+refs/heads/new-child:refs/heads/new-child",
+                ],
+                dir.path(),
+            );
+            run_ok(
+                "git",
+                &[
+                    "config",
+                    "--add",
+                    "remote.origin.fetch",
+                    "^refs/heads/unrelated",
+                ],
+                dir.path(),
+            );
+        }
+        let trace = repo.path().join("sync-discovery-trace");
+        kin_cmd()
+            .arg("sync")
+            .env("GIT_TRACE", &trace)
+            .current_dir(dir.path())
+            .assert()
+            .success();
+        let contains_head = format!("--contains={feature}");
+        let discoveries = fs::read_to_string(trace)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                line.contains("trace: built-in: git for-each-ref") && line.contains(&contains_head)
+            })
+            .count();
+        assert_eq!(
+            discoveries,
+            if advance_trunk || add_local_branch {
+                2
+            } else {
+                1
+            },
+            "advance_trunk={advance_trunk}, add_local_branch={add_local_branch}"
+        );
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(
+            repo.find_commit(tip(&repo, "feature"))
+                .unwrap()
+                .parent_id(0)
+                .unwrap(),
+            tip(&repo, "origin/main")
+        );
+    }
+}
