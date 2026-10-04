@@ -615,7 +615,7 @@ The `kin wt temp` and `kin wt add` synopses have two forms: without `-b`, the op
 - `clean`: No special state applies.
 - `current`: This row is the current worktree.
 - `dirty`: The worktree has uncommitted changes.
-- `merged`: A temp worktree branch has already been merged into trunk and is eligible for cleanup.
+- `merged`: A temp or cleanup-only worktree branch has already been merged into trunk and is eligible for cleanup.
 - `missing`: Git lists this worktree but its directory no longer exists on disk (run `git worktree prune`).
 
 **Behavior notes:**

@@ -1,6 +1,6 @@
 use crate::worktree::WorktreeRole;
 use crate::worktree::cleanup::{CleanupCandidate, find_cleanup_candidates};
-use crate::worktree::config::{WorktreeConfig, load_worktree_config};
+use crate::worktree::config::{WorktreeConfig, canonical_worktree_path, load_worktree_config};
 use crate::worktree::git::{
     LiveWorktree, add_worktree, checkout_worktree_branch, checkout_worktree_detached,
     create_local_branch_from_start_point_strict, current_branch, current_head_oid,
@@ -27,10 +27,11 @@ pub(crate) fn role_for_path(
     config: &WorktreeConfig,
     normalized: &Path,
 ) -> Result<Option<WorktreeRole>> {
-    if normalized == normalize_path(&config.main.path).as_path() {
+    let normalized = canonical_worktree_path(normalized);
+    if normalized == canonical_worktree_path(&config.main.path) {
         return Ok(Some(WorktreeRole::Main));
     }
-    if normalized == normalize_path(&config.review.path).as_path() {
+    if normalized == canonical_worktree_path(&config.review.path) {
         return Ok(Some(WorktreeRole::Review));
     }
     // Only consult the temp template when temp worktrees are enabled: a disabled
@@ -38,7 +39,7 @@ pub(crate) fn role_for_path(
     // `temp_template_root` would reject, and that must not break main/review
     // classification.
     if config.temp.enabled {
-        let temp_root = temp_template_root(&config.temp.path_template)?;
+        let temp_root = canonical_worktree_path(&temp_template_root(&config.temp.path_template)?);
         if normalized.starts_with(&temp_root) {
             return Ok(Some(WorktreeRole::Temp));
         }
@@ -46,7 +47,7 @@ pub(crate) fn role_for_path(
     if config
         .cleanup
         .iter()
-        .any(|entry| normalized.starts_with(&entry.path))
+        .any(|entry| normalized.starts_with(canonical_worktree_path(&entry.path)))
     {
         return Ok(Some(WorktreeRole::Cleanup));
     }

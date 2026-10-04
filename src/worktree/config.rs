@@ -296,7 +296,12 @@ fn resolve_config_path(base: &Path, value: &str) -> PathBuf {
 }
 
 fn resolve_cleanup_path(base: &Path, value: &str) -> PathBuf {
-    let path = resolve_config_path(base, value);
+    canonical_worktree_path(&resolve_config_path(base, value))
+}
+
+/// Match Git’s canonical paths even when only an ancestor exists on disk.
+pub(crate) fn canonical_worktree_path(path: &Path) -> PathBuf {
+    let path = normalize_path(path);
     // Git reports canonical worktree paths. Resolve aliases such as /tmp on
     // macOS, including when the configured directory has not been created yet.
     for ancestor in path.ancestors() {

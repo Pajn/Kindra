@@ -375,3 +375,52 @@ path = ".git/agent-alias/not-created"
         "{listing}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn cleanup_locations_preserve_roles_configured_through_symlink_aliases() {
+    let dir = setup_worktree_repo();
+    let alias = dir.path().join(".git/role-alias");
+    std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+    let review = dir.path().join("agents/review");
+    let temp = dir.path().join("agents/temp/retained");
+    add_worktree(dir.path(), &review, "review-branch");
+    add_worktree(dir.path(), &temp, "retained-temp");
+    write_repo_config(
+        dir.path(),
+        r#"
+[worktrees]
+root = "."
+[worktrees.main]
+path = ".git/role-alias"
+[worktrees.review]
+path = ".git/role-alias/agents/review"
+[worktrees.temp]
+path_template = ".git/role-alias/agents/temp/{branch}"
+delete_merged = false
+[[worktrees.cleanup]]
+path = "."
+"#,
+    );
+    let listing = list(dir.path());
+    assert!(row(&listing, "main").starts_with("main "), "{listing}");
+    assert!(
+        row(&listing, "review-branch").starts_with("review "),
+        "{listing}"
+    );
+    assert!(
+        row(&listing, "retained-temp").starts_with("temp "),
+        "{listing}"
+    );
+    let output = kin_cmd()
+        .args(["wt", "cleanup", "--yes"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No worktrees are eligible"));
+    assert!(review.is_dir());
+    assert!(temp.is_dir());
+    assert!(branch_exists(dir.path(), "review-branch"));
+    assert!(branch_exists(dir.path(), "retained-temp"));
+}
