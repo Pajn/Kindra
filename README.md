@@ -91,6 +91,7 @@ For a full list of commands and detailed examples, see the [CLI Reference](docs/
 ### Agents and CI
 
 ```bash
+kin push --no-interactive feature/auth
 kin pr --no-interactive --current --title "Add authentication" --body-file auth.md --draft
 kin pr --no-interactive --metadata-file prs.toml --draft
 ```

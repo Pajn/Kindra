@@ -854,10 +854,9 @@ exit 1
         .output()
         .unwrap();
 
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
     assert!(
-        output.status.success(),
-        "kin pr --no-push failed: {:?}",
-        output
+        String::from_utf8_lossy(&output.stderr).contains("kin push --no-interactive -- 'feature'")
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -9132,4 +9131,83 @@ exit 1
             assert!(preserved.contains("#100"), "{preserved}");
         }
     }
+}
+
+#[test]
+fn pr_missing_upstreams_names_explicit_push_command_before_publication() {
+    for no_push in [false, true] {
+        let fx = AfterPrFixture::new(false);
+        run_ok(
+            "git",
+            &["branch", "--unset-upstream", "feature-b"],
+            fx.root(),
+        );
+        let before = remote_tip(&fx.remote(), "refs/heads/feature-b");
+        let mut args = vec!["pr", "--no-interactive", "--current", "--title", "B"];
+        if no_push {
+            args.push("--no-push");
+        }
+        let output = fx.kin(fx.root(), &args);
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("kin push --no-interactive -- 'feature-b'"),
+            "{stderr}"
+        );
+        assert!(!fx.gh_calls().contains("pr create"));
+        assert!(!fx.gh_calls().contains("pr edit"));
+        assert_eq!(remote_tip(&fx.remote(), "refs/heads/feature-b"), before);
+    }
+}
+
+#[test]
+fn pr_missing_upstreams_lists_all_needed_branches_and_explicit_push_recovers() {
+    let fx = AfterPrFixture::new(false);
+    run_ok(
+        "git",
+        &["branch", "--unset-upstream", "feature-a"],
+        fx.root(),
+    );
+    run_ok(
+        "git",
+        &["branch", "--unset-upstream", "feature-b"],
+        fx.root(),
+    );
+    let output = fx.kin(
+        fx.root(),
+        &[
+            "pr",
+            "--no-interactive",
+            "--metadata-all",
+            "--title",
+            "T",
+            "--body-from-commits",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("kin push --no-interactive -- 'feature-a' 'feature-b'"),
+        "{stderr}"
+    );
+    assert!(!fx.gh_calls().contains("pr create"));
+    assert!(!fx.gh_calls().contains("pr edit"));
+    let output = fx.kin(
+        fx.root(),
+        &["push", "--no-interactive", "feature-a", "feature-b"],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let output = fx.kin(
+        fx.root(),
+        &[
+            "pr",
+            "--no-interactive",
+            "--metadata-all",
+            "--title",
+            "T",
+            "--body-from-commits",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fx.gh_calls().matches("pr create").count(), 2);
 }
