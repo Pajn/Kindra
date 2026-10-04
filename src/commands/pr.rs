@@ -1,3 +1,5 @@
+mod metadata;
+
 use crate::commands::pr_merge::pr_merge;
 use crate::gh::{self, CreatePrParams};
 use crate::stack::{
@@ -96,9 +98,15 @@ impl PrReviewArgs {
 /// wizard, so new PRs can be created without prompting (agents/CI).
 #[derive(Default, Clone)]
 pub struct PrCreateOptions {
-    /// Title for every new PR (see the non-interactive require-title rule in
+    /// Title for a new PR (see the non-interactive require-title rule in
     /// [`prompt_title`]).
     pub title: Option<String>,
+    pub current: bool,
+    pub metadata_all: bool,
+    pub body_file: Option<PathBuf>,
+    pub metadata_file: Option<PathBuf>,
+    /// Resolved body, loaded before publication starts.
+    pub body: Option<String>,
     /// Build the body deterministically from the branch commits.
     pub body_from_commits: bool,
     /// Force draft (`Some(true)`) or ready (`Some(false)`); `None` = ask/default.
@@ -182,8 +190,63 @@ fn pr_create_or_update(
     // mutates PR bases below.
     let gh_repository = gh::PrRepository::resolve()?;
     let mut open_prs = open_prs_for_stack(&gh_repository, &all_stack_branches)?;
+    let candidates = if options.current {
+        let head = repo.head()?;
+        let name = head
+            .shorthand()
+            .filter(|_| head.is_branch())
+            .ok_or_else(|| anyhow!("--current requires a checked-out branch"))?;
+        let selected = all_stack_branches
+            .iter()
+            .filter(|branch| branch.name == name)
+            .cloned()
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return Err(anyhow!("Current branch '{name}' is not a stack branch"));
+        }
+        selected
+    } else {
+        all_stack_branches.clone()
+    };
     let scoped_stack_branches =
-        filter_stack_branches_for_pr_scope(&open_prs, all_stack_branches.clone(), include_all)?;
+        filter_stack_branches_for_pr_scope(&open_prs, candidates, include_all)?;
+    let planning_branches = if skip_preflight {
+        discover_stack_branches_with_upstream(&repo)?.1
+    } else {
+        stack_branches_for_base_map(&all_stack_branches)
+    };
+    let planning_base_map = compute_base_map(&repo, &planning_branches, &upstream_name)?;
+    // Input validation precedes every push, base edit and PR creation. Resolve
+    // against all local branches, including ones whose upstream will be set by push.
+    let creation_options = metadata::resolve(
+        &repo,
+        &all_stack_branches,
+        &scoped_stack_branches,
+        &open_prs,
+        &planning_base_map,
+        options,
+        skip_preflight,
+    )?;
+    let mut push_names = scoped_stack_branches
+        .iter()
+        .map(|branch| branch.name.clone())
+        .collect::<HashSet<_>>();
+    if options.current {
+        for branch in &scoped_stack_branches {
+            let mut name = &branch.name;
+            while let Some(parent) = planning_base_map.get(name) {
+                if !planning_base_map.contains_key(parent) || !push_names.insert(parent.clone()) {
+                    break;
+                }
+                name = parent;
+            }
+        }
+    }
+    let push_branches = all_stack_branches
+        .iter()
+        .filter(|branch| push_names.contains(&branch.name))
+        .cloned()
+        .collect::<Vec<_>>();
 
     if !skip_preflight {
         let flattened = run_pr_create_or_update_preflight(
@@ -192,11 +255,13 @@ fn pr_create_or_update(
             &upstream_name,
             &all_stack_branches,
             &scoped_stack_branches,
+            &push_branches,
         )?;
         if flattened {
             // Flatten retargeted PR bases on GitHub, so the pre-flatten snapshot is
-            // stale for base comparisons. Refresh it before processing.
-            open_prs = open_prs_for_stack(&gh_repository, &scoped_stack_branches)?;
+            // stale for base comparisons. Keep the full stack in the refreshed
+            // snapshot so --current can render navigation without editing peers.
+            open_prs = open_prs_for_stack(&gh_repository, &all_stack_branches)?;
         }
     }
 
@@ -237,9 +302,14 @@ fn pr_create_or_update(
             .unwrap_or_else(|| upstream_name.clone());
         let gh_base = normalize_base_for_gh(&git_base);
 
-        if let Some((pr, draft)) =
-            process_branch_pr(&open_prs, &repo, &sb.name, &git_base, &gh_base, options)?
-        {
+        if let Some((pr, draft)) = process_branch_pr(
+            &open_prs,
+            &repo,
+            &sb.name,
+            &git_base,
+            &gh_base,
+            creation_options.get(&sb.name).unwrap_or(options),
+        )? {
             drafts.insert(sb.name.clone(), draft);
             processed_prs.push(StackPr {
                 branch_name: sb.name.clone(),
@@ -266,7 +336,28 @@ fn pr_create_or_update(
 
     // Now that we have all active PRs, update descriptions to include the full stack
     // (including merged ones parsed from existing descriptions).
-    sync_stack_descriptions(&processed_prs, &base_map)?;
+    // --current updates only its target, but its navigation still lists the
+    // other existing PRs. Do not rewrite their descriptions as a side effect.
+    let mut navigation_prs = processed_prs.clone();
+    if options.current {
+        for branch in &all_stack_branches {
+            if !scoped_branch_names.contains(&branch.name)
+                && let Some(pr) = open_prs.get(&branch.name)
+            {
+                navigation_prs.push(StackPr {
+                    branch_name: branch.name.clone(),
+                    pr: pr.to_editable(),
+                });
+            }
+        }
+        let order = all_stack_branches
+            .iter()
+            .enumerate()
+            .map(|(i, branch)| (branch.name.as_str(), i))
+            .collect::<HashMap<_, _>>();
+        navigation_prs.sort_by_key(|pr| order.get(pr.branch_name.as_str()).copied());
+    }
+    sync_stack_descriptions(&processed_prs, &navigation_prs, &base_map)?;
 
     if !after_pr.is_empty() {
         let prs = processed_prs
@@ -381,6 +472,7 @@ fn run_pr_create_or_update_preflight(
     upstream_name: &str,
     all_stack_branches: &[StackBranch],
     scoped_stack_branches: &[StackBranch],
+    push_branches: &[StackBranch],
 ) -> Result<bool> {
     let all_branches_with_upstream = stack_branches_for_base_map(all_stack_branches);
     let scoped_branches_with_upstream = stack_branches_for_base_map(scoped_stack_branches);
@@ -402,7 +494,7 @@ fn run_pr_create_or_update_preflight(
     }
 
     println!("Pushing branches first...\n");
-    let branch_names = scoped_stack_branches
+    let branch_names = push_branches
         .iter()
         .map(|sb| sb.name.clone())
         .collect::<Vec<_>>();
@@ -1379,7 +1471,10 @@ fn create_pr_interactive(
     // A supplied --title wins; otherwise prompt (or apply the non-interactive
     // require-title rule).
     let title = match &options.title {
-        Some(title) => title.clone(),
+        Some(title) => {
+            println!("  PR title: {title}");
+            title.clone()
+        }
         None => prompt_title(branch_name, &commits)?,
     };
     if title.is_empty() {
@@ -1394,7 +1489,9 @@ fn create_pr_interactive(
         repo.path(),
         &format!("pr-body-{branch_name}"),
     ));
-    let body = if options.body_from_commits {
+    let body = if let Some(body) = &options.body {
+        body.clone()
+    } else if options.body_from_commits {
         build_body_from_commits(&commits)
     } else {
         prompt_body(branch_name, &commits, &draft)?
@@ -1460,10 +1557,14 @@ fn create_pr_interactive(
     )))
 }
 
-fn sync_stack_descriptions(prs: &[StackPr], base_map: &HashMap<String, String>) -> Result<()> {
+fn sync_stack_descriptions(
+    prs: &[StackPr],
+    navigation: &[StackPr],
+    base_map: &HashMap<String, String>,
+) -> Result<()> {
     for pr in prs {
         let old_list = parse_stack_section(&pr.pr.body);
-        let merged_list = merge_stack_lists(&old_list, prs, &pr.branch_name)?;
+        let merged_list = merge_stack_lists(&old_list, navigation, &pr.branch_name)?;
         let stack_section = render_stack_section(&merged_list, base_map);
         let updated_body = update_stack_section(&pr.pr.body, stack_section);
 

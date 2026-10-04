@@ -73,7 +73,12 @@ Run `kin tree` from any branch in a stack to see that entire connected stack, in
    - `kin pr --all` to include PRs in the stack that are authored by other GitHub users
    - `kin pr --no-push` to skip that preflight and use the old create/update behavior
    - `kin pr open` to open a PR from the stack
-   - `kin pr edit` to edit title/body/labels/reviewers
+   - `kin pr --current --title "Title" --body-file body.md` to publish only the current branch's PR with prepared metadata
+   - `kin pr --metadata-file prs.toml` to publish a stack with distinct titles and descriptions per branch
+   - `kin pr --metadata-all --title "Shared title" --body-file body.md` to explicitly reuse metadata across new PRs
+   - `kin pr --body-from-commits` to generate each new PR's description from its commits
+   - Add repeatable `--label` / `--reviewer` flags, and `--draft` / `--no-draft`, to control new PR submission
+   - `kin pr edit` to edit title/body/labels/reviewers in a terminal
    - `kin pr flatten` to retarget all open stack PRs to the resolved upstream base branch on GitHub
    - `kin pr status` to inspect reviewers, unresolved comments, and failing/running checks
    - `kin pr review` to render PR review threads as markdown, optionally write them to a file, or copy them via OSC 52
@@ -82,6 +87,33 @@ Run `kin tree` from any branch in a stack to see that entire connected stack, in
 10. **Undo a mistake**: Didn't like the result of a `sync`, `reorder`, `move`, `restack`, or `split`? Run `kin undo` to restore the previous branch tips (and `kin redo` to reapply, or `kin reflog` to review recent operations).
 
 For a full list of commands and detailed examples, see the [CLI Reference](docs/cli_reference.md).
+
+### Agents and CI
+
+Use global `--no-interactive` to prevent prompts, or `--yes` to also accept all
+confirmations, including destructive actions. These flags are mutually exclusive;
+`--yes` does not supply missing input. Without a terminal on both stdin and stdout,
+Kindra automatically runs non-interactively. `KIN_INTERACTIVE=0|1` overrides that
+automatic detection; CLI flags take precedence.
+
+```bash
+kin pr --no-interactive --current --title "Add authentication" --body-file auth.md --draft
+kin pr --no-interactive --metadata-file prs.toml --draft
+```
+
+Single-commit PRs default to the commit subject and body. Multi-commit PRs require
+an explicit title; use a per-branch metadata file for a stack. Supplying `--title`
+or `--body-file` for multiple new PRs requires explicit `--metadata-all`.
+`--body-from-commits` generates independent descriptions. Without an explicit body
+source, Kindra reuses a saved creation draft, then falls back to the single commit's
+body or the PR template for multiple commits. New PRs are ready by default; pass
+`--draft` when publication should start as a draft.
+
+Missing required input exits with **3**; operation failures exit with 1 and CLI
+argument errors with 2. PR creation inputs are validated before publishing.
+`kin pr edit` needs a terminal; use `gh pr edit` for unattended edits, preserving
+both `kindra-stack` markers and their enclosed section. See the
+[CLI reference](docs/cli_reference.md#pr) for the manifest format and marker contract.
 
 ### `kin reorder` editor format
 

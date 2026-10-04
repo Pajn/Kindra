@@ -7725,16 +7725,20 @@ if [[ "$1" == "pr" && "$2" == "create" ]]; then
         echo "simulated create failure" >&2
         exit 1
     fi
-    head=""; base=""; draft=false
+    head=""; base=""; title=""; body=""; draft=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --head) head="$2"; shift ;;
             --base) base="$2"; shift ;;
-            --title|--body|--label|--reviewer) shift ;;
+            --title) title="$2"; shift ;;
+            --body) body="$2"; shift ;;
+            --label|--reviewer) shift ;;
             --draft) draft=true ;;
         esac
         shift
     done
+    printf '%s' "$title" > "$state/$head.title"
+    printf '%s' "$body" > "$state/$head.body"
     count=$(cat "$state/prs" 2>/dev/null | wc -l)
     number=$((101 + count))
     echo "$number $head $base $draft" >> "$state/prs"
@@ -7853,7 +7857,16 @@ impl AfterPrFixture {
 
     /// Non-interactive `kin pr` that creates PRs without prompting.
     fn kin_pr(&self, cwd: &std::path::Path) -> std::process::Output {
-        self.kin(cwd, &["pr", "--title", "T", "--body-from-commits"])
+        self.kin(
+            cwd,
+            &[
+                "pr",
+                "--metadata-all",
+                "--title",
+                "T",
+                "--body-from-commits",
+            ],
+        )
     }
 
     fn gh_calls(&self) -> String {
@@ -7981,7 +7994,16 @@ after_pr = ['echo "${GIT_DIR-unset} ${GIT_WORK_TREE-unset} ${GIT_INDEX_FILE-unse
     );
     let foreign = common::ForeignRepository::new();
 
-    let mut cmd = fx.kin_cmd(fx.root(), &["pr", "--title", "T", "--body-from-commits"]);
+    let mut cmd = fx.kin_cmd(
+        fx.root(),
+        &[
+            "pr",
+            "--metadata-all",
+            "--title",
+            "T",
+            "--body-from-commits",
+        ],
+    );
     foreign.name_in(&mut cmd);
     assert_success(&cmd.output().unwrap());
 
@@ -8006,7 +8028,14 @@ fn after_pr_hook_orders_branching_tree_parents_first() {
 
     let output = fx.kin(
         fx.root(),
-        &["pr", "--title", "T", "--body-from-commits", "--draft"],
+        &[
+            "pr",
+            "--metadata-all",
+            "--title",
+            "T",
+            "--body-from-commits",
+            "--draft",
+        ],
     );
     assert_success(&output);
 
@@ -8180,7 +8209,16 @@ fn after_pr_hook_does_not_run_when_kin_pr_fails() {
     write_repo_config(fx.root(), &record_hook_config("run"));
 
     let output = fx
-        .kin_cmd(fx.root(), &["pr", "--title", "T", "--body-from-commits"])
+        .kin_cmd(
+            fx.root(),
+            &[
+                "pr",
+                "--metadata-all",
+                "--title",
+                "T",
+                "--body-from-commits",
+            ],
+        )
         .env("MOCK_GH_FAIL_CREATE", "1")
         .output()
         .unwrap();
@@ -8560,4 +8598,430 @@ fn pr_flatten_pages_a_head_until_a_pr_from_this_repository_turns_up() {
         queries[1]
     );
     assert!(queries[1].contains("-f h0=feature-a"), "{}", queries[1]);
+}
+
+#[test]
+fn pr_metadata_rejects_ambiguous_title_before_publication() {
+    let fx = AfterPrFixture::new(false);
+    let before = remote_tip(&fx.remote(), "refs/heads/feature-b");
+    let output = fx.kin(fx.root(), &["pr", "--no-interactive", "--title", "Shared"]);
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--current") && stderr.contains("--metadata-all"),
+        "{stderr}"
+    );
+    assert!(!fx.gh_calls().contains("pr create"));
+    assert!(!fx.gh_calls().contains("pr edit"));
+    assert_eq!(remote_tip(&fx.remote(), "refs/heads/feature-b"), before);
+}
+
+#[test]
+fn pr_metadata_validates_all_missing_titles_before_publication() {
+    let fx = AfterPrFixture::new(false);
+    run_ok("git", &["checkout", "feature-a"], fx.root());
+    run_ok(
+        "git",
+        &["commit", "--allow-empty", "-m", "second a"],
+        fx.root(),
+    );
+    run_ok("git", &["checkout", "feature-b"], fx.root());
+    run_ok("git", &["rebase", "feature-a"], fx.root());
+    let before = remote_tip(&fx.remote(), "refs/heads/feature-b");
+    let output = fx.kin(fx.root(), &["pr", "--no-interactive"]);
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("feature-a") && stderr.contains("feature-b"),
+        "{stderr}"
+    );
+    assert!(!fx.gh_calls().contains("pr create"));
+    assert!(!fx.gh_calls().contains("pr edit"));
+    assert_eq!(remote_tip(&fx.remote(), "refs/heads/feature-b"), before);
+}
+
+#[test]
+fn pr_metadata_current_reads_body_and_pushes_dependencies_only() {
+    let fx = AfterPrFixture::new(true);
+    run_ok("git", &["checkout", "feature-a"], fx.root());
+    run_ok(
+        "git",
+        &["commit", "--allow-empty", "-m", "parent update"],
+        fx.root(),
+    );
+    run_ok("git", &["checkout", "feature-b"], fx.root());
+    run_ok("git", &["rebase", "feature-a"], fx.root());
+    let sibling_before = remote_tip(&fx.remote(), "refs/heads/feature-c");
+    let body = fx.tools.path().join("body.md");
+    fs::write(&body, "Real description\n\nTesting: cargo test\n").unwrap();
+    let output = fx.kin(
+        fx.root(),
+        &[
+            "pr",
+            "--no-interactive",
+            "--current",
+            "--title",
+            "Real title",
+            "--body-file",
+            body.to_str().unwrap(),
+            "--draft",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(fx.tools.path().join("feature-b.title")).unwrap(),
+        "Real title"
+    );
+    assert_eq!(
+        fs::read_to_string(fx.tools.path().join("feature-b.body")).unwrap(),
+        fs::read_to_string(body).unwrap()
+    );
+    let prs = fs::read_to_string(fx.tools.path().join("prs")).unwrap();
+    assert_eq!(prs.lines().count(), 1, "{prs}");
+    assert!(prs.contains("feature-b feature-a true"), "{prs}");
+    assert_eq!(
+        remote_tip(&fx.remote(), "refs/heads/feature-a").to_string(),
+        fx.rev("feature-a")
+    );
+    assert_eq!(
+        remote_tip(&fx.remote(), "refs/heads/feature-b").to_string(),
+        fx.rev("feature-b")
+    );
+    assert_eq!(
+        remote_tip(&fx.remote(), "refs/heads/feature-c"),
+        sibling_before
+    );
+}
+
+#[test]
+fn pr_metadata_manifest_creates_distinct_prs_with_relative_body_paths() {
+    let fx = AfterPrFixture::new(false);
+    let inputs = fx.tools.path().join("inputs");
+    fs::create_dir(&inputs).unwrap();
+    fs::write(inputs.join("b.md"), "Body B\n").unwrap();
+    let manifest = inputs.join("prs.toml");
+    fs::write(
+        &manifest,
+        r#"
+[branches."feature-a"]
+title = "Title A"
+body = "Body A"
+draft = false
+[branches."feature-b"]
+title = "Title B"
+body_file = "b.md"
+"#,
+    )
+    .unwrap();
+    let args = [
+        "pr",
+        "--no-interactive",
+        "--metadata-file",
+        manifest.to_str().unwrap(),
+        "--draft",
+        "--label",
+        "enhancement",
+        "--reviewer",
+        "alice",
+    ];
+    let output = fx.kin(fx.root(), &args);
+    assert!(output.status.success(), "{output:?}");
+    for (branch, title, body) in [
+        ("feature-a", "Title A", "Body A"),
+        ("feature-b", "Title B", "Body B\n"),
+    ] {
+        assert_eq!(
+            fs::read_to_string(fx.tools.path().join(format!("{branch}.title"))).unwrap(),
+            title
+        );
+        assert_eq!(
+            fs::read_to_string(fx.tools.path().join(format!("{branch}.body"))).unwrap(),
+            body
+        );
+    }
+    let prs = fs::read_to_string(fx.tools.path().join("prs")).unwrap();
+    assert!(prs.contains("feature-a main false"), "{prs}");
+    assert!(prs.contains("feature-b feature-a true"), "{prs}");
+    assert!(
+        fx.gh_calls()
+            .contains("--label enhancement --reviewer alice")
+    );
+    // Repeating creation inputs must not create again or replace existing titles.
+    fs::write(fx.tools.path().join("calls"), "").unwrap();
+    let output = fx.kin(fx.root(), &args);
+    assert!(output.status.success(), "{output:?}");
+    assert!(!fx.gh_calls().contains("pr create"));
+    assert!(!fx.gh_calls().contains("--title Title"));
+}
+
+#[test]
+fn pr_metadata_all_explicitly_reuses_title_and_body() {
+    let fx = AfterPrFixture::new(false);
+    let body = fx.tools.path().join("body.md");
+    fs::write(&body, "Shared body").unwrap();
+    let output = fx.kin(
+        fx.root(),
+        &[
+            "pr",
+            "--no-interactive",
+            "--metadata-all",
+            "--title",
+            "Shared",
+            "--body-file",
+            body.to_str().unwrap(),
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    for branch in ["feature-a", "feature-b"] {
+        assert_eq!(
+            fs::read_to_string(fx.tools.path().join(format!("{branch}.title"))).unwrap(),
+            "Shared"
+        );
+        assert_eq!(
+            fs::read_to_string(fx.tools.path().join(format!("{branch}.body"))).unwrap(),
+            "Shared body"
+        );
+    }
+}
+
+#[test]
+fn pr_metadata_single_input_allowed_when_only_one_pr_is_new() {
+    let fx = AfterPrFixture::new(false);
+    fs::write(fx.tools.path().join("prs"), "101 feature-a main false\n").unwrap();
+    let body = fx.tools.path().join("body.md");
+    fs::write(&body, "Body B").unwrap();
+    let output = fx.kin(
+        fx.root(),
+        &[
+            "pr",
+            "--no-interactive",
+            "--title",
+            "Title B",
+            "--body-file",
+            body.to_str().unwrap(),
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fx.gh_calls().matches("pr create").count(), 1);
+    assert_eq!(
+        fs::read_to_string(fx.tools.path().join("feature-b.title")).unwrap(),
+        "Title B"
+    );
+    assert!(!fx.gh_calls().contains("pr edit 101 --title Title B"));
+}
+
+#[test]
+fn pr_metadata_invalid_inputs_never_publish() {
+    let fx = AfterPrFixture::new(false);
+    let manifest = fx.tools.path().join("prs.toml");
+    let before = remote_tip(&fx.remote(), "refs/heads/feature-b");
+    for text in [
+        "[branches.typo]\ntitle = 'Oops'",
+        "[branches.feature-b]\ntitle = 'B'\nbody_file = 'missing.md'",
+        "[branches.feature-b]\ntitle = 'B'\nbody = 'B'\nbody_file = 'missing.md'",
+        "[branches.feature-b]\ntitle = '  '",
+        "[branches.feature-b]\ntitel = 'Typo'",
+        "not valid toml",
+    ] {
+        fs::write(&manifest, text).unwrap();
+        let output = fx.kin(
+            fx.root(),
+            &[
+                "pr",
+                "--no-interactive",
+                "--metadata-file",
+                manifest.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(1), "{text}: {output:?}");
+        assert!(!fx.gh_calls().contains("pr create"));
+        assert!(!fx.gh_calls().contains("pr edit"));
+        assert_eq!(remote_tip(&fx.remote(), "refs/heads/feature-b"), before);
+    }
+}
+
+#[test]
+fn pr_metadata_conflicting_sources_and_scopes_are_rejected() {
+    let fx = AfterPrFixture::new(false);
+    let manifest = fx.tools.path().join("prs.toml");
+    fs::write(&manifest, "[branches.feature-b]\ntitle = 'B'\nbody = 'B'").unwrap();
+    let path = manifest.to_str().unwrap();
+    for args in [
+        vec!["pr", "--current", "--metadata-all"],
+        vec!["pr", "--body-file", path, "--body-from-commits"],
+        vec!["pr", "--metadata-file", path, "--title", "B"],
+        vec!["pr", "--metadata-file", path, "--body-file", path],
+        vec!["pr", "--metadata-file", path, "--metadata-all"],
+    ] {
+        let output = fx.kin(fx.root(), &args);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+    }
+    let output = fx.kin(
+        fx.root(),
+        &["pr", "--metadata-file", path, "--body-from-commits"],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!fx.gh_calls().contains("pr create"));
+}
+
+#[test]
+fn pr_metadata_commit_bodies_and_ready_default_are_per_branch() {
+    let fx = AfterPrFixture::new(false);
+    let output = fx.kin(
+        fx.root(),
+        &[
+            "pr",
+            "--no-interactive",
+            "--metadata-all",
+            "--title",
+            "T",
+            "--body-from-commits",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(fx.tools.path().join("feature-a.body")).unwrap(),
+        ""
+    );
+    assert_eq!(
+        fs::read_to_string(fx.tools.path().join("feature-b.body")).unwrap(),
+        "- feat: b\n- feat: b2"
+    );
+    assert!(!fx.gh_calls().contains("--draft"));
+}
+
+#[test]
+fn pr_metadata_no_push_uses_the_publication_base_for_commit_bodies() {
+    let fx = AfterPrFixture::new(false);
+    run_ok(
+        "git",
+        &["branch", "--unset-upstream", "feature-a"],
+        fx.root(),
+    );
+    let output = fx.kin(
+        fx.root(),
+        &[
+            "pr",
+            "--no-interactive",
+            "--no-push",
+            "--title",
+            "B",
+            "--body-from-commits",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let body = fs::read_to_string(fx.tools.path().join("feature-b.body")).unwrap();
+    assert_eq!(body, "- feat: a\n- feat: b\n- feat: b2");
+    assert_eq!(fx.gh_calls().matches("pr create").count(), 1);
+}
+
+#[test]
+fn pr_metadata_current_keeps_navigation_after_flatten_without_editing_other_prs() {
+    let fx = AfterPrFixture::new(false);
+    fs::write(
+        fx.tools.path().join("prs"),
+        "101 feature-a main false\n102 feature-b main false\n",
+    )
+    .unwrap();
+    let output = fx.kin(fx.root(), &["pr", "--no-interactive", "--current"]);
+    assert!(output.status.success(), "{output:?}");
+    let calls = fx.gh_calls();
+    assert!(calls.contains("[feature-a]"), "{calls}");
+    assert!(!calls.contains("pr edit 101"), "{calls}");
+    assert!(!calls.contains("pr create"), "{calls}");
+}
+
+#[test]
+fn pr_metadata_body_only_is_ambiguous_and_bad_body_files_do_not_push() {
+    let fx = AfterPrFixture::new(false);
+    let body = fx.tools.path().join("body.md");
+    fs::write(&body, "Body").unwrap();
+    let before = remote_tip(&fx.remote(), "refs/heads/feature-b");
+    let output = fx.kin(
+        fx.root(),
+        &[
+            "pr",
+            "--no-interactive",
+            "--body-file",
+            body.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    for contents in [None, Some(vec![0xff]), Some(b"Valid body".to_vec())] {
+        match contents {
+            None => fs::remove_file(&body).unwrap(),
+            Some(bytes) => fs::write(&body, bytes).unwrap(),
+        }
+        let output = fx.kin(
+            fx.root(),
+            &[
+                "pr",
+                "--no-interactive",
+                "--current",
+                "--title",
+                " ",
+                "--body-file",
+                body.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+    }
+    assert!(!fx.gh_calls().contains("pr create"));
+    assert!(!fx.gh_calls().contains("pr edit"));
+    assert_eq!(remote_tip(&fx.remote(), "refs/heads/feature-b"), before);
+}
+
+#[test]
+fn pr_metadata_current_rejects_detached_head_and_out_of_scope_entries() {
+    let fx = AfterPrFixture::new(false);
+    let manifest = fx.tools.path().join("prs.toml");
+    fs::write(&manifest, "[branches.feature-a]\ntitle = 'A'").unwrap();
+    let output = fx.kin(
+        fx.root(),
+        &[
+            "pr",
+            "--no-interactive",
+            "--current",
+            "--metadata-file",
+            manifest.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("outside the submission scope"));
+    run_ok("git", &["checkout", "--detach"], fx.root());
+    let output = fx.kin(fx.root(), &["pr", "--no-interactive", "--current"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("checked-out branch"));
+    assert!(!fx.gh_calls().contains("pr create"));
+    assert!(!fx.gh_calls().contains("pr edit"));
+}
+
+#[test]
+fn pr_metadata_partial_manifest_uses_single_commit_defaults() {
+    let fx = AfterPrFixture::new(false);
+    let manifest = fx.tools.path().join("prs.toml");
+    fs::write(
+        &manifest,
+        "[branches.feature-b]\ntitle = 'Title B'\nbody = 'Body B'",
+    )
+    .unwrap();
+    let output = fx.kin(
+        fx.root(),
+        &[
+            "pr",
+            "--no-interactive",
+            "--metadata-file",
+            manifest.to_str().unwrap(),
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(fx.tools.path().join("feature-a.title")).unwrap(),
+        "feat: a"
+    );
+    assert_eq!(
+        fs::read_to_string(fx.tools.path().join("feature-a.body")).unwrap(),
+        ""
+    );
+    assert!(!fx.gh_calls().contains("--draft"));
 }
