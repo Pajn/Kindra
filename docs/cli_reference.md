@@ -709,12 +709,13 @@ It emits static text and does not require being inside a repository, so it is sa
 
 ### `push`
 
-**Description:** Pushes all branches in the current stack to their respective upstreams.
+**Description:** Pushes the current stack, or explicitly named local branches, to their remote upstreams.
 
 **Usage:**
 
 ```bash
-kin push
+kin push [<branch>...]
+kin push --no-interactive feature/auth feature/session
 kin push --force
 kin push --allow-base-push <branch>
 ```
@@ -724,7 +725,23 @@ kin push --allow-base-push <branch>
 - `--allow-base-push <BRANCH>`: Allow `<BRANCH>` to push onto the base branch it tracks. Repeatable; each branch must be named explicitly.
 - `--force`: Replace `--force-if-includes` with `--no-force-if-includes`, keeping `--atomic` and `--force-with-lease`.
 
-This command performs an atomic push of all branches in the stack using `force-with-lease` to ensure safety. It refuses while a Kindra operation is paused, since only part of the stack has been rewritten; `kin pr`, `kin pr flatten` and `kin pr merge` refuse for the same reason, `kin pr merge` before it merges anything on GitHub. Each of them holds the repository lock from that check until it has finished publishing (for `kin pr merge`, through the local cascade), so another `kin` command started meanwhile is refused rather than rewriting the branches being published.
+Pushes use atomic batches and `force-with-lease` to ensure safety. It refuses while a Kindra operation is paused, since only part of the stack has been rewritten; `kin pr`, `kin pr flatten` and `kin pr merge` refuse for the same reason, `kin pr merge` before it merges anything on GitHub. Each of them holds the repository lock from that check until it has finished publishing (for `kin pr merge`, through the local cascade), so another `kin` command started meanwhile is refused rather than rewriting the branches being published.
+
+**Explicit branch selection:** `kin push <branch>...` pushes only the named local
+branches, without prompting. Branches that already have upstreams keep their
+remote and destination. For branches without upstreams, Kindra selects `origin`
+(or the sole remote when there is no `origin`) and sets tracking to a same-named
+remote branch. All names and base-branch guards are validated before pushing;
+new and tracked branches for the same remote are pushed in one atomic batch.
+Duplicate names are ignored. Branch selection works from trunk or detached HEAD,
+and does not discover or publish other branches in the stack. Pushes to different
+remotes are separate batches and cannot be atomic across remotes.
+
+Without branch arguments, the existing stack behavior is unchanged: interactive
+runs offer to push and track branches without upstreams; non-interactive runs
+push only branches that already have upstreams. `--yes` does not select branches
+in that picker. Explicit branch names authorize setting tracking, but do not
+bypass the base-branch guard or imply `--force`.
 
 **What `--force` does and does not relax.** Normal pushes use `--atomic --force-with-lease --force-if-includes`. The lease refuses to overwrite a remote branch whose tip has moved since your remote-tracking ref was last updated; `--force-if-includes` adds a stricter requirement: the remote-tracking tip must have been integrated into your local branch at some point, which Git checks by looking for it in the branch's reflog. A fetch alone does not satisfy it; a rebase onto or merge of the fetched commits does, even if you later rewrote them away. `kin push --force` replaces `--force-if-includes` with `--no-force-if-includes` to turn off that stricter check for the run, so a push rejected only on those grounds lands. `--atomic` (the stack lands as one unit or not at all) and `--force-with-lease` still apply, as does the base-branch refusal below; `--force` is not `git push --force`. Relaxed pushes are labelled in the output.
 
@@ -832,6 +849,21 @@ kin pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--reviewe
 - `kin pr merge`: Select an open PR in the current stack and merge it only when review/check state is ready, or prompt/error with the blocking reasons.
 - `kin pr status`: Show each stack PR's reviewer status, unresolved comments, and running/failed checks. It also reports any interrupted `kin commit`, `kin move`, `kin reorder`, `kin sync`, or `kin restack` operation in the current repo and points you to `kin continue`/`kin abort` or native Git rebase commands when there is no saved Kindra state.
 - `kin pr review`: Select an open PR in the current stack, fetch its review threads through `gh api graphql`, and render them as markdown.
+
+**Missing upstreams in non-interactive runs:** Before the normal flatten/push
+preflight changes anything, `kin pr` checks the selected branches and required
+push dependencies. Missing upstreams exit with code 3 and a command listing the
+branches to push and track, for example:
+
+```bash
+kin push --no-interactive -- 'feature/auth' 'feature/session'
+kin pr --no-interactive --metadata-file prs.toml
+```
+
+Follow this setup instruction, then retry the PR command; the normal PR preflight
+still pushes subsequent updates. This removes the need for a manual `git push -u`.
+`--no-push` still processes only branches with upstreams; if none of the selected
+branches has one, it reports the same setup instruction with exit code 3.
 
 **Creation inputs and scope:**
 

@@ -1640,3 +1640,203 @@ fn push_holds_the_repository_lock_while_pushing() {
         feature_id
     );
 }
+
+fn explicit_push_fixture() -> (tempfile::TempDir, tempfile::TempDir, Repository) {
+    let dir = common::setup_repo();
+    let remote = tempdir().unwrap();
+    run_ok("git", &["init", "--bare"], remote.path());
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "feature-a"],
+        dir.path(),
+    );
+    let repo = Repository::open(dir.path()).unwrap();
+    (dir, remote, repo)
+}
+
+#[test]
+fn push_explicit_branch_sets_upstream_and_only_pushes_named_branches() {
+    let (dir, remote, repo) = explicit_push_fixture();
+    let a_before = remote_tip(remote.path(), "refs/heads/feature-a");
+    run_ok("git", &["checkout", "feature-a"], dir.path());
+    run_ok(
+        "git",
+        &["commit", "--allow-empty", "-m", "update a"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "main"], dir.path());
+    let output = kin_cmd()
+        .args(["push", "--no-interactive", "feature-b"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        remote_tip(remote.path(), "refs/heads/feature-b"),
+        repo.refname_to_id("refs/heads/feature-b").unwrap()
+    );
+    assert_eq!(
+        repo.find_branch("feature-b", git2::BranchType::Local)
+            .unwrap()
+            .upstream()
+            .unwrap()
+            .name()
+            .unwrap(),
+        Some("origin/feature-b")
+    );
+    assert_eq!(remote_tip(remote.path(), "refs/heads/feature-a"), a_before);
+}
+
+#[test]
+fn push_explicit_validates_every_branch_before_pushing() {
+    let (dir, remote, repo) = explicit_push_fixture();
+    let output = kin_cmd()
+        .args(["push", "--no-interactive", "feature-b", "typo"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("typo"));
+    assert!(
+        Repository::open_bare(remote.path())
+            .unwrap()
+            .refname_to_id("refs/heads/feature-b")
+            .is_err()
+    );
+    assert!(
+        repo.find_branch("feature-b", git2::BranchType::Local)
+            .unwrap()
+            .upstream()
+            .is_err()
+    );
+}
+
+#[test]
+fn push_explicit_mixed_new_and_tracked_branches_are_atomic() {
+    let (dir, remote, repo) = explicit_push_fixture();
+    let before = remote_tip(remote.path(), "refs/heads/feature-a");
+    run_ok("git", &["checkout", "feature-a"], dir.path());
+    run_ok("git", &["commit", "--amend", "-m", "rewrite a"], dir.path());
+    run_ok(
+        "git",
+        &["config", "receive.denyNonFastForwards", "true"],
+        remote.path(),
+    );
+    let output = kin_cmd()
+        .args(["push", "--no-interactive", "feature-b", "feature-a"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(remote_tip(remote.path(), "refs/heads/feature-a"), before);
+    assert!(
+        Repository::open_bare(remote.path())
+            .unwrap()
+            .refname_to_id("refs/heads/feature-b")
+            .is_err()
+    );
+    assert!(
+        repo.find_branch("feature-b", git2::BranchType::Local)
+            .unwrap()
+            .upstream()
+            .is_err()
+    );
+}
+
+#[test]
+fn push_explicit_preserves_base_guard_before_pushing_any_branch() {
+    let (dir, remote, repo) = setup_trunk_tracking_branch("feature-x");
+    let before = remote_tip(remote.path(), "refs/heads/main");
+    run_ok("git", &["branch", "untracked", "main"], dir.path());
+    let output = kin_cmd()
+        .args(["push", "--no-interactive", "untracked", "feature-x"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Refusing to push"));
+    assert_eq!(remote_tip(remote.path(), "refs/heads/main"), before);
+    assert!(
+        Repository::open_bare(remote.path())
+            .unwrap()
+            .refname_to_id("refs/heads/untracked")
+            .is_err()
+    );
+    assert!(
+        repo.find_branch("untracked", git2::BranchType::Local)
+            .unwrap()
+            .upstream()
+            .is_err()
+    );
+}
+
+#[test]
+fn push_explicit_deduplicates_branches_and_uses_the_only_remote() {
+    let (dir, remote, repo) = explicit_push_fixture();
+    run_ok(
+        "git",
+        &["remote", "rename", "origin", "upstream"],
+        dir.path(),
+    );
+    run_ok("git", &["checkout", "--detach"], dir.path());
+    let output = kin_cmd()
+        .args(["push", "--no-interactive", "feature-b", "feature-b"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Pushing 1 branches to upstream"));
+    assert_eq!(
+        remote_tip(remote.path(), "refs/heads/feature-b"),
+        repo.refname_to_id("refs/heads/feature-b").unwrap()
+    );
+    assert_eq!(
+        repo.find_branch("feature-b", git2::BranchType::Local)
+            .unwrap()
+            .upstream()
+            .unwrap()
+            .name()
+            .unwrap(),
+        Some("upstream/feature-b")
+    );
+}
+
+#[test]
+fn push_explicit_existing_upstream_keeps_its_remote_and_destination() {
+    let (dir, remote, repo) = explicit_push_fixture();
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "feature-b:published-b"],
+        dir.path(),
+    );
+    let output = kin_cmd()
+        .args(["push", "--no-interactive", "feature-b"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        remote_tip(remote.path(), "refs/heads/published-b"),
+        repo.refname_to_id("refs/heads/feature-b").unwrap()
+    );
+    assert!(
+        Repository::open_bare(remote.path())
+            .unwrap()
+            .refname_to_id("refs/heads/feature-b")
+            .is_err()
+    );
+    assert_eq!(
+        repo.find_branch("feature-b", git2::BranchType::Local)
+            .unwrap()
+            .upstream()
+            .unwrap()
+            .name()
+            .unwrap(),
+        Some("origin/published-b")
+    );
+}

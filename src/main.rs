@@ -64,7 +64,7 @@ struct Cli {
 enum Commands {
     /// Opens $EDITOR to manage branches in a stack of commits
     Split(SplitArgs),
-    /// Pushes all branches with upstreams (atomic, force-with-lease)
+    /// Push stack or explicitly named branches (atomic, force-with-lease)
     Push(PushArgs),
     /// Create/update PRs for stack branches, or open existing PRs in the browser
     Pr {

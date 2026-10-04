@@ -249,6 +249,7 @@ fn pr_create_or_update(
         .collect::<Vec<_>>();
 
     if !skip_preflight {
+        require_pr_upstreams(&repo, &push_branches)?;
         let flattened = run_pr_create_or_update_preflight(
             &open_prs,
             &repo,
@@ -278,8 +279,18 @@ fn pr_create_or_update(
         .collect::<Vec<_>>();
 
     if branches_with_upstream.is_empty() {
+        require_pr_upstreams(&repo, &scoped_stack_branches)?;
         println!("No branches with a remote upstream to create PRs for.");
-        println!("Run `kin push` first to set upstreams.");
+        let names = scoped_stack_branches
+            .iter()
+            .map(|branch| branch.name.clone())
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            println!(
+                "Run `{}` first to set upstreams.",
+                crate::commands::push::explicit_push_hint(&names)
+            );
+        }
         return Ok(());
     }
 
@@ -390,6 +401,26 @@ fn pr_create_or_update(
         )?;
     }
 
+    Ok(())
+}
+
+fn require_pr_upstreams(repo: &Repository, branches: &[StackBranch]) -> Result<()> {
+    let mode = crate::interaction::current();
+    if mode.is_interactive() || mode.scripted().is_some() {
+        return Ok(());
+    }
+    let names = branches
+        .iter()
+        .map(|branch| branch.name.clone())
+        .collect::<Vec<_>>();
+    let missing = crate::commands::push::missing_upstreams(repo, &names)?;
+    if !missing.is_empty() {
+        return Err(crate::interaction::input_required(format!(
+            "PR branches need remote upstreams: {}. Run `{}` to push and track them, then retry kin pr.",
+            missing.join(", "),
+            crate::commands::push::explicit_push_hint(&missing)
+        )));
+    }
     Ok(())
 }
 

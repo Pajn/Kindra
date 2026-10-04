@@ -1,6 +1,6 @@
 use crate::commands::{find_upstream, foreign_base_target, protected_push_targets};
 use crate::stack::get_stack_branches_for_head;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::Args;
 use git2::{BranchType, ErrorCode, Repository};
 use std::collections::HashSet;
@@ -12,6 +12,9 @@ const ALLOW_BASE_PUSH_CONFIG: &str = "kinAllowBasePush";
 
 #[derive(Args, Default)]
 pub struct PushArgs {
+    /// Push only these local branches, setting upstreams without prompting
+    #[arg(value_name = "BRANCH", add = crate::commands::local_branch_completer())]
+    pub branches: Vec<String>,
     /// Allow this branch to push onto the base branch it tracks, overriding the
     /// safety refusal. Repeatable; each branch must be named explicitly, so this
     /// cannot blanket-disable the guard. Equivalent per-branch config:
@@ -55,6 +58,10 @@ pub fn push(args: &PushArgs) -> Result<()> {
         crate::operation_state::Allow::PUBLISH,
     )?;
 
+    if !args.branches.is_empty() {
+        return push_explicit_branches(&repo, args);
+    }
+
     let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
         anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
     })?;
@@ -76,6 +83,56 @@ pub fn push(args: &PushArgs) -> Result<()> {
     push_stack_branches(&repo, &branch_names, &args.allow_base_push, args.force)
 }
 
+fn push_explicit_branches(repo: &Repository, args: &PushArgs) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+    let mut default_remote = None;
+    for name in &args.branches {
+        if !seen.insert(name) {
+            continue;
+        }
+        let branch = repo
+            .find_branch(name, BranchType::Local)
+            .with_context(|| format!("Local branch '{name}' not found"))?;
+        let target = match tracked_push_target(repo, &branch, name.clone())? {
+            Some(target) => target,
+            None => {
+                let remote = match &default_remote {
+                    Some(remote) => remote,
+                    None => default_remote.insert(resolve_remote(repo)?),
+                };
+                BranchStatus::with_upstream(name.clone(), remote, name)
+            }
+        };
+        targets.push(target);
+    }
+    // Validate all targets and base-branch guards before any remote changes.
+    // Include new and tracked branches in the same atomic push per remote.
+    perform_push_impl(repo, targets, &args.allow_base_push, args.force, true)
+}
+
+/// A copyable command that explicitly authorizes the missing upstreams, rather
+/// than suggesting the implicit stack picker (which has no unattended answer).
+pub(crate) fn explicit_push_hint(branches: &[String]) -> String {
+    let names = branches
+        .iter()
+        .map(|name| format!("'{}'", name.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("kin push --no-interactive -- {names}")
+}
+
+pub(crate) fn missing_upstreams(repo: &Repository, names: &[String]) -> Result<Vec<String>> {
+    names
+        .iter()
+        .filter_map(|name| match repo.find_branch(name, BranchType::Local) {
+            Ok(branch) if branch.upstream().is_err() => Some(Ok(name.clone())),
+            Ok(_) => None,
+            Err(error) => Some(Err(error.into())),
+        })
+        .collect()
+}
+
 /// The error for branches whose upstream is a protected base branch, listing each
 /// offending mapping and how to repoint it.
 ///
@@ -95,9 +152,11 @@ fn protected_target_error(mistracked: &[(String, String, String)]) -> anyhow::Er
          branch.autoSetupMerge=true makes 'git switch -c <branch> <remote>/<base>' track <base>.\n\
          Repoint each branch at its own remote branch:\n",
     );
-    for (branch, remote, _) in mistracked {
+    for (branch, _, _) in mistracked {
+        let quoted = format!("'{}'", branch.replace('\'', "'\\''"));
         message.push_str(&format!(
-            "  git branch --unset-upstream {branch}   # then re-run, or 'git push -u {remote} {branch}'\n"
+            "  git branch --unset-upstream -- {quoted}\n  {}\n",
+            explicit_push_hint(std::slice::from_ref(branch))
         ));
     }
     // Callers only build this error for a non-empty set; take the first element
@@ -441,6 +500,16 @@ fn perform_push(
     allow_base_push: &[String],
     force: bool,
 ) -> Result<()> {
+    perform_push_impl(repo, branches, allow_base_push, force, false)
+}
+
+fn perform_push_impl(
+    repo: &Repository,
+    branches: Vec<BranchStatus>,
+    allow_base_push: &[String],
+    force: bool,
+    set_upstream: bool,
+) -> Result<()> {
     if branches.is_empty() {
         println!("Nothing to push.");
         return Ok(());
@@ -504,6 +573,9 @@ fn perform_push(
         }
         announce_force(force);
         let mut cmd = push_command(repo, force);
+        if set_upstream {
+            cmd.arg("-u");
+        }
         cmd.arg(&remote);
 
         for (local_name, remote_ref) in &refs {
