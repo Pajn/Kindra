@@ -43,7 +43,24 @@ pub(crate) fn role_for_path(
             return Ok(Some(WorktreeRole::Temp));
         }
     }
+    if config
+        .cleanup
+        .iter()
+        .any(|entry| normalized.starts_with(&entry.path))
+    {
+        return Ok(Some(WorktreeRole::Cleanup));
+    }
     Ok(None)
+}
+
+/// Keep classification and cleanup eligibility together so list, cleanup and
+/// removal agree, including persistent roles nested under cleanup directories.
+pub(crate) fn is_cleanup_location(config: &WorktreeConfig, path: &Path) -> Result<bool> {
+    Ok(match role_for_path(config, path)? {
+        Some(WorktreeRole::Temp) => config.temp.delete_merged,
+        Some(WorktreeRole::Cleanup) => true,
+        _ => false,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -357,7 +374,8 @@ pub fn ensure_temp_new_branch(
 /// `kin wt add`. Unlike the role worktrees this has no policy: it defaults to a
 /// sibling directory when the repo has a parent directory, otherwise
 /// `<repo>/worktrees` (or an explicit `path`), runs only the global
-/// create-hooks, is never force-added, and is never auto-cleaned. If a worktree
+/// create-hooks and is never force-added. Its role and cleanup eligibility are
+/// derived from its path like every other worktree. If a worktree
 /// is already checked out on the branch, its path is returned unchanged
 /// (idempotent).
 pub fn ensure_added(
@@ -497,7 +515,7 @@ pub fn list_managed_worktrees(repo: &Repository) -> Result<Vec<WorktreeListRow>>
         normalize_path(repo.workdir().ok_or_else(|| {
             anyhow!("Kindra worktree management requires a non-bare repository.")
         })?);
-    let merged_branches = if ctx.config.temp.delete_merged {
+    let merged_branches = if ctx.config.temp.delete_merged || !ctx.config.cleanup.is_empty() {
         crate::stack::collect_merged_local_branches(
             repo,
             &ctx.config.trunk,
@@ -531,7 +549,7 @@ pub fn list_managed_worktrees(repo: &Repository) -> Result<Vec<WorktreeListRow>>
                 state.push("current".to_string());
             }
         }
-        if role == Some(WorktreeRole::Temp)
+        if is_cleanup_location(&ctx.config, &normalized)?
             && let Some(branch) = &live.branch
             && merged_branches.contains(branch)
         {
@@ -589,8 +607,12 @@ pub fn remove_target(
     let is_trunk_branch = resolved.branch == ctx.config.trunk;
     let worktree_role = role_for_path(&ctx.config, &normalize_path(&resolved.path))?;
     let is_persistent_role = is_persistent_worktree_role(worktree_role);
-    let auto_delete_allowed =
-        ctx.config.temp.delete_merged && !is_trunk_branch && !is_persistent_role;
+    let delete_merged = if worktree_role == Some(WorktreeRole::Cleanup) {
+        true
+    } else {
+        ctx.config.temp.delete_merged
+    };
+    let auto_delete_allowed = delete_merged && !is_trunk_branch && !is_persistent_role;
 
     let will_delete_branch = if keep_branch {
         false
@@ -832,7 +854,8 @@ pub fn cleanup_temp_worktrees(
     println!("Cleanup candidates:");
     for (candidate, dirty) in &candidates_with_dirty {
         println!(
-            "  temp {:<20} {:<14} {}{}",
+            "  {} {:<20} {:<14} {}{}",
+            role_label_for_path(&ctx.config, &candidate.live.normalized_path())?,
             candidate.branch,
             "merged",
             candidate.path.display(),
@@ -849,19 +872,19 @@ pub fn cleanup_temp_worktrees(
     let base = if will_delete_branches {
         if cross_worktree_branch_skip_count > 0 {
             format!(
-                "Remove {} temp worktree candidate(s) and delete branches where possible ({} checked out elsewhere)",
+                "Remove {} worktree candidate(s) and delete branches where possible ({} checked out elsewhere)",
                 candidates_with_dirty.len(),
                 cross_worktree_branch_skip_count
             )
         } else {
             format!(
-                "Remove {} temp worktree candidate(s) and delete their branches",
+                "Remove {} worktree candidate(s) and delete their branches",
                 candidates_with_dirty.len()
             )
         }
     } else {
         format!(
-            "Remove {} temp worktree candidate(s)",
+            "Remove {} worktree candidate(s)",
             candidates_with_dirty.len()
         )
     };
@@ -888,10 +911,12 @@ pub fn cleanup_temp_worktrees(
             path: candidate.path.clone(),
             live: Some(candidate.live.clone()),
         };
+        let role = role_label_for_path(&ctx.config, &resolved.path)?;
 
         if dirty && !force {
             println!(
-                "Skipping dirty temp worktree '{}' at '{}'. Re-run with --force to remove it.",
+                "Skipping dirty {} worktree '{}' at '{}'. Re-run with --force to remove it.",
+                role,
                 resolved.branch,
                 resolved.path.display()
             );
@@ -938,8 +963,7 @@ pub fn cleanup_temp_worktrees(
             .unwrap_or((false, None));
 
         removed.push(RemoveResult {
-            // Cleanup only ever targets temp worktrees.
-            role: WorktreeRole::Temp.to_string(),
+            role,
             branch: resolved.branch,
             path: resolved.path,
             branch_deleted,
@@ -1093,7 +1117,7 @@ fn resolve_target(ctx: &LoadedContext, target: &str) -> Result<ResolvedTarget> {
                 live: Some(live),
             })
         }
-        WorktreeTarget::Role(WorktreeRole::Temp) => unreachable!(
+        WorktreeTarget::Role(WorktreeRole::Temp | WorktreeRole::Cleanup) => unreachable!(
             "parse_target only yields Role(Main), Role(Review), or Branch — there is no bare `temp` keyword"
         ),
         WorktreeTarget::Branch(branch) => {

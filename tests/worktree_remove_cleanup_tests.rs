@@ -221,7 +221,7 @@ fn worktree_cleanup_yes_skips_dirty_candidates_without_force() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Skipping dirty temp worktree 'feature-a'"));
-    assert!(stdout.contains("found 1 temp worktree candidate(s), removed 0, skipped 1"));
+    assert!(stdout.contains("found 1 worktree candidate(s), removed 0, skipped 1"));
     assert!(temp_path.exists());
 
     let output = kin_cmd()
