@@ -9025,3 +9025,111 @@ fn pr_metadata_partial_manifest_uses_single_commit_defaults() {
     );
     assert!(!fx.gh_calls().contains("--draft"));
 }
+
+#[test]
+fn pr_restores_stack_after_external_body_replacement_but_not_deleted_history() {
+    for current_only in [false, true] {
+        let fx = AfterPrFixture::new(false);
+        let replacement = "Rewritten description\n\n## Validation\nTests pass.\n";
+        let old_body = "Old description\n\n<!-- kindra-stack:start -->\n## Stack\n\n- ~[merged](https://github.com/owner/repo/pull/100) #100~ (merged)\n- [feature-a](https://github.com/owner/repo/pull/101) #101\n- → feature-b #102\n<!-- kindra-stack:end -->";
+        let snapshot = |body_b: &str| {
+            serde_json::json!([
+                {
+                    "number": 101, "headRefName": "feature-a", "baseRefName": "main",
+                    "isDraft": false, "title": "A", "body": old_body,
+                    "url": "https://github.com/owner/repo/pull/101", "labels": [], "reviewRequests": []
+                },
+                {
+                    "number": 102, "headRefName": "feature-b", "baseRefName": "feature-a",
+                    "isDraft": false, "title": "B", "body": body_b,
+                    "url": "https://github.com/owner/repo/pull/102", "labels": [], "reviewRequests": []
+                }
+            ]).to_string()
+        };
+        fs::write(fx.tools.path().join("snapshot.json"), snapshot(old_body)).unwrap();
+        fs::write(
+            fx.tools.path().join("replacement.json"),
+            snapshot(replacement),
+        )
+        .unwrap();
+        let body_file = fx.tools.path().join("body.md");
+        fs::write(&body_file, replacement).unwrap();
+        write_script(
+            &fx.tools.path().join("gh"),
+            &common::with_open_prs_by_head(
+                r#"#!/bin/bash
+state="$MOCK_GH_STATE"
+echo "$*" >> "$state/calls"
+if [[ "$1" == "auth" ]]; then exit 0; fi
+if [[ "$1" == "pr" && "$2" == "list" ]]; then cat "$state/snapshot.json"; exit 0; fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then echo '{"state":"MERGED"}'; exit 0; fi
+if [[ "$1" == "pr" && "$2" == "edit" ]]; then
+    number="$3"
+    shift 3
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --body-file)
+                cp "$2" "$state/external-body"
+                cp "$state/replacement.json" "$state/snapshot.json"
+                shift ;;
+            --body) printf '%s' "$2" > "$state/edited-$number.body"; shift ;;
+            --title) printf '%s' "$2" > "$state/edited-$number.title"; shift ;;
+        esac
+        shift
+    done
+    exit 0
+fi
+echo "unexpected gh command: $*" >&2
+exit 1
+"#,
+            ),
+        );
+        // Perform the external rewrite through the same mocked gh that kin uses.
+        let status = std::process::Command::new(fx.tools.path().join("gh"))
+            .args([
+                "pr",
+                "edit",
+                "102",
+                "--body-file",
+                body_file.to_str().unwrap(),
+            ])
+            .env("MOCK_GH_STATE", fx.tools.path())
+            .current_dir(fx.root())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            fs::read_to_string(fx.tools.path().join("external-body")).unwrap(),
+            replacement
+        );
+        fs::write(fx.tools.path().join("calls"), "").unwrap();
+        let mut args = vec!["pr", "--no-interactive"];
+        if current_only {
+            args.extend(["--current", "--no-push"]);
+        }
+        let output = fx.kin(fx.root(), &args);
+        assert!(output.status.success(), "{output:?}");
+        let restored = fs::read_to_string(fx.tools.path().join("edited-102.body")).unwrap();
+        assert!(restored.starts_with(replacement.trim_end()), "{restored}");
+        assert_eq!(restored.matches("<!-- kindra-stack:start -->").count(), 1);
+        assert_eq!(restored.matches("<!-- kindra-stack:end -->").count(), 1);
+        assert!(
+            restored.contains("[feature-a]") && restored.contains("→ feature-b #102"),
+            "{restored}"
+        );
+        // Historical links are recovered only from this PR's old body, even
+        // when another PR in the stack retains the historical entry.
+        assert!(!restored.contains("#100"), "{restored}");
+        assert_eq!(
+            fs::read_to_string(fx.tools.path().join("edited-102.title")).unwrap(),
+            "B"
+        );
+        assert!(!fx.gh_calls().contains("pr create"));
+        if current_only {
+            assert!(!fx.gh_calls().contains("pr edit 101"));
+        } else {
+            let preserved = fs::read_to_string(fx.tools.path().join("edited-101.body")).unwrap();
+            assert!(preserved.contains("#100"), "{preserved}");
+        }
+    }
+}

@@ -907,17 +907,6 @@ kin pr --no-interactive --current --title "Add authentication" --body-file auth.
 kin pr --no-interactive --metadata-file prs.toml --draft
 ```
 
-**Stack description contract:**
-
-Kindra owns the region between the exact markers
-`<!-- kindra-stack:start -->` and `<!-- kindra-stack:end -->`. These delimiters
-are a stable interface for agents and skills. External edits, including
-`gh pr edit --body-file`, must preserve both markers and the entire enclosed
-section. Edit the surrounding description instead. Kindra refreshes navigation
-within this section as the stack changes, preserving the surrounding text.
-Legacy `gits-stack` markers are recognized and migrated to `kindra-stack` markers.
-Stack sections are synchronized after creation, once the new PR numbers exist.
-
 `kin pr merge` automatically merges when the PR has no unresolved review comments, no outstanding review state, no running/failed checks, and GitHub reports the PR as mergeable. If issues remain but GitHub would still allow merging, Kindra prints the outstanding reviews/checks and asks for confirmation. If GitHub/repository rules block the merge, Kindra exits with a clear reason instead of attempting it.
 
 `kin pr flatten` only updates PR base branches on GitHub. It does not modify local git refs, stack relationships, PR titles, or PR bodies.
@@ -948,6 +937,34 @@ Stack sections are synchronized after creation, once the new PR numbers exist.
 - These commands require authenticated GitHub CLI (`gh auth status` must succeed).
 - Both `kin status` and `kin pr status` report interrupted `kin commit`, `kin move`, `kin reorder`, `kin sync`, and `kin restack` operations.
 - When a saved Kindra state exists, continue with `kin continue` or clean up with `kin abort`. If there is no saved Kindra state and Git itself is mid-rebase, use `git rebase --continue` or `git rebase --abort`.
+
+#### Stack description contract
+
+Kindra owns the region between the exact markers
+`<!-- kindra-stack:start -->` and `<!-- kindra-stack:end -->`. These delimiters
+are a stable interface for agents and skills. External edits should preserve both
+markers and the entire enclosed section, editing the surrounding description.
+Kindra refreshes navigation within this section as the stack changes. Legacy
+`gits-stack` markers are recognized and migrated to `kindra-stack` markers.
+Stack sections are synchronized after creation, once the new PR numbers exist.
+
+If an external body replacement removes the block, `kin pr --no-interactive`
+rebuilds navigation for active PRs in the selected stack and preserves the new
+description. It also runs the usual push/base preflight and may create missing
+PRs, which still require complete creation inputs. To repair only an existing
+PR on the checked-out branch without pushing:
+
+```bash
+gh pr edit <number> --body-file body.md
+kin pr --no-interactive --current --no-push
+```
+
+**Merged history cannot be reconstructed from a removed block.** Historical
+merged PR links are read from that PR's previous body, not from other stack PRs.
+Preserve the block when those links matter. A lone active PR with no retained
+history needs no stack section. Stack-description edit failures are reported on
+stderr; the existing sync loop continues and does not make the overall command
+fail, so a successful exit alone does not guarantee every block was restored.
 
 ---
 
