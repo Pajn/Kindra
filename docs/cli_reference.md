@@ -5,6 +5,7 @@ This document provides a detailed overview of the commands available in Kindra v
 ## Table of Contents
 
 - [Core Concepts](#core-concepts)
+- [Agents and CI](#agents-and-ci)
 - [Configuration](#configuration)
 - [Command Reference](#command-reference)
   - [absorb](#absorb)
@@ -36,6 +37,34 @@ Kindra automatically identifies your stack by looking for local branches that ar
 The base branch is the **trunk**. Kindra resolves it in this order: `upstream_branch` in [repository config](#configuration) (an error if it names no existing branch; a name that exists only as `origin/<name>` resolves to that), otherwise `git config init.defaultBranch`, `main`, `master` and `trunk`. All of those are first looked up as local branches, in that order, and only if none exists as `origin/<name>`, in the same order. For example, with `init.defaultBranch = develop`, a local `main` is chosen over `origin/develop`.
 
 Kindra works on the repository that contains its working directory, as `git` run there without options would. It ignores the repository variables Git exports to its hooks and wrappers set — `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and the others `git rev-parse --local-env-vars` lists, and `GIT_NAMESPACE` — and does not pass them on: `kin run` commands, hooks, editors and `gh` find the repository from their own working directory. `kin` run from a Git hook therefore acts on the repository of the directory it runs in.
+
+---
+
+## Agents and CI
+
+`--no-interactive` and `--yes` are global flags and may appear before or after
+any subcommand. They are mutually exclusive:
+
+- `--no-interactive`: Never prompt. Use safe defaults where available; fail when
+  a real answer is required.
+- `--yes`: Also runs without prompts, but accepts every confirmation, including
+  destructive actions. It does not supply missing titles or other required input.
+
+Without either flag, Kindra prompts only when both stdin and stdout are terminals.
+`KIN_INTERACTIVE=0` (or `false`) forces non-interactive mode;
+`KIN_INTERACTIVE=1` (or `true`) forces interactive mode. CLI flags take precedence.
+
+Exit codes are `0` for success, `1` for operation failures (including unreadable
+or invalid metadata files), `2` for CLI argument errors, and **`3` when required
+prompt input or an input scope is unavailable**. Exit code 3 is not a transaction
+rollback guarantee for every command. `kin pr` validates creation metadata for
+all selected new PRs before pushing, retargeting bases, or creating PRs; later Git
+or GitHub failures can still leave a partially published stack.
+
+For unattended PR creation, supply each multi-commit branch's title through
+`--metadata-file`, or use `--current --title` for one branch. Use `--body-file`
+for a prepared description, or `--body-from-commits` for generated descriptions.
+See [`pr`](#pr) for defaults and file format.
 
 ---
 
@@ -782,7 +811,10 @@ kin run --tree -c 'gt track --parent "$KINDRA_PARENT"'
 **Usage:**
 
 ```bash
-kin pr [--no-push] [--all]
+kin pr [--no-push] [--all] [--current|--metadata-all]
+       [--title <title>] [--body-file <path>|--body-from-commits]
+       [--metadata-file <path>] [--label <label>]... [--reviewer <login>]...
+       [--draft|--no-draft]
 kin pr open
 kin pr edit
 kin pr flatten
@@ -795,11 +827,85 @@ kin pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--reviewe
 - `kin pr --no-push`: Skip that automatic flatten/push preflight and use the previous create/update behavior.
 - `kin pr --all`: Include stack PRs authored by other GitHub users in push, base update, and stack-section updates.
 - `kin pr open`: Open a PR URL in the default browser (if multiple, choose one).
-- `kin pr edit`: Select a PR (if multiple), then edit title/body/labels/reviewers.
+- `kin pr edit`: Select a PR (if multiple), then edit title/body/labels/reviewers. This workflow requires a terminal; use `gh pr edit` for unattended metadata edits.
 - `kin pr flatten`: Retarget every open PR in the current stack to the resolved upstream base branch on GitHub (for example, `origin/main` normalizes to `main`).
 - `kin pr merge`: Select an open PR in the current stack and merge it only when review/check state is ready, or prompt/error with the blocking reasons.
 - `kin pr status`: Show each stack PR's reviewer status, unresolved comments, and running/failed checks. It also reports any interrupted `kin commit`, `kin move`, `kin reorder`, `kin sync`, or `kin restack` operation in the current repo and points you to `kin continue`/`kin abort` or native Git rebase commands when there is no saved Kindra state.
 - `kin pr review`: Select an open PR in the current stack, fetch its review threads through `gh api graphql`, and render them as markdown.
+
+**Creation inputs and scope:**
+
+- `--current`: Create/update only the checked-out branch's PR. The push preflight
+  also pushes its stack ancestors, but does not create/update their PRs or publish
+  sibling branches. Requires a checked-out stack branch. `--no-push` skips those
+  dependency pushes too.
+- `--title <title>`: Set the title of a new PR. Empty or whitespace-only titles
+  are rejected.
+- `--body-file <path>`: Read the new PR's description from a UTF-8 file, relative
+  to the current working directory. The contents are submitted as supplied;
+  Kindra maintains its stack section afterward. Cannot be combined with
+  `--body-from-commits` or `--metadata-file`.
+- `--metadata-all`: Explicitly reuse `--title` and/or `--body-file` for every new
+  PR. Without this flag, supplying either input when more than one nonempty
+  branch needs a new PR fails with exit code 3. Existing PRs do not count toward
+  that ambiguity check. Use `--current` for one PR or `--metadata-file` for
+  distinct inputs. `--current` and `--metadata-all` are mutually exclusive.
+- `--body-from-commits`: Generate bodies separately for each branch. For one
+  commit, use its trimmed body; for multiple commits, use a bullet for each
+  subject followed by its indented body.
+- `--label <label>` / `--reviewer <login>`: Apply labels/request reviewers on
+  every new PR; both flags can be repeated.
+- `--draft` / `--no-draft`: Force new PRs to draft/ready respectively. The last
+  of these flags wins. Without either, the interactive submission menu chooses;
+  non-interactive creation is **ready for review by default**.
+
+These creation inputs do not replace existing PR titles, descriptions, labels,
+reviewers or draft state. Repeat runs update bases and Kindra's stack sections.
+The existing `--all` flag still controls inclusion of PRs authored by other users;
+it does not authorize reusing a title or body.
+
+**Per-branch metadata:**
+
+`--metadata-file <path>` reads a TOML manifest. It cannot be combined with
+`--title`, `--body-file`, or `--metadata-all`:
+
+```toml
+[branches."feature/auth"]
+title = "Add authentication"
+body_file = "auth.md"
+draft = true
+
+[branches."feature/session"]
+title = "Persist authenticated sessions"
+body = "Persist sessions across application restarts."
+```
+
+Each entry can contain `title`, either `body` or `body_file`, and `draft`.
+Body file paths resolve relative to the manifest. A per-branch `draft` overrides
+CLI draft/ready state, which acts as the default for other entries. Unknown fields,
+unknown stack branches, entries outside the selected submission scope, conflicting
+body sources, empty titles, and unreadable files fail before publication. Combining
+`--body-from-commits` with an entry containing `body` or `body_file` is an error.
+Entries and fields may be omitted to use the normal per-branch defaults. Valid
+entries for existing PRs are ignored for creation, but the file is still validated.
+
+**Non-interactive defaults:**
+
+A single-commit branch uses its commit subject as its title. A multi-commit branch
+requires an explicit title; Kindra reports all branches needing input together
+and exits with code 3 before publication. `--yes` does not bypass this requirement.
+
+Without an explicit body source, Kindra first recovers a saved body draft from an
+earlier creation attempt. Otherwise it uses the single commit's trimmed body,
+or the PR template for a multi-commit branch (empty if no template exists), with
+the leading commit-reference comment removed from recovered drafts or generated
+prefills. `--body-file`, an explicit manifest body, or `--body-from-commits`
+bypasses this fallback.
+
+```bash
+kin pr --no-interactive --current --title "Add authentication" --body-file auth.md --draft
+kin pr --no-interactive --metadata-file prs.toml --draft
+```
 
 `kin pr merge` automatically merges when the PR has no unresolved review comments, no outstanding review state, no running/failed checks, and GitHub reports the PR as mergeable. If issues remain but GitHub would still allow merging, Kindra prints the outstanding reviews/checks and asks for confirmation. If GitHub/repository rules block the merge, Kindra exits with a clear reason instead of attempting it.
 
@@ -831,6 +937,34 @@ kin pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--reviewe
 - These commands require authenticated GitHub CLI (`gh auth status` must succeed).
 - Both `kin status` and `kin pr status` report interrupted `kin commit`, `kin move`, `kin reorder`, `kin sync`, and `kin restack` operations.
 - When a saved Kindra state exists, continue with `kin continue` or clean up with `kin abort`. If there is no saved Kindra state and Git itself is mid-rebase, use `git rebase --continue` or `git rebase --abort`.
+
+#### Stack description contract
+
+Kindra owns the region between the exact markers
+`<!-- kindra-stack:start -->` and `<!-- kindra-stack:end -->`. These delimiters
+are a stable interface for agents and skills. External edits should preserve both
+markers and the entire enclosed section, editing the surrounding description.
+Kindra refreshes navigation within this section as the stack changes. Legacy
+`gits-stack` markers are recognized and migrated to `kindra-stack` markers.
+Stack sections are synchronized after creation, once the new PR numbers exist.
+
+If an external body replacement removes the block, `kin pr --no-interactive`
+rebuilds navigation for active PRs in the selected stack and preserves the new
+description. It also runs the usual push/base preflight and may create missing
+PRs, which still require complete creation inputs. To repair only an existing
+PR on the checked-out branch without pushing:
+
+```bash
+gh pr edit <number> --body-file body.md
+kin pr --no-interactive --current --no-push
+```
+
+**Merged history cannot be reconstructed from a removed block.** Historical
+merged PR links are read from that PR's previous body, not from other stack PRs.
+Preserve the block when those links matter. A lone active PR with no retained
+history needs no stack section. Stack-description edit failures are reported on
+stderr; the existing sync loop continues and does not make the overall command
+fail, so a successful exit alone does not guarantee every block was restored.
 
 ---
 

@@ -73,7 +73,12 @@ Run `kin tree` from any branch in a stack to see that entire connected stack, in
    - `kin pr --all` to include PRs in the stack that are authored by other GitHub users
    - `kin pr --no-push` to skip that preflight and use the old create/update behavior
    - `kin pr open` to open a PR from the stack
-   - `kin pr edit` to edit title/body/labels/reviewers
+   - `kin pr --current --title "Title" --body-file body.md` to publish only the current branch's PR with prepared metadata
+   - `kin pr --metadata-file prs.toml` to publish a stack with distinct titles and descriptions per branch
+   - `kin pr --metadata-all --title "Shared title" --body-file body.md` to explicitly reuse metadata across new PRs
+   - `kin pr --body-from-commits` to generate each new PR's description from its commits
+   - Add repeatable `--label` / `--reviewer` flags, and `--draft` / `--no-draft`, to control new PR submission
+   - `kin pr edit` to edit title/body/labels/reviewers in a terminal
    - `kin pr flatten` to retarget all open stack PRs to the resolved upstream base branch on GitHub
    - `kin pr status` to inspect reviewers, unresolved comments, and failing/running checks
    - `kin pr review` to render PR review threads as markdown, optionally write them to a file, or copy them via OSC 52
@@ -82,6 +87,17 @@ Run `kin tree` from any branch in a stack to see that entire connected stack, in
 10. **Undo a mistake**: Didn't like the result of a `sync`, `reorder`, `move`, `restack`, or `split`? Run `kin undo` to restore the previous branch tips (and `kin redo` to reapply, or `kin reflog` to review recent operations).
 
 For a full list of commands and detailed examples, see the [CLI Reference](docs/cli_reference.md).
+
+### Agents and CI
+
+```bash
+kin pr --no-interactive --current --title "Add authentication" --body-file auth.md --draft
+kin pr --no-interactive --metadata-file prs.toml --draft
+```
+
+See [Agents and CI](docs/cli_reference.md#agents-and-ci) for global flags and exit
+codes, and [`pr`](docs/cli_reference.md#pr) for creation defaults, the metadata
+manifest format, and the stack description contract.
 
 ### `kin reorder` editor format
 

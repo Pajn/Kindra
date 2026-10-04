@@ -79,10 +79,21 @@ enum Commands {
         /// Set labels on all created PRs (can be specified multiple times)
         #[arg(long)]
         label: Vec<String>,
-        /// Title for created PRs (required non-interactively when a branch has
-        /// multiple commits); applies to every new PR in the stack
+        /// Title for a new PR; multiple new PRs require --current or --metadata-all
         #[arg(long)]
         title: Option<String>,
+        /// Create/update only the current branch's PR (push dependencies too)
+        #[arg(long, conflicts_with = "metadata_all")]
+        current: bool,
+        /// Explicitly reuse --title/--body-file for all new PRs
+        #[arg(long)]
+        metadata_all: bool,
+        /// Read a new PR's description from a UTF-8 file
+        #[arg(long, conflicts_with_all = ["body_from_commits", "metadata_file"])]
+        body_file: Option<std::path::PathBuf>,
+        /// Read per-branch titles, bodies and draft state from a TOML file
+        #[arg(long, conflicts_with_all = ["title", "metadata_all"])]
+        metadata_file: Option<std::path::PathBuf>,
         /// Build PR bodies from the branch commits instead of prompting/template
         #[arg(long)]
         body_from_commits: bool,
@@ -290,6 +301,10 @@ fn dispatch() -> Result<()> {
             label,
             title,
             body_from_commits,
+            current,
+            metadata_all,
+            body_file,
+            metadata_file,
             draft,
             no_draft,
             reviewer,
@@ -307,6 +322,11 @@ fn dispatch() -> Result<()> {
                 *all,
                 crate::commands::pr::PrCreateOptions {
                     title: title.clone(),
+                    current: *current,
+                    metadata_all: *metadata_all,
+                    body_file: body_file.clone(),
+                    metadata_file: metadata_file.clone(),
+                    body: None,
                     body_from_commits: *body_from_commits,
                     draft,
                     reviewers: reviewer.clone(),
