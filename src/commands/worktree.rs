@@ -23,7 +23,7 @@ pub enum WorktreeSubcommand {
     Cd(PathArgs),
     /// Remove a managed worktree target
     Remove(RemoveArgs),
-    /// Clean up merged or stale temp worktrees
+    /// Clean up merged temp and cleanup-only worktrees
     Cleanup(CleanupArgs),
 }
 
@@ -102,7 +102,7 @@ pub struct CleanupArgs {
     pub force: bool,
 
     /// Do not delete the merged local branches (by default cleanup deletes
-    /// branches for merged temp worktrees)
+    /// branches for merged temp and cleanup-only worktrees)
     #[arg(long)]
     pub keep_branch: bool,
 }
@@ -187,11 +187,11 @@ pub fn worktree(subcommand: &Option<WorktreeSubcommand>) -> Result<()> {
         Some(WorktreeSubcommand::Cleanup(args)) => {
             let summary = roles::cleanup_temp_worktrees(&repo, args.force, args.keep_branch)?;
             if summary.candidates == 0 {
-                println!("No temp worktrees are eligible for cleanup.");
+                println!("No worktrees are eligible for cleanup.");
             } else {
                 let branches_deleted = summary.removed.iter().filter(|r| r.branch_deleted).count();
                 let mut msg = format!(
-                    "Cleanup complete: found {} temp worktree candidate(s), removed {}, skipped {}.",
+                    "Cleanup complete: found {} worktree candidate(s), removed {}, skipped {}.",
                     summary.candidates,
                     summary.removed.len(),
                     summary.skipped

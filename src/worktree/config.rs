@@ -40,6 +40,12 @@ pub struct TempWorktreeConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanupWorktreeConfig {
+    /// Recognize Git worktrees at or beneath this directory. Never create here.
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorktreeConfig {
     /// The repository config file these settings come from, for messages that
     /// point the user at it.
@@ -50,6 +56,7 @@ pub struct WorktreeConfig {
     pub main: MainWorktreeConfig,
     pub review: ReviewWorktreeConfig,
     pub temp: TempWorktreeConfig,
+    pub cleanup: Vec<CleanupWorktreeConfig>,
     /// Default `{branch}` template for `kin wt add`. Unlike the role paths this is
     /// deliberately *not* constrained under `root` — added worktrees default to a
     /// visible sibling directory when possible, fall back to `<repo>/worktrees`
@@ -73,6 +80,8 @@ struct RawWorktreeConfig {
     review: Option<RawReviewWorktreeConfig>,
     #[serde(default)]
     temp: Option<RawTempWorktreeConfig>,
+    #[serde(default)]
+    cleanup: Vec<RawCleanupWorktreeConfig>,
     #[serde(default)]
     add_path_template: Option<String>,
 }
@@ -141,6 +150,12 @@ struct RawTempWorktreeConfig {
     on_checkout: Vec<String>,
     #[serde(default)]
     on_remove: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCleanupWorktreeConfig {
+    path: String,
 }
 
 pub fn load_worktree_config(repo: &Repository) -> Result<WorktreeConfig> {
@@ -241,6 +256,21 @@ pub fn load_worktree_config(repo: &Repository) -> Result<WorktreeConfig> {
         .map(|value| resolve_config_path(config_base, &value))
         .unwrap_or_else(|| normalize_path(default_add_template));
 
+    let cleanup = raw
+        .cleanup
+        .into_iter()
+        .map(|entry| {
+            if entry.path.trim().is_empty() {
+                return Err(anyhow!("worktrees.cleanup.path must not be empty."));
+            }
+            // Unlike creation paths, cleanup-only directories can live outside root:
+            // only this repository's registered Git worktrees are ever considered.
+            Ok(CleanupWorktreeConfig {
+                path: resolve_cleanup_path(config_base, &entry.path),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let config = WorktreeConfig {
         config_path: repo_config.path().to_path_buf(),
         root: normalize_path(root),
@@ -249,6 +279,7 @@ pub fn load_worktree_config(repo: &Repository) -> Result<WorktreeConfig> {
         main,
         review,
         temp,
+        cleanup,
         add_path_template,
     };
     validate_config(&config)?;
@@ -262,6 +293,25 @@ fn resolve_config_path(base: &Path, value: &str) -> PathBuf {
     } else {
         normalize_path(base.join(path))
     }
+}
+
+fn resolve_cleanup_path(base: &Path, value: &str) -> PathBuf {
+    canonical_worktree_path(&resolve_config_path(base, value))
+}
+
+/// Match Git’s canonical paths even when only an ancestor exists on disk.
+pub(crate) fn canonical_worktree_path(path: &Path) -> PathBuf {
+    let path = normalize_path(path);
+    // Git reports canonical worktree paths. Resolve aliases such as /tmp on
+    // macOS, including when the configured directory has not been created yet.
+    for ancestor in path.ancestors() {
+        if let Ok(canonical) = std::fs::canonicalize(ancestor)
+            && let Ok(suffix) = path.strip_prefix(ancestor)
+        {
+            return normalize_path(canonical.join(suffix));
+        }
+    }
+    path
 }
 
 fn validate_config(config: &WorktreeConfig) -> Result<()> {

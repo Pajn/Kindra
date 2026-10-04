@@ -1,17 +1,15 @@
-use crate::worktree::WorktreeRole;
 use crate::worktree::config::WorktreeConfig;
 use crate::worktree::git::LiveWorktree;
-use crate::worktree::roles::role_for_path;
+use crate::worktree::roles::is_cleanup_location;
 use anyhow::Result;
 use git2::Repository;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-/// A temp worktree eligible for cleanup because its branch has already been
-/// merged into trunk. The managed set is derived from git's live worktrees plus
-/// the configured temp path — there is no stored metadata to reconcile, so the
-/// old "stale metadata" reason no longer exists (a worktree whose directory is
-/// gone is git's own prunable state, handled separately).
+/// A temp or cleanup-only worktree eligible because its branch is merged into
+/// trunk. The managed set is derived from Git's live worktrees and configured
+/// locations; there is no stored metadata to reconcile. A worktree whose
+/// directory is gone is Git's own prunable state, handled separately.
 #[derive(Clone, Debug)]
 pub struct CleanupCandidate {
     pub branch: String,
@@ -24,7 +22,7 @@ pub fn find_cleanup_candidates(
     config: &WorktreeConfig,
     live_worktrees: &[LiveWorktree],
 ) -> Result<Vec<CleanupCandidate>> {
-    if !config.temp.delete_merged {
+    if !config.temp.delete_merged && config.cleanup.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -35,11 +33,9 @@ pub fn find_cleanup_candidates(
 
     let mut candidates = Vec::new();
     for live in live_worktrees {
-        // Only temp worktrees are cleanup candidates. Reuse the shared role
-        // classifier rather than re-deriving the temp-root boundary here, so the
-        // two never drift (and a main/review worktree nested under an overlapping
-        // temp root is correctly excluded).
-        if role_for_path(config, &live.normalized_path())? != Some(WorktreeRole::Temp) {
+        // Reuse the shared classifier and policy, including persistent roles
+        // nested under overlapping temp or cleanup-only directories.
+        if !is_cleanup_location(config, &live.normalized_path())? {
             continue;
         }
         // A worktree whose directory is gone is git's own prunable state (see the
@@ -106,6 +102,7 @@ mod tests {
                 delete_merged: true,
                 hooks: HookListConfig::default(),
             },
+            cleanup: Vec::new(),
             add_path_template: dir.join("worktrees").join("{branch}"),
         }
     }

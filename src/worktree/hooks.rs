@@ -32,6 +32,7 @@ pub fn hooks_for_role(
         WorktreeRole::Main => hooks_from_list(&config.main.hooks, event),
         WorktreeRole::Review => hooks_from_list(&config.review.hooks, event),
         WorktreeRole::Temp => hooks_from_list(&config.temp.hooks, event),
+        WorktreeRole::Cleanup => Vec::new(),
     };
 
     global.into_iter().chain(role_hooks).collect()
@@ -175,6 +176,7 @@ mod tests {
                 delete_merged: true,
                 hooks: HookListConfig::default(),
             },
+            cleanup: Vec::new(),
             add_path_template: PathBuf::from("../repo-worktrees/{branch}"),
         }
     }

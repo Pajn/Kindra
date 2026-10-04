@@ -15,6 +15,8 @@ pub enum WorktreeRole {
     Main,
     Review,
     Temp,
+    /// Existing worktrees eligible for cleanup, with no creation location.
+    Cleanup,
 }
 
 impl WorktreeRole {
@@ -23,6 +25,7 @@ impl WorktreeRole {
             Self::Main => "main",
             Self::Review => "review",
             Self::Temp => "temp",
+            Self::Cleanup => "cleanup",
         }
     }
 }
