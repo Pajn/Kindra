@@ -308,6 +308,64 @@ pub(crate) fn push_stack_branches(
     Ok(())
 }
 
+/// Ask each remote whether it would accept the push of `branches` to the remote
+/// branches they track, without updating anything (`git push --dry-run`, with
+/// the same lease flags as the real push). Callers that must change something
+/// else before pushing use it to fail while nothing has changed yet.
+///
+/// Only branches with a usable upstream are checked: a branch without one is
+/// pushed to a new remote branch, which the lease does not guard, and one
+/// tracking a base branch is refused by the push itself.
+pub(crate) fn check_tracked_push(
+    repo: &Repository,
+    branches: &[String],
+    force: bool,
+) -> Result<()> {
+    let protected = protected_push_targets(repo)?;
+    let mut by_remote: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    for name in branches {
+        let branch = repo.find_branch(name, BranchType::Local)?;
+        let Some(target) = tracked_push_target(repo, &branch, name.clone())? else {
+            continue;
+        };
+        if target.protected_target(&protected).is_some() {
+            continue;
+        }
+        let (Some(remote), Some(remote_ref)) = (target.tracked_remote, target.tracked_ref) else {
+            continue;
+        };
+        match by_remote
+            .iter_mut()
+            .find(|(existing, _)| *existing == remote)
+        {
+            Some((_, refs)) => refs.push((target.name, remote_ref)),
+            None => by_remote.push((remote, vec![(target.name, remote_ref)])),
+        }
+    }
+
+    for (remote, refs) in by_remote {
+        let mut cmd = push_command(repo, force);
+        cmd.arg("--dry-run").arg(&remote);
+        for (local_name, remote_ref) in &refs {
+            cmd.arg(format!("{local_name}:{remote_ref}"));
+        }
+        let output = cmd.output()?;
+        if output.status.success() {
+            continue;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        eprint!("{stderr}");
+        if push_rejected_by_lease(&stderr) {
+            report_push_divergence(repo, &remote, &refs, force);
+        }
+        return Err(anyhow!(
+            "A push to '{remote}' would be rejected, so nothing was changed"
+        ));
+    }
+    Ok(())
+}
+
 fn push_upstream_branch(repo: &Repository, upstream_name: &str, force: bool) -> Result<()> {
     let branch = repo.find_branch(upstream_name, BranchType::Local)?;
     if let Some(target) = tracked_push_target(repo, &branch, upstream_name.to_string())? {
@@ -630,8 +688,13 @@ fn report_push_divergence(repo: &Repository, remote: &str, refs: &[(String, Stri
     eprintln!("Push to '{remote}' was rejected. Kindra uses {flags}, which");
     eprintln!("refuses to overwrite remote commits you have never integrated locally.");
     eprintln!("Per-branch status (local vs last-fetched {remote}/…):");
+    let deleted = deleted_on_remote(repo, remote, refs);
     for (local_name, remote_ref) in refs {
+        let is_deleted = deleted.contains(local_name);
         match branch_ahead_behind(repo, local_name, remote, remote_ref) {
+            Ok(Some(_)) if is_deleted => {
+                eprintln!("  {local_name}: {remote}/{remote_ref} no longer exists on {remote}");
+            }
             Ok(Some((ahead, behind))) => {
                 eprintln!("  {local_name}: ↑{ahead} ↓{behind} vs {remote}/{remote_ref}");
             }
@@ -646,6 +709,22 @@ fn report_push_divergence(repo: &Repository, remote: &str, refs: &[(String, Stri
         }
     }
     eprintln!();
+    if !deleted.is_empty() {
+        // The lease expects the last-fetched tip, so a deleted branch is refused
+        // with or without --force; only dropping the branch locally helps.
+        let names = deleted
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "The remote branch of {names} was deleted, usually because its pull request was merged."
+        );
+        eprintln!(
+            "Run 'kin sync' to fetch, drop merged branches and rebase the rest onto the trunk, then push again."
+        );
+        return;
+    }
     eprintln!(
         "The remote likely advanced (a teammate pushed, or GitHub's \"Update branch\" was used)."
     );
@@ -660,6 +739,44 @@ fn report_push_divergence(repo: &Repository, remote: &str, refs: &[(String, Stri
         );
         eprintln!("drops --force-if-includes while keeping --force-with-lease.");
     }
+}
+
+/// The local branches among `refs` whose remote branch was fetched once but is
+/// gone from `remote` now. Asks the remote (`git ls-remote`); an empty set when
+/// it cannot answer, so a network failure falls back to the generic advice.
+fn deleted_on_remote(repo: &Repository, remote: &str, refs: &[(String, String)]) -> Vec<String> {
+    let fetched = refs
+        .iter()
+        .filter(|(_, remote_ref)| {
+            repo.find_reference(&format!("refs/remotes/{remote}/{remote_ref}"))
+                .is_ok()
+        })
+        .collect::<Vec<_>>();
+    if fetched.is_empty() {
+        return Vec::new();
+    }
+    let mut cmd = crate::repository::git_command(repo);
+    cmd.args(["ls-remote", "--heads", remote]);
+    for (_, remote_ref) in &fetched {
+        cmd.arg(format!("refs/heads/{remote_ref}"));
+    }
+    let Ok(output) = cmd.output() else {
+        return Vec::new();
+    };
+    // ls-remote exits 0 with no output when no named ref exists.
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let present = listing
+        .lines()
+        .filter_map(|line| line.split('\t').nth(1))
+        .collect::<HashSet<_>>();
+    fetched
+        .into_iter()
+        .filter(|(_, remote_ref)| !present.contains(format!("refs/heads/{remote_ref}").as_str()))
+        .map(|(local_name, _)| local_name.clone())
+        .collect()
 }
 
 /// Ahead/behind of a local branch vs its last-fetched remote-tracking ref.
