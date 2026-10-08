@@ -870,7 +870,7 @@ kin pr status
 kin pr review [--output <path>] [--copy] [--no-outdated] [--resolved] [--reviewer <login>] [--bots|--no-bots]
 ```
 
-- `kin pr`: Create/update PRs for stack branches with upstreams, skipping open PRs authored by other GitHub users. By default it first checks whether open PR bases on GitHub still match the local stack order, flattens them to the resolved upstream base if needed, and pushes before running normal PR creation/update logic.
+- `kin pr`: Create/update PRs for stack branches with upstreams, skipping open PRs authored by other GitHub users. By default it first checks whether open PR bases on GitHub still match the local stack order, flattens them to the resolved upstream base if needed, and pushes before running normal PR creation/update logic. The flatten comes first so that pushing a reordered stack cannot make GitHub mark PRs merged; before flattening, a `git push --dry-run` checks that the push would be accepted, so a rejected push leaves every PR base unchanged. A stack that still holds a branch merged into the trunk by squash or rebase is refused before anything is pushed or retargeted: run `kin sync` to drop it first.
 - `kin pr --no-push`: Skip that automatic flatten/push preflight and use the previous create/update behavior.
 - `kin pr --all`: Include stack PRs authored by other GitHub users in push, base update, and stack-section updates.
 - `kin pr open`: Open a PR URL in the default browser (if multiple, choose one).

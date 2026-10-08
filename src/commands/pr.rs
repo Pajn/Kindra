@@ -182,6 +182,7 @@ fn pr_create_or_update(
     let after_pr = crate::hooks::after_pr_commands(&repo)?;
 
     let (upstream_name, all_stack_branches) = discover_stack_branches(&repo)?;
+    require_no_merged_branches(&repo, &all_stack_branches, &upstream_name)?;
 
     // One snapshot of the stack's open PRs serves scope filtering, the
     // flatten-need check, and per-branch processing — instead of ~4 `gh pr view`
@@ -404,6 +405,45 @@ fn pr_create_or_update(
     Ok(())
 }
 
+/// Refuse to publish a stack that still holds branches already merged into the
+/// trunk. Their PRs are closed, and GitHub may have deleted their remote
+/// branches and moved the PRs above onto the trunk: publishing would read that
+/// as a base mismatch, flatten the whole stack, then push (or recreate) the
+/// merged branches. `kin sync` drops them and rebases the rest first.
+fn require_no_merged_branches(
+    repo: &Repository,
+    branches: &[StackBranch],
+    upstream_name: &str,
+) -> Result<()> {
+    // A branch the trunk already contains (a fast-forward merge) adds no commits
+    // and already resolves to the trunk as a base; only one integrated by
+    // content (squash or rebase merges) still carries commits of its own.
+    let trunk = repo.revparse_single(upstream_name)?.peel_to_commit()?.id();
+    let mut merged = Vec::new();
+    for name in crate::stack::merged_stack_branches(repo, branches, upstream_name)? {
+        let Some(branch) = branches.iter().find(|branch| branch.name == name) else {
+            continue;
+        };
+        if branch.id != trunk && !repo.graph_descendant_of(trunk, branch.id)? {
+            merged.push(name);
+        }
+    }
+    if merged.is_empty() {
+        return Ok(());
+    }
+    let names = merged
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(anyhow!(
+        "{names} {} already merged into '{upstream_name}'. Run 'kin sync' to drop {} and rebase \
+         the branches above, then run 'kin pr' again. Nothing was pushed and no PR was changed.",
+        if merged.len() == 1 { "is" } else { "are" },
+        if merged.len() == 1 { "it" } else { "them" },
+    ))
+}
+
 fn require_pr_upstreams(repo: &Repository, branches: &[StackBranch]) -> Result<()> {
     let mode = crate::interaction::current();
     if mode.is_interactive() || mode.scripted().is_some() {
@@ -508,6 +548,11 @@ fn run_pr_create_or_update_preflight(
     let all_branches_with_upstream = stack_branches_for_base_map(all_stack_branches);
     let scoped_branches_with_upstream = stack_branches_for_base_map(scoped_stack_branches);
 
+    let branch_names = push_branches
+        .iter()
+        .map(|sb| sb.name.clone())
+        .collect::<Vec<_>>();
+
     let mut flattened = false;
     if !scoped_branches_with_upstream.is_empty()
         && stack_pr_bases_need_flatten(
@@ -519,22 +564,32 @@ fn run_pr_create_or_update_preflight(
         )?
     {
         println!("Detected PR base mismatches relative to the local stack. Flattening first...\n");
+        // Flatten must precede the push: pushing a reordered stack while PRs
+        // still target their old parents lets GitHub mark them merged. But a
+        // flatten followed by a rejected push leaves every PR on the trunk,
+        // showing the whole stack's diff. Ask the remote first; a dry run
+        // checks the lease without updating anything, so nothing can merge.
+        crate::commands::push::check_tracked_push(repo, &branch_names, false)?;
         flatten_stack_prs_to_upstream(open_prs, &scoped_branches_with_upstream, upstream_name)?;
         flattened = true;
         println!();
     }
 
     println!("Pushing branches first...\n");
-    let branch_names = push_branches
-        .iter()
-        .map(|sb| sb.name.clone())
-        .collect::<Vec<_>>();
     // `kin pr` exposes no --allow-base-push: a PR whose head branch was pushed to a
     // differently-named base ref is incoherent (the head ref never lands under its
     // own name). A per-branch config opt-in still applies. It exposes no --force
     // either: this push is a preflight the user did not ask for by name, so it must
     // not relax a safety check on their behalf — run `kin push --force` first.
-    crate::commands::push::push_stack_branches(repo, &branch_names, &[], false)?;
+    let pushed = crate::commands::push::push_stack_branches(repo, &branch_names, &[], false);
+    if flattened && pushed.is_err() {
+        eprintln!(
+            "\nThe stack's PRs were retargeted onto '{}' before the push failed. \
+             Fix the push and run 'kin pr' again to restore their stacked bases.",
+            normalize_base_for_gh(upstream_name)
+        );
+    }
+    pushed?;
     println!();
 
     Ok(flattened)

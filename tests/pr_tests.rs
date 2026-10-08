@@ -5318,6 +5318,147 @@ exit 1
     assert!(edit_args.contains("pr\nedit\n11\n--base\nfeature-a"));
 }
 
+/// main → feature-a → feature-b, all pushed, then feature-a's PR is
+/// squash-merged on the remote and its branch deleted, as GitHub does. GitHub
+/// has moved feature-b's PR (#11) onto main; feature-a has no open PR. The
+/// local `origin/feature-a` still names the deleted branch. With
+/// `fetch_trunk`, `origin/main` already holds the squash commit.
+///
+/// Returns the work tree; the `gh` mock appends `gh pr edit` and
+/// `gh pr create` arguments to `edits.log` in the Git directory.
+fn setup_stack_with_merged_bottom(fetch_trunk: bool) -> tempfile::TempDir {
+    let (dir, _repo) = setup_two_level_stack();
+    init_origin_and_push(dir.path(), &["main", "feature-a", "feature-b"]);
+    let remote_dir = dir.path().join("remote.git");
+
+    let other = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            "--branch",
+            "main",
+            remote_dir.to_str().unwrap(),
+            other.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok(
+        "git",
+        &["merge", "--squash", "origin/feature-a"],
+        other.path(),
+    );
+    run_ok("git", &["commit", "-m", "feat: a (#10)"], other.path());
+    run_ok("git", &["push", "origin", "main"], other.path());
+    run_ok(
+        "git",
+        &["push", "origin", "--delete", "feature-a"],
+        other.path(),
+    );
+    if fetch_trunk {
+        run_ok("git", &["fetch", "origin", "main"], dir.path());
+    }
+
+    common::write_gh_script(
+        dir.path().join("gh"),
+        r#"#!/bin/bash
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[{"number":11,"title":"B title","body":"B body","url":"https://github.com/test/repo/pull/11","baseRefName":"main","state":"OPEN","labels":[],"reviewRequests":[],"isDraft":false,"headRefName":"feature-b"}]'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && { [[ "$2" == "edit" ]] || [[ "$2" == "create" ]]; }; then
+    printf "%s\n" "$@" >> "$(git rev-parse --git-dir)/edits.log"
+    echo "https://github.com/test/repo/pull/12"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    run_ok("chmod", &["+x", "gh"], dir.path());
+    dir
+}
+
+/// A merged branch still in the stack is refused before anything is published:
+/// its deleted remote branch and the PR GitHub retargeted would otherwise make
+/// `kin pr` flatten every PR in the stack and then fail to push.
+#[test]
+fn pr_refuses_a_stack_with_a_merged_branch_before_publishing() {
+    let dir = setup_stack_with_merged_bottom(true);
+    let remote_b_before = remote_tip(&dir.path().join("remote.git"), "refs/heads/feature-b");
+
+    let output = kin_with_gh_mock(dir.path(), &["pr"]).output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "kin pr succeeded:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("'feature-a' is already merged into") && stderr.contains("Run 'kin sync'"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!stdout.contains("Flattening"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("Pushing"), "stdout:\n{stdout}");
+    assert!(
+        !dir.path().join(".git/edits.log").exists(),
+        "no PR may be edited or created"
+    );
+    assert_eq!(
+        remote_tip(&dir.path().join("remote.git"), "refs/heads/feature-b"),
+        remote_b_before
+    );
+}
+
+/// When the merge is not yet visible locally (the trunk was not fetched), the
+/// flatten preflight still asks the remote before retargeting: the push of
+/// the deleted branch would be rejected, so no PR base changes, and the
+/// rejection names the deleted branch and `kin sync` rather than guessing that
+/// the remote advanced.
+#[test]
+fn pr_checks_the_push_before_flattening_and_names_a_deleted_branch() {
+    let dir = setup_stack_with_merged_bottom(false);
+
+    let output = kin_with_gh_mock(dir.path(), &["pr"]).output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "kin pr succeeded:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Detected PR base mismatches"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Flattening stack PRs"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !dir.path().join(".git/edits.log").exists(),
+        "no PR may be retargeted when the push would be rejected"
+    );
+    assert!(
+        stderr.contains("feature-a: origin/feature-a no longer exists on origin"),
+        "stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("Run 'kin sync'"), "stderr:\n{stderr}");
+    assert!(
+        !stderr.contains("The remote likely advanced"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("would be rejected, so nothing was changed"),
+        "stderr:\n{stderr}"
+    );
+}
+
 #[test]
 fn pr_default_preflight_skips_flatten_when_pr_bases_match() {
     let (dir, _repo) = setup_two_level_stack();

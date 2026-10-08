@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use git2::{Commit, Oid, Repository};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
 use std::rc::Rc;
@@ -3359,6 +3359,23 @@ pub fn visualize_stack(
     }
 
     Ok(result)
+}
+
+/// The stack branches already integrated into `upstream`, as `kin sync` would
+/// find them: each tip's lineage is cut where [`find_sync_boundary`] stops, so
+/// a squash-merged branch counts as well as a merged one. Sorted by name.
+pub fn merged_stack_branches(
+    repo: &Repository,
+    branches: &[StackBranch],
+    upstream: &str,
+) -> Result<Vec<String>> {
+    let mut cache = SyncScanCache::default();
+    let mut merged = BTreeSet::new();
+    for tip in get_stack_tips(repo, branches)? {
+        let boundary = find_sync_boundary_cached(repo, &tip, upstream, branches, &mut cache)?;
+        merged.extend(boundary.merged_branches);
+    }
+    Ok(merged.into_iter().collect())
 }
 
 pub struct TreeSyncPlan {
