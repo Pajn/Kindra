@@ -1857,7 +1857,7 @@ fn render_stack_section(
     // only forks indent. A fork child's own stack nests beneath it, keeping it
     // apart from the siblings that follow.
     let mut pending: Vec<_> = if branching {
-        let forked_roots = roots.len() > 1;
+        let forked_roots = roots.iter().filter(|&&idx| !items[idx].is_merged).count() > 1;
         roots
             .into_iter()
             .rev()
@@ -2847,6 +2847,44 @@ mod tests {
                 "  - [e](url5) #5",
                 "    - [f](url6) #6",
                 "    - [g](url7) #7",
+            ]
+        );
+    }
+
+    #[test]
+    fn merged_root_does_not_indent_the_stack_above_it() {
+        let item = |name: &str, number, is_merged| RenderItem {
+            branch_name: name.to_string(),
+            url: format!("url{number}"),
+            number,
+            is_current: false,
+            is_merged,
+        };
+        let items = [
+            item("old", 1, true),
+            item("a", 2, false),
+            item("b", 3, false),
+            item("c", 4, false),
+            item("d", 5, false),
+        ];
+        let base_map = [("a", "main"), ("b", "a"), ("c", "b"), ("d", "b")]
+            .into_iter()
+            .map(|(branch, base)| (branch.to_string(), base.to_string()))
+            .collect();
+
+        let section = render_stack_section(&items, &base_map).unwrap();
+        let lines: Vec<_> = section
+            .lines()
+            .filter(|l| l.trim_start().starts_with("- "))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "- ~[old](url1) #1~ (merged)",
+                "- [a](url2) #2",
+                "- [b](url3) #3",
+                "  - [c](url4) #4",
+                "  - [d](url5) #5",
             ]
         );
     }
