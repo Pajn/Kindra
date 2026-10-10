@@ -1853,13 +1853,21 @@ fn render_stack_section(
     // Historical merged entries alone do not turn a linear stack into a fork.
     let branching = children.iter().any(|children| children.len() > 1)
         || roots.iter().filter(|&&idx| !items[idx].is_merged).count() > 1;
+    // Stacks are mostly linear, so a lone child stays at its parent's depth and
+    // only forks indent. A fork child's own stack nests beneath it, keeping it
+    // apart from the siblings that follow.
     let mut pending: Vec<_> = if branching {
-        roots.into_iter().rev().map(|idx| (idx, 0)).collect()
+        let forked_roots = roots.iter().filter(|&&idx| !items[idx].is_merged).count() > 1;
+        roots
+            .into_iter()
+            .rev()
+            .map(|idx| (idx, 0, forked_roots))
+            .collect()
     } else {
         // Preserve the original ordering of historical entries in flat stacks.
-        (0..items.len()).rev().map(|idx| (idx, 0)).collect()
+        (0..items.len()).rev().map(|idx| (idx, 0, false)).collect()
     };
-    while let Some((idx, depth)) = pending.pop() {
+    while let Some((idx, depth, is_fork_child)) = pending.pop() {
         let item = &items[idx];
         section.push_str(&"  ".repeat(depth));
         if item.is_current {
@@ -1876,7 +1884,18 @@ fn render_stack_section(
             ));
         }
         if branching {
-            pending.extend(children[idx].iter().rev().map(|&child| (child, depth + 1)));
+            let forks = children[idx].len() > 1;
+            let child_depth = if forks || is_fork_child {
+                depth + 1
+            } else {
+                depth
+            };
+            pending.extend(
+                children[idx]
+                    .iter()
+                    .rev()
+                    .map(|&child| (child, child_depth, forks)),
+            );
         }
     }
 
@@ -2780,6 +2799,94 @@ mod tests {
         assert_eq!(prs[0].number, 111);
         assert_eq!(prs[1].number, 222);
         assert_eq!(prs[2].number, 333);
+    }
+
+    #[test]
+    fn stack_section_indents_only_at_forks() {
+        let item = |name: &str, number| RenderItem {
+            branch_name: name.to_string(),
+            url: format!("url{number}"),
+            number,
+            is_current: name == "d",
+            is_merged: false,
+        };
+        let items = [
+            item("a", 1),
+            item("b", 2),
+            item("c", 3),
+            item("d", 4),
+            item("e", 5),
+            item("f", 6),
+            item("g", 7),
+        ];
+        let base_map = [
+            ("a", "main"),
+            ("b", "a"),
+            ("c", "b"),
+            ("d", "c"),
+            ("e", "c"),
+            ("f", "e"),
+            ("g", "f"),
+        ]
+        .into_iter()
+        .map(|(branch, base)| (branch.to_string(), base.to_string()))
+        .collect();
+
+        let section = render_stack_section(&items, &base_map).unwrap();
+        let lines: Vec<_> = section
+            .lines()
+            .filter(|l| l.trim_start().starts_with("- "))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "- [a](url1) #1",
+                "- [b](url2) #2",
+                "- [c](url3) #3",
+                "  - → d #4",
+                "  - [e](url5) #5",
+                "    - [f](url6) #6",
+                "    - [g](url7) #7",
+            ]
+        );
+    }
+
+    #[test]
+    fn merged_root_does_not_indent_the_stack_above_it() {
+        let item = |name: &str, number, is_merged| RenderItem {
+            branch_name: name.to_string(),
+            url: format!("url{number}"),
+            number,
+            is_current: false,
+            is_merged,
+        };
+        let items = [
+            item("old", 1, true),
+            item("a", 2, false),
+            item("b", 3, false),
+            item("c", 4, false),
+            item("d", 5, false),
+        ];
+        let base_map = [("a", "main"), ("b", "a"), ("c", "b"), ("d", "b")]
+            .into_iter()
+            .map(|(branch, base)| (branch.to_string(), base.to_string()))
+            .collect();
+
+        let section = render_stack_section(&items, &base_map).unwrap();
+        let lines: Vec<_> = section
+            .lines()
+            .filter(|l| l.trim_start().starts_with("- "))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "- ~[old](url1) #1~ (merged)",
+                "- [a](url2) #2",
+                "- [b](url3) #3",
+                "  - [c](url4) #4",
+                "  - [d](url5) #5",
+            ]
+        );
     }
 
     #[test]
