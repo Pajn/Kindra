@@ -89,8 +89,12 @@ pub fn checkout(
         }
         Some(CheckoutSubcommand::Down) => {
             let current_name = current_branch_name.ok_or_else(|| anyhow!("Not on a branch"))?;
-            let parent_branches =
-                find_first_parent_branches_via_git_log(&repo, &upstream_name, &current_name)?;
+            let parent_branches = find_first_parent_branches_via_git_log(
+                &repo,
+                upstream_id,
+                &upstream_name,
+                &current_name,
+            )?;
 
             match parent_branches.len() {
                 0 => perform_git_checkout(&upstream_name),
@@ -528,6 +532,7 @@ fn git_checkout(repo: &Repository, name: &str) -> Result<()> {
 
 fn find_first_parent_branches_via_git_log(
     repo: &git2::Repository,
+    upstream_id: git2::Oid,
     upstream_name: &str,
     current_branch: &str,
 ) -> Result<Vec<String>> {
@@ -538,7 +543,7 @@ fn find_first_parent_branches_via_git_log(
             "--decorate=full",
             "--format=%H%x00%D",
             "HEAD",
-            &format!("^{upstream_name}"),
+            &format!("^{upstream_id}"),
         ])
         .output()?;
 

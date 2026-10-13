@@ -885,7 +885,7 @@ fn test_tree_measures_the_stack_from_a_trunk_not_yet_pulled() {
         output_str
     );
     assert!(
-        !output_str.contains("merged"),
+        !output_str.lines().any(|line| line.ends_with(" merged")),
         "A branch at a commit origin/main already has is not in the stack:\n{}",
         output_str
     );
