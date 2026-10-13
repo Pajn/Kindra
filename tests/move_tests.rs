@@ -2983,3 +2983,26 @@ fn move_refuses_branch_being_rebased_or_bisected_in_another_worktree() {
         common::assert_no_kindra_operation(dir.path());
     }
 }
+
+/// `move --onto main` with a local trunk behind `origin/main` replays only the
+/// branch's own commits, not the ones `origin/main` already merged.
+#[test]
+fn test_move_onto_a_trunk_not_yet_pulled_replays_only_branch_commits() {
+    let (dir, _remote_dir) = common::setup_stale_trunk();
+
+    kin_cmd()
+        .args(["move", "--onto", "main", "--no-interactive"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let main = repo.revparse_single("main").unwrap().id();
+    let feature = repo
+        .revparse_single("feature")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    assert_eq!(feature.parent_id(0).unwrap(), main);
+    assert_eq!(feature.summary(), Some("feat: feature work"));
+}

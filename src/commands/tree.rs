@@ -154,9 +154,8 @@ pub fn tree(args: &TreeArgs) -> Result<()> {
         None
     };
 
-    // Get upstream commit ID
-    let upstream_obj = repo.revparse_single(&upstream_name)?;
-    let upstream_id = upstream_obj.id();
+    // The commit the stack is measured from
+    let upstream_id = crate::trunk::stack_base(&repo, &upstream_name)?;
 
     // Discover the full stack independently of HEAD's position within it.
     let head_id = repo
@@ -360,7 +359,7 @@ fn get_branch_commits_list(
     upstream_name: &str,
 ) -> Result<Vec<BranchCommit>> {
     let branch_id = repo.revparse_single(branch_name)?.peel_to_commit()?.id();
-    let upstream_id = repo.revparse_single(upstream_name)?.peel_to_commit()?.id();
+    let upstream_id = crate::trunk::stack_base(repo, upstream_name)?;
 
     let merge_base = repo.merge_base(upstream_id, branch_id)?;
 
@@ -417,7 +416,7 @@ fn calculate_sync_status(
     upstream_name: &str,
 ) -> Result<SyncStatus> {
     // Check if branch is merged into upstream
-    let upstream_id = repo.revparse_single(upstream_name)?.id();
+    let upstream_id = crate::trunk::stack_base(repo, upstream_name)?;
     let branch_id = tb.branch.id;
 
     // If branch is ancestor of upstream, it's merged

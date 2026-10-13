@@ -51,8 +51,7 @@ pub fn checkout(
     let upstream_name = find_upstream(&repo)?.ok_or_else(|| {
         anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
     })?;
-    let upstream_obj = repo.revparse_single(&upstream_name)?;
-    let upstream_id = upstream_obj.id();
+    let upstream_id = crate::trunk::stack_base(&repo, &upstream_name)?;
     let head = repo.head()?;
     let head_id = head.peel_to_commit()?.id();
 

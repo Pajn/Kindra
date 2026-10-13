@@ -107,8 +107,7 @@ fn run_locked(repo: &git2::Repository, args: &RunArgs) -> Result<()> {
         None
     };
 
-    let upstream_obj = repo.revparse_single(&upstream_name)?;
-    let upstream_id = upstream_obj.id();
+    let upstream_id = crate::trunk::stack_base(repo, &upstream_name)?;
     let merge_base = resolve_merge_base(repo, upstream_id, head_id)?;
 
     let mut stack_branches =
