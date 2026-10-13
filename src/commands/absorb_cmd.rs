@@ -67,7 +67,7 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
     let upstream_name = find_upstream(repo)?.ok_or_else(|| {
         anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
     })?;
-    let upstream_id = repo.revparse_single(&upstream_name)?.id();
+    let upstream_id = crate::trunk::stack_base(repo, &upstream_name)?;
     let merge_base = repo.merge_base(upstream_id, head_before)?;
     let stack_branches = get_stack_branches_from_merge_base(
         repo,

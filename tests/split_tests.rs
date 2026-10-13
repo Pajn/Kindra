@@ -476,6 +476,21 @@ fn test_checkout_down_from_bottom_branch_goes_to_upstream() {
     assert_eq!(new_head, "main");
 }
 
+/// A branch at a commit `origin/main` already merged is not the parent of the
+/// branch above it, even while the local trunk has not pulled that commit.
+#[test]
+fn test_checkout_down_skips_a_branch_at_a_commit_the_remote_trunk_merged() {
+    let (dir, _remote_dir) = common::setup_stale_trunk();
+
+    kin_cmd()
+        .args(["checkout", "down"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    assert_eq!(common::current_branch(dir.path()), "main");
+}
+
 #[test]
 fn test_split_fork_selection() {
     let (dir, repo) = setup_repo();

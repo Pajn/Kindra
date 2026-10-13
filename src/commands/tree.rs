@@ -154,9 +154,8 @@ pub fn tree(args: &TreeArgs) -> Result<()> {
         None
     };
 
-    // Get upstream commit ID
-    let upstream_obj = repo.revparse_single(&upstream_name)?;
-    let upstream_id = upstream_obj.id();
+    // The commit the stack is measured from
+    let upstream_id = crate::trunk::stack_base(&repo, &upstream_name)?;
 
     // Discover the full stack independently of HEAD's position within it.
     let head_id = repo
@@ -191,7 +190,7 @@ pub fn tree(args: &TreeArgs) -> Result<()> {
     if show_commits || show_remote || show_pr {
         populate_branch_details(
             &repo,
-            &upstream_name,
+            upstream_id,
             &mut tree,
             show_commits,
             show_remote,
@@ -298,7 +297,7 @@ fn build_tree_structure(
 /// Populate branch details (commits, remote, PR)
 fn populate_branch_details(
     repo: &git2::Repository,
-    upstream_name: &str,
+    upstream_id: git2::Oid,
     tree: &mut HashMap<String, TreeBranch>,
     show_commits: bool,
     show_remote: bool,
@@ -330,7 +329,7 @@ fn populate_branch_details(
 
         // Get commits
         if show_commits {
-            tb.commits = get_branch_commits_list(repo, branch_name, upstream_name)?;
+            tb.commits = get_branch_commits_list(repo, branch_name, upstream_id)?;
         }
 
         // Get remote sync status
@@ -347,7 +346,7 @@ fn populate_branch_details(
         }
 
         // Calculate sync status (needs rebase if not in sync with parent)
-        tb.sync_status = Some(calculate_sync_status(repo, tb, upstream_name)?);
+        tb.sync_status = Some(calculate_sync_status(repo, tb, upstream_id)?);
     }
 
     Ok(())
@@ -357,10 +356,9 @@ fn populate_branch_details(
 fn get_branch_commits_list(
     repo: &git2::Repository,
     branch_name: &str,
-    upstream_name: &str,
+    upstream_id: git2::Oid,
 ) -> Result<Vec<BranchCommit>> {
     let branch_id = repo.revparse_single(branch_name)?.peel_to_commit()?.id();
-    let upstream_id = repo.revparse_single(upstream_name)?.peel_to_commit()?.id();
 
     let merge_base = repo.merge_base(upstream_id, branch_id)?;
 
@@ -414,10 +412,9 @@ fn get_remote_sync_status(
 fn calculate_sync_status(
     repo: &git2::Repository,
     tb: &TreeBranch,
-    upstream_name: &str,
+    upstream_id: git2::Oid,
 ) -> Result<SyncStatus> {
     // Check if branch is merged into upstream
-    let upstream_id = repo.revparse_single(upstream_name)?.id();
     let branch_id = tb.branch.id;
 
     // If branch is ancestor of upstream, it's merged

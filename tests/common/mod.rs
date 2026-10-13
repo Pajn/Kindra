@@ -539,6 +539,58 @@ pub fn advance_remote_main(dir: &std::path::Path, remote_dir: &std::path::Path, 
     run_ok("git", &["fetch", "origin"], dir);
 }
 
+/// A clone whose local `main` tracks `origin/main` but has not pulled its last
+/// two commits. `merged` is left at the first of them, as a branch is after its
+/// pull request merges, and the checked-out `feature` adds one commit to
+/// `origin/main`. Returns the working repo dir and the remote dir.
+#[allow(dead_code)]
+pub fn setup_stale_trunk() -> (tempfile::TempDir, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "main.txt",
+        "initial",
+        "initial commit",
+        &[],
+    );
+    repo.set_head("refs/heads/main").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let remote_dir = tempfile::tempdir().unwrap();
+    run_ok(
+        "git",
+        &["init", "--bare", "--initial-branch=main"],
+        remote_dir.path(),
+    );
+    run_ok(
+        "git",
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote_dir.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    run_ok("git", &["push", "-u", "origin", "main"], dir.path());
+    advance_remote_main(dir.path(), remote_dir.path(), 2);
+
+    run_ok("git", &["branch", "merged", "origin/main~1"], dir.path());
+    run_ok(
+        "git",
+        &["checkout", "--no-track", "-b", "feature", "origin/main"],
+        dir.path(),
+    );
+    fs::write(dir.path().join("feature.txt"), "feature").unwrap();
+    run_ok("git", &["add", "feature.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "feat: feature work"], dir.path());
+
+    (dir, remote_dir)
+}
+
 #[allow(dead_code)]
 pub fn remote_tip(remote_dir: &std::path::Path, refname: &str) -> git2::Oid {
     Repository::open(remote_dir)

@@ -42,7 +42,7 @@ fn reorder_locked(repo: &git2::Repository, args: &ReorderArgs) -> Result<()> {
     }
 
     let head_id = head.peel_to_commit()?.id();
-    let upstream_id = repo.revparse_single(&upstream_name)?.id();
+    let upstream_id = crate::trunk::stack_base(repo, &upstream_name)?;
     let merge_base = repo.merge_base(upstream_id, head_id)?;
 
     let stack_component = crate::stack::collect_stack_component(

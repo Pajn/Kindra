@@ -1303,7 +1303,7 @@ fn floating_patch_id_boundary(
         return Ok(None);
     }
 
-    let upstream_id = repo.revparse_single(&upstream_name)?.id();
+    let upstream_id = crate::trunk::stack_base(repo, &upstream_name)?;
     let merge_base = repo.merge_base(target_id, upstream_id)?;
     let stack_branches = get_stack_branches(repo, target_id, upstream_id, &upstream_name)?;
 
@@ -2557,7 +2557,7 @@ pub fn enumerate_stack_commits(
     let mut ordered_branches = stack_branches.to_vec();
     sort_branches_topologically(repo, &mut ordered_branches)?;
 
-    let upstream_id = repo.revparse_single(upstream_name)?.peel_to_commit()?.id();
+    let upstream_id = crate::trunk::stack_base(repo, upstream_name)?;
     let mut seen = HashSet::new();
     let mut branch_chunks = Vec::new();
 
@@ -2670,7 +2670,7 @@ pub fn enumerate_current_fixup_commits(repo: &Repository) -> Result<Vec<StackCom
     let Some(upstream_name) = crate::trunk::resolve_trunk(repo)? else {
         return Ok(Vec::new());
     };
-    let upstream_id = repo.revparse_single(&upstream_name)?.id();
+    let upstream_id = crate::trunk::stack_base(repo, &upstream_name)?;
     let head = repo.head()?;
     let head_id = head.peel_to_commit()?.id();
     let Some(current_branch_name) = head.shorthand() else {

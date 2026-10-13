@@ -70,8 +70,7 @@ pub fn push(args: &PushArgs) -> Result<()> {
         return push_upstream_branch(&repo, &upstream_name, args.force);
     }
 
-    let upstream_obj = repo.revparse_single(&upstream_name)?;
-    let upstream_id = upstream_obj.id();
+    let upstream_id = crate::trunk::stack_base(&repo, &upstream_name)?;
     let head_id = repo.head()?.peel_to_commit()?.id();
 
     let stack_branches = get_stack_branches_for_head(&repo, head_id, upstream_id, &upstream_name)?;

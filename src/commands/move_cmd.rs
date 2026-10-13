@@ -89,8 +89,7 @@ fn start_move_locked(repo: &Repository, args: &MoveArgs) -> Result<()> {
         let upstream_name = find_upstream(repo)?.ok_or_else(|| {
             anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
         })?;
-        let upstream_obj = repo.revparse_single(&upstream_name)?;
-        let upstream_id = upstream_obj.id();
+        let upstream_id = crate::trunk::stack_base(repo, &upstream_name)?;
         let merge_base = repo.merge_base(upstream_id, head_id)?;
         let all_branches_in_stack = get_stack_branches_from_merge_base(
             repo,
@@ -135,8 +134,7 @@ fn start_move_locked(repo: &Repository, args: &MoveArgs) -> Result<()> {
     let upstream_name = find_upstream(repo)?.ok_or_else(|| {
         anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
     })?;
-    let upstream_obj = repo.revparse_single(&upstream_name)?;
-    let upstream_id = upstream_obj.id();
+    let upstream_id = crate::trunk::stack_base(repo, &upstream_name)?;
     let merge_base = repo.merge_base(upstream_id, head_id)?;
     let all_branches_in_stack =
         get_stack_branches_from_merge_base(repo, merge_base, head_id, upstream_id, &upstream_name)?;
