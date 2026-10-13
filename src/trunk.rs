@@ -62,7 +62,9 @@ pub fn resolve_trunk(repo: &Repository) -> Result<Option<String>> {
 /// remote-tracking branch when the local trunk is behind it, else the trunk's
 /// own tip. Commits the remote merged but the local trunk has not pulled are
 /// then trunk history, not stack work, so a branch left at one of them is not
-/// a stack branch. A local trunk that is ahead or has diverged keeps its tip.
+/// a stack branch. A local trunk that is ahead or has diverged keeps its tip,
+/// as does one whose remote-tracking commit can't be read: the stack is then
+/// measured as it was before the remote trunk was consulted.
 pub fn stack_base(repo: &Repository, trunk: &str) -> Result<Oid> {
     let local = repo.revparse_single(trunk)?.peel_to_commit()?.id();
     let remote = repo
@@ -71,7 +73,11 @@ pub fn stack_base(repo: &Repository, trunk: &str) -> Result<Oid> {
         .ok()
         .and_then(|upstream| upstream.get().target());
     match remote {
-        Some(remote) if remote != local && repo.graph_descendant_of(remote, local)? => Ok(remote),
+        Some(remote)
+            if remote != local && repo.graph_descendant_of(remote, local).unwrap_or(false) =>
+        {
+            Ok(remote)
+        }
         _ => Ok(local),
     }
 }

@@ -890,3 +890,24 @@ fn test_tree_measures_the_stack_from_a_trunk_not_yet_pulled() {
         output_str
     );
 }
+
+/// A remote-tracking trunk whose commit can't be read leaves the stack
+/// measured from the local trunk, as before Kindra read the remote trunk.
+#[test]
+fn test_tree_falls_back_to_the_local_trunk_when_the_remote_trunk_is_unreadable() {
+    let (dir, _remote_dir) = common::setup_stale_trunk();
+    let missing = "0123456789abcdef0123456789abcdef01234567";
+    std::fs::write(
+        dir.path().join(".git/refs/remotes/origin/main"),
+        format!("{missing}\n"),
+    )
+    .unwrap();
+
+    let output_str = run_tree_command(dir.path(), &[]);
+
+    assert!(
+        output_str.contains("feature"),
+        "Output should contain 'feature':\n{}",
+        output_str
+    );
+}
