@@ -390,7 +390,7 @@ impl SyncScanCache {
             return;
         }
         // Without a common ancestor there is no single floor; keep per-range walks.
-        if let Ok(floor) = repo.merge_base_octopus(bases) {
+        if let Ok(Some(floor)) = octopus_merge_base(repo, bases) {
             self.shared_floor = Some((target_tip, floor));
             self.shared_history = None;
         }
@@ -1200,14 +1200,20 @@ pub fn collect_merged_local_branches(
     // across the loop even though the per-stack answers are not reused.
     let mut cache = SyncScanCache::default();
     let tips_in_target = local_branches_by_ancestry(repo, &[("--merged", target_id)])?;
-    let mut unmerged_by_graph = Vec::new();
+    let mut unmerged = Vec::new();
     for (name, branch_id) in branches {
         if tips_in_target.contains(&name) {
             merged_branches.push(name);
-        } else if let Ok(merge_base) = repo.merge_base(branch_id, target_id) {
-            unmerged_by_graph.push((name, branch_id, merge_base));
+        } else {
+            unmerged.push((name, branch_id));
         }
     }
+    let tips = unmerged.iter().map(|&(_, tip)| tip).collect::<Vec<_>>();
+    let merge_bases = merge_bases_with_target(repo, target_id, &tips)?;
+    let unmerged_by_graph = unmerged
+        .into_iter()
+        .filter_map(|(name, tip)| Some((name, tip, *merge_bases.get(&tip)?)))
+        .collect::<Vec<_>>();
 
     // Each range differs in its base, so per-range walks of the target rarely
     // repeat; one walk above all the bases answers every range instead.
@@ -1257,6 +1263,127 @@ fn local_branches_by_ancestry(
         .filter_map(|line| line.strip_prefix("refs/heads/"))
         .map(str::to_string)
         .collect())
+}
+
+/// Run `command` with `input` on its stdin and collect its output.
+fn output_with_stdin(
+    mut command: std::process::Command,
+    input: String,
+) -> Result<std::process::Output> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("Failed to open git's stdin."))?;
+    // Feed the input from another thread: with enough of it the output fills
+    // the pipe before the input is fully written, and both ends would block.
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            use std::io::Write;
+            stdin.write_all(input.as_bytes())
+        });
+        let output = child.wait_with_output();
+        let written = writer
+            .join()
+            .map_err(|_| anyhow!("git input writer panicked"))?;
+        // A closed pipe means git exited early; its status carries the error.
+        if let Err(err) = written
+            && err.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(err.into());
+        }
+        output.map_err(anyhow::Error::from)
+    })
+}
+
+/// The merge base of each of `tips` with `target`, or no entry for a tip
+/// that shares no history with it.
+///
+/// One `git rev-list` lists every commit the tips hold that the target does
+/// not, with its parents. A tip whose commits leave that set through exactly
+/// one parent has that parent as its only merge base: every commit the tip
+/// shares with the target lies below it. Git reads the commit-graph, where
+/// libgit2 would walk each tip's history to the target in turn. Tips that
+/// leave the set through several parents, or none, ask libgit2 instead, as
+/// every tip does when the listing fails.
+fn merge_bases_with_target(
+    repo: &Repository,
+    target: Oid,
+    tips: &[Oid],
+) -> Result<HashMap<Oid, Oid>> {
+    let mut bases = HashMap::new();
+    if tips.is_empty() {
+        return Ok(bases);
+    }
+    let mut command = crate::repository::git_command(repo);
+    command.args(["rev-list", "--parents", "--stdin"]);
+    let mut input = format!("^{target}\n");
+    for tip in tips {
+        input.push_str(&format!("{tip}\n"));
+    }
+    let mut parents: HashMap<Oid, Vec<Oid>> = HashMap::new();
+    if let Ok(output) = output_with_stdin(command, input)
+        && output.status.success()
+    {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut ids = line.split_whitespace().map(Oid::from_str);
+            if let Some(Ok(commit)) = ids.next() {
+                parents.insert(commit, ids.collect::<Result<_, _>>()?);
+            }
+        }
+    }
+
+    for &tip in tips {
+        let mut exits = HashSet::new();
+        if parents.contains_key(&tip) {
+            let mut seen = HashSet::new();
+            let mut pending = vec![tip];
+            while let Some(commit) = pending.pop() {
+                if !seen.insert(commit) {
+                    continue;
+                }
+                for &parent in &parents[&commit] {
+                    if parents.contains_key(&parent) {
+                        pending.push(parent);
+                    } else {
+                        exits.insert(parent);
+                    }
+                }
+            }
+        }
+        let base = match exits.len() {
+            1 => exits.into_iter().next(),
+            _ => repo.merge_base(tip, target).ok(),
+        };
+        if let Some(base) = base {
+            bases.insert(tip, base);
+        }
+    }
+    Ok(bases)
+}
+
+/// The best common ancestor of all `commits`, as `git merge-base --octopus`
+/// finds it, or `None` when they share none or git cannot tell. It matches
+/// libgit2's `merge_base_octopus`, but git reads the commit-graph.
+fn octopus_merge_base(repo: &Repository, commits: &[Oid]) -> Result<Option<Oid>> {
+    let mut seen = HashSet::new();
+    let output = crate::repository::git_command(repo)
+        .args(["merge-base", "--octopus"])
+        .args(
+            commits
+                .iter()
+                .filter(|commit| seen.insert(**commit))
+                .map(Oid::to_string),
+        )
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text.lines().next().map(Oid::from_str).transpose()?)
 }
 
 pub struct FloatingTargetContext {
@@ -1555,7 +1682,8 @@ fn touched_path_sets(repo: &Repository, commit_ids: &[Oid]) -> Result<HashMap<Oi
     if commit_ids.is_empty() {
         return Ok(sets);
     }
-    let mut child = crate::repository::git_command(repo)
+    let mut command = crate::repository::git_command(repo);
+    command
         .arg("diff-tree")
         .arg("-r")
         .arg("--root")
@@ -1563,34 +1691,9 @@ fn touched_path_sets(repo: &Repository, commit_ids: &[Oid]) -> Result<HashMap<Oi
         .arg("-z")
         .arg("--no-ext-diff")
         .arg("--stdin")
-        .current_dir(repo_root(repo)?)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("Failed to open git diff-tree stdin for path listing."))?;
+        .current_dir(repo_root(repo)?);
     let input: String = commit_ids.iter().map(|oid| format!("{oid}\n")).collect();
-    // Feed the ids from another thread: with enough commits the output fills
-    // the pipe before the input is fully written, and both ends would block.
-    let output = std::thread::scope(|scope| {
-        let writer = scope.spawn(move || {
-            use std::io::Write;
-            stdin.write_all(input.as_bytes())
-        });
-        let output = child.wait_with_output();
-        let written = writer
-            .join()
-            .map_err(|_| anyhow!("git diff-tree input writer panicked"))?;
-        // A closed pipe means diff-tree exited early; its status carries the error.
-        if let Err(err) = written
-            && err.kind() != std::io::ErrorKind::BrokenPipe
-        {
-            return Err(err.into());
-        }
-        output.map_err(anyhow::Error::from)
-    })?;
+    let output = output_with_stdin(command, input)?;
     if !output.status.success() {
         return Err(anyhow!("git diff-tree failed while listing touched paths."));
     }
