@@ -163,9 +163,13 @@ impl RepoLock {
     /// Acquire the repository lock, failing fast if another `kin` process holds it.
     pub fn acquire(repo: &Repository) -> Result<Self> {
         Self::try_acquire(repo)?.ok_or_else(|| {
+            // The lock file stays on disk between commands; only an open handle
+            // holds the lock. Deleting the file while another process holds it
+            // would let a second process lock a fresh file, so never suggest it.
             anyhow!(
-                "Another 'kin' process is operating on this repository. Wait for it to finish and try again. \
-                 If you are sure no other 'kin' process is running, remove '{}'.",
+                "Another 'kin' process is operating on this repository, possibly from another worktree. \
+                 Run the command again once it releases the lock. The lock file '{}' stays on disk \
+                 and does not need to be removed.",
                 lock_path(repo).display()
             )
         })
