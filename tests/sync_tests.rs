@@ -3485,6 +3485,95 @@ fn squash_merged_branch_with_quoted_path_is_detected_as_merged() {
     assert_eq!(merged, vec!["feature".to_string()]);
 }
 
+/// A branch that merged upstream in reaches upstream's history through more
+/// than one parent, so its merge base with upstream is the latest upstream
+/// commit it merged, not where it forked. Measuring the range from the fork
+/// point would count upstream's own changes as the branch's, and the squash
+/// that landed the branch would no longer match.
+#[test]
+fn squash_merged_branch_that_merged_upstream_in_is_detected_as_merged() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let root = dir.path();
+    run_ok("git", &["config", "user.name", "Test User"], root);
+    run_ok("git", &["config", "user.email", "test@example.com"], root);
+
+    let base_lines: Vec<String> = (1..=12).map(|n| format!("line {n}")).collect();
+    fs::write(root.join("a.txt"), base_lines.join("\n") + "\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "base"], root);
+
+    run_ok("git", &["checkout", "-b", "feature"], root);
+    let mut edited = base_lines.clone();
+    edited[6] = "line 7 changed on feature".to_string();
+    fs::write(root.join("a.txt"), edited.join("\n") + "\n").unwrap();
+    run_ok("git", &["commit", "-am", "feature: edit a"], root);
+
+    run_ok("git", &["checkout", "main"], root);
+    fs::write(root.join("up.txt"), "upstream\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "upstream: add up"], root);
+
+    run_ok("git", &["checkout", "feature"], root);
+    run_ok("git", &["merge", "--no-edit", "main"], root);
+    fs::write(root.join("b.txt"), "added by feature\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "feature: add b"], root);
+
+    run_ok("git", &["checkout", "main"], root);
+    run_ok("git", &["merge", "--squash", "feature"], root);
+    run_ok("git", &["commit", "-m", "squash: feature (#1)"], root);
+    let mut after = edited.clone();
+    after[0] = "line 1 changed upstream".to_string();
+    fs::write(root.join("a.txt"), after.join("\n") + "\n").unwrap();
+    run_ok("git", &["commit", "-am", "upstream: later edit"], root);
+
+    // An unmerged branch beside it keeps the shared history walk in play.
+    run_ok("git", &["checkout", "-b", "other", "HEAD~2"], root);
+    fs::write(root.join("c.txt"), "other work\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "other: add c"], root);
+    run_ok("git", &["checkout", "main"], root);
+
+    let repo = Repository::open(repo.path()).unwrap();
+    let merged = kindra::stack::collect_merged_local_branches(&repo, "main", &["main"]).unwrap();
+    assert_eq!(merged, vec!["feature".to_string()]);
+}
+
+/// A branch with no history in common with upstream has no merge base, so
+/// there is no range to compare: it is not merged, and the scan goes on.
+#[test]
+fn branch_with_unrelated_history_is_not_merged() {
+    let dir = tempdir().unwrap();
+    let repo = repo_init(dir.path());
+    let root = dir.path();
+    run_ok("git", &["config", "user.name", "Test User"], root);
+    run_ok("git", &["config", "user.email", "test@example.com"], root);
+
+    fs::write(root.join("a.txt"), "base\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "base"], root);
+
+    run_ok("git", &["checkout", "-b", "feature"], root);
+    fs::write(root.join("b.txt"), "feature\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "feature: add b"], root);
+    run_ok("git", &["checkout", "main"], root);
+    run_ok("git", &["merge", "--squash", "feature"], root);
+    run_ok("git", &["commit", "-m", "squash: feature (#1)"], root);
+
+    run_ok("git", &["checkout", "--orphan", "unrelated"], root);
+    run_ok("git", &["rm", "-rfq", "."], root);
+    fs::write(root.join("z.txt"), "elsewhere\n").unwrap();
+    run_ok("git", &["add", "."], root);
+    run_ok("git", &["commit", "-m", "unrelated root"], root);
+    run_ok("git", &["checkout", "main"], root);
+
+    let repo = Repository::open(repo.path()).unwrap();
+    let merged = kindra::stack::collect_merged_local_branches(&repo, "main", &["main"]).unwrap();
+    assert_eq!(merged, vec!["feature".to_string()]);
+}
+
 #[test]
 fn sync_names_the_native_operation_it_refuses_to_run_during() {
     for (op, hint) in [
