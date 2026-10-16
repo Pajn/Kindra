@@ -171,8 +171,9 @@ fn pr_create_or_update(
     let repo = crate::open_repo()?;
     // A paused operation has rewritten only part of the stack; publishing
     // now would push (or merge) a half-rebased stack. The lock is held until
-    // publication is done, so no other `kin` process rewrites the branches
-    // being published.
+    // the push is done and the stack it published is recorded, so no other
+    // `kin` process rewrites the branches in between. The pull request work
+    // after it only touches GitHub and runs without the lock.
     let lock = crate::operation_state::lock_and_ensure_idle(
         &repo,
         crate::operation_state::Allow::PUBLISH,
@@ -299,6 +300,15 @@ fn pr_create_or_update(
     // The base is the branch directly beneath it in the stack (or the repo
     // upstream if it sits directly on top of main/master).
     let base_map = compute_base_map(&repo, &all_branches_with_upstream, &upstream_name)?;
+    let published = PublishedStack::record(
+        &repo,
+        &all_branches_with_upstream,
+        &branches_with_upstream,
+        &upstream_name,
+    )?;
+    // Everything below changes only GitHub, so another `kin` may rewrite the
+    // branches meanwhile; `published` stops the run if one republishes them.
+    drop(lock);
 
     println!(
         "Found {} branch(es) with upstreams. Processing PRs...\n",
@@ -317,6 +327,7 @@ fn pr_create_or_update(
         if let Some((pr, draft)) = process_branch_pr(
             &open_prs,
             &repo,
+            &published,
             &sb.name,
             &git_base,
             &gh_base,
@@ -369,7 +380,13 @@ fn pr_create_or_update(
             .collect::<HashMap<_, _>>();
         navigation_prs.sort_by_key(|pr| order.get(pr.branch_name.as_str()).copied());
     }
-    sync_stack_descriptions(&processed_prs, &navigation_prs, &base_map)?;
+    sync_stack_descriptions(
+        &repo,
+        &published,
+        &processed_prs,
+        &navigation_prs,
+        &base_map,
+    )?;
 
     if !after_pr.is_empty() {
         let prs = processed_prs
@@ -390,8 +407,6 @@ fn pr_create_or_update(
                 (stack_pr.branch_name.clone(), pr)
             })
             .collect();
-        // Publishing is done: release the lock so hooks can run `kin` too.
-        drop(lock);
         run_after_pr_hooks(
             &repo,
             &after_pr,
@@ -1502,9 +1517,106 @@ pub(crate) fn normalize_base_for_gh(base: &str) -> String {
     base.to_string()
 }
 
+/// The stack one `kin pr` run published, recorded while it still holds the
+/// repository lock: each stack branch's commit, and where each pushed
+/// branch's remote-tracking ref pointed right after the push.
+///
+/// The pull request work runs without the lock, so a `kin` in another
+/// worktree may rewrite the stack and publish it again meanwhile. Pull request
+/// bases set from this run's stack would then contradict the branches on the
+/// remote, so every change to GitHub first checks that no published branch
+/// has moved since. Reading a ref needs no lock.
+struct PublishedStack {
+    /// Stack branches and the trunk, mapped to the commit each pointed at.
+    revisions: HashMap<String, git2::Oid>,
+    /// Each pushed branch, its remote-tracking ref and that ref's commit.
+    remote_tips: Vec<(String, String, git2::Oid)>,
+}
+
+impl PublishedStack {
+    fn record(
+        repo: &Repository,
+        stack: &[(StackBranch, String)],
+        pushed: &[(StackBranch, String)],
+        upstream_name: &str,
+    ) -> Result<Self> {
+        let mut revisions = stack
+            .iter()
+            .map(|(branch, _)| (branch.name.clone(), branch.id))
+            .collect::<HashMap<_, _>>();
+        revisions.insert(
+            upstream_name.to_string(),
+            repo.revparse_single(upstream_name)?.peel_to_commit()?.id(),
+        );
+        let mut remote_tips = Vec::new();
+        for (branch, _) in pushed {
+            let upstream = repo
+                .find_branch(&branch.name, BranchType::Local)?
+                .upstream()?;
+            let reference = upstream.get();
+            if let (Some(name), Some(id)) = (reference.name(), reference.target()) {
+                remote_tips.push((branch.name.clone(), name.to_string(), id));
+            }
+        }
+        Ok(Self {
+            revisions,
+            remote_tips,
+        })
+    }
+
+    /// The commit `name` pointed at when the stack was published, as a
+    /// revision; `name` itself when it is not part of the stack.
+    fn revision(&self, name: &str) -> String {
+        self.revisions
+            .get(name)
+            .map_or_else(|| name.to_string(), git2::Oid::to_string)
+    }
+
+    /// Fail when a branch this run pushed has moved on the remote since,
+    /// which means another `kin pr` published the stack again.
+    fn ensure_current(&self, repo: &Repository) -> Result<()> {
+        for (branch, remote_ref, pushed) in &self.remote_tips {
+            let now = repo
+                .find_reference(remote_ref)
+                .ok()
+                .and_then(|reference| reference.target());
+            if now != Some(*pushed) {
+                return Err(StackRepublished {
+                    branch: branch.clone(),
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A branch this `kin pr` run pushed moved on the remote before the run was
+/// done with GitHub. Retrying the same change cannot help; only a new run,
+/// which reads the stack again, can.
+#[derive(Debug)]
+struct StackRepublished {
+    branch: String,
+}
+
+impl std::fmt::Display for StackRepublished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "'{}' changed on the remote after this run pushed it, so another 'kin pr' has \
+             published the stack again. Stopped before changing more pull requests; run \
+             'kin pr' again to publish the current stack.",
+            self.branch
+        )
+    }
+}
+
+impl std::error::Error for StackRepublished {}
+
 fn process_branch_pr(
     open_prs: &HashMap<String, gh::OpenPr>,
     repo: &Repository,
+    published: &PublishedStack,
     branch_name: &str,
     git_base: &str,
     gh_base: &str,
@@ -1518,6 +1630,7 @@ fn process_branch_pr(
             println!("  Open PR #{} found.", existing.number);
             if existing.base_branch != gh_base {
                 println!("  Updating base: {} → {}", existing.base_branch, gh_base);
+                published.ensure_current(repo)?;
                 gh::update_pr_base(existing.number, gh_base)?;
                 println!("  ✓ Base updated.");
             } else {
@@ -1527,7 +1640,7 @@ fn process_branch_pr(
         }
         None => {
             // New PR: run the creation wizard (or apply supplied flags).
-            create_pr_interactive(repo, branch_name, git_base, gh_base, options)
+            create_pr_interactive(repo, published, branch_name, git_base, gh_base, options)
         }
     }
 }
@@ -1538,12 +1651,19 @@ fn process_branch_pr(
 
 fn create_pr_interactive(
     repo: &Repository,
+    published: &PublishedStack,
     branch_name: &str,
     git_base: &str,
     gh_base: &str,
     options: &PrCreateOptions,
 ) -> Result<Option<(crate::gh::EditablePr, bool)>> {
-    let commits = get_branch_commits(repo, branch_name, git_base)?;
+    // Read the commits this run pushed, not the branch tips now: without the
+    // lock another `kin` may have rewritten the branch since.
+    let commits = get_branch_commits(
+        repo,
+        &published.revision(branch_name),
+        &published.revision(git_base),
+    )?;
 
     if commits.is_empty() {
         println!(
@@ -1606,6 +1726,7 @@ fn create_pr_interactive(
     let url = submit_with_retry(
         &draft,
         || {
+            published.ensure_current(repo)?;
             gh::create_pr(&CreatePrParams {
                 title: title.clone(),
                 body: body.borrow().clone(),
@@ -1644,6 +1765,8 @@ fn create_pr_interactive(
 }
 
 fn sync_stack_descriptions(
+    repo: &Repository,
+    published: &PublishedStack,
     prs: &[StackPr],
     navigation: &[StackPr],
     base_map: &HashMap<String, String>,
@@ -1659,6 +1782,7 @@ fn sync_stack_descriptions(
         }
 
         println!("Syncing stack section for PR #{}.", pr.pr.number);
+        published.ensure_current(repo)?;
         if let Err(err) = gh::edit_pr(&gh::EditPrParams {
             number: pr.pr.number,
             title: pr.pr.title.clone(),
@@ -2277,7 +2401,9 @@ enum SubmitRetry {
 fn prompt_submit_retry(err: &anyhow::Error, draft: &crate::editor::Draft) -> SubmitRetry {
     eprintln!("  ✗ Submission failed: {err:#}");
 
-    if !crate::interaction::current().is_interactive() {
+    if err.downcast_ref::<StackRepublished>().is_some()
+        || !crate::interaction::current().is_interactive()
+    {
         return SubmitRetry::Abort;
     }
 

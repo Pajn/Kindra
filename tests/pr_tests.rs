@@ -7715,28 +7715,30 @@ fn kin_with_gh_mock(dir: &std::path::Path, args: &[&str]) -> assert_cmd::Command
     cmd
 }
 
-/// `kin pr` holds the repository lock from its idle check until the PRs are
-/// created, so another `kin` process cannot rewrite the branches it pushes.
+/// `kin pr` holds the repository lock from its idle check until the push is
+/// done, so another `kin` process cannot rewrite the branches it pushes.
+/// (`kin_pr_releases_the_lock_before_creating_pull_requests` covers the pull
+/// request work after it, which runs without the lock.)
 #[test]
-fn pr_holds_the_repository_lock_while_publishing() {
+fn pr_holds_the_repository_lock_while_pushing() {
     let (dir, _repo) = setup_simple_stack();
     init_origin_and_push(dir.path(), &["main"]);
     run_ok("git", &["checkout", "feature"], dir.path());
+    write_script(
+        &dir.path().join(".git").join("hooks").join("pre-push"),
+        &format!("#!/bin/sh\n{}\nexit 0\n", common::BLOCK_UNTIL_RELEASED),
+    );
     write_gh_mock(
         dir.path(),
-        &format!(
-            r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then echo '[]'; exit 0; fi
+        r#"if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then echo '[]'; exit 0; fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "view" ]]; then
     echo "no pull requests found for branch" >&2
     exit 1
 fi
 if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
-{}
     echo "https://github.com/test/repo/pull/1"
     exit 0
 fi"#,
-            common::BLOCK_UNTIL_RELEASED
-        ),
     );
 
     let mut pr = kin_with_gh_mock(dir.path(), &["pr"]);
@@ -7864,6 +7866,11 @@ if [[ "$1" == "pr" && "$2" == "create" ]]; then
     if [[ -n "$MOCK_GH_FAIL_CREATE" ]]; then
         echo "simulated create failure" >&2
         exit 1
+    fi
+    # Run once, during the first create, what a concurrent `kin` would do.
+    if [[ -n "$MOCK_GH_ON_FIRST_CREATE" && ! -f "$state/on-first-create.done" ]]; then
+        touch "$state/on-first-create.done"
+        eval "$MOCK_GH_ON_FIRST_CREATE"
     fi
     head=""; base=""; title=""; body=""; draft=false
     while [[ $# -gt 0 ]]; do
@@ -9351,4 +9358,113 @@ fn pr_missing_upstreams_lists_all_needed_branches_and_explicit_push_recovers() {
     );
     assert!(output.status.success(), "{output:?}");
     assert_eq!(fx.gh_calls().matches("pr create").count(), 2);
+}
+
+/// The pull request work after the push runs without the repository lock, so
+/// a `kin` in another worktree is not refused meanwhile.
+#[test]
+fn kin_pr_releases_the_lock_before_creating_pull_requests() {
+    let fx = AfterPrFixture::new(false);
+    let output = fx
+        .kin_cmd(
+            fx.root(),
+            &[
+                "pr",
+                "--metadata-all",
+                "--title",
+                "T",
+                "--body-from-commits",
+            ],
+        )
+        .env(
+            "MOCK_GH_ON_FIRST_CREATE",
+            format!(
+                "\"{}\" restack > \"$state/nested.out\" 2>&1; echo $? > \"$state/nested.status\"",
+                env!("CARGO_BIN_EXE_kin")
+            ),
+        )
+        .output()
+        .unwrap();
+    assert_success(&output);
+
+    let nested = fs::read_to_string(fx.tools.path().join("nested.out")).unwrap();
+    assert!(!nested.contains("Another 'kin' process"), "{nested}");
+    assert_eq!(
+        fs::read_to_string(fx.tools.path().join("nested.status"))
+            .unwrap()
+            .trim(),
+        "0",
+        "{nested}"
+    );
+    assert_eq!(fx.gh_calls().matches("pr create").count(), 2);
+}
+
+/// Another `kin pr` publishing the stack while this one is still working on
+/// GitHub stops this one before it changes another pull request.
+#[test]
+fn kin_pr_stops_when_another_run_republishes_the_stack() {
+    let fx = AfterPrFixture::new(false);
+    let output = fx
+        .kin_cmd(
+            fx.root(),
+            &[
+                "pr",
+                "--metadata-all",
+                "--title",
+                "T",
+                "--body-from-commits",
+            ],
+        )
+        .env(
+            "MOCK_GH_ON_FIRST_CREATE",
+            "git update-ref refs/remotes/origin/feature-b feature-a",
+        )
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "'feature-b' changed on the remote after this run pushed it, so another 'kin pr' has published the stack again."
+        ),
+        "{stderr}"
+    );
+    let calls = fx.gh_calls();
+    assert_eq!(calls.matches("pr create").count(), 1, "{calls}");
+    assert!(calls.contains("--head feature-a"), "{calls}");
+    assert!(!calls.contains("pr edit"), "{calls}");
+}
+
+/// A branch rewritten locally after the push does not leak into the pull
+/// request: its body comes from the commits this run pushed. Prompted runs
+/// read the commits while creating the pull request, after the lock is gone;
+/// the scripted prompt seam stands in for one.
+#[test]
+fn kin_pr_describes_the_commits_it_pushed() {
+    let fx = AfterPrFixture::new(false);
+    let output = fx
+        .kin_cmd(
+            fx.root(),
+            &[
+                "pr",
+                "--metadata-all",
+                "--title",
+                "T",
+                "--body-from-commits",
+            ],
+        )
+        .env("KIN_TEST_PR_BODY_ACTION", "enter")
+        .env(
+            "MOCK_GH_ON_FIRST_CREATE",
+            "git update-ref refs/heads/feature-b \
+             \"$(git commit-tree -p feature-b -m 'feat: rewritten later' 'feature-b^{tree}')\"",
+        )
+        .output()
+        .unwrap();
+    assert_success(&output);
+
+    let body = fs::read_to_string(fx.tools.path().join("feature-b.body")).unwrap();
+    assert!(body.contains("feat: b2"), "{body}");
+    assert!(!body.contains("rewritten later"), "{body}");
 }
