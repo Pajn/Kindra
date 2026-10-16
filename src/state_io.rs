@@ -179,7 +179,12 @@ impl RepoLock {
     /// waiting in an editor, still produces an error instead of a hang.
     pub fn acquire(repo: &Repository) -> Result<Self> {
         let timeout = lock_wait_timeout();
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            anyhow!(
+                "KIN_LOCK_TIMEOUT is too large: {} seconds.",
+                timeout.as_secs()
+            )
+        })?;
         let mut announced = false;
         let mut delay = Duration::from_millis(50);
         loop {

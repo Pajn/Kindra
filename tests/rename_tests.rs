@@ -430,3 +430,21 @@ fn rename_gives_up_once_the_lock_wait_times_out() {
             .is_ok()
     );
 }
+
+#[test]
+fn rename_rejects_a_lock_timeout_too_large_to_wait_for() {
+    let dir = common::setup_repo();
+    let repo = git2::Repository::open(dir.path()).unwrap();
+
+    common::kin_cmd()
+        .current_dir(dir.path())
+        .env("KIN_LOCK_TIMEOUT", u64::MAX.to_string())
+        .args(["rename", "feature-b", "renamed"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("KIN_LOCK_TIMEOUT is too large"));
+    assert!(
+        repo.find_branch("feature-b", git2::BranchType::Local)
+            .is_ok()
+    );
+}

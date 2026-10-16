@@ -57,7 +57,8 @@ Without either flag, Kindra prompts only when both stdin and stdout are terminal
 Only one `kin` command changes a repository at a time, across all of its
 worktrees. A command that finds another one running waits for it to release the
 lock, up to 60 seconds, then fails with exit code `1`. `KIN_LOCK_TIMEOUT` sets
-the wait in seconds; `0` fails at once. `.git/kindra.lock` stays on disk between
+the wait in seconds; `0` fails at once. `kin status` never waits: it reports the
+saved state without reconciling it. `.git/kindra.lock` stays on disk between
 commands and never needs to be removed.
 
 Exit codes are `0` for success, `1` for operation failures (including unreadable
