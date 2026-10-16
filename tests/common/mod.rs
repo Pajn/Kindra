@@ -104,6 +104,9 @@ pub fn kin_cmd() -> Command {
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test User")
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        // Tests that hold the repository lock expect the refusal at once;
+        // the ones about waiting set their own timeout.
+        .env("KIN_LOCK_TIMEOUT", "0")
         // Never let a subprocess (git commit, git rebase --continue, kin's own
         // file editor) fall through to an interactive editor: on CI there is no
         // $EDITOR and no core.editor, so it would resolve to `vi` and hang
