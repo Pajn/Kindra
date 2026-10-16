@@ -24,7 +24,7 @@ use git2::Repository;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Atomically replace the contents of `path` with `contents`.
 ///
@@ -148,6 +148,16 @@ pub fn lock_path(repo: &Repository) -> PathBuf {
     repo.commondir().join("kindra.lock")
 }
 
+/// How long [`RepoLock::acquire`] waits for another `kin` process, from
+/// `KIN_LOCK_TIMEOUT` in whole seconds. `0` fails at once.
+fn lock_wait_timeout() -> Duration {
+    const DEFAULT: Duration = Duration::from_secs(60);
+    std::env::var("KIN_LOCK_TIMEOUT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(DEFAULT, Duration::from_secs)
+}
+
 /// A held exclusive lock over all Kindra state mutations in a repository.
 ///
 /// The lock is released when the guard is dropped, i.e. when the current `kin`
@@ -160,19 +170,45 @@ pub struct RepoLock {
 }
 
 impl RepoLock {
-    /// Acquire the repository lock, failing fast if another `kin` process holds it.
+    /// Acquire the repository lock, waiting a bounded time for another `kin`
+    /// process to release it.
+    ///
+    /// Most contention is another `kin` in a sibling worktree running a short
+    /// command, so a refusal would only make the caller retry by hand. The wait
+    /// is bounded so a `kin` that holds the lock for a long time, such as one
+    /// waiting in an editor, still produces an error instead of a hang.
     pub fn acquire(repo: &Repository) -> Result<Self> {
-        Self::try_acquire(repo)?.ok_or_else(|| {
-            // The lock file stays on disk between commands; only an open handle
-            // holds the lock. Deleting the file while another process holds it
-            // would let a second process lock a fresh file, so never suggest it.
-            anyhow!(
-                "Another 'kin' process is operating on this repository, possibly from another worktree. \
-                 Run the command again once it releases the lock. The lock file '{}' stays on disk \
-                 and does not need to be removed.",
-                lock_path(repo).display()
-            )
-        })
+        let timeout = lock_wait_timeout();
+        let deadline = Instant::now() + timeout;
+        let mut announced = false;
+        let mut delay = Duration::from_millis(50);
+        loop {
+            if let Some(lock) = Self::try_acquire(repo)? {
+                return Ok(lock);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            if !announced {
+                eprintln!(
+                    "Waiting for another 'kin' process to release the lock (up to {}s)...",
+                    timeout.as_secs()
+                );
+                announced = true;
+            }
+            std::thread::sleep(delay.min(deadline - now));
+            delay = (delay * 2).min(Duration::from_millis(500));
+        }
+        // The lock file stays on disk between commands; only an open handle
+        // holds the lock. Deleting the file while another process holds it
+        // would let a second process lock a fresh file, so never suggest it.
+        Err(anyhow!(
+            "Another 'kin' process is operating on this repository, possibly from another worktree. \
+             Run the command again once it releases the lock. The lock file '{}' stays on disk \
+             and does not need to be removed.",
+            lock_path(repo).display()
+        ))
     }
 
     /// Acquire the repository lock, or `None` if another `kin` process holds it.

@@ -368,3 +368,65 @@ fn rename_refuses_during_native_rebase() {
     assert!(common::branch_exists(dir.path(), "feature-a"));
     assert!(!common::branch_exists(dir.path(), "renamed"));
 }
+
+fn hold_repository_lock(repo: &git2::Repository) -> std::fs::File {
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(repo.commondir().join("kindra.lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+    lock
+}
+
+#[test]
+fn rename_waits_for_another_kin_to_release_the_lock() {
+    let dir = common::setup_repo();
+    let repo = git2::Repository::open(dir.path()).unwrap();
+    let lock = hold_repository_lock(&repo);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        fs2::FileExt::unlock(&lock).unwrap();
+    });
+
+    common::kin_cmd()
+        .current_dir(dir.path())
+        .env("KIN_LOCK_TIMEOUT", "30")
+        .args(["rename", "feature-b", "renamed"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains(
+            "Waiting for another 'kin' process to release the lock",
+        ));
+    release.join().unwrap();
+    assert!(repo.find_branch("renamed", git2::BranchType::Local).is_ok());
+}
+
+#[test]
+fn rename_gives_up_once_the_lock_wait_times_out() {
+    let dir = common::setup_repo();
+    let repo = git2::Repository::open(dir.path()).unwrap();
+    let lock = hold_repository_lock(&repo);
+
+    let started = std::time::Instant::now();
+    common::kin_cmd()
+        .current_dir(dir.path())
+        .env("KIN_LOCK_TIMEOUT", "1")
+        .args(["rename", "feature-b", "renamed"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "Waiting for another 'kin' process",
+        ))
+        .stderr(predicates::str::contains(
+            "Another 'kin' process is operating on this repository",
+        ));
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    fs2::FileExt::unlock(&lock).unwrap();
+    assert!(
+        repo.find_branch("feature-b", git2::BranchType::Local)
+            .is_ok()
+    );
+}

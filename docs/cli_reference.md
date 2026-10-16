@@ -54,6 +54,12 @@ Without either flag, Kindra prompts only when both stdin and stdout are terminal
 `KIN_INTERACTIVE=0` (or `false`) forces non-interactive mode;
 `KIN_INTERACTIVE=1` (or `true`) forces interactive mode. CLI flags take precedence.
 
+Only one `kin` command changes a repository at a time, across all of its
+worktrees. A command that finds another one running waits for it to release the
+lock, up to 60 seconds, then fails with exit code `1`. `KIN_LOCK_TIMEOUT` sets
+the wait in seconds; `0` fails at once. `.git/kindra.lock` stays on disk between
+commands and never needs to be removed.
+
 Exit codes are `0` for success, `1` for operation failures (including unreadable
 or invalid metadata files), `2` for CLI argument errors, and **`3` when required
 prompt input or an input scope is unavailable**. Exit code 3 is not a transaction
