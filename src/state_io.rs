@@ -168,8 +168,8 @@ impl RepoLock {
             // would let a second process lock a fresh file, so never suggest it.
             anyhow!(
                 "Another 'kin' process is operating on this repository, possibly from another worktree. \
-                 Run the command again once it finishes. The lock is released when that process exits; \
-                 '{}' stays on disk and does not need to be removed.",
+                 Run the command again once it releases the lock. The lock file '{}' stays on disk \
+                 and does not need to be removed.",
                 lock_path(repo).display()
             )
         })
