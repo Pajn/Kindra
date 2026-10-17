@@ -413,6 +413,7 @@ fn pr_create_or_update(
             &upstream_name,
             &branches_with_upstream,
             &base_map,
+            &published,
             prs,
         )?;
     }
@@ -492,6 +493,7 @@ fn run_after_pr_hooks(
     trunk_ref: &str,
     branches: &[(StackBranch, String)],
     base_map: &HashMap<String, String>,
+    published: &PublishedStack,
     mut prs: HashMap<String, crate::hooks::AfterPrPullRequest>,
 ) -> Result<()> {
     let payload = (|| -> Result<crate::hooks::AfterPrPayload> {
@@ -501,8 +503,10 @@ fn run_after_pr_hooks(
                 .get(&sb.name)
                 .map(String::as_str)
                 .unwrap_or(trunk_ref);
+            // Read the base as published, like `head_sha`: without the lock
+            // another `kin` may have moved it since.
             let base_id = repo
-                .revparse_single(git_base)
+                .revparse_single(&published.revision(git_base))
                 .and_then(|object| object.peel_to_commit())
                 .with_context(|| format!("Could not resolve '{git_base}'"))?
                 .id();
@@ -911,6 +915,10 @@ fn pr_flatten() -> Result<()> {
                 Some((sb.name.clone(), pr))
             })
             .collect();
+        // Record the stack while the lock still holds it; the payload is
+        // built after the lock is released.
+        let published =
+            PublishedStack::record(&repo, &branches_with_upstream, &[], &upstream_name)?;
         // Publishing is done: release the lock so hooks can run `kin` too.
         drop(lock);
         run_after_pr_hooks(
@@ -919,6 +927,7 @@ fn pr_flatten() -> Result<()> {
             &upstream_name,
             &branches_with_upstream,
             &base_map,
+            &published,
             prs,
         )?;
     }

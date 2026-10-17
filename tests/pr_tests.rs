@@ -9468,3 +9468,42 @@ fn kin_pr_describes_the_commits_it_pushed() {
     assert!(body.contains("feat: b2"), "{body}");
     assert!(!body.contains("rewritten later"), "{body}");
 }
+
+/// The `after_pr` payload is built after the lock is released, so a base
+/// rewritten meanwhile must not leak in: each fork point comes from the stack
+/// this run published, like `head_sha`.
+#[test]
+fn after_pr_payload_uses_the_published_bases() {
+    let fx = AfterPrFixture::new(false);
+    write_repo_config(fx.root(), &record_hook_config("run"));
+    let published_a = fx.rev("feature-a");
+    let output = fx
+        .kin_cmd(
+            fx.root(),
+            &[
+                "pr",
+                "--metadata-all",
+                "--title",
+                "T",
+                "--body-from-commits",
+            ],
+        )
+        .env(
+            "MOCK_GH_ON_FIRST_CREATE",
+            "git update-ref refs/heads/feature-a \
+             \"$(git commit-tree -p main -m 'feat: a rewritten' 'main^{tree}')\"",
+        )
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_ne!(
+        fx.rev("feature-a"),
+        published_a,
+        "the mock rewrote feature-a"
+    );
+
+    let payload = fx.payload("run");
+    let entry = payload_branch(&payload, "feature-b");
+    assert_eq!(entry["parent"], "feature-a");
+    assert_eq!(entry["fork_point"], published_a);
+}
