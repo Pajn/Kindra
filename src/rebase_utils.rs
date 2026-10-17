@@ -1781,10 +1781,11 @@ pub fn delete_merged_branches(
         })
         .collect();
 
-    // One `git branch -D` for all of them. Git deletes them in one
-    // transaction, so if any of them cannot be deleted, none is; then each is
-    // deleted on its own, reporting the ones Git refuses. Which were deleted
-    // is read from the refs after.
+    // One `git branch -D` for all of them. When one of them cannot be
+    // deleted, Git may leave all of them in place or only some, depending on
+    // its version and ref backend; the ones still present are then deleted on
+    // their own, reporting the ones Git refuses. Which were deleted is read
+    // from the refs after.
     let together = git_command(repo)
         .arg("branch")
         .arg("-D")
@@ -1793,7 +1794,11 @@ pub fn delete_merged_branches(
         .stderr(Stdio::null())
         .status()?;
     if !together.success() {
-        for branch_name in branches {
+        let present: HashSet<String> = crate::stack::local_branch_tips(repo)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for branch_name in branches.iter().filter(|name| present.contains(*name)) {
             git_command(repo)
                 .arg("branch")
                 .arg("-D")

@@ -4857,7 +4857,11 @@ fn sync_deletes_the_merged_branches_it_can_when_one_cannot_be_deleted() {
         .stdout(predicate::str::contains(
             "Warning: Failed to delete merged branch: landed-b.",
         ))
-        .stdout(predicate::str::contains("Deleted merged branch: landed-c"));
+        .stdout(predicate::str::contains("Deleted merged branch: landed-c"))
+        // Only the branch Git refused is reported, not the ones it deleted.
+        .stderr(predicate::str::contains("landed-b"))
+        .stderr(predicate::str::contains("landed-a").not())
+        .stderr(predicate::str::contains("landed-c").not());
     fs::remove_file(&lock).unwrap();
 
     let repo = Repository::open(dir.path()).unwrap();
