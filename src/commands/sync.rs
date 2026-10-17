@@ -314,6 +314,16 @@ fn sync_upstream_branch(
 
     let upstream_id = repo.revparse_single(upstream_name)?.id();
     let rebase_onto_id = repo.revparse_single(rebase_onto_name)?.id();
+    if upstream_id != rebase_onto_id
+        && repo.graph_descendant_of(rebase_onto_id, upstream_id)?
+        && fast_forward_trunk(repo, upstream_name, rebase_onto_name)?
+    {
+        if !args.no_delete {
+            let _p = phase("delete merged branches");
+            delete_merged_branches(repo, &merged_branches, upstream_name)?;
+        }
+        return Ok(());
+    }
     if upstream_id != rebase_onto_id {
         let rebase_root_id = repo.merge_base(upstream_id, rebase_onto_id)?;
         crate::rebase_utils::ensure_git_supports_reapply_cherry_picks()?;
@@ -370,6 +380,45 @@ fn sync_upstream_branch(
     // The undo guard held by the calling `sync` settles the pending snapshot on
     // return (the rebase path defers to the rebase loop's completion).
     Ok(())
+}
+
+/// Fast-forward the checked-out trunk `upstream_name` to `onto` when it has no
+/// commits of its own, returning whether it did.
+///
+/// A rebase would only check `onto` out, but it starts an operation: a
+/// journal, a set-aside of the working tree and a checkout back to the trunk
+/// once done. `git merge --ff-only` updates the branch and the working tree in
+/// one step. It is used only when the rebase would set nothing aside, so the
+/// two leave the same result; with changes to carry, the caller rebases as
+/// before, and so it does if the merge refuses, which leaves nothing changed.
+fn fast_forward_trunk(repo: &git2::Repository, upstream_name: &str, onto: &str) -> Result<bool> {
+    let _p = phase("fast-forward");
+    if !crate::set_aside::whole_tree_clean(repo)? {
+        return Ok(false);
+    }
+    let mut plan = crate::overrides::Plan::default();
+    crate::overrides::prepare(repo, plan.checkout_rev(repo, onto))?;
+    let before = repo.revparse_single(upstream_name)?.id();
+    // Git's refusal is not shown, since the rebase takes over; anything else
+    // on stderr, such as a post-merge hook's output, is passed on.
+    let output = crate::repository::git_command(repo)
+        .args(["merge", "--ff-only", "--quiet", "--no-stat"])
+        .arg(onto)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    std::io::Write::write_all(&mut std::io::stderr(), &output.stderr)?;
+    let after = repo.revparse_single(upstream_name)?.id();
+    println!(
+        "Fast-forwarded {upstream_name} to {onto}: {}..{}",
+        &before.to_string()[..7],
+        &after.to_string()[..7]
+    );
+    Ok(true)
 }
 
 /// The branches sync rebases, with their merge base with the trunk `onto`: the

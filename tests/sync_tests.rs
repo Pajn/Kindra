@@ -1833,6 +1833,17 @@ fn sync_on_main_errors_when_git_too_old_for_reapply_cherry_picks() {
         remote_worktree.path(),
     );
     run_ok("git", &["push", "origin", "main"], remote_worktree.path());
+    // A commit of its own, so main is rebased rather than fast-forwarded.
+    let base = repo.find_commit(tip(&repo, "main")).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "local.txt",
+        "local",
+        "local main commit",
+        &[&base],
+    );
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
 
     // Outside the working tree: operations set its untracked files aside.
     let mock_bin = dir.path().join(".git/mock-bin");
@@ -4647,5 +4658,99 @@ fn sync_reports_phase_timings_with_kin_timings() {
     assert!(
         !String::from_utf8_lossy(&quiet.stderr).contains("kin timing:"),
         "{quiet:?}"
+    );
+}
+
+/// The `git` subcommands a `GIT_TRACE` log records kin running.
+fn traced_git_commands(trace: &std::path::Path) -> Vec<String> {
+    fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_once("trace: built-in: git ").map(|(_, cmd)| cmd))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn sync_on_main_fast_forwards_without_starting_an_operation() {
+    let (dir, remote) = remote_backed_repo();
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    run_ok("git", &["checkout", "-b", "landed"], dir.path());
+    fs::write(dir.path().join("landed.txt"), "landed").unwrap();
+    run_ok("git", &["add", "landed.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "landed work"], dir.path());
+    run_ok("git", &["push", "origin", "landed:main"], dir.path());
+    run_ok("git", &["checkout", "main"], dir.path());
+    common::push_remote_commit(remote.path(), "main", "remote.txt");
+    let repo = Repository::open(dir.path()).unwrap();
+    let main_before = tip(&repo, "main");
+    let landed = tip(&repo, "landed");
+
+    let trace = dir.path().join(".git/trace.log");
+    kin_cmd()
+        .arg("sync")
+        .env("GIT_TRACE", &trace)
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Fast-forwarded main to origin/main",
+        ))
+        .stdout(predicate::str::contains("Deleted merged branch: landed"));
+
+    let commands = traced_git_commands(&trace);
+    assert!(
+        commands
+            .iter()
+            .any(|cmd| cmd.starts_with("merge --ff-only")),
+        "{commands:#?}"
+    );
+    assert!(
+        !commands
+            .iter()
+            .any(|cmd| cmd.starts_with("rebase") || cmd.starts_with("stash")),
+        "{commands:#?}"
+    );
+    assert_eq!(tip(&repo, "main"), tip(&repo, "origin/main"));
+    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+    assert!(dir.path().join("remote.txt").exists());
+    assert!(repo.find_branch("landed", BranchType::Local).is_err());
+    assert!(!rebase_state_file(dir.path()).exists());
+    common::assert_no_rebase_in_progress(dir.path());
+
+    kin_cmd()
+        .args(["undo", "--force"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(tip(&repo, "main"), main_before);
+    assert_eq!(tip(&repo, "landed"), landed);
+}
+
+#[test]
+fn sync_on_main_rebases_when_there_are_untracked_files_to_set_aside() {
+    let (dir, remote) = remote_backed_repo();
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    common::push_remote_commit(remote.path(), "main", "remote.txt");
+    fs::write(dir.path().join("scratch.txt"), "untracked local edit\n").unwrap();
+
+    let trace = dir.path().join(".git/trace.log");
+    kin_cmd()
+        .arg("sync")
+        .env("GIT_TRACE", &trace)
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let commands = traced_git_commands(&trace);
+    assert!(
+        commands.iter().any(|cmd| cmd.starts_with("rebase")),
+        "{commands:#?}"
+    );
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(tip(&repo, "main"), tip(&repo, "origin/main"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "untracked local edit\n"
     );
 }

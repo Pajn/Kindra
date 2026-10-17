@@ -231,6 +231,29 @@ pub fn take_whole_tree(repo: &Repository, allowed: bool) -> Result<Option<SetAsi
     take(repo, Kind::WholeTree, "kin-autostash")
 }
 
+/// Whether [`take_whole_tree`] would find nothing to set aside: no tracked
+/// changes, staged or not, and no untracked files other than local override
+/// files, which it leaves in place.
+pub fn whole_tree_clean(repo: &Repository) -> Result<bool> {
+    let output = git_command(repo)
+        .args([
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=normal",
+            "--",
+        ])
+        .args(crate::overrides::stash_pathspecs(repo)?)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git status failed while checking for changes to set aside: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output.stdout.is_empty())
+}
+
 /// Set the tracked changes aside as a whole tree, honouring the permission
 /// `allowed` as [`take_whole_tree`] does. Returns:
 /// - `Ok(None)` if the tree is clean (nothing set aside),
