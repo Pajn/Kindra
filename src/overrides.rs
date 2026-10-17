@@ -11,7 +11,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use git2::{Oid, Repository, RepositoryState};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -545,8 +545,25 @@ fn branch(repo: &Repository) -> Result<String> {
 }
 
 enum Session {
-    Kept { config: Config, branch: String },
+    Kept {
+        config: Config,
+        branch: String,
+        unchanged: Unchanged,
+    },
     Suspended(State),
+}
+
+/// The checks of [`plan_keeps_overlays`] that found an override path
+/// unchanged, so a later `prepare` of the same operation need not run them
+/// again: they depend only on the commits compared. An operation prepares the
+/// same checkouts and replays more than once, such as before setting its
+/// working tree aside and again as its rebase loop starts.
+#[derive(Default)]
+struct Unchanged {
+    /// `(HEAD, commit)` pairs whose trees agree on every override path.
+    checkouts: HashSet<(Oid, Oid)>,
+    /// Ranges with no commit that changes an override path.
+    replays: HashSet<(Option<Oid>, Oid)>,
 }
 
 thread_local! {
@@ -610,39 +627,49 @@ fn changes_paths(repo: &Repository, config: &Config, args: &[&str]) -> Result<bo
 
 // Skip-worktree entries whose blobs are identical on both sides survive every
 // checkout, rebase, and reset, as do untracked files at paths neither side tracks.
-fn plan_keeps_overlays(repo: &Repository, config: &Config, plan: &Plan) -> Result<bool> {
+fn plan_keeps_overlays(
+    repo: &Repository,
+    config: &Config,
+    plan: &Plan,
+    unchanged: &mut Unchanged,
+) -> Result<bool> {
     if plan.unresolved {
         return Ok(false);
     }
-    let Some(head) = resolve(repo, "HEAD") else {
+    let Some(head_id) = resolve(repo, "HEAD") else {
         return Ok(false);
     };
-    let head = head.to_string();
+    let head = head_id.to_string();
     if changes_paths(repo, config, &["diff", "--cached", "--name-only", "-z"])? {
         return Ok(false);
     }
-    for id in &plan.commits {
-        let id = id.to_string();
-        if id != head
-            && changes_paths(
-                repo,
-                config,
-                &[
-                    "diff-tree",
-                    "-r",
-                    "--name-only",
-                    "-z",
-                    "--no-renames",
-                    &head,
-                    &id,
-                ],
-            )?
-        {
+    for &commit in &plan.commits {
+        if commit == head_id || unchanged.checkouts.contains(&(head_id, commit)) {
+            continue;
+        }
+        let id = commit.to_string();
+        if changes_paths(
+            repo,
+            config,
+            &[
+                "diff-tree",
+                "-r",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                &head,
+                &id,
+            ],
+        )? {
             return Ok(false);
         }
+        unchanged.checkouts.insert((head_id, commit));
     }
-    for (base, tip) in &plan.ranges {
-        let tip = tip.to_string();
+    for &(base, tip_id) in &plan.ranges {
+        if unchanged.replays.contains(&(base, tip_id)) {
+            continue;
+        }
+        let tip = tip_id.to_string();
         let hide = base.map(|base| format!("^{base}"));
         let mut args = vec![
             "rev-list",
@@ -655,6 +682,7 @@ fn plan_keeps_overlays(repo: &Repository, config: &Config, plan: &Plan) -> Resul
         if changes_paths(repo, config, &args)? {
             return Ok(false);
         }
+        unchanged.replays.insert((base, tip_id));
     }
     Ok(true)
 }
@@ -714,6 +742,7 @@ pub fn with_planned_during<T>(
         *session.borrow_mut() = Some(Session::Kept {
             config,
             branch: start,
+            unchanged: Unchanged::default(),
         })
     });
     let result = operation();
@@ -722,6 +751,7 @@ pub fn with_planned_during<T>(
         Some(Session::Kept {
             config,
             branch: start,
+            ..
         }) if config.branch_env && !busy(repo) && branch(repo)? != start => {
             let reapplied = snapshot(repo, config).and_then(|mut state| apply(repo, &mut state));
             match (result, reapplied) {
@@ -739,14 +769,25 @@ pub fn with_planned_during<T>(
 /// Declare the next working-tree changes of a planned operation. Suspends the
 /// overlays first if the plan would touch an override path.
 pub fn prepare(repo: &Repository, plan: &Plan) -> Result<()> {
-    let config = SESSION.with(|session| match &*session.borrow() {
-        Some(Session::Kept { config, .. }) => Some(config.clone()),
+    let kept = SESSION.with(|session| match &mut *session.borrow_mut() {
+        Some(Session::Kept {
+            config, unchanged, ..
+        }) => Some((config.clone(), std::mem::take(unchanged))),
         _ => None,
     });
-    let Some(config) = config else {
+    let Some((config, mut unchanged)) = kept else {
         return Ok(());
     };
-    if plan_keeps_overlays(repo, &config, plan)? {
+    let keeps = plan_keeps_overlays(repo, &config, plan, &mut unchanged);
+    SESSION.with(|session| {
+        if let Some(Session::Kept {
+            unchanged: kept, ..
+        }) = &mut *session.borrow_mut()
+        {
+            *kept = unchanged;
+        }
+    });
+    if keeps? {
         return Ok(());
     }
     // A resumed rebase was planned in full before it first stopped.
