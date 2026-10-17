@@ -444,6 +444,7 @@ pub fn state_path(repo: &Repository) -> PathBuf {
 }
 
 pub fn save_state(repo: &Repository, state: &RebaseState) -> Result<()> {
+    let _p = crate::timing::phase("save journal");
     let mut persisted_state = state.clone();
     merge_persisted_original_tips(repo, &mut persisted_state)?;
     augment_original_tip_map(repo, &mut persisted_state)?;
@@ -1536,12 +1537,14 @@ fn replay_step(
     if !options.keep_other_refs {
         rebase.arg("--update-refs");
     }
+    let rebasing = crate::timing::phase("git rebase");
     let status = rebase
         .arg("--onto")
         .arg(&new_base)
         .arg(&old_parent_id_str)
         .arg(branch)
         .status()?;
+    drop(rebasing);
 
     if status.success() {
         state.advance();
@@ -1695,6 +1698,7 @@ fn move_commit(repo: &Repository, branch: &str, onto: &str) -> Result<()> {
 /// Run a [`Step::Complete`] that checks out `checkout`.
 fn complete_step(repo: &Repository, state: &mut RebaseState, checkout: Option<&str>) -> Result<()> {
     if let Some(restore_branch) = checkout {
+        let _p = crate::timing::phase("check out original branch");
         println!(
             "Operation completed. Checking out original branch {}...",
             restore_branch
@@ -1708,7 +1712,10 @@ fn complete_step(repo: &Repository, state: &mut RebaseState, checkout: Option<&s
         })?;
     }
 
-    set_aside::restore_all(repo, state, set_aside::Phase::Completion)?;
+    {
+        let _p = crate::timing::phase("restore set-aside changes");
+        set_aside::restore_all(repo, state, set_aside::Phase::Completion)?;
+    }
 
     if state.unstage_on_restore {
         unstage_all(repo)?;
@@ -1720,7 +1727,11 @@ fn complete_step(repo: &Repository, state: &mut RebaseState, checkout: Option<&s
         .cleanup_checkout_fallback
         .as_deref()
         .unwrap_or(state.target_branch.as_str());
-    let deleted = delete_merged_branches(repo, &state.cleanup_merged_branches, checkout_fallback);
+    let deleted = {
+        let _p = crate::timing::phase("delete merged branches");
+        delete_merged_branches(repo, &state.cleanup_merged_branches, checkout_fallback)
+    };
+    let _p = crate::timing::phase("record undo");
     // Record the operation for undo from the branches as they are now, even if
     // a deletion failed, so the pending snapshot is never orphaned once the
     // journal is gone; the deletion error is reported afterwards.
