@@ -7,6 +7,7 @@ use crate::stack::{
     collect_merged_local_branches, find_sync_boundary, get_stack_branches_from_merge_base,
     get_stack_tips, resolve_merge_base,
 };
+use crate::timing::phase;
 use anyhow::{Result, anyhow};
 use clap::Args;
 use git2::BranchType;
@@ -45,9 +46,13 @@ pub struct SyncArgs {
 }
 
 pub fn sync(args: &SyncArgs) -> Result<()> {
+    let _total = phase("sync");
     let repo = crate::open_repo()?;
 
-    let lock = crate::state_io::RepoLock::acquire(&repo)?;
+    let lock = {
+        let _p = phase("acquire lock");
+        crate::state_io::RepoLock::acquire(&repo)?
+    };
     sync_holding_lock(&repo, &lock, args)
 }
 
@@ -58,7 +63,10 @@ pub(crate) fn sync_holding_lock(
     lock: &crate::state_io::RepoLock,
     args: &SyncArgs,
 ) -> Result<()> {
-    crate::operation_state::ensure_idle(repo, lock, crate::operation_state::Allow::NOTHING)?;
+    {
+        let _p = phase("check operation state");
+        crate::operation_state::ensure_idle(repo, lock, crate::operation_state::Allow::NOTHING)?;
+    }
     crate::overrides::with_planned(repo, false, || sync_locked(repo, args))
 }
 
@@ -71,11 +79,13 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
         None
     };
 
+    let resolve_trunk = phase("resolve trunk");
     let upstream_name = find_upstream(repo)?.ok_or_else(|| {
         anyhow!("Could not find a base branch (init.defaultBranch, main, master, or trunk)")
     })?;
     let local_upstream = upstream_name.clone();
     let (rebase_onto_name, fetch_remote) = resolve_sync_onto(repo, &upstream_name)?;
+    drop(resolve_trunk);
     let mut prefetched_stack = None;
     if let Some(remote) = fetch_remote.as_deref() {
         // If fetching changes the trunk or local branches, discover the stack
@@ -89,6 +99,7 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
         let discovered = if current_branch_name.as_deref() == Some(&upstream_name) {
             None
         } else {
+            let _p = phase("discover stack before fetch");
             discover_stack(
                 repo,
                 head_id,
@@ -120,7 +131,10 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
     // snapshot. The guard settles it on every exit below — the rebase path, the
     // delete-only path, the up-to-date no-op, and `sync_upstream_branch` — unless
     // a rebase is left in progress for `kin continue` / `kin abort` to settle.
-    let _snapshot = crate::oplog::begin(repo, "sync")?;
+    let _snapshot = {
+        let _p = phase("undo snapshot");
+        crate::oplog::begin(repo, "sync")?
+    };
 
     if current_branch_name.as_deref() == Some(&upstream_name) {
         return sync_upstream_branch(repo, args, &upstream_name, &rebase_onto_name);
@@ -128,12 +142,15 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
 
     let (merge_base, stack_branches) = match prefetched_stack {
         Some(stack) => stack,
-        None => discover_stack(
-            repo,
-            head_id,
-            current_branch_name.as_deref(),
-            &rebase_onto_name,
-        )?,
+        None => {
+            let _p = phase("discover stack");
+            discover_stack(
+                repo,
+                head_id,
+                current_branch_name.as_deref(),
+                &rebase_onto_name,
+            )?
+        }
     };
     let distinct_tips: std::collections::HashSet<_> = get_stack_tips(repo, &stack_branches)?
         .iter()
@@ -174,8 +191,12 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
     let top_branch_tip = repo.revparse_single(&top_branch)?.id();
     let upstream_id = repo.revparse_single(&rebase_onto_name)?.id();
 
-    let boundary = find_sync_boundary(repo, &top_branch, &rebase_onto_name, &stack_branches)?;
+    let boundary = {
+        let _p = phase("find sync boundary");
+        find_sync_boundary(repo, &top_branch, &rebase_onto_name, &stack_branches)?
+    };
     if let Some(old_base) = boundary.old_base {
+        let _p = phase("check merged branches survive replay");
         crate::rebase_utils::ensure_replay_keeps_merged_branches(
             repo,
             Some(old_base),
@@ -199,7 +220,10 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
         .filter(|sb| !boundary.merged_branches.contains(&sb.name))
         .map(|sb| sb.name.clone())
         .collect::<Vec<_>>();
-    crate::rebase_utils::check_worktrees(repo, &branches_to_check, args.force)?;
+    {
+        let _p = phase("check worktrees");
+        crate::rebase_utils::check_worktrees(repo, &branches_to_check, args.force)?;
+    }
 
     if let Some(old_base) = boundary.old_base {
         crate::rebase_utils::ensure_git_supports_update_refs()?;
@@ -246,10 +270,15 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
         // tree aside before that checkout, and keep it in the journal until
         // the sync returns to the caller, including across rebase conflicts
         // and aborts.
-        begin_replay(repo, &mut state, autostash)?;
+        {
+            let _p = phase("set changes aside");
+            begin_replay(repo, &mut state, autostash)?;
+        }
         if current_branch_name.as_deref() != Some(top_branch.as_str()) {
+            let _p = phase("check out top branch");
             checkout_branch(repo, &top_branch)?;
         }
+        let _p = phase("rebase");
         return run_rebase_loop(repo, &mut state);
     } else {
         println!(
@@ -258,7 +287,10 @@ fn sync_locked(repo: &git2::Repository, args: &SyncArgs) -> Result<()> {
         );
     }
 
-    delete_merged_branches(repo, &merged_branches, &local_upstream)?;
+    {
+        let _p = phase("delete merged branches");
+        delete_merged_branches(repo, &merged_branches, &local_upstream)?;
+    }
 
     // The undo guard settles the pending snapshot on return: it records the
     // merged-branch deletions (if any) or drops the snapshot when nothing
@@ -275,12 +307,23 @@ fn sync_upstream_branch(
     let mut merged_branches = if args.no_delete {
         Vec::new()
     } else {
+        let _p = phase("find merged branches");
         collect_merged_local_branches(repo, rebase_onto_name, &[upstream_name])?
     };
     crate::rebase_utils::keep_merged_branches_checked_out_elsewhere(repo, &mut merged_branches)?;
 
     let upstream_id = repo.revparse_single(upstream_name)?.id();
     let rebase_onto_id = repo.revparse_single(rebase_onto_name)?.id();
+    if upstream_id != rebase_onto_id
+        && repo.graph_descendant_of(rebase_onto_id, upstream_id)?
+        && fast_forward_trunk(repo, upstream_name, rebase_onto_name)?
+    {
+        if !args.no_delete {
+            let _p = phase("delete merged branches");
+            delete_merged_branches(repo, &merged_branches, upstream_name)?;
+        }
+        return Ok(());
+    }
     if upstream_id != rebase_onto_id {
         let rebase_root_id = repo.merge_base(upstream_id, rebase_onto_id)?;
         crate::rebase_utils::ensure_git_supports_reapply_cherry_picks()?;
@@ -319,19 +362,63 @@ fn sync_upstream_branch(
             created_branch: None,
         };
 
-        begin_replay(repo, &mut state, autostash)?;
+        {
+            let _p = phase("set changes aside");
+            begin_replay(repo, &mut state, autostash)?;
+        }
+        let _p = phase("rebase");
         return run_rebase_loop(repo, &mut state);
     } else {
         println!("{} is already up to date.", upstream_name);
     }
 
     if !args.no_delete {
+        let _p = phase("delete merged branches");
         delete_merged_branches(repo, &merged_branches, upstream_name)?;
     }
 
     // The undo guard held by the calling `sync` settles the pending snapshot on
     // return (the rebase path defers to the rebase loop's completion).
     Ok(())
+}
+
+/// Fast-forward the checked-out trunk `upstream_name` to `onto` when it has no
+/// commits of its own, returning whether it did.
+///
+/// A rebase would only check `onto` out, but it starts an operation: a
+/// journal, a set-aside of the working tree and a checkout back to the trunk
+/// once done. `git merge --ff-only` updates the branch and the working tree in
+/// one step. It is used only when the rebase would set nothing aside, so the
+/// two leave the same result; with changes to carry, the caller rebases as
+/// before, and so it does if the merge refuses, which leaves nothing changed.
+fn fast_forward_trunk(repo: &git2::Repository, upstream_name: &str, onto: &str) -> Result<bool> {
+    let _p = phase("fast-forward");
+    if !crate::set_aside::whole_tree_clean(repo)? {
+        return Ok(false);
+    }
+    let mut plan = crate::overrides::Plan::default();
+    crate::overrides::prepare(repo, plan.checkout_rev(repo, onto))?;
+    let before = repo.revparse_single(upstream_name)?.id();
+    // Git's refusal is not shown, since the rebase takes over; anything else
+    // on stderr, such as a post-merge hook's output, is passed on.
+    let output = crate::repository::git_command(repo)
+        .args(["merge", "--ff-only", "--quiet", "--no-stat"])
+        .arg(onto)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    std::io::Write::write_all(&mut std::io::stderr(), &output.stderr)?;
+    let after = repo.revparse_single(upstream_name)?.id();
+    println!(
+        "Fast-forwarded {upstream_name} to {onto}: {}..{}",
+        &before.to_string()[..7],
+        &after.to_string()[..7]
+    );
+    Ok(true)
 }
 
 /// The branches sync rebases, with their merge base with the trunk `onto`: the
@@ -442,6 +529,7 @@ fn fetch_sync_remote(
     onto: &str,
     stack: Option<&[crate::stack::StackBranch]>,
 ) -> Result<()> {
+    let _p = phase("fetch");
     if let Some(stack) = stack
         && let Some(trunk) = trunk_tracked_ref(repo, remote_name, onto)
     {
@@ -451,6 +539,7 @@ fn fetch_sync_remote(
         }
     }
 
+    let _full = phase("full fetch");
     let status = crate::repository::git_command(repo)
         .arg("fetch")
         .arg(remote_name)
@@ -492,6 +581,7 @@ fn targeted_fetch(
         .collect();
 
     loop {
+        let attempt = phase("targeted fetch");
         let output = crate::repository::git_command(repo)
             .args(["fetch", "--quiet", "--no-tags", remote_name])
             .args(
@@ -504,6 +594,7 @@ fn targeted_fetch(
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .output()?;
+        drop(attempt);
         if output.status.success() {
             break;
         }
@@ -653,17 +744,24 @@ fn sync_tree(
         bases,
         parents,
         merged,
-    } = crate::stack::plan_tree_sync(repo, branches, upstream, merge_base)?;
+    } = {
+        let _p = phase("plan tree sync");
+        crate::stack::plan_tree_sync(repo, branches, upstream, merge_base)?
+    };
     // The plan never rebases a merged branch, so only the others are checked.
     let check: Vec<_> = branches
         .iter()
         .filter(|b| !merged.contains(&b.name))
         .map(|b| b.name.clone())
         .collect();
-    crate::rebase_utils::check_worktrees(repo, &check, args.force)?;
+    {
+        let _p = phase("check worktrees");
+        crate::rebase_utils::check_worktrees(repo, &check, args.force)?;
+    }
     let mut merged = if args.no_delete { Vec::new() } else { merged };
     crate::rebase_utils::keep_merged_branches_checked_out_elsewhere(repo, &mut merged)?;
     if remaining.is_empty() {
+        let _p = phase("delete merged branches");
         return delete_merged_branches(repo, &merged, local_upstream);
     }
     let original = caller.unwrap_or(&remaining[0]).to_string();
@@ -701,6 +799,10 @@ fn sync_tree(
         cleanup_checkout_fallback: Some(local_upstream.to_string()),
         created_branch: None,
     };
-    begin_replay(repo, &mut state, autostash)?;
+    {
+        let _p = phase("set changes aside");
+        begin_replay(repo, &mut state, autostash)?;
+    }
+    let _p = phase("rebase");
     run_rebase_loop(repo, &mut state)
 }

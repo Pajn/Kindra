@@ -14,6 +14,7 @@ mod runtime;
 mod set_aside;
 mod stack;
 mod state_io;
+mod timing;
 mod trunk;
 mod worktree;
 

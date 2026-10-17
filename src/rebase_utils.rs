@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::repository::git_command;
 
@@ -444,6 +444,7 @@ pub fn state_path(repo: &Repository) -> PathBuf {
 }
 
 pub fn save_state(repo: &Repository, state: &RebaseState) -> Result<()> {
+    let _p = crate::timing::phase("save journal");
     let mut persisted_state = state.clone();
     merge_persisted_original_tips(repo, &mut persisted_state)?;
     augment_original_tip_map(repo, &mut persisted_state)?;
@@ -791,19 +792,10 @@ fn capture_owned_tip_map(repo: &Repository, state: &RebaseState) -> HashMap<Stri
         }
     }
 
-    if let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) {
-        for branch_result in branches.flatten() {
-            let (branch, _) = branch_result;
-            let Ok(Some(branch_name)) = branch.name() else {
-                continue;
-            };
-            let Some(oid) = branch.get().target() else {
-                continue;
-            };
+    if let Ok(branches) = crate::stack::local_branch_tips(repo) {
+        for (branch_name, oid) in branches {
             if rebased_commit_set.contains(&oid) {
-                tip_map
-                    .entry(branch_name.to_string())
-                    .or_insert(oid.to_string());
+                tip_map.entry(branch_name).or_insert(oid.to_string());
             }
         }
     }
@@ -817,22 +809,13 @@ fn augment_original_tip_map(repo: &Repository, state: &mut RebaseState) -> Resul
         return Ok(());
     }
 
-    let branches = repo.branches(Some(git2::BranchType::Local))?;
-    for branch_result in branches {
-        let (branch, _) = branch_result?;
-        let Some(oid) = branch.get().target() else {
-            continue;
-        };
+    for (branch_name, oid) in crate::stack::local_branch_tips(repo)? {
         if !rebased_commit_set.contains(&oid) {
             continue;
         }
-
-        let Ok(Some(branch_name)) = branch.name() else {
-            continue;
-        };
         state
             .original_tip_map
-            .entry(branch_name.to_string())
+            .entry(branch_name)
             .or_insert_with(|| oid.to_string());
     }
 
@@ -1287,20 +1270,10 @@ pub fn local_branch_tips_in_range(
     }
     let rewritten: HashSet<Oid> = walk.filter_map(|id| id.ok()).collect();
 
-    let mut tips = Vec::new();
-    for (branch, _) in repo.branches(Some(git2::BranchType::Local))?.flatten() {
-        let Some(oid) = branch.get().target() else {
-            continue;
-        };
-        if !rewritten.contains(&oid) {
-            continue;
-        }
-        let Ok(Some(name)) = branch.name() else {
-            continue;
-        };
-        tips.push((name.to_string(), oid));
-    }
-    Ok(tips)
+    Ok(crate::stack::local_branch_tips(repo)?
+        .into_iter()
+        .filter(|(_, oid)| rewritten.contains(oid))
+        .collect())
 }
 
 /// Refuse a `git rebase --update-refs` of `base..head` onto `onto` that would
@@ -1564,12 +1537,14 @@ fn replay_step(
     if !options.keep_other_refs {
         rebase.arg("--update-refs");
     }
+    let rebasing = crate::timing::phase("git rebase");
     let status = rebase
         .arg("--onto")
         .arg(&new_base)
         .arg(&old_parent_id_str)
         .arg(branch)
         .status()?;
+    drop(rebasing);
 
     if status.success() {
         state.advance();
@@ -1723,6 +1698,7 @@ fn move_commit(repo: &Repository, branch: &str, onto: &str) -> Result<()> {
 /// Run a [`Step::Complete`] that checks out `checkout`.
 fn complete_step(repo: &Repository, state: &mut RebaseState, checkout: Option<&str>) -> Result<()> {
     if let Some(restore_branch) = checkout {
+        let _p = crate::timing::phase("check out original branch");
         println!(
             "Operation completed. Checking out original branch {}...",
             restore_branch
@@ -1736,7 +1712,10 @@ fn complete_step(repo: &Repository, state: &mut RebaseState, checkout: Option<&s
         })?;
     }
 
-    set_aside::restore_all(repo, state, set_aside::Phase::Completion)?;
+    {
+        let _p = crate::timing::phase("restore set-aside changes");
+        set_aside::restore_all(repo, state, set_aside::Phase::Completion)?;
+    }
 
     if state.unstage_on_restore {
         unstage_all(repo)?;
@@ -1748,7 +1727,11 @@ fn complete_step(repo: &Repository, state: &mut RebaseState, checkout: Option<&s
         .cleanup_checkout_fallback
         .as_deref()
         .unwrap_or(state.target_branch.as_str());
-    let deleted = delete_merged_branches(repo, &state.cleanup_merged_branches, checkout_fallback);
+    let deleted = {
+        let _p = crate::timing::phase("delete merged branches");
+        delete_merged_branches(repo, &state.cleanup_merged_branches, checkout_fallback)
+    };
+    let _p = crate::timing::phase("record undo");
     // Record the operation for undo from the branches as they are now, even if
     // a deletion failed, so the pending snapshot is never orphaned once the
     // journal is gone; the deletion error is reported afterwards.
@@ -1786,23 +1769,51 @@ pub fn delete_merged_branches(
         })?;
     }
 
-    for branch_name in branches {
-        // Capture the tip before deletion so it is recoverable from the printed
-        // SHA (and from `kin undo`) even after the branch ref is gone.
-        let old_tip = repo
-            .find_branch(branch_name, git2::BranchType::Local)
-            .ok()
-            .and_then(|b| b.get().target())
-            .map(|oid| oid.to_string());
+    // Capture the tips before deletion so they are recoverable from the
+    // printed SHAs (and from `kin undo`) even after the refs are gone.
+    let old_tips: Vec<Option<String>> = branches
+        .iter()
+        .map(|branch_name| {
+            repo.find_branch(branch_name, git2::BranchType::Local)
+                .ok()
+                .and_then(|b| b.get().target())
+                .map(|oid| oid.to_string())
+        })
+        .collect();
 
-        let status = git_command(repo)
-            .arg("branch")
-            .arg("-D")
-            .arg("--quiet")
-            .arg(branch_name)
-            .status()?;
+    // One `git branch -D` for all of them. When one of them cannot be
+    // deleted, Git may leave all of them in place or only some, depending on
+    // its version and ref backend; the ones still present are then deleted on
+    // their own, reporting the ones Git refuses. Which were deleted is read
+    // from the refs after.
+    let together = git_command(repo)
+        .arg("branch")
+        .arg("-D")
+        .arg("--quiet")
+        .args(branches)
+        .stderr(Stdio::null())
+        .status()?;
+    if !together.success() {
+        let present: HashSet<String> = crate::stack::local_branch_tips(repo)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for branch_name in branches.iter().filter(|name| present.contains(*name)) {
+            git_command(repo)
+                .arg("branch")
+                .arg("-D")
+                .arg("--quiet")
+                .arg(branch_name)
+                .status()?;
+        }
+    }
 
-        if !status.success() {
+    let remaining: HashSet<String> = crate::stack::local_branch_tips(repo)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    for (branch_name, old_tip) in branches.iter().zip(old_tips) {
+        if old_tip.is_none() || remaining.contains(branch_name) {
             println!(
                 "Warning: Failed to delete merged branch: {}. It might be checked out in another worktree.",
                 branch_name
@@ -1815,8 +1826,6 @@ pub fn delete_merged_branches(
                 branch_name,
                 tip,
             );
-        } else {
-            println!("Deleted merged branch: {}", branch_name);
         }
     }
     Ok(())

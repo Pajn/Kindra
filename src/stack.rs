@@ -3,7 +3,7 @@ use git2::{Commit, Oid, Repository};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
 pub struct StackBranch {
@@ -258,14 +258,16 @@ pub struct SyncScanCache {
     in_upstream: HashMap<Oid, bool>,
     /// Paths a commit range touches, by `(base, tip)`. The lineages of a tree
     /// stack overlap heavily, so the same ranges are asked for repeatedly.
-    touched_paths: HashMap<(Oid, Oid), Rc<Vec<String>>>,
+    touched_paths: HashMap<(Oid, Oid), Arc<Vec<String>>>,
     /// Target history indexed by the base, target tip and exact path set it was loaded for.
-    histories: HashMap<(Oid, Oid, Vec<String>), Rc<TargetPathHistory>>,
+    histories: HashMap<(Oid, Oid, Vec<String>), Arc<TargetPathHistory>>,
     /// A floor below every base about to be scanned against a target, set by
     /// [`SyncScanCache::share_history`]; the history above it loads on first need.
     shared_floor: Option<(Oid, Oid)>,
-    /// The unfiltered target history above `shared_floor`, once loaded.
-    shared_history: Option<Rc<TargetPathHistory>>,
+    /// The unfiltered target history above `shared_floor`, once loaded. Shared
+    /// with the caches of [`SyncScanCache::worker`], so it loads once for all
+    /// of them.
+    shared_history: Arc<Mutex<Option<Arc<TargetPathHistory>>>>,
 }
 
 impl SyncScanCache {
@@ -292,32 +294,21 @@ impl SyncScanCache {
         // never be in one, whichever tip is being asked about.
         let above_merge_base = local_branches_by_ancestry(repo, &[("--contains", merge_base)])?;
         let mut candidates = Vec::new();
-        for res in repo.branches(Some(git2::BranchType::Local))? {
-            let (branch, _) = res?;
-            let Some(name) = branch.name()? else { continue };
-            let name = name.to_string();
-            if name == upstream_name {
+        for branch in local_branches_with_upstreams(repo)? {
+            if branch.name == upstream_name {
                 continue;
-            }
-            let Some(id) = branch.get().target() else {
-                continue;
-            };
-
-            if let Some(ref ref_name) = upstream_ref_name {
-                if branch.get().name() == Some(ref_name) {
-                    continue;
-                }
-                if let Ok(upstream) = branch.upstream()
-                    && upstream.get().name() == Some(ref_name)
-                {
-                    continue;
-                }
             }
 
-            if !above_merge_base.contains(&name) {
+            if let Some(ref ref_name) = upstream_ref_name
+                && (branch.refname == *ref_name || branch.upstream.as_ref() == Some(ref_name))
+            {
                 continue;
             }
-            candidates.push((name, id));
+
+            if !above_merge_base.contains(&branch.name) {
+                continue;
+            }
+            candidates.push((branch.name, branch.tip));
         }
 
         self.candidates = candidates;
@@ -340,12 +331,13 @@ impl SyncScanCache {
         repo: &Repository,
         base_id: Oid,
         tip: Oid,
-    ) -> Result<Rc<Vec<String>>> {
+    ) -> Result<Arc<Vec<String>>> {
         if let Some(known) = self.touched_paths.get(&(base_id, tip)) {
-            return Ok(Rc::clone(known));
+            return Ok(Arc::clone(known));
         }
-        let paths = Rc::new(range_touched_paths(repo, base_id, tip)?);
-        self.touched_paths.insert((base_id, tip), Rc::clone(&paths));
+        let paths = Arc::new(range_touched_paths(repo, base_id, tip)?);
+        self.touched_paths
+            .insert((base_id, tip), Arc::clone(&paths));
         Ok(paths)
     }
 
@@ -355,9 +347,9 @@ impl SyncScanCache {
         base_id: Oid,
         target_tip: Oid,
         paths: &[String],
-    ) -> Result<Rc<TargetPathHistory>> {
+    ) -> Result<Arc<TargetPathHistory>> {
         if paths.is_empty() {
-            return Ok(Rc::new(TargetPathHistory {
+            return Ok(Arc::new(TargetPathHistory {
                 floor: base_id,
                 commits: Vec::new(),
                 ancestry: None,
@@ -366,20 +358,35 @@ impl SyncScanCache {
         if let Some((target, floor)) = self.shared_floor
             && target == target_tip
         {
-            if let Some(shared) = &self.shared_history {
-                return Ok(Rc::clone(shared));
+            // Held while loading, so workers asking at once wait for one load.
+            let mut shared = self
+                .shared_history
+                .lock()
+                .map_err(|_| anyhow!("A thread loading the target history panicked."))?;
+            if let Some(shared) = &*shared {
+                return Ok(Arc::clone(shared));
             }
-            let shared = Rc::new(TargetPathHistory::load(repo, floor, target_tip, &[])?);
-            self.shared_history = Some(Rc::clone(&shared));
-            return Ok(shared);
+            let history = Arc::new(TargetPathHistory::load(repo, floor, target_tip, &[])?);
+            *shared = Some(Arc::clone(&history));
+            return Ok(history);
         }
         let key = (base_id, target_tip, paths.to_vec());
         if let Some(known) = self.histories.get(&key) {
-            return Ok(Rc::clone(known));
+            return Ok(Arc::clone(known));
         }
-        let history = Rc::new(TargetPathHistory::load(repo, base_id, target_tip, paths)?);
-        self.histories.insert(key, Rc::clone(&history));
+        let history = Arc::new(TargetPathHistory::load(repo, base_id, target_tip, paths)?);
+        self.histories.insert(key, Arc::clone(&history));
         Ok(history)
+    }
+
+    /// A cache for another thread scanning against the same target, sharing
+    /// this one's shared history but none of its per-range answers.
+    fn worker(&self) -> Self {
+        Self {
+            shared_floor: self.shared_floor,
+            shared_history: Arc::clone(&self.shared_history),
+            ..Self::default()
+        }
     }
 
     /// Serves every later history request against `target_tip` from one walk of
@@ -392,7 +399,7 @@ impl SyncScanCache {
         // Without a common ancestor there is no single floor; keep per-range walks.
         if let Ok(Some(floor)) = octopus_merge_base(repo, bases) {
             self.shared_floor = Some((target_tip, floor));
-            self.shared_history = None;
+            self.shared_history = Arc::default();
         }
     }
 }
@@ -477,8 +484,8 @@ pub fn find_sync_boundary_cached(
             Some(present) => present,
             None => {
                 let history = match &target_history {
-                    Some(history) => Rc::clone(history),
-                    None => Rc::clone(target_history.insert(cache.history(
+                    Some(history) => Arc::clone(history),
+                    None => Arc::clone(target_history.insert(cache.history(
                         repo,
                         branch_cutoff,
                         upstream_id,
@@ -658,7 +665,7 @@ pub fn collect_stack_component(
     upstream_id: Oid,
     upstream_name: &str,
 ) -> Result<Vec<StackBranch>> {
-    let local_branches = repo.branches(Some(git2::BranchType::Local))?;
+    let local_branches = local_branch_tips(repo)?;
     let mut candidates = Vec::new();
     // At or above the merge base and not yet in upstream, for every branch in
     // one query.
@@ -667,20 +674,12 @@ pub fn collect_stack_component(
         &[("--contains", merge_base), ("--no-merged", upstream_id)],
     )?;
 
-    for branch_result in local_branches {
-        let (branch, _) = branch_result?;
-        let Some(name) = branch.name()? else {
-            continue;
-        };
+    for (name, id) in local_branches {
         if name == upstream_name {
             continue;
         }
 
-        let Some(id) = branch.get().target() else {
-            continue;
-        };
-
-        if unmerged_above_merge_base.contains(name) {
+        if unmerged_above_merge_base.contains(&name) {
             candidates.push(StackBranch {
                 name: name.to_string(),
                 id,
@@ -1130,15 +1129,14 @@ pub fn find_merged_branch_in_replay(
     Ok(None)
 }
 
-/// Every local branch and its tip, sorted by name.
+/// Every local branch and its tip, sorted by name. Read with git, as
+/// [`local_branches_with_upstreams`] explains; listing hundreds of branches
+/// through libgit2 takes several times as long.
 pub(crate) fn local_branch_tips(repo: &Repository) -> Result<Vec<(String, Oid)>> {
-    let mut tips = Vec::new();
-    for branch in repo.branches(Some(git2::BranchType::Local))? {
-        let (branch, _) = branch?;
-        if let (Some(tip), Ok(Some(name))) = (branch.get().target(), branch.name()) {
-            tips.push((name.to_string(), tip));
-        }
-    }
+    let mut tips: Vec<_> = local_branches_with_upstreams(repo)?
+        .into_iter()
+        .map(|branch| (branch.name, branch.tip))
+        .collect();
     tips.sort();
     Ok(tips)
 }
@@ -1164,41 +1162,26 @@ pub fn collect_merged_local_branches(
         .collect::<HashSet<_>>();
 
     let mut branches = Vec::new();
-    for branch_result in repo.branches(Some(git2::BranchType::Local))? {
-        let (branch, _) = branch_result?;
-        let Some(name) = branch.name()? else {
-            continue;
-        };
-        if protected_branches.contains(name) {
+    for branch in local_branches_with_upstreams(repo)? {
+        if protected_branches.contains(&branch.name) || branch.name == target_short_name {
             continue;
         }
 
-        if branch.get().shorthand() == Some(target_short_name) {
-            continue;
-        }
-
-        if let Ok(upstream_branch) = branch.upstream()
-            && let Some(upstream_name) = upstream_branch.name()?
-        {
-            // Get the short name of the upstream branch
-            let upstream_short = upstream_name
-                .strip_prefix("refs/remotes/")
-                .unwrap_or(upstream_name);
+        if let Some(upstream) = &branch.upstream {
+            let upstream_short = upstream.strip_prefix("refs/remotes/").unwrap_or(upstream);
             if upstream_short == target_short_name {
                 continue;
             }
         }
 
-        let Some(branch_id) = branch.get().target() else {
-            continue;
-        };
-        branches.push((name.to_string(), branch_id));
+        branches.push((branch.name, branch.tip));
     }
 
     let mut merged_branches = Vec::new();
     // Branches here share ranges and path sets, so the memoised lookups pay off
     // across the loop even though the per-stack answers are not reused.
     let mut cache = SyncScanCache::default();
+    let finding_bases = crate::timing::phase("merge bases");
     let tips_in_target = local_branches_by_ancestry(repo, &[("--merged", target_id)])?;
     let mut unmerged = Vec::new();
     for (name, branch_id) in branches {
@@ -1222,14 +1205,135 @@ pub fn collect_merged_local_branches(
         .map(|&(_, _, merge_base)| merge_base)
         .collect::<Vec<_>>();
     cache.share_history(repo, target_id, &bases);
-    for (name, branch_id, merge_base) in unmerged_by_graph {
-        if range_changes_present_in_target(repo, merge_base, branch_id, target_id, &mut cache)? {
-            merged_branches.push(name);
-        }
-    }
+    drop(finding_bases);
+    let _checking = crate::timing::phase("squash-merge checks");
+    merged_branches.extend(ranges_present_in_target(
+        repo,
+        target_id,
+        unmerged_by_graph,
+        &cache,
+    )?);
 
     merged_branches.sort();
     Ok(merged_branches)
+}
+
+/// The names among `ranges`, each a branch with its tip and merge base, whose
+/// changes [`range_changes_present_in_target`] finds in `target`.
+///
+/// Each range is answered on its own, so they are spread over a few threads,
+/// each with its own repository handle and a [`SyncScanCache::worker`]
+/// of `cache`, which loads the shared target history once for all of them.
+/// With hundreds of local branches these checks are most of a sync's scan.
+fn ranges_present_in_target(
+    repo: &Repository,
+    target: Oid,
+    ranges: Vec<(String, Oid, Oid)>,
+    cache: &SyncScanCache,
+) -> Result<Vec<String>> {
+    // Below this many ranges, opening handles costs more than threads save.
+    const MIN_RANGES_PER_THREAD: usize = 8;
+    // libgit2 serialises reads of pack files across the whole process, so
+    // beyond a handful of threads they mostly wait on each other.
+    const MAX_THREADS: usize = 8;
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_THREADS)
+        .min(ranges.len() / MIN_RANGES_PER_THREAD)
+        .max(1);
+    // Ranges are taken one at a time, so one slow range does not hold up a
+    // share of the others behind it.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let scan = |repo: &Repository| -> Result<Vec<String>> {
+        let mut cache = cache.worker();
+        let mut present = Vec::new();
+        while let Some((name, tip, base)) =
+            ranges.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        {
+            if range_changes_present_in_target(repo, *base, *tip, target, &mut cache)? {
+                present.push(name.clone());
+            }
+        }
+        Ok(present)
+    };
+    if threads == 1 {
+        return scan(repo);
+    }
+
+    // libgit2 handles cannot cross threads; each worker opens its own.
+    let path = repo.path();
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| -> Result<Vec<String>> {
+                    let repo = Repository::open(path)?;
+                    scan(&repo)
+                })
+            })
+            .collect();
+        let mut present = Vec::new();
+        for worker in workers {
+            let found = worker
+                .join()
+                .map_err(|_| anyhow!("A thread checking merged branches panicked."))??;
+            present.extend(found);
+        }
+        Ok(present)
+    })
+}
+
+/// A local branch, its tip and the full name of its configured upstream.
+struct LocalBranch {
+    name: String,
+    refname: String,
+    tip: Oid,
+    upstream: Option<String>,
+}
+
+/// Every local branch with its tip and upstream, from one `git for-each-ref`.
+/// With hundreds of branches, libgit2 takes several times as long to list
+/// them, and reads each branch's upstream from its config and the remote's
+/// refspecs anew. Symbolic branch refs and names that are not UTF-8 are left
+/// out, as libgit2's listing gives them no tip or name.
+fn local_branches_with_upstreams(repo: &Repository) -> Result<Vec<LocalBranch>> {
+    let output = crate::repository::git_command(repo)
+        .args([
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)%00%(upstream)%00%(symref)",
+            "refs/heads/",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git for-each-ref failed while listing local branches: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut branches = Vec::new();
+    for line in output.stdout.split(|&b| b == b'\n') {
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
+        let mut fields = line.split('\0');
+        let (Some(refname), Some(tip), Some(upstream), Some(symref)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Some(name) = refname.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        if !symref.is_empty() {
+            continue;
+        }
+        branches.push(LocalBranch {
+            name: name.to_string(),
+            refname: refname.to_string(),
+            tip: Oid::from_str(tip)?,
+            upstream: (!upstream.is_empty()).then(|| upstream.to_string()),
+        });
+    }
+    Ok(branches)
 }
 
 /// Local branches whose tips pass every `(filter, commit)` pair: `--merged`
@@ -2933,19 +3037,10 @@ pub fn get_stack_branches_from_merge_base(
 
     let mut branches = Vec::new();
     let mut above_head = Vec::new();
-    for res in repo.branches(Some(git2::BranchType::Local))? {
-        let (branch, _) = res?;
-        let name = match branch.name()? {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
+    for (name, id) in local_branch_tips(repo)? {
         if name == upstream_name {
             continue;
         }
-        let id = match branch.get().target() {
-            Some(id) => id,
-            None => continue,
-        };
 
         if lineage.is_private(id) {
             branches.push(StackBranch { name, id });

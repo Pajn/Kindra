@@ -21,6 +21,7 @@ pub mod repository;
 pub mod set_aside;
 pub mod stack;
 pub(crate) mod state_io;
+pub(crate) mod timing;
 pub mod trunk;
 pub mod worktree;
 

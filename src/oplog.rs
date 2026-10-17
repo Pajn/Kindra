@@ -628,17 +628,10 @@ fn remove_anchors(repo: &Repository, id: &str) {
 // ---------------------------------------------------------------------------
 
 fn all_local_branches(repo: &Repository) -> Result<BTreeMap<String, String>> {
-    let mut map = BTreeMap::new();
-    for branch in repo.branches(Some(BranchType::Local))? {
-        let (branch, _) = branch?;
-        let Some(name) = branch.name()? else {
-            continue;
-        };
-        if let Some(oid) = branch.get().target() {
-            map.insert(name.to_string(), oid.to_string());
-        }
-    }
-    Ok(map)
+    Ok(crate::stack::local_branch_tips(repo)?
+        .into_iter()
+        .map(|(name, oid)| (name, oid.to_string()))
+        .collect())
 }
 
 fn branch_oid(repo: &Repository, name: &str) -> Option<String> {

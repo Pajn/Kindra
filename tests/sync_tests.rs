@@ -1833,6 +1833,17 @@ fn sync_on_main_errors_when_git_too_old_for_reapply_cherry_picks() {
         remote_worktree.path(),
     );
     run_ok("git", &["push", "origin", "main"], remote_worktree.path());
+    // A commit of its own, so main is rebased rather than fast-forwarded.
+    let base = repo.find_commit(tip(&repo, "main")).unwrap();
+    make_commit(
+        &repo,
+        "refs/heads/main",
+        "local.txt",
+        "local",
+        "local main commit",
+        &[&base],
+    );
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
 
     // Outside the working tree: operations set its untracked files aside.
     let mock_bin = dir.path().join(".git/mock-bin");
@@ -4603,4 +4614,258 @@ fn sync_reuses_stack_discovery_only_when_fetched_graph_is_unchanged() {
             tip(&repo, "origin/main")
         );
     }
+}
+
+#[test]
+fn sync_reports_phase_timings_with_kin_timings() {
+    let (dir, _remote_dir) = common::setup_stale_trunk();
+
+    let output = kin_cmd()
+        .args(["sync", "--no-delete"])
+        .env("KIN_TIMINGS", "1")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let phases: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("kin timing: "))
+        .collect();
+    for phase in [
+        "  acquire lock ",
+        "  resolve trunk ",
+        "  fetch ",
+        "    targeted fetch ",
+        "  find sync boundary ",
+        "  rebase ",
+        "sync ",
+    ] {
+        assert!(
+            phases.iter().any(|line| line.starts_with(phase)),
+            "missing {phase:?} in:\n{stderr}"
+        );
+    }
+    assert!(phases.last().unwrap().starts_with("sync "), "{stderr}");
+
+    let quiet = kin_cmd()
+        .args(["sync", "--no-delete"])
+        .env("KIN_TIMINGS", "0")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(quiet.status.success(), "{quiet:?}");
+    assert!(
+        !String::from_utf8_lossy(&quiet.stderr).contains("kin timing:"),
+        "{quiet:?}"
+    );
+}
+
+/// The `git` subcommands a `GIT_TRACE` log records kin running.
+fn traced_git_commands(trace: &std::path::Path) -> Vec<String> {
+    fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_once("trace: built-in: git ").map(|(_, cmd)| cmd))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn sync_on_main_fast_forwards_without_starting_an_operation() {
+    let (dir, remote) = remote_backed_repo();
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    run_ok("git", &["checkout", "-b", "landed"], dir.path());
+    fs::write(dir.path().join("landed.txt"), "landed").unwrap();
+    run_ok("git", &["add", "landed.txt"], dir.path());
+    run_ok("git", &["commit", "-m", "landed work"], dir.path());
+    run_ok("git", &["push", "origin", "landed:main"], dir.path());
+    run_ok("git", &["checkout", "main"], dir.path());
+    common::push_remote_commit(remote.path(), "main", "remote.txt");
+    let repo = Repository::open(dir.path()).unwrap();
+    let main_before = tip(&repo, "main");
+    let landed = tip(&repo, "landed");
+
+    let trace = dir.path().join(".git/trace.log");
+    kin_cmd()
+        .arg("sync")
+        .env("GIT_TRACE", &trace)
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Fast-forwarded main to origin/main",
+        ))
+        .stdout(predicate::str::contains("Deleted merged branch: landed"));
+
+    let commands = traced_git_commands(&trace);
+    assert!(
+        commands
+            .iter()
+            .any(|cmd| cmd.starts_with("merge --ff-only")),
+        "{commands:#?}"
+    );
+    assert!(
+        !commands
+            .iter()
+            .any(|cmd| cmd.starts_with("rebase") || cmd.starts_with("stash")),
+        "{commands:#?}"
+    );
+    assert_eq!(tip(&repo, "main"), tip(&repo, "origin/main"));
+    assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+    assert!(dir.path().join("remote.txt").exists());
+    assert!(repo.find_branch("landed", BranchType::Local).is_err());
+    assert!(!rebase_state_file(dir.path()).exists());
+    common::assert_no_rebase_in_progress(dir.path());
+
+    kin_cmd()
+        .args(["undo", "--force"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert_eq!(tip(&repo, "main"), main_before);
+    assert_eq!(tip(&repo, "landed"), landed);
+}
+
+#[test]
+fn sync_on_main_rebases_when_there_are_untracked_files_to_set_aside() {
+    let (dir, remote) = remote_backed_repo();
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    common::push_remote_commit(remote.path(), "main", "remote.txt");
+    fs::write(dir.path().join("scratch.txt"), "untracked local edit\n").unwrap();
+
+    let trace = dir.path().join(".git/trace.log");
+    kin_cmd()
+        .arg("sync")
+        .env("GIT_TRACE", &trace)
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let commands = traced_git_commands(&trace);
+    assert!(
+        commands.iter().any(|cmd| cmd.starts_with("rebase")),
+        "{commands:#?}"
+    );
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(tip(&repo, "main"), tip(&repo, "origin/main"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("scratch.txt")).unwrap(),
+        "untracked local edit\n"
+    );
+}
+
+/// Enough branches that the merged-branch scan runs on several threads: some
+/// squash-merged, some later edited upstream after landing, so only their
+/// patch in the trunk's history shows them merged, and the rest unmerged,
+/// one of them on a path upstream changed too.
+#[test]
+fn sync_on_main_finds_squash_merges_among_many_branches() {
+    let (dir, remote) = remote_backed_repo();
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    let branches: Vec<String> = (0..24).map(|i| format!("feature-{i:02}")).collect();
+    for (i, branch) in branches.iter().enumerate() {
+        run_ok("git", &["checkout", "-B", branch, "main"], dir.path());
+        let file = format!("f{i:02}.txt");
+        fs::write(
+            dir.path().join(&file),
+            format!("line one\nwork of {branch}\n"),
+        )
+        .unwrap();
+        run_ok("git", &["add", &file], dir.path());
+        run_ok(
+            "git",
+            &["commit", "-m", &format!("work on {branch}")],
+            dir.path(),
+        );
+    }
+    run_ok("git", &["checkout", "main"], dir.path());
+
+    let squashed = [0, 3, 7, 12, 18, 23];
+    let edited_after_landing = [3, 18];
+    let unmerged_but_touched_upstream = 9;
+    let upstream = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote.path().to_str().unwrap(),
+            upstream.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    let commit_file = |file: &str, content: &str, message: &str| {
+        fs::write(upstream.path().join(file), content).unwrap();
+        run_ok("git", &["add", file], upstream.path());
+        run_ok("git", &["commit", "-m", message], upstream.path());
+    };
+    for &i in &squashed {
+        commit_file(
+            &format!("f{i:02}.txt"),
+            &format!("line one\nwork of {}\n", branches[i]),
+            &format!("Squash {}", branches[i]),
+        );
+    }
+    for &i in &edited_after_landing {
+        commit_file(
+            &format!("f{i:02}.txt"),
+            &format!("line one\nwork of {}\nmore\n", branches[i]),
+            &format!("Extend f{i:02}"),
+        );
+    }
+    let i = unmerged_but_touched_upstream;
+    commit_file(
+        &format!("f{i:02}.txt"),
+        "line one\nsomething else\n",
+        "Unrelated change",
+    );
+    run_ok("git", &["push", "origin", "main"], upstream.path());
+
+    kin_cmd()
+        .arg("sync")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    for (i, branch) in branches.iter().enumerate() {
+        assert_eq!(
+            repo.find_branch(branch, BranchType::Local).is_err(),
+            squashed.contains(&i),
+            "{branch}"
+        );
+    }
+}
+
+#[test]
+fn sync_deletes_the_merged_branches_it_can_when_one_cannot_be_deleted() {
+    let (dir, _remote) = remote_backed_repo();
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    for branch in ["landed-a", "landed-b", "landed-c"] {
+        run_ok("git", &["branch", branch, "main"], dir.path());
+    }
+    // A stale lock on one ref makes Git refuse to delete that branch alone.
+    let lock = dir.path().join(".git/refs/heads/landed-b.lock");
+    fs::write(&lock, "").unwrap();
+
+    kin_cmd()
+        .arg("sync")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Deleted merged branch: landed-a"))
+        .stdout(predicate::str::contains(
+            "Warning: Failed to delete merged branch: landed-b.",
+        ))
+        .stdout(predicate::str::contains("Deleted merged branch: landed-c"))
+        // Only the branch Git refused is reported, not the ones it deleted.
+        .stderr(predicate::str::contains("landed-b"))
+        .stderr(predicate::str::contains("landed-a").not())
+        .stderr(predicate::str::contains("landed-c").not());
+    fs::remove_file(&lock).unwrap();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert!(repo.find_branch("landed-a", BranchType::Local).is_err());
+    assert!(repo.find_branch("landed-b", BranchType::Local).is_ok());
+    assert!(repo.find_branch("landed-c", BranchType::Local).is_err());
 }
