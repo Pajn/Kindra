@@ -4755,6 +4755,88 @@ fn sync_on_main_rebases_when_there_are_untracked_files_to_set_aside() {
     );
 }
 
+/// Enough branches that the merged-branch scan runs on several threads: some
+/// squash-merged, some later edited upstream after landing, so only their
+/// patch in the trunk's history shows them merged, and the rest unmerged,
+/// one of them on a path upstream changed too.
+#[test]
+fn sync_on_main_finds_squash_merges_among_many_branches() {
+    let (dir, remote) = remote_backed_repo();
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    let branches: Vec<String> = (0..24).map(|i| format!("feature-{i:02}")).collect();
+    for (i, branch) in branches.iter().enumerate() {
+        run_ok("git", &["checkout", "-B", branch, "main"], dir.path());
+        let file = format!("f{i:02}.txt");
+        fs::write(
+            dir.path().join(&file),
+            format!("line one\nwork of {branch}\n"),
+        )
+        .unwrap();
+        run_ok("git", &["add", &file], dir.path());
+        run_ok(
+            "git",
+            &["commit", "-m", &format!("work on {branch}")],
+            dir.path(),
+        );
+    }
+    run_ok("git", &["checkout", "main"], dir.path());
+
+    let squashed = [0, 3, 7, 12, 18, 23];
+    let edited_after_landing = [3, 18];
+    let unmerged_but_touched_upstream = 9;
+    let upstream = tempdir().unwrap();
+    run_ok(
+        "git",
+        &[
+            "clone",
+            remote.path().to_str().unwrap(),
+            upstream.path().to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    let commit_file = |file: &str, content: &str, message: &str| {
+        fs::write(upstream.path().join(file), content).unwrap();
+        run_ok("git", &["add", file], upstream.path());
+        run_ok("git", &["commit", "-m", message], upstream.path());
+    };
+    for &i in &squashed {
+        commit_file(
+            &format!("f{i:02}.txt"),
+            &format!("line one\nwork of {}\n", branches[i]),
+            &format!("Squash {}", branches[i]),
+        );
+    }
+    for &i in &edited_after_landing {
+        commit_file(
+            &format!("f{i:02}.txt"),
+            &format!("line one\nwork of {}\nmore\n", branches[i]),
+            &format!("Extend f{i:02}"),
+        );
+    }
+    let i = unmerged_but_touched_upstream;
+    commit_file(
+        &format!("f{i:02}.txt"),
+        "line one\nsomething else\n",
+        "Unrelated change",
+    );
+    run_ok("git", &["push", "origin", "main"], upstream.path());
+
+    kin_cmd()
+        .arg("sync")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    for (i, branch) in branches.iter().enumerate() {
+        assert_eq!(
+            repo.find_branch(branch, BranchType::Local).is_err(),
+            squashed.contains(&i),
+            "{branch}"
+        );
+    }
+}
+
 #[test]
 fn sync_deletes_the_merged_branches_it_can_when_one_cannot_be_deleted() {
     let (dir, _remote) = remote_backed_repo();
