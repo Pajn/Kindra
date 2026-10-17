@@ -791,19 +791,10 @@ fn capture_owned_tip_map(repo: &Repository, state: &RebaseState) -> HashMap<Stri
         }
     }
 
-    if let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) {
-        for branch_result in branches.flatten() {
-            let (branch, _) = branch_result;
-            let Ok(Some(branch_name)) = branch.name() else {
-                continue;
-            };
-            let Some(oid) = branch.get().target() else {
-                continue;
-            };
+    if let Ok(branches) = crate::stack::local_branch_tips(repo) {
+        for (branch_name, oid) in branches {
             if rebased_commit_set.contains(&oid) {
-                tip_map
-                    .entry(branch_name.to_string())
-                    .or_insert(oid.to_string());
+                tip_map.entry(branch_name).or_insert(oid.to_string());
             }
         }
     }
@@ -817,22 +808,13 @@ fn augment_original_tip_map(repo: &Repository, state: &mut RebaseState) -> Resul
         return Ok(());
     }
 
-    let branches = repo.branches(Some(git2::BranchType::Local))?;
-    for branch_result in branches {
-        let (branch, _) = branch_result?;
-        let Some(oid) = branch.get().target() else {
-            continue;
-        };
+    for (branch_name, oid) in crate::stack::local_branch_tips(repo)? {
         if !rebased_commit_set.contains(&oid) {
             continue;
         }
-
-        let Ok(Some(branch_name)) = branch.name() else {
-            continue;
-        };
         state
             .original_tip_map
-            .entry(branch_name.to_string())
+            .entry(branch_name)
             .or_insert_with(|| oid.to_string());
     }
 
@@ -1287,20 +1269,10 @@ pub fn local_branch_tips_in_range(
     }
     let rewritten: HashSet<Oid> = walk.filter_map(|id| id.ok()).collect();
 
-    let mut tips = Vec::new();
-    for (branch, _) in repo.branches(Some(git2::BranchType::Local))?.flatten() {
-        let Some(oid) = branch.get().target() else {
-            continue;
-        };
-        if !rewritten.contains(&oid) {
-            continue;
-        }
-        let Ok(Some(name)) = branch.name() else {
-            continue;
-        };
-        tips.push((name.to_string(), oid));
-    }
-    Ok(tips)
+    Ok(crate::stack::local_branch_tips(repo)?
+        .into_iter()
+        .filter(|(_, oid)| rewritten.contains(oid))
+        .collect())
 }
 
 /// Refuse a `git rebase --update-refs` of `base..head` onto `onto` that would

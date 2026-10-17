@@ -292,32 +292,21 @@ impl SyncScanCache {
         // never be in one, whichever tip is being asked about.
         let above_merge_base = local_branches_by_ancestry(repo, &[("--contains", merge_base)])?;
         let mut candidates = Vec::new();
-        for res in repo.branches(Some(git2::BranchType::Local))? {
-            let (branch, _) = res?;
-            let Some(name) = branch.name()? else { continue };
-            let name = name.to_string();
-            if name == upstream_name {
+        for branch in local_branches_with_upstreams(repo)? {
+            if branch.name == upstream_name {
                 continue;
-            }
-            let Some(id) = branch.get().target() else {
-                continue;
-            };
-
-            if let Some(ref ref_name) = upstream_ref_name {
-                if branch.get().name() == Some(ref_name) {
-                    continue;
-                }
-                if let Ok(upstream) = branch.upstream()
-                    && upstream.get().name() == Some(ref_name)
-                {
-                    continue;
-                }
             }
 
-            if !above_merge_base.contains(&name) {
+            if let Some(ref ref_name) = upstream_ref_name
+                && (branch.refname == *ref_name || branch.upstream.as_ref() == Some(ref_name))
+            {
                 continue;
             }
-            candidates.push((name, id));
+
+            if !above_merge_base.contains(&branch.name) {
+                continue;
+            }
+            candidates.push((branch.name, branch.tip));
         }
 
         self.candidates = candidates;
@@ -658,7 +647,7 @@ pub fn collect_stack_component(
     upstream_id: Oid,
     upstream_name: &str,
 ) -> Result<Vec<StackBranch>> {
-    let local_branches = repo.branches(Some(git2::BranchType::Local))?;
+    let local_branches = local_branch_tips(repo)?;
     let mut candidates = Vec::new();
     // At or above the merge base and not yet in upstream, for every branch in
     // one query.
@@ -667,20 +656,12 @@ pub fn collect_stack_component(
         &[("--contains", merge_base), ("--no-merged", upstream_id)],
     )?;
 
-    for branch_result in local_branches {
-        let (branch, _) = branch_result?;
-        let Some(name) = branch.name()? else {
-            continue;
-        };
+    for (name, id) in local_branches {
         if name == upstream_name {
             continue;
         }
 
-        let Some(id) = branch.get().target() else {
-            continue;
-        };
-
-        if unmerged_above_merge_base.contains(name) {
+        if unmerged_above_merge_base.contains(&name) {
             candidates.push(StackBranch {
                 name: name.to_string(),
                 id,
@@ -1130,15 +1111,14 @@ pub fn find_merged_branch_in_replay(
     Ok(None)
 }
 
-/// Every local branch and its tip, sorted by name.
+/// Every local branch and its tip, sorted by name. Read with git, as
+/// [`local_branches_with_upstreams`] explains; listing hundreds of branches
+/// through libgit2 takes several times as long.
 pub(crate) fn local_branch_tips(repo: &Repository) -> Result<Vec<(String, Oid)>> {
-    let mut tips = Vec::new();
-    for branch in repo.branches(Some(git2::BranchType::Local))? {
-        let (branch, _) = branch?;
-        if let (Some(tip), Ok(Some(name))) = (branch.get().target(), branch.name()) {
-            tips.push((name.to_string(), tip));
-        }
-    }
+    let mut tips: Vec<_> = local_branches_with_upstreams(repo)?
+        .into_iter()
+        .map(|branch| (branch.name, branch.tip))
+        .collect();
     tips.sort();
     Ok(tips)
 }
@@ -1164,35 +1144,19 @@ pub fn collect_merged_local_branches(
         .collect::<HashSet<_>>();
 
     let mut branches = Vec::new();
-    for branch_result in repo.branches(Some(git2::BranchType::Local))? {
-        let (branch, _) = branch_result?;
-        let Some(name) = branch.name()? else {
-            continue;
-        };
-        if protected_branches.contains(name) {
+    for branch in local_branches_with_upstreams(repo)? {
+        if protected_branches.contains(&branch.name) || branch.name == target_short_name {
             continue;
         }
 
-        if branch.get().shorthand() == Some(target_short_name) {
-            continue;
-        }
-
-        if let Ok(upstream_branch) = branch.upstream()
-            && let Some(upstream_name) = upstream_branch.name()?
-        {
-            // Get the short name of the upstream branch
-            let upstream_short = upstream_name
-                .strip_prefix("refs/remotes/")
-                .unwrap_or(upstream_name);
+        if let Some(upstream) = &branch.upstream {
+            let upstream_short = upstream.strip_prefix("refs/remotes/").unwrap_or(upstream);
             if upstream_short == target_short_name {
                 continue;
             }
         }
 
-        let Some(branch_id) = branch.get().target() else {
-            continue;
-        };
-        branches.push((name.to_string(), branch_id));
+        branches.push((branch.name, branch.tip));
     }
 
     let mut merged_branches = Vec::new();
@@ -1230,6 +1194,60 @@ pub fn collect_merged_local_branches(
 
     merged_branches.sort();
     Ok(merged_branches)
+}
+
+/// A local branch, its tip and the full name of its configured upstream.
+struct LocalBranch {
+    name: String,
+    refname: String,
+    tip: Oid,
+    upstream: Option<String>,
+}
+
+/// Every local branch with its tip and upstream, from one `git for-each-ref`.
+/// With hundreds of branches, libgit2 takes several times as long to list
+/// them, and reads each branch's upstream from its config and the remote's
+/// refspecs anew. Symbolic branch refs and names that are not UTF-8 are left
+/// out, as libgit2's listing gives them no tip or name.
+fn local_branches_with_upstreams(repo: &Repository) -> Result<Vec<LocalBranch>> {
+    let output = crate::repository::git_command(repo)
+        .args([
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)%00%(upstream)%00%(symref)",
+            "refs/heads/",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git for-each-ref failed while listing local branches: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut branches = Vec::new();
+    for line in output.stdout.split(|&b| b == b'\n') {
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
+        let mut fields = line.split('\0');
+        let (Some(refname), Some(tip), Some(upstream), Some(symref)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Some(name) = refname.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        if !symref.is_empty() {
+            continue;
+        }
+        branches.push(LocalBranch {
+            name: name.to_string(),
+            refname: refname.to_string(),
+            tip: Oid::from_str(tip)?,
+            upstream: (!upstream.is_empty()).then(|| upstream.to_string()),
+        });
+    }
+    Ok(branches)
 }
 
 /// Local branches whose tips pass every `(filter, commit)` pair: `--merged`
@@ -2933,19 +2951,10 @@ pub fn get_stack_branches_from_merge_base(
 
     let mut branches = Vec::new();
     let mut above_head = Vec::new();
-    for res in repo.branches(Some(git2::BranchType::Local))? {
-        let (branch, _) = res?;
-        let name = match branch.name()? {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
+    for (name, id) in local_branch_tips(repo)? {
         if name == upstream_name {
             continue;
         }
-        let id = match branch.get().target() {
-            Some(id) => id,
-            None => continue,
-        };
 
         if lineage.is_private(id) {
             branches.push(StackBranch { name, id });
