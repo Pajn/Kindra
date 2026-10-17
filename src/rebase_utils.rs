@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::repository::git_command;
 
@@ -1758,23 +1758,46 @@ pub fn delete_merged_branches(
         })?;
     }
 
-    for branch_name in branches {
-        // Capture the tip before deletion so it is recoverable from the printed
-        // SHA (and from `kin undo`) even after the branch ref is gone.
-        let old_tip = repo
-            .find_branch(branch_name, git2::BranchType::Local)
-            .ok()
-            .and_then(|b| b.get().target())
-            .map(|oid| oid.to_string());
+    // Capture the tips before deletion so they are recoverable from the
+    // printed SHAs (and from `kin undo`) even after the refs are gone.
+    let old_tips: Vec<Option<String>> = branches
+        .iter()
+        .map(|branch_name| {
+            repo.find_branch(branch_name, git2::BranchType::Local)
+                .ok()
+                .and_then(|b| b.get().target())
+                .map(|oid| oid.to_string())
+        })
+        .collect();
 
-        let status = git_command(repo)
-            .arg("branch")
-            .arg("-D")
-            .arg("--quiet")
-            .arg(branch_name)
-            .status()?;
+    // One `git branch -D` for all of them. Git deletes them in one
+    // transaction, so if any of them cannot be deleted, none is; then each is
+    // deleted on its own, reporting the ones Git refuses. Which were deleted
+    // is read from the refs after.
+    let together = git_command(repo)
+        .arg("branch")
+        .arg("-D")
+        .arg("--quiet")
+        .args(branches)
+        .stderr(Stdio::null())
+        .status()?;
+    if !together.success() {
+        for branch_name in branches {
+            git_command(repo)
+                .arg("branch")
+                .arg("-D")
+                .arg("--quiet")
+                .arg(branch_name)
+                .status()?;
+        }
+    }
 
-        if !status.success() {
+    let remaining: HashSet<String> = crate::stack::local_branch_tips(repo)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    for (branch_name, old_tip) in branches.iter().zip(old_tips) {
+        if old_tip.is_none() || remaining.contains(branch_name) {
             println!(
                 "Warning: Failed to delete merged branch: {}. It might be checked out in another worktree.",
                 branch_name
@@ -1787,8 +1810,6 @@ pub fn delete_merged_branches(
                 branch_name,
                 tip,
             );
-        } else {
-            println!("Deleted merged branch: {}", branch_name);
         }
     }
     Ok(())

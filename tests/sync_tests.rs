@@ -4754,3 +4754,32 @@ fn sync_on_main_rebases_when_there_are_untracked_files_to_set_aside() {
         "untracked local edit\n"
     );
 }
+
+#[test]
+fn sync_deletes_the_merged_branches_it_can_when_one_cannot_be_deleted() {
+    let (dir, _remote) = remote_backed_repo();
+    run_ok("git", &["checkout", "-f", "main"], dir.path());
+    for branch in ["landed-a", "landed-b", "landed-c"] {
+        run_ok("git", &["branch", branch, "main"], dir.path());
+    }
+    // A stale lock on one ref makes Git refuse to delete that branch alone.
+    let lock = dir.path().join(".git/refs/heads/landed-b.lock");
+    fs::write(&lock, "").unwrap();
+
+    kin_cmd()
+        .arg("sync")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Deleted merged branch: landed-a"))
+        .stdout(predicate::str::contains(
+            "Warning: Failed to delete merged branch: landed-b.",
+        ))
+        .stdout(predicate::str::contains("Deleted merged branch: landed-c"));
+    fs::remove_file(&lock).unwrap();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    assert!(repo.find_branch("landed-a", BranchType::Local).is_err());
+    assert!(repo.find_branch("landed-b", BranchType::Local).is_ok());
+    assert!(repo.find_branch("landed-c", BranchType::Local).is_err());
+}
