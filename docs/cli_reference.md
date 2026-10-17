@@ -424,6 +424,8 @@ kin sync [--force] [--no-delete] [--autostash|--no-autostash]
 - **Automatically deletes local branches** in the stack that are already merged into the upstream branch (unless `--no-delete` is used). A merged branch checked out in another worktree is kept, with a note, since Git cannot delete it; this does not stop the sync.
 - If your current branch is deleted because it was merged, Kindra automatically switches you to the upstream branch.
 
+**Timings:** Set `KIN_TIMINGS=1` to see where a sync spends its time. Each phase (acquiring the lock, resolving the trunk, discovering the stack, each fetch, finding the sync boundary, the rebase, deleting merged branches, and the sync as a whole) prints its duration to stderr as it ends, prefixed with `kin timing:`, with phases indented under the phase that contains them. A phase that fails still reports how long it ran.
+
 **When to use it:** Use this after one or more lower PRs in your stack have already landed on the upstream branch, and you want to sync all remaining branches and clean up the merged ones in one pass.
 
 **Conflict handling:** If a sync started by Kindra conflicts, resolve it and run `kin continue`, or abandon it with `kin abort`. If you are in a plain native Git rebase with no saved Kindra state, use `git rebase --continue` or `git rebase --abort`.

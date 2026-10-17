@@ -4604,3 +4604,48 @@ fn sync_reuses_stack_discovery_only_when_fetched_graph_is_unchanged() {
         );
     }
 }
+
+#[test]
+fn sync_reports_phase_timings_with_kin_timings() {
+    let (dir, _remote_dir) = common::setup_stale_trunk();
+
+    let output = kin_cmd()
+        .args(["sync", "--no-delete"])
+        .env("KIN_TIMINGS", "1")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let phases: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("kin timing: "))
+        .collect();
+    for phase in [
+        "  acquire lock ",
+        "  resolve trunk ",
+        "  fetch ",
+        "    targeted fetch ",
+        "  find sync boundary ",
+        "  rebase ",
+        "sync ",
+    ] {
+        assert!(
+            phases.iter().any(|line| line.starts_with(phase)),
+            "missing {phase:?} in:\n{stderr}"
+        );
+    }
+    assert!(phases.last().unwrap().starts_with("sync "), "{stderr}");
+
+    let quiet = kin_cmd()
+        .args(["sync", "--no-delete"])
+        .env("KIN_TIMINGS", "0")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(quiet.status.success(), "{quiet:?}");
+    assert!(
+        !String::from_utf8_lossy(&quiet.stderr).contains("kin timing:"),
+        "{quiet:?}"
+    );
+}
