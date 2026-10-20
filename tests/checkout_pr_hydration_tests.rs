@@ -946,3 +946,180 @@ fn checkout_refuses_during_native_revert_and_bisect() {
         assert!(!state_file(dir.path(), StateFile::Checkout).exists());
     }
 }
+
+// A `gh` that records every call, kept in the Git directory so no operation
+// sets it aside. Checkouts that do not hydrate must never reach it.
+fn refusing_gh(path: &Path) -> std::ffi::OsString {
+    let bin = path.join(".git/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/gh.log\"\nexit 1\n",
+    )
+    .unwrap();
+    make_executable(&gh);
+    mocked_path(&bin)
+}
+
+fn gh_log(path: &Path) -> String {
+    fs::read_to_string(path.join(".git/bin/gh.log")).unwrap_or_default()
+}
+
+fn two_branch_repo() -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    repo_init(dir.path());
+    configure_repo(dir.path());
+    write_file(&dir.path().join("README.md"), "main\n");
+    commit_all(dir.path(), "initial");
+    run_ok("git", &["tag", "v1"], dir.path());
+    run_ok("git", &["checkout", "-b", "feature"], dir.path());
+    write_file(&dir.path().join("a.txt"), "a\n");
+    commit_all(dir.path(), "feature");
+    run_ok("git", &["checkout", "main"], dir.path());
+    dir
+}
+
+#[test]
+fn checkout_of_a_revision_that_is_not_a_branch_skips_hydration() {
+    let dir = two_branch_repo();
+    let path = refusing_gh(dir.path());
+    let feature = rev_parse(dir.path(), "feature");
+
+    for (target, expected) in [
+        ("v1", rev_parse(dir.path(), "main")),
+        (feature.as_str(), feature.clone()),
+    ] {
+        kin_cmd()
+            .args(["co", target])
+            .current_dir(dir.path())
+            .env("PATH", &path)
+            .assert()
+            .success();
+        assert_eq!(rev_parse(dir.path(), "HEAD"), expected);
+        assert_eq!(current_branch(dir.path()), "");
+    }
+    kin_cmd()
+        .args(["co", "feature~1"])
+        .current_dir(dir.path())
+        .env("PATH", &path)
+        .assert()
+        .success();
+    assert_eq!(rev_parse(dir.path(), "HEAD"), rev_parse(dir.path(), "main"));
+    assert_eq!(gh_log(dir.path()), "");
+}
+
+#[test]
+fn checkout_dash_returns_to_the_previous_branch_without_hydrating() {
+    let dir = two_branch_repo();
+    let path = refusing_gh(dir.path());
+    run_ok("git", &["checkout", "feature"], dir.path());
+    kin_cmd()
+        .args(["co", "-"])
+        .current_dir(dir.path())
+        .env("PATH", &path)
+        .assert()
+        .success();
+    assert_eq!(current_branch(dir.path()), "main");
+    assert_eq!(gh_log(dir.path()), "");
+}
+
+#[test]
+fn no_hydrate_checks_out_a_branch_without_fetching_or_gh() {
+    let dir = two_branch_repo();
+    let path = refusing_gh(dir.path());
+    // A remote that cannot be reached: fetching would fail the checkout.
+    run_ok(
+        "git",
+        &["remote", "add", "origin", "/nonexistent/remote.git"],
+        dir.path(),
+    );
+    kin_cmd()
+        .args(["co", "--no-hydrate", "feature"])
+        .current_dir(dir.path())
+        .env("PATH", &path)
+        .assert()
+        .success();
+    assert_eq!(current_branch(dir.path()), "feature");
+    assert_eq!(gh_log(dir.path()), "");
+}
+
+#[test]
+fn checkout_of_a_branch_name_still_hydrates() {
+    let dir = two_branch_repo();
+    let path = refusing_gh(dir.path());
+    kin_cmd()
+        .args(["co", "feature"])
+        .current_dir(dir.path())
+        .env("PATH", &path)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("gh auth login"));
+    assert_eq!(current_branch(dir.path()), "main");
+    assert_eq!(gh_log(dir.path()), "auth token\n");
+}
+
+#[test]
+fn new_branch_starts_at_head_or_its_start_point_and_tracks_nothing() {
+    let dir = two_branch_repo();
+    let path = refusing_gh(dir.path());
+    // Git would otherwise set even a local start point as the upstream.
+    run_ok(
+        "git",
+        &["config", "branch.autoSetupMerge", "always"],
+        dir.path(),
+    );
+
+    kin_cmd()
+        .args(["co", "-b", "at-head"])
+        .current_dir(dir.path())
+        .env("PATH", &path)
+        .assert()
+        .success();
+    assert_eq!(current_branch(dir.path()), "at-head");
+    assert_eq!(rev_parse(dir.path(), "HEAD"), rev_parse(dir.path(), "main"));
+
+    kin_cmd()
+        .args(["co", "-b", "from-feature", "feature"])
+        .current_dir(dir.path())
+        .env("PATH", &path)
+        .assert()
+        .success();
+    assert_eq!(current_branch(dir.path()), "from-feature");
+    assert_eq!(
+        rev_parse(dir.path(), "HEAD"),
+        rev_parse(dir.path(), "feature")
+    );
+    let upstream = std::process::Command::new("git")
+        .args(["config", "branch.from-feature.merge"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!upstream.status.success(), "from-feature tracks a branch");
+    assert_eq!(gh_log(dir.path()), "");
+}
+
+#[test]
+fn new_branch_refuses_an_existing_name_and_stack_navigation() {
+    let dir = two_branch_repo();
+    kin_cmd()
+        .args(["co", "-b", "feature"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("already exists"));
+    kin_cmd()
+        .args(["co", "-b", "fresh", "up"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("start point"));
+    kin_cmd()
+        .args(["co", "-b", "fresh", "--all"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("cannot be used with"));
+    assert_eq!(current_branch(dir.path()), "main");
+    assert!(!local_branch_exists(dir.path(), "fresh"));
+}

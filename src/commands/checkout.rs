@@ -13,12 +13,26 @@ pub fn checkout(
     subcommand: &Option<CheckoutSubcommand>,
     branch: &Option<String>,
     all: bool,
+    new_branch: &Option<String>,
+    no_hydrate: bool,
 ) -> Result<()> {
     let repo = crate::open_repo()?;
+
+    if let Some(name) = new_branch {
+        if subcommand.is_some() {
+            return Err(anyhow!(
+                "-b cannot be combined with up, down or top; name a start point instead"
+            ));
+        }
+        return create_branch(&repo, name, branch.as_deref());
+    }
 
     if let Some(branch) = branch {
         let lock = crate::state_io::RepoLock::acquire(&repo)?;
         crate::operation_state::ensure_idle(&repo, &lock, crate::operation_state::Allow::NOTHING)?;
+        if no_hydrate || !names_branch(&repo, branch) {
+            return crate::overrides::with_planned(&repo, false, || git_checkout(&repo, branch));
+        }
         return crate::overrides::with_planned(&repo, false, || {
             checkout_branch_with_pr_hydration(&repo, branch)
         });
@@ -43,7 +57,7 @@ pub fn checkout(
         let selected_name = crate::commands::prompt_select(
             "Select branch to checkout:",
             branch_names,
-            crate::commands::Fallback::Require("Run 'git checkout <branch>' instead."),
+            crate::commands::Fallback::Require("Run 'kin checkout --no-hydrate <branch>' instead."),
         )?;
         return perform_git_checkout(&selected_name);
     }
@@ -81,7 +95,9 @@ pub fn checkout(
                     let selected = crate::commands::prompt_select(
                         "Multiple branches ahead. Select one:",
                         successors,
-                        crate::commands::Fallback::Require("Run 'git checkout <branch>' instead."),
+                        crate::commands::Fallback::Require(
+                            "Run 'kin checkout --no-hydrate <branch>' instead.",
+                        ),
                     )?;
                     perform_git_checkout(&selected)
                 }
@@ -103,7 +119,9 @@ pub fn checkout(
                     let selected = crate::commands::prompt_select(
                         "Multiple parent branches found. Select one:",
                         parent_branches,
-                        crate::commands::Fallback::Require("Run 'git checkout <branch>' instead."),
+                        crate::commands::Fallback::Require(
+                            "Run 'kin checkout --no-hydrate <branch>' instead.",
+                        ),
                     )?;
                     perform_git_checkout(&selected)
                 }
@@ -127,7 +145,9 @@ pub fn checkout(
                     let selected = crate::commands::prompt_select(
                         "Multiple stack tips found. Select one:",
                         tips,
-                        crate::commands::Fallback::Require("Run 'git checkout <branch>' instead."),
+                        crate::commands::Fallback::Require(
+                            "Run 'kin checkout --no-hydrate <branch>' instead.",
+                        ),
                     )?;
                     perform_git_checkout(&selected)
                 }
@@ -157,7 +177,9 @@ pub fn checkout(
             let selected_display = crate::commands::prompt_select(
                 "Select branch to checkout:",
                 options,
-                crate::commands::Fallback::Require("Run 'git checkout <branch>' instead."),
+                crate::commands::Fallback::Require(
+                    "Run 'kin checkout --no-hydrate <branch>' instead.",
+                ),
             )?;
 
             let selected_name = visualized
@@ -399,8 +421,6 @@ fn run_hydration(repo: &Repository, mut journal: HydrationJournal) -> Result<()>
                 save_hydration(repo, &journal)?;
             }
             HydrationStep::Checkout { branch } => {
-                let mut plan = crate::overrides::Plan::default();
-                crate::overrides::prepare(repo, plan.checkout_rev(repo, &branch))?;
                 git_checkout(repo, &branch).context(
                     "Checkout hydration stopped. Run 'kin continue' to retry checkout or 'kin abort'",
                 )?;
@@ -501,28 +521,70 @@ fn resolve_remote_tracking_ref(
     Ok(candidates.into_iter().next().map(|(name, _)| name))
 }
 
+/// Whether `kin co <target>` hydrates `target` as a branch. A local or
+/// remote-tracking branch is one, and so is a name that resolves to nothing,
+/// since it may be a PR branch not fetched yet. Anything else Git can resolve
+/// (a commit, a tag, `HEAD~2`, `-`), or that could not be a branch name, is
+/// checked out as it is.
+fn names_branch(repo: &Repository, target: &str) -> bool {
+    if repo.find_branch(target, BranchType::Local).is_ok()
+        || repo.find_branch(target, BranchType::Remote).is_ok()
+    {
+        return true;
+    }
+    target != "-"
+        && git2::Branch::name_is_valid(target).unwrap_or(false)
+        && repo.revparse_single(target).is_err()
+}
+
 fn perform_git_checkout(name: &str) -> Result<()> {
     let repo = crate::open_repo()?;
     let lock = crate::state_io::RepoLock::acquire(&repo)?;
     crate::operation_state::ensure_idle(&repo, &lock, crate::operation_state::Allow::NOTHING)?;
-    crate::overrides::with_planned(&repo, false, || {
-        let mut plan = crate::overrides::Plan::default();
-        crate::overrides::prepare(&repo, plan.checkout_rev(&repo, name))?;
-        git_checkout(&repo, name)
+    crate::overrides::with_planned(&repo, false, || git_checkout(&repo, name))
+}
+
+/// Check out `target` as `git checkout` would, inside a planned overrides
+/// session.
+fn git_checkout(repo: &Repository, target: &str) -> Result<()> {
+    // `git checkout -` is the previous branch, which revparse spells `@{-1}`.
+    let planned = if target == "-" { "@{-1}" } else { target };
+    let mut plan = crate::overrides::Plan::default();
+    crate::overrides::prepare(repo, plan.checkout_rev(repo, planned))?;
+    run_git_checkout(repo, &[target])
+}
+
+/// `kin co -b <name> [<start>]`. The branch never tracks its start point:
+/// starting from a remote base branch would otherwise make that base the new
+/// branch's push destination.
+fn create_branch(repo: &Repository, name: &str, start: Option<&str>) -> Result<()> {
+    let lock = crate::state_io::RepoLock::acquire(repo)?;
+    crate::operation_state::ensure_idle(repo, &lock, crate::operation_state::Allow::NOTHING)?;
+    crate::overrides::with_planned(repo, false, || {
+        let mut args = vec!["--no-track", "-b", name];
+        // Without a start point the branch is created at HEAD and the working
+        // tree does not change, so there is nothing to prepare.
+        if let Some(start) = start {
+            let mut plan = crate::overrides::Plan::default();
+            crate::overrides::prepare(repo, plan.checkout_rev(repo, start))?;
+            args.push(start);
+        }
+        run_git_checkout(repo, &args)
     })
 }
 
-fn git_checkout(repo: &Repository, name: &str) -> Result<()> {
+fn run_git_checkout(repo: &Repository, args: &[&str]) -> Result<()> {
+    let command = format!("git checkout {}", args.join(" "));
     let output = crate::repository::git_command(repo)
         .arg("checkout")
-        .arg(name)
+        .args(args)
         .output()
-        .with_context(|| format!("Failed to run `git checkout {name}`"))?;
+        .with_context(|| format!("Failed to run `{command}`"))?;
 
     if !output.status.success() {
         return Err(anyhow!(
-            "git checkout failed for branch '{}': {}",
-            name,
+            "`{}` failed: {}",
+            command,
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }

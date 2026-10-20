@@ -1617,3 +1617,37 @@ fn split_is_refused_while_override_recovery_is_pending() {
     assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), head);
     assert_eq!(fs::read_to_string(&recovery).unwrap(), saved);
 }
+#[test]
+fn checkout_of_a_commit_suspends_and_reapplies_overrides() {
+    let dir = setup();
+    let main = git(dir.path(), &["rev-parse", "main"]);
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["checkout", main.trim()])
+        .assert()
+        .success();
+    assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), main);
+    assert_applied(dir.path());
+}
+#[test]
+fn new_branch_keeps_overlays_at_head_and_reruns_the_hook_for_its_name() {
+    let dir = logging_setup("");
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["checkout", "-b", "fresh"])
+        .assert()
+        .success();
+    assert_eq!(hook_log(dir.path()), "local override fresh\n");
+    assert_applied(dir.path());
+}
+#[test]
+fn new_branch_from_a_start_point_suspends_overlays_it_would_change() {
+    let dir = logging_setup("");
+    kin_cmd()
+        .current_dir(dir.path())
+        .args(["checkout", "-b", "from-main", "main"])
+        .assert()
+        .success();
+    assert_eq!(hook_log(dir.path()), "base from-main\n");
+    assert_applied(dir.path());
+}
