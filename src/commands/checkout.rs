@@ -573,11 +573,15 @@ fn create_branch(repo: &Repository, name: &str, start: Option<&str>) -> Result<(
     })
 }
 
+/// Run `git checkout <args> --`. The trailing `--` makes Git read the target
+/// only as a revision: without it, a target that is not one, such as `.`, is
+/// a pathspec, and Git would restore those files and discard their changes.
 fn run_git_checkout(repo: &Repository, args: &[&str]) -> Result<()> {
     let command = format!("git checkout {}", args.join(" "));
     let output = crate::repository::git_command(repo)
         .arg("checkout")
         .args(args)
+        .arg("--")
         .output()
         .with_context(|| format!("Failed to run `{command}`"))?;
 

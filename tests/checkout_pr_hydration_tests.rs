@@ -1123,3 +1123,27 @@ fn new_branch_refuses_an_existing_name_and_stack_navigation() {
     assert_eq!(current_branch(dir.path()), "main");
     assert!(!local_branch_exists(dir.path(), "fresh"));
 }
+
+#[test]
+fn checkout_never_treats_its_target_as_a_path() {
+    let dir = two_branch_repo();
+    write_file(&dir.path().join("README.md"), "uncommitted\n");
+    for args in [
+        &["co", "."][..],
+        &["co", "--no-hydrate", "README.md"],
+        &["co", "-b", "fresh", "."],
+    ] {
+        kin_cmd()
+            .args(args)
+            .current_dir(dir.path())
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("invalid reference"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("README.md")).unwrap(),
+            "uncommitted\n"
+        );
+    }
+    assert_eq!(current_branch(dir.path()), "main");
+    assert!(!local_branch_exists(dir.path(), "fresh"));
+}
