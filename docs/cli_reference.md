@@ -525,19 +525,23 @@ main -> [A1'] -> (feature-A) -> [B1'] -> (feature-B)
 
 ### `checkout` (alias `co`)
 
-**Description:** Provides an interactive interface to navigate branches in the stack.
+**Description:** Navigates branches in the stack, checks out branches and other revisions, and creates branches, keeping [local overrides](#local-overrides) applied throughout.
 
 **Usage:**
 
 ```bash
 kin checkout [--all]
-kin checkout <branch>
+kin checkout [--no-hydrate] <branch-or-revision>
+kin checkout -b <name> [<start>]
 kin checkout [subcommand]
 ```
 
 - `kin co`: Opens an interactive selection menu for branches in the current stack.
 - `kin co --all`: Opens an interactive selection menu for all local branches.
 - `kin co <branch>`: Fetches remotes, hydrates the requested branch's PR stack ancestors and descendants from GitHub, creates any missing local tracking branches, and checks out `<branch>`. Requires an authenticated `gh` CLI. Existing local branches retain their commits; PRs from forks and siblings of ancestors are excluded.
+- `kin co <revision>`: Anything that is not a branch — a commit, a tag, `HEAD~2`, or `-` for the previous branch — is checked out as `git checkout` would, without fetching or `gh`. A name counts as a branch when it is a local or remote-tracking branch, or when it resolves to nothing at all, since it may be a PR branch that has not been fetched yet.
+- `kin co --no-hydrate <branch>`: Checks out a branch as `git checkout` would, without fetching or hydrating its PR stack.
+- `kin co -b <name> [<start>]`: Creates `<name>` at `<start>` (default `HEAD`) and checks it out, like `git checkout -b`. The new branch never tracks its start point, so starting from `origin/main` does not make `main` its [push destination](#push). To fork and commit in one step, use [`kin commit -b`](#commit).
 - Interrupted named checkout: `kin continue` resumes the saved hydration plan and retries checkout; `kin abort` cancels it, retaining branches already created. Local overrides stay suspended until recovery finishes. Remote-qualified names (for example, `origin/feature`) hydrate and check out the corresponding local branch. Missing branches must resolve to the same repository as the GitHub PR query.
 - `kin co up`: Checkout the branch immediately "above" the current one in the stack.
 - `kin co down`: Checkout the branch immediately "below" the current one in the stack.
@@ -1158,7 +1162,8 @@ suspended throughout all intermediate checkouts, including commands executed by
 `kin run`. When `kin run` keeps them, its commands see the overlays on every
 branch. New worktrees apply overrides before their
 `on_create` hooks; review switches apply before `on_checkout`. Ordinary
-`kin checkout` reapplies overrides but does not run worktree setup hooks.
+`kin checkout`, including `kin checkout -b` and checkouts of commits and tags,
+reapplies overrides but does not run worktree setup hooks.
 Read-only commands do not apply overrides. Direct `git` commands bypass this
 lifecycle. Sparse checkout is not supported with local overrides.
 

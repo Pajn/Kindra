@@ -108,16 +108,23 @@ enum Commands {
         #[arg(long = "reviewer")]
         reviewer: Vec<String>,
     },
-    /// Interactive branch checkout
+    /// Check out a branch interactively, by name, or a new one with -b
     #[command(alias = "co")]
     Checkout {
         #[command(subcommand)]
         subcommand: Option<CheckoutSubcommand>,
-        /// Checkout a branch directly, hydrating its PR stack first
+        /// Branch to check out, hydrating its PR stack first, or any other
+        /// revision to check out as Git would. With -b, the new branch's start point
         branch: Option<String>,
         /// List all local branches instead of just the stack
         #[arg(long, conflicts_with = "branch")]
         all: bool,
+        /// Create a branch with this name and check it out
+        #[arg(short = 'b', long = "new-branch", value_name = "name", conflicts_with_all = ["all", "no_hydrate"])]
+        new_branch: Option<String>,
+        /// Check out a branch as it is, without fetching or hydrating its PR stack
+        #[arg(long, requires = "branch")]
+        no_hydrate: bool,
     },
     /// Move current branch stack onto another branch
     Move(MoveArgs),
@@ -339,7 +346,9 @@ fn dispatch() -> Result<()> {
             subcommand,
             branch,
             all,
-        } => checkout(subcommand, branch, *all)?,
+            new_branch,
+            no_hydrate,
+        } => checkout(subcommand, branch, *all, new_branch, *no_hydrate)?,
         Commands::Move(args) => move_cmd(args)?,
         Commands::Rename(args) => rename(args)?,
         Commands::Reorder(args) => reorder(args)?,

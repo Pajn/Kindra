@@ -61,7 +61,7 @@ cargo release 0.3.0 --execute
 
 Run `kin tree` from any branch in a stack to see that entire connected stack, including sibling forks, without unrelated stacks. Run it from the base branch (such as `main`) to see all stacks branching from that base. Add `--commits` to include commit details.
 
-1. **Start a stack**: Create several branches, each building on the previous one — with plain `git checkout -b`, or `kin commit -b <name>` to fork a branch and commit onto it in one step (add `--insert` to splice it into the middle of an existing stack).
+1. **Start a stack**: Create several branches, each building on the previous one — with `kin co -b <name>` (`git checkout -b` that keeps [local overrides](docs/cli_reference.md#local-overrides) in place), or `kin commit -b <name>` to fork a branch and commit onto it in one step (add `--insert` to splice it into the middle of an existing stack).
 2. **Make a change**: Checkout a branch in the middle of the stack and run `kin commit`.
 3. **Watch the magic**: Kindra will automatically rebase all branches that depend on your change.
 4. **Move the stack**: Ready to target a different feature? `kin move --onto main` relocates the current branch and its descendants, preserving branch relationships. Moving onto a descendant rotates that target and its single-child chain ahead of the current branch, stopping at a fork; side branches retain their parents. Conflicts support `kin continue` and `kin abort`. Descendant rotations do not support merge commits.
