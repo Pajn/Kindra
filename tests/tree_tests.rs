@@ -1164,6 +1164,27 @@ fn test_tree_reports_sync_of_the_current_branch_on_the_trunk() {
     );
 }
 
+/// A branch whose commits reached the trunk by a fast-forward sits on the trunk
+/// just like one created there, but it had commits, and they are merged.
+#[test]
+fn test_tree_reports_a_branch_fast_forwarded_into_the_trunk_as_merged() {
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    repo_init(path);
+    git(path, &["commit", "--allow-empty", "-m", "root"]);
+    git(path, &["switch", "-c", "feature"]);
+    git(path, &["commit", "--allow-empty", "-m", "feature"]);
+    git(path, &["switch", "main"]);
+    git(path, &["merge", "--ff-only", "feature"]);
+    git(path, &["switch", "feature"]);
+
+    assert_eq!(
+        run_tree_command(path, &["-r"]),
+        "main\n\
+         └─ feature [Merged]\n"
+    );
+}
+
 #[test]
 fn test_tree_shows_the_current_branch_on_a_trunk_without_a_stack() {
     let dir = tempdir().unwrap();

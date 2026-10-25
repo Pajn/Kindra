@@ -3394,21 +3394,11 @@ impl CreationSources {
         let Ok(reflog) = repo.reflog(&format!("refs/heads/{name}")) else {
             return Ok(None);
         };
-        let Some(created) = reflog
-            .len()
-            .checked_sub(1)
-            .and_then(|last| reflog.get(last))
-        else {
-            return Ok(None);
-        };
-        let Some(source) = created
-            .message()
-            .and_then(|message| message.strip_prefix("branch: Created from "))
-        else {
+        let Some((created, source)) = creation_entry(&reflog) else {
             return Ok(None);
         };
         if source != "HEAD" {
-            return Ok(Some(source.to_string()));
+            return Ok(Some(source));
         }
 
         let id = created.id_new();
@@ -3487,6 +3477,23 @@ impl CreationSources {
         }
         Ok(self.head_entries.as_deref().unwrap_or_default())
     }
+}
+
+/// The oldest entry of a branch's reflog and the start point it names, when
+/// that entry records the branch's creation (`branch: Created from <S>`).
+fn creation_entry(reflog: &git2::Reflog) -> Option<(git2::ReflogEntry<'_>, String)> {
+    let created = reflog.get(reflog.len().checked_sub(1)?)?;
+    let source = created
+        .message()?
+        .strip_prefix("branch: Created from ")?
+        .to_string();
+    Some((created, source))
+}
+
+/// The commit `name` was created on, if its reflog still records the creation.
+pub fn branch_creation_commit(repo: &Repository, name: &str) -> Option<Oid> {
+    let reflog = repo.reflog(&format!("refs/heads/{name}")).ok()?;
+    creation_entry(&reflog).map(|(created, _)| created.id_new())
 }
 
 /// Resolves which branch of a set each branch is stacked on.

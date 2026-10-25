@@ -1,7 +1,8 @@
 use crate::commands::find_upstream;
 use crate::gh;
 use crate::stack::{
-    StackBranch, find_parents_in_stack, get_full_stack_branches_for_head, is_on_history_of,
+    StackBranch, branch_creation_commit, find_parents_in_stack, get_full_stack_branches_for_head,
+    is_on_history_of,
 };
 use anyhow::{Context, Result};
 use clap::Args;
@@ -259,7 +260,13 @@ fn build_tree_structure(
         let parent_name = parents[&sb.name].clone();
         let no_commits = match &parent_name {
             Some(parent) => tips[parent.as_str()] == sb.id,
-            None => is_on_history_of(repo, sb.id, upstream_id)?,
+            // The trunk also contains a branch whose commits it merged by a
+            // fast-forward; only one still on the commit it was created on has
+            // none of its own.
+            None => {
+                is_on_history_of(repo, sb.id, upstream_id)?
+                    && branch_creation_commit(repo, &sb.name) == Some(sb.id)
+            }
         };
 
         tree.insert(
