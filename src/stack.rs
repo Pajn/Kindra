@@ -3356,6 +3356,9 @@ struct HeadEntry {
     message: String,
     id: Oid,
     time: i64,
+    /// Which worktree's HEAD reflog the entry is from. Entries are in time
+    /// order only within one worktree.
+    worktree: usize,
 }
 
 /// Branch creation sources read from the reflogs, each at most once. Reading
@@ -3412,7 +3415,7 @@ impl CreationSources {
         let time = created.committer().when().seconds();
         let prefix = "checkout: moving from ";
         let suffix = format!(" to {name}");
-        Ok(self
+        let matches = self
             .head_entries(repo)?
             .iter()
             .filter(|entry| {
@@ -3423,10 +3426,26 @@ impl CreationSources {
                     .message
                     .strip_prefix(prefix)?
                     .strip_suffix(suffix.as_str())?;
-                Some(((entry.time - time).abs(), source))
+                Some(((entry.time - time).abs(), entry.worktree, source))
             })
-            .min_by_key(|(distance, _)| *distance)
-            .map(|(_, source)| source.to_string()))
+            .collect::<Vec<_>>();
+        let Some(closest) = matches.iter().map(|(distance, _, _)| *distance).min() else {
+            return Ok(None);
+        };
+        // Within a worktree the first tied entry is the creating checkout. Ties
+        // in different worktrees cannot be ordered, so they only resolve when
+        // they agree.
+        let mut first_in_worktree = HashMap::new();
+        for (distance, worktree, source) in matches {
+            if distance == closest {
+                first_in_worktree.entry(worktree).or_insert(source);
+            }
+        }
+        let mut sources = first_in_worktree.into_values();
+        let source = sources.next();
+        Ok(source
+            .filter(|source| sources.all(|other| other == *source))
+            .map(str::to_string))
     }
 
     /// The HEAD reflog entries of the main worktree and every linked one, read
@@ -3447,19 +3466,19 @@ impl CreationSources {
             repos.push(main);
 
             let mut entries = Vec::new();
-            for repo in &repos {
+            for (worktree, repo) in repos.iter().enumerate() {
                 let Ok(reflog) = repo.reflog("HEAD") else {
                     continue;
                 };
-                // Oldest first: a later checkout of a branch can fall in the
-                // second it was created, and a tie goes to the first entry,
-                // which is then the checkout that created it.
+                // Oldest first, so the creating checkout comes before a later
+                // checkout of the branch in the same second.
                 for entry in reflog.iter().rev() {
                     if let Some(message) = entry.message() {
                         entries.push(HeadEntry {
                             message: message.to_string(),
                             id: entry.id_new(),
                             time: entry.committer().when().seconds(),
+                            worktree,
                         });
                     }
                 }

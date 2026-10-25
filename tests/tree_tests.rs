@@ -1058,6 +1058,38 @@ fn test_tree_nests_a_chain_of_branches_created_on_the_same_tip() {
     );
 }
 
+/// HEAD reflogs of different worktrees have no order between them, so checkouts
+/// of a branch in two worktrees in the second it was created leave its origin
+/// unknown when they moved from different branches.
+#[test]
+fn test_tree_places_a_branch_checked_out_in_two_worktrees_in_one_second_by_ancestry() {
+    let dir = setup_reflogged_stack();
+    let path = dir.path();
+    git(path, &["switch", "a"]);
+    git(path, &["branch", "c"]);
+    let (_parent, linked) = common::add_linked_worktree(path, "c");
+    let at_one_second = |cwd: &std::path::Path, args: &[&str]| {
+        let status = common::git_command(cwd)
+            .args(args)
+            .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    at_one_second(path, &["switch", "-c", "x"]);
+    at_one_second(path, &["switch", "b"]);
+    at_one_second(&linked, &["switch", "x"]);
+
+    assert_eq!(
+        run_tree_command(path, &[]),
+        "main\n\
+         ├─ a\n\
+         │   ├─ b\n\
+         │   └─ c\n\
+         └─ x\n"
+    );
+}
+
 /// A branch whose creation Git no longer records, or never recorded with a
 /// start point, keeps the place its ancestry alone gives it.
 #[test]
