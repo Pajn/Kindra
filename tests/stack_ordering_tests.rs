@@ -135,3 +135,38 @@ fn stack_component_keeps_cousins_and_excludes_independent_trunk_forks() {
         .collect::<Vec<_>>();
     assert_eq!(names, ["parent", "left", "right"]);
 }
+
+/// Branches sharing a tip have no ancestry between them, so the sort and every
+/// parent lookup must take the order Git recorded when one was created from
+/// the other, even against the names' order.
+#[test]
+fn branch_created_on_another_branch_tip_follows_it() {
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    let repo = repo_init(path);
+    common::run_ok("git", &["commit", "--allow-empty", "-m", "root"], path);
+    common::run_ok("git", &["switch", "-c", "zz-parent"], path);
+    common::commit_on(path, "zz-parent", "p.txt", "p");
+    common::run_ok("git", &["switch", "-c", "aa-child"], path);
+    let base = repo.revparse_single("main").unwrap().id();
+
+    let mut branches = vec![tip(&repo, "aa-child"), tip(&repo, "zz-parent")];
+    sort_branches_topologically(&repo, &mut branches).unwrap();
+    let names = branches
+        .iter()
+        .map(|branch| branch.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["zz-parent", "aa-child"]);
+
+    let parents = kindra::stack::current_parent_name_map(&repo, &branches, base, "main").unwrap();
+    assert_eq!(parents["aa-child"], "zz-parent");
+    assert_eq!(parents["zz-parent"], "main");
+
+    let with_upstream = branches
+        .iter()
+        .map(|branch| (branch.clone(), String::new()))
+        .collect::<Vec<_>>();
+    let bases = kindra::stack::compute_base_map(&repo, &with_upstream, "main").unwrap();
+    assert_eq!(bases["aa-child"], "zz-parent");
+    assert_eq!(bases["zz-parent"], "main");
+}

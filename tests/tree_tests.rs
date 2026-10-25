@@ -911,3 +911,140 @@ fn test_tree_falls_back_to_the_local_trunk_when_the_remote_trunk_is_unreadable()
         output_str
     );
 }
+
+/// `main ← a ← b`, one commit each, built with the `git` CLI so every branch
+/// has the reflog Git writes for it. HEAD is left on `b`.
+fn setup_reflogged_stack() -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    repo_init(dir.path());
+    common::run_ok(
+        "git",
+        &["commit", "--allow-empty", "-m", "root"],
+        dir.path(),
+    );
+    common::run_ok("git", &["switch", "-c", "a"], dir.path());
+    common::commit_on(dir.path(), "a", "a.txt", "a");
+    common::run_ok("git", &["switch", "-c", "b"], dir.path());
+    common::commit_on(dir.path(), "b", "b.txt", "b");
+    dir
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    common::run_ok("git", args, dir);
+}
+
+/// A branch created on another branch's tip has no commits of its own, so only
+/// where it was created from tells it apart from a sibling.
+#[test]
+fn test_tree_nests_branches_created_with_switch_on_another_branch_tip() {
+    let dir = setup_reflogged_stack();
+    let path = dir.path();
+    git(path, &["switch", "a"]);
+    git(path, &["switch", "-c", "empty-on-a"]);
+    git(path, &["switch", "b"]);
+    git(path, &["switch", "-c", "empty-on-b"]);
+
+    assert_eq!(
+        run_tree_command(path, &[]),
+        "main\n\
+         └─ a\n    \
+             ├─ b\n    \
+             │   └─ empty-on-b\n    \
+             └─ empty-on-a\n"
+    );
+}
+
+#[test]
+fn test_tree_nests_a_branch_created_from_a_named_start_point() {
+    let dir = setup_reflogged_stack();
+    let path = dir.path();
+    git(path, &["branch", "x", "a"]);
+
+    assert_eq!(
+        run_tree_command(path, &[]),
+        "main\n\
+         └─ a\n    \
+             ├─ b\n    \
+             └─ x\n"
+    );
+}
+
+/// HEAD reflogs belong to each worktree, so a branch created by a checkout in
+/// a linked worktree is found from the main one, and the other way round.
+#[test]
+fn test_tree_nests_branches_created_in_other_worktrees() {
+    let dir = setup_reflogged_stack();
+    let path = dir.path();
+    let worktrees = tempdir().unwrap();
+    let linked = worktrees.path().join("linked");
+    git(
+        path,
+        &["worktree", "add", "-b", "v", linked.to_str().unwrap(), "a"],
+    );
+    git(&linked, &["switch", "-c", "w"]);
+
+    let expected = "main\n\
+                    └─ a\n    \
+                        ├─ b\n    \
+                        └─ v\n        \
+                            └─ w\n";
+    assert_eq!(run_tree_command(path, &[]), expected);
+    assert_eq!(run_tree_command(&linked, &[]), expected);
+}
+
+#[test]
+fn test_tree_keeps_branches_created_from_the_same_branch_as_siblings() {
+    let dir = setup_reflogged_stack();
+    let path = dir.path();
+    git(path, &["switch", "a"]);
+    git(path, &["switch", "-c", "x"]);
+    git(path, &["switch", "a"]);
+    git(path, &["switch", "-c", "y"]);
+
+    assert_eq!(
+        run_tree_command(path, &[]),
+        "main\n\
+         └─ a\n    \
+             ├─ b\n    \
+             ├─ x\n    \
+             └─ y\n"
+    );
+}
+
+#[test]
+fn test_tree_nests_a_chain_of_branches_created_on_the_same_tip() {
+    let dir = setup_reflogged_stack();
+    let path = dir.path();
+    git(path, &["switch", "a"]);
+    git(path, &["switch", "-c", "x"]);
+    git(path, &["switch", "-c", "y"]);
+
+    assert_eq!(
+        run_tree_command(path, &[]),
+        "main\n\
+         └─ a\n    \
+             ├─ b\n    \
+             └─ x\n        \
+                 └─ y\n"
+    );
+}
+
+/// A branch whose creation Git no longer records, or never recorded with a
+/// start point, keeps the place its ancestry alone gives it.
+#[test]
+fn test_tree_places_a_branch_of_unknown_origin_by_ancestry() {
+    let dir = setup_reflogged_stack();
+    let path = dir.path();
+    git(path, &["switch", "a"]);
+    git(path, &["switch", "-c", "empty-on-a"]);
+    git(path, &["switch", "b"]);
+    git(path, &["reflog", "expire", "--expire=all", "--all"]);
+
+    assert_eq!(
+        run_tree_command(path, &[]),
+        "main\n\
+         ├─ a\n\
+         │   └─ b\n\
+         └─ empty-on-a\n"
+    );
+}

@@ -676,6 +676,36 @@ fn run_tree_visits_every_parent_before_its_children() {
     );
 }
 
+/// A branch created on its parent's tip shares that tip, so only where Git
+/// recorded it was created from makes it the parent's child: it is visited
+/// after the parent and reports it, even when its name sorts first.
+#[test]
+fn run_tree_visits_a_branch_without_commits_after_the_branch_it_was_created_from() {
+    let dir = setup_run_repo();
+    run_ok("git", &["checkout", "feature-a"], dir.path());
+    run_ok("git", &["checkout", "-b", "a-empty"], dir.path());
+    run_ok("git", &["checkout", "feature-b"], dir.path());
+
+    let log_path = dir.path().join("run.log");
+    let mut cmd = kin_cmd();
+    cmd.arg("run")
+        .arg("--tree")
+        .arg("--command")
+        .arg("echo \"$KINDRA_BRANCH parent=$KINDRA_PARENT\" >> run.log")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    assert_eq!(
+        read_lines(&log_path),
+        vec![
+            "feature-a parent=main",
+            "a-empty parent=feature-a",
+            "feature-b parent=feature-a",
+        ],
+    );
+}
+
 /// A detached HEAD has no branch to anchor the component on. `--tree` must still
 /// mean the component, rather than silently collapsing to the narrower scope the
 /// flag was passed to leave.
