@@ -3300,3 +3300,36 @@ fn test_restack_from_a_subdirectory_sets_aside_and_restores_the_whole_tree() {
         "untracked"
     );
 }
+
+/// A branch created on its parent's tip owns no commits, so restacking it after
+/// the parent is amended must only move it to the parent's new tip, not replay
+/// the parent's old commit onto it.
+#[test]
+fn test_restack_moves_a_branch_without_commits_to_its_amended_parent() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path();
+    repo_init(path);
+    run_ok("git", &["commit", "--allow-empty", "-m", "root"], path);
+    run_ok("git", &["switch", "-c", "a"], path);
+    common::commit_on(path, "a", "a.txt", "a");
+    run_ok("git", &["switch", "-c", "b"], path);
+    common::commit_on(path, "b", "b.txt", "b");
+    run_ok("git", &["switch", "a"], path);
+    run_ok("git", &["switch", "-c", "empty-on-a"], path);
+    run_ok("git", &["switch", "a"], path);
+    run_ok("git", &["commit", "--amend", "-m", "a amended"], path);
+
+    kin_cmd()
+        .current_dir(path)
+        .arg("restack")
+        .assert()
+        .success();
+
+    let repo = Repository::open(path).unwrap();
+    let id = |name: &str| repo.revparse_single(name).unwrap().id();
+    assert_eq!(id("empty-on-a"), id("a"));
+    let b = repo.find_commit(id("b")).unwrap();
+    assert_eq!(b.parent_id(0).unwrap(), id("a"));
+    assert_eq!(b.summary(), Some("b b"));
+    assert_no_rebase_in_progress(path);
+}

@@ -11,6 +11,31 @@ pub struct StackBranch {
     pub id: Oid,
 }
 
+/// What a stack branch is stacked on: another branch of the stack, or the
+/// commit the stack is measured from when no branch lies below it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StackParent {
+    Base(Oid),
+    Branch { name: String, id: Oid },
+}
+
+impl StackParent {
+    /// The commit the branch's own commits start above.
+    pub fn id(&self) -> Oid {
+        match self {
+            Self::Base(id) | Self::Branch { id, .. } => *id,
+        }
+    }
+
+    /// The parent branch, or `None` when the branch sits on the base.
+    pub fn branch_name(&self) -> Option<&str> {
+        match self {
+            Self::Base(_) => None,
+            Self::Branch { name, .. } => Some(name),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StackCommit {
     pub commit_id: Oid,
@@ -593,8 +618,9 @@ pub fn plan_descendant_reorder(
     }
 
     sort_branches_topologically(repo, &mut sub_stack)?;
-    let current_parent_id =
+    let current_parent =
         find_parent_in_stack(repo, current_branch_name, all_branches_in_stack, merge_base)?;
+    let current_parent_id = current_parent.id();
     // A tree rotation cannot preserve merge edges using branch-by-branch rebases.
     // The parent and its ancestors are unchanged, so exclude them from validation.
     for branch in &sub_stack {
@@ -607,23 +633,20 @@ pub fn plan_descendant_reorder(
         }
     }
 
-    let current_parent = if current_parent_id == merge_base {
-        upstream_name.to_string()
-    } else {
-        parent_base_spec(
-            current_parent_id,
-            current_branch_name,
-            all_branches_in_stack,
-        )
-    };
+    let current_parent = current_parent
+        .branch_name()
+        .unwrap_or(upstream_name)
+        .to_string();
 
+    let parents = find_parents_in_stack(repo, all_branches_in_stack, merge_base)?;
     let mut new_base_map = HashMap::new();
     for branch in &sub_stack {
-        let parent_id =
-            find_parent_in_stack(repo, &branch.name, all_branches_in_stack, merge_base)?;
+        let parent = &parents[&branch.name];
         new_base_map.insert(
             branch.name.clone(),
-            parent_base_spec(parent_id, &branch.name, all_branches_in_stack),
+            parent
+                .branch_name()
+                .map_or_else(|| parent.id().to_string(), str::to_string),
         );
     }
 
@@ -704,19 +727,15 @@ pub fn collect_stack_component(
 
     // Every candidate uses the same tips and base. Build their ancestry once,
     // including unrelated trunk forks, instead of walking it once per branch.
-    let parent_ids = find_parents_in_stack(repo, &candidates, merge_base)?;
+    let parents = find_parents_in_stack(repo, &candidates, merge_base)?;
     for branch in &candidates {
-        let parent_id = parent_ids[&branch.name];
-        if let Some(parent_branch) = candidates
-            .iter()
-            .find(|candidate| candidate.id == parent_id && candidate.name != branch.name)
-        {
+        if let Some(parent_name) = parents[&branch.name].branch_name() {
             adjacency
                 .get_mut(&branch.name)
                 .expect("branch adjacency entry must exist")
-                .push(parent_branch.name.clone());
+                .push(parent_name.to_string());
             adjacency
-                .get_mut(&parent_branch.name)
+                .get_mut(parent_name)
                 .expect("parent adjacency entry must exist")
                 .push(branch.name.clone());
         }
@@ -754,27 +773,14 @@ pub fn current_parent_name_map(
     // One shared ancestry walk for the whole set, rather than rebuilding it per
     // branch: the parent of every branch is the same computation, and the walk is
     // what costs.
-    let parent_ids = find_parents_in_stack(repo, branches, merge_base)?;
-    let mut parent_map = HashMap::new();
-
-    for branch in branches {
-        let parent_id = parent_ids
-            .get(&branch.name)
-            .copied()
-            .ok_or_else(|| anyhow!("Failed to resolve parent branch for '{}'.", branch.name))?;
-        let parent_name = if parent_id == merge_base {
-            upstream_name.to_string()
-        } else {
-            branches
-                .iter()
-                .find(|candidate| candidate.id == parent_id && candidate.name != branch.name)
-                .map(|candidate| candidate.name.clone())
-                .ok_or_else(|| anyhow!("Failed to resolve parent branch for '{}'.", branch.name))?
-        };
-        parent_map.insert(branch.name.clone(), parent_name);
-    }
-
-    Ok(parent_map)
+    let parents = find_parents_in_stack(repo, branches, merge_base)?;
+    Ok(parents
+        .into_iter()
+        .map(|(name, parent)| {
+            let parent_name = parent.branch_name().unwrap_or(upstream_name).to_string();
+            (name, parent_name)
+        })
+        .collect())
 }
 
 pub fn plan_graph_reorder(
@@ -827,11 +833,11 @@ pub fn plan_graph_reorder(
     let remaining_branches =
         topologically_sort_edited_graph(edited_parent_map, upstream_name, &order_hint)?;
 
+    let parents = find_parents_in_stack(repo, branches, merge_base)?;
     let mut parent_id_map = HashMap::new();
     let mut new_base_map = HashMap::new();
     for branch in branches {
-        let parent_id = find_parent_in_stack(repo, &branch.name, branches, merge_base)?;
-        parent_id_map.insert(branch.name.clone(), parent_id.to_string());
+        parent_id_map.insert(branch.name.clone(), parents[&branch.name].id().to_string());
         new_base_map.insert(
             branch.name.clone(),
             edited_parent_map
@@ -1545,12 +1551,9 @@ fn floating_patch_id_boundary(
         return Ok(Some(merge_base));
     }
 
-    Ok(Some(find_parent_in_stack(
-        repo,
-        target_branch,
-        &stack_branches,
-        merge_base,
-    )?))
+    Ok(Some(
+        find_parent_in_stack(repo, target_branch, &stack_branches, merge_base)?.id(),
+    ))
 }
 
 pub fn build_floating_target_context(
@@ -3127,7 +3130,34 @@ pub fn collect_descendants(
         })?;
 
     result.push(root.clone());
-    collect_descendants_of_id(repo, root.id, all_branches, result)
+    if !all_branches
+        .iter()
+        .any(|b| b.id == root.id && b.name != root.name)
+    {
+        return collect_descendants_of_id(repo, root.id, all_branches, result);
+    }
+
+    // Another branch shares the root's tip, so descending from that commit does
+    // not make a branch the root's: it belongs to whichever of them it is
+    // stacked on.
+    let tips = all_branches.iter().map(|b| b.id).collect::<Vec<_>>();
+    let mut resolver = ParentResolver::new(repo, TipAncestry::new(repo, &tips)?, all_branches);
+    let parents = (0..all_branches.len())
+        .map(|index| resolver.parent(index, None))
+        .collect::<Result<Vec<_>>>()?;
+    for (index, branch) in all_branches.iter().enumerate() {
+        let mut parent = parents[index];
+        while let Some(ancestor) = parent {
+            if all_branches[ancestor].name == root.name {
+                if !result.iter().any(|existing| existing.name == branch.name) {
+                    result.push(branch.clone());
+                }
+                break;
+            }
+            parent = parents[ancestor];
+        }
+    }
+    Ok(())
 }
 
 /// The branches at `root_id` together with every branch descending from it.
@@ -3314,43 +3344,365 @@ fn descends(repo: &Repository, ancestry: Option<&TipAncestry>, a: Oid, b: Oid) -
     }
 }
 
-/// The deepest branch in `all_branches` that `branch` descends from, or
-/// `merge_base` when it descends from none of them.
-fn nearest_parent_in_stack(
-    repo: &Repository,
-    ancestry: Option<&TipAncestry>,
-    branch: &StackBranch,
-    all_branches: &[StackBranch],
-    merge_base: Oid,
-) -> Result<Oid> {
-    let mut best_parent = merge_base;
-    for b in all_branches {
-        if b.name == branch.name || b.id == branch.id {
-            continue;
-        }
-        if !descends(repo, ancestry, branch.id, b.id)? {
-            continue;
-        }
-        if best_parent == merge_base || descends(repo, ancestry, b.id, best_parent)? {
-            best_parent = b.id;
-        }
-    }
-    Ok(best_parent)
+/// How far apart, in seconds, the branch reflog and a HEAD reflog may date the
+/// same `git checkout -b`/`git switch -c`. Both entries are written by one
+/// command, so they normally carry the same second; the bound has to stay
+/// small because every later plain checkout of the branch writes the same
+/// `checkout: moving from <source> to <branch>` message with the same commit.
+const CREATION_CHECKOUT_WINDOW_SECONDS: i64 = 1;
+
+/// One entry of a worktree's HEAD reflog.
+struct HeadEntry {
+    message: String,
+    id: Oid,
+    time: i64,
+    /// Which worktree's HEAD reflog the entry is from. Entries are in time
+    /// order only within one worktree.
+    worktree: usize,
 }
 
+/// Branch creation sources read from the reflogs, each at most once. Reading
+/// them costs a reflog per branch, and for branches created at HEAD the HEAD
+/// reflog of every worktree, so callers only ask for branches whose tip
+/// another branch shares.
+#[derive(Default)]
+struct CreationSources {
+    /// The start point of each branch as the user named it: a branch, another
+    /// ref or a commit.
+    creations: HashMap<String, Option<String>>,
+    head_entries: Option<Vec<HeadEntry>>,
+}
+
+impl CreationSources {
+    /// The local branch `name` was created from, if Git recorded one.
+    fn source(&mut self, repo: &Repository, name: &str) -> Result<Option<String>> {
+        if !self.creations.contains_key(name) {
+            let creation = self.read_creation(repo, name)?;
+            self.creations.insert(name.to_string(), creation);
+        }
+        Ok(self.creations[name].as_deref().and_then(|source| {
+            let source = source.strip_prefix("refs/heads/").unwrap_or(source);
+            (source != name).then(|| source.to_string())
+        }))
+    }
+
+    /// Read the oldest entry of the branch's reflog, `branch: Created from <S>`.
+    /// Git names the start point there, except when the branch was created at
+    /// HEAD by a checkout, where it writes `HEAD` and the creating worktree's
+    /// HEAD reflog holds the branch it moved from.
+    fn read_creation(&mut self, repo: &Repository, name: &str) -> Result<Option<String>> {
+        let Ok(reflog) = repo.reflog(&format!("refs/heads/{name}")) else {
+            return Ok(None);
+        };
+        let Some(created) = reflog
+            .len()
+            .checked_sub(1)
+            .and_then(|last| reflog.get(last))
+        else {
+            return Ok(None);
+        };
+        let Some(source) = created
+            .message()
+            .and_then(|message| message.strip_prefix("branch: Created from "))
+        else {
+            return Ok(None);
+        };
+        if source != "HEAD" {
+            return Ok(Some(source.to_string()));
+        }
+
+        let id = created.id_new();
+        let time = created.committer().when().seconds();
+        let prefix = "checkout: moving from ";
+        let suffix = format!(" to {name}");
+        let matches = self
+            .head_entries(repo)?
+            .iter()
+            .filter(|entry| {
+                entry.id == id && (entry.time - time).abs() <= CREATION_CHECKOUT_WINDOW_SECONDS
+            })
+            .filter_map(|entry| {
+                let source = entry
+                    .message
+                    .strip_prefix(prefix)?
+                    .strip_suffix(suffix.as_str())?;
+                Some(((entry.time - time).abs(), entry.worktree, source))
+            })
+            .collect::<Vec<_>>();
+        let Some(closest) = matches.iter().map(|(distance, _, _)| *distance).min() else {
+            return Ok(None);
+        };
+        // Within a worktree the first tied entry is the creating checkout. Ties
+        // in different worktrees cannot be ordered, so they only resolve when
+        // they agree.
+        let mut first_in_worktree = HashMap::new();
+        for (distance, worktree, source) in matches {
+            if distance == closest {
+                first_in_worktree.entry(worktree).or_insert(source);
+            }
+        }
+        let mut sources = first_in_worktree.into_values();
+        let source = sources.next();
+        Ok(source
+            .filter(|source| sources.all(|other| other == *source))
+            .map(str::to_string))
+    }
+
+    /// The HEAD reflog entries of the main worktree and every linked one, read
+    /// on first use. HEAD reflogs are per worktree, and a branch may have been
+    /// created in any of them.
+    fn head_entries(&mut self, repo: &Repository) -> Result<&[HeadEntry]> {
+        if self.head_entries.is_none() {
+            let main = Repository::open(repo.commondir())?;
+            let mut repos = Vec::new();
+            for name in main.worktrees()?.iter().flatten() {
+                let worktree = main.find_worktree(name)?;
+                // A worktree whose directory is gone cannot be opened, and no
+                // branch is being created there.
+                if worktree.validate().is_ok() {
+                    repos.push(Repository::open_from_worktree(&worktree)?);
+                }
+            }
+            repos.push(main);
+
+            let mut entries = Vec::new();
+            for (worktree, repo) in repos.iter().enumerate() {
+                let Ok(reflog) = repo.reflog("HEAD") else {
+                    continue;
+                };
+                // Oldest first, so the creating checkout comes before a later
+                // checkout of the branch in the same second.
+                for entry in reflog.iter().rev() {
+                    if let Some(message) = entry.message() {
+                        entries.push(HeadEntry {
+                            message: message.to_string(),
+                            id: entry.id_new(),
+                            time: entry.committer().when().seconds(),
+                            worktree,
+                        });
+                    }
+                }
+            }
+            self.head_entries = Some(entries);
+        }
+        Ok(self.head_entries.as_deref().unwrap_or_default())
+    }
+}
+
+/// Resolves which branch of a set each branch is stacked on.
+///
+/// Ancestry decides it, except between branches that share a tip: a branch
+/// created on another branch's tip has no commits of its own yet, so only where
+/// Git recorded it was created from tells child from parent.
+struct ParentResolver<'a> {
+    repo: &'a Repository,
+    ancestry: Option<TipAncestry>,
+    branches: &'a [StackBranch],
+    by_name: HashMap<&'a str, usize>,
+    by_tip: HashMap<Oid, Vec<usize>>,
+    sources: CreationSources,
+}
+
+impl<'a> ParentResolver<'a> {
+    fn new(
+        repo: &'a Repository,
+        ancestry: Option<TipAncestry>,
+        branches: &'a [StackBranch],
+    ) -> Self {
+        let mut by_name = HashMap::new();
+        let mut by_tip: HashMap<Oid, Vec<usize>> = HashMap::new();
+        for (index, branch) in branches.iter().enumerate() {
+            by_name.entry(branch.name.as_str()).or_insert(index);
+            by_tip.entry(branch.id).or_default().push(index);
+        }
+        Self {
+            repo,
+            ancestry,
+            branches,
+            by_name,
+            by_tip,
+            sources: CreationSources::default(),
+        }
+    }
+
+    fn descends(&self, a: Oid, b: Oid) -> Result<bool> {
+        descends(self.repo, self.ancestry.as_ref(), a, b)
+    }
+
+    fn shares_tip(&self, index: usize) -> bool {
+        self.by_tip[&self.branches[index].id].len() > 1
+    }
+
+    /// The branch of the set that `index` was created from, at any tip.
+    fn source(&mut self, index: usize) -> Result<Option<usize>> {
+        let source = self.sources.source(self.repo, &self.branches[index].name)?;
+        Ok(source
+            .and_then(|source| self.by_name.get(source.as_str()).copied())
+            .filter(|&source| source != index))
+    }
+
+    /// The branch `index` was created from when it shares `index`'s tip.
+    fn same_tip_source(&mut self, index: usize) -> Result<Option<usize>> {
+        if !self.shares_tip(index) {
+            return Ok(None);
+        }
+        let tip = self.branches[index].id;
+        Ok(self
+            .source(index)?
+            .filter(|&source| self.branches[source].id == tip))
+    }
+
+    /// The branch `index` was created on while sharing its tip. A branch that
+    /// was deleted and recreated can make two branches each other's source;
+    /// such a cycle names no parent.
+    fn same_tip_parent(&mut self, index: usize) -> Result<Option<usize>> {
+        let Some(parent) = self.same_tip_source(index)? else {
+            return Ok(None);
+        };
+        let mut seen = HashSet::from([parent]);
+        let mut current = parent;
+        while let Some(next) = self.same_tip_source(current)? {
+            if next == index {
+                return Ok(None);
+            }
+            if !seen.insert(next) {
+                break;
+            }
+            current = next;
+        }
+        Ok(Some(parent))
+    }
+
+    /// The branch `index` is stacked on, or `None` when it sits on the base.
+    /// A branch at `merge_base` is the base itself, not a parent.
+    fn parent(&mut self, index: usize, merge_base: Option<Oid>) -> Result<Option<usize>> {
+        if let Some(parent) = self.same_tip_parent(index)? {
+            return Ok(Some(parent));
+        }
+
+        let branches = self.branches;
+        let branch = &branches[index];
+        let mut deepest: Option<usize> = None;
+        for (candidate_index, candidate) in branches.iter().enumerate() {
+            if candidate.name == branch.name
+                || candidate.id == branch.id
+                || Some(candidate.id) == merge_base
+            {
+                continue;
+            }
+            if !self.descends(branch.id, candidate.id)? {
+                continue;
+            }
+            let deeper = match deepest {
+                None => true,
+                Some(best) => self.descends(candidate.id, branches[best].id)?,
+            };
+            if deeper {
+                deepest = Some(candidate_index);
+            }
+        }
+        let Some(deepest) = deepest else {
+            return Ok(None);
+        };
+
+        let tip = self.branches[deepest].id;
+        let group = self.by_tip[&tip].clone();
+        if group.len() == 1 {
+            return Ok(Some(deepest));
+        }
+        if let Some(source) = self.source(index)?
+            && self.branches[source].id == tip
+        {
+            return Ok(Some(source));
+        }
+        let mut roots = Vec::new();
+        for &member in &group {
+            if self.same_tip_parent(member)?.is_none() {
+                roots.push(member);
+            }
+        }
+        if let [root] = roots[..] {
+            return Ok(Some(root));
+        }
+        // History alone cannot tell these branches apart; keep the first in
+        // the set's order so the answer is at least stable.
+        Ok(Some(deepest))
+    }
+
+    fn stack_parent(&mut self, index: usize, merge_base: Oid) -> Result<StackParent> {
+        Ok(match self.parent(index, Some(merge_base))? {
+            Some(parent) => StackParent::Branch {
+                name: self.branches[parent].name.clone(),
+                id: self.branches[parent].id,
+            },
+            None => StackParent::Base(merge_base),
+        })
+    }
+}
+
+/// Local branches created on a commit `branch_name` has since been rewritten
+/// away from, directly from it or through other branches created on that same
+/// commit, and still sitting there, each with that commit. They have no commits
+/// of their own, so nothing in their history ties them to the rewritten branch;
+/// only the reflogs do. A commit the branch still contains is not left behind:
+/// a branch there is part of the branch's history. Nothing is left behind by
+/// the trunk, because a branch without commits of its own on the trunk is not
+/// stacked on it.
+pub fn branches_left_on_rewritten_tip(
+    repo: &Repository,
+    branch_name: &str,
+    branch_tip: Oid,
+) -> Result<Vec<(String, Oid)>> {
+    if crate::trunk::resolve_trunk(repo)?.as_deref() == Some(branch_name) {
+        return Ok(Vec::new());
+    }
+    let former_tips = read_branch_reflog_ids(repo, branch_name);
+    let tips = local_branch_tips(repo)?;
+    let tip_of = tips
+        .iter()
+        .map(|(name, tip)| (name.as_str(), *tip))
+        .collect::<HashMap<_, _>>();
+    let mut sources = CreationSources::default();
+    let mut left = Vec::new();
+    for (name, tip) in &tips {
+        if name == branch_name
+            || *tip == branch_tip
+            || !former_tips.contains(tip)
+            || repo.graph_descendant_of(branch_tip, *tip)?
+        {
+            continue;
+        }
+        let mut current = name.clone();
+        let mut seen = HashSet::from([name.clone()]);
+        while let Some(source) = sources.source(repo, &current)? {
+            if source == branch_name {
+                left.push((name.clone(), *tip));
+                break;
+            }
+            if tip_of.get(source.as_str()) != Some(tip) || !seen.insert(source.clone()) {
+                break;
+            }
+            current = source;
+        }
+    }
+    Ok(left)
+}
+
+/// The branch in `all_branches` that `branch_name` is stacked on, or
+/// `merge_base` when it is stacked on none of them.
 pub fn find_parent_in_stack(
     repo: &Repository,
     branch_name: &str,
     all_branches: &[StackBranch],
     merge_base: Oid,
-) -> Result<Oid> {
-    let branch = all_branches
+) -> Result<StackParent> {
+    let index = all_branches
         .iter()
-        .find(|b| b.name == branch_name)
+        .position(|b| b.name == branch_name)
         .ok_or_else(|| anyhow!("Branch '{}' not found in stack.", branch_name))?;
 
     let ancestry = TipAncestry::for_branches(repo, all_branches, merge_base)?;
-    nearest_parent_in_stack(repo, ancestry.as_ref(), branch, all_branches, merge_base)
+    ParentResolver::new(repo, ancestry, all_branches).stack_parent(index, merge_base)
 }
 
 /// [`find_parent_in_stack`] for every branch at once, sharing a single ancestry
@@ -3359,23 +3711,17 @@ pub fn find_parents_in_stack(
     repo: &Repository,
     all_branches: &[StackBranch],
     merge_base: Oid,
-) -> Result<HashMap<String, Oid>> {
+) -> Result<HashMap<String, StackParent>> {
     let ancestry = TipAncestry::for_branches(repo, all_branches, merge_base)?;
+    let mut resolver = ParentResolver::new(repo, ancestry, all_branches);
     let mut parents = HashMap::new();
-    for branch in all_branches {
-        let parent =
-            nearest_parent_in_stack(repo, ancestry.as_ref(), branch, all_branches, merge_base)?;
-        parents.insert(branch.name.clone(), parent);
+    for (index, branch) in all_branches.iter().enumerate() {
+        parents.insert(
+            branch.name.clone(),
+            resolver.stack_parent(index, merge_base)?,
+        );
     }
     Ok(parents)
-}
-
-fn parent_base_spec(parent_id: Oid, branch_name: &str, all_branches: &[StackBranch]) -> String {
-    all_branches
-        .iter()
-        .find(|branch| branch.id == parent_id && branch.name != branch_name)
-        .map(|branch| branch.name.clone())
-        .unwrap_or_else(|| parent_id.to_string())
 }
 
 fn is_descendant(repo: &Repository, a: Oid, b: Oid) -> Result<bool> {
@@ -3396,6 +3742,7 @@ pub fn sort_branches_topologically(repo: &Repository, branches: &mut [StackBranc
     // tips, in which case fall back to asking the graph pair by pair.
     let tips = original.iter().map(|b| b.id).collect::<Vec<_>>();
     let ancestry = TipAncestry::new(repo, &tips)?;
+    let mut resolver = ParentResolver::new(repo, ancestry, &original);
 
     for (idx, branch) in original.iter().enumerate() {
         for (other_idx, other) in original.iter().enumerate() {
@@ -3403,10 +3750,16 @@ pub fn sort_branches_topologically(repo: &Repository, branches: &mut [StackBranc
                 continue;
             }
 
-            if descends(repo, ancestry.as_ref(), branch.id, other.id)? {
+            if resolver.descends(branch.id, other.id)? {
                 outgoing[other_idx].push(idx);
                 indegree[idx] += 1;
             }
+        }
+        // Branches sharing a tip have no ancestry between them; one created on
+        // the other's tip still comes after it.
+        if let Some(parent_idx) = resolver.same_tip_parent(idx)? {
+            outgoing[parent_idx].push(idx);
+            indegree[idx] += 1;
         }
     }
 
@@ -3451,34 +3804,20 @@ pub fn compute_base_map(
     branches: &[(StackBranch, String)],
     upstream_name: &str,
 ) -> Result<HashMap<String, String>> {
+    let stack_branches = branches
+        .iter()
+        .map(|(branch, _)| branch.clone())
+        .collect::<Vec<_>>();
+    let tips = stack_branches.iter().map(|b| b.id).collect::<Vec<_>>();
+    let ancestry = TipAncestry::new(repo, &tips)?;
+    let mut resolver = ParentResolver::new(repo, ancestry, &stack_branches);
     let mut map = HashMap::new();
-
-    for (sb, _) in branches {
-        let branch_id = sb.id;
-        let mut best: Option<&StackBranch> = None;
-
-        for (candidate, _) in branches {
-            if candidate.name == sb.name {
-                continue;
-            }
-
-            // The candidate must be an ancestor of the branch.
-            if repo.graph_descendant_of(branch_id, candidate.id)? {
-                // We want the "closest" ancestor, i.e., the one that is NOT an ancestor of any other candidate ancestor.
-                if let Some(current_best) = best {
-                    if repo.graph_descendant_of(candidate.id, current_best.id)? {
-                        best = Some(candidate);
-                    }
-                } else {
-                    best = Some(candidate);
-                }
-            }
-        }
-
-        let base = best
-            .map(|b| b.name.clone())
-            .unwrap_or_else(|| upstream_name.to_string());
-        map.insert(sb.name.clone(), base);
+    for (index, branch) in stack_branches.iter().enumerate() {
+        let base = match resolver.parent(index, None)? {
+            Some(parent) => stack_branches[parent].name.clone(),
+            None => upstream_name.to_string(),
+        };
+        map.insert(branch.name.clone(), base);
     }
 
     Ok(map)
@@ -3495,16 +3834,16 @@ pub fn build_parent_maps(
     let mut parent_id_map = HashMap::new();
     let mut parent_name_map = HashMap::new();
 
+    let parents = find_parents_in_stack(repo, all_branches_in_stack, merge_base)?;
     for sb in sub_stack {
-        let parent_id = find_parent_in_stack(repo, &sb.name, all_branches_in_stack, merge_base)?;
+        let parent = &parents[&sb.name];
+        let parent_id = parent.id();
         parent_id_map.insert(sb.name.clone(), parent_id.to_string());
 
-        // Resolve parent_name_map by finding a parent branch in sub_stack with matching id (and different name)
-        if let Some(parent_branch) = sub_stack
-            .iter()
-            .find(|p| p.id == parent_id && p.name != sb.name)
+        if let Some(parent_name) = parent.branch_name()
+            && sub_stack.iter().any(|p| p.name == parent_name)
         {
-            parent_name_map.insert(sb.name.clone(), parent_branch.name.clone());
+            parent_name_map.insert(sb.name.clone(), parent_name.to_string());
         } else if parent_id == head_id {
             // or, if parent_id == head_id, map to current_branch_name
             parent_name_map.insert(sb.name.clone(), current_branch_name.to_string());
@@ -3601,6 +3940,7 @@ pub fn plan_tree_sync(
     // the same local branches, and they only depend on the merge base and
     // upstream.
     let mut scan_cache = SyncScanCache::default();
+    let stack_parents = find_parents_in_stack(repo, branches, merge_base)?;
     for branch in &ordered {
         let boundary =
             find_sync_boundary_cached(repo, &branch.name, upstream, branches, &mut scan_cache)?;
@@ -3608,15 +3948,13 @@ pub fn plan_tree_sync(
         let Some(mut base) = boundary.old_base else {
             continue;
         };
-        let parent_id = find_parent_in_stack(repo, &branch.name, branches, merge_base)?;
-        let parent = ordered
-            .iter()
-            .find(|p| p.id == parent_id && remaining.contains(&p.name));
-        let onto = if let Some(parent) = parent
-            && (parent.id == base || repo.graph_descendant_of(parent.id, base)?)
+        let parent = &stack_parents[&branch.name];
+        let onto = if let Some(parent_name) = parent.branch_name()
+            && remaining.iter().any(|name| name == parent_name)
+            && (parent.id() == base || repo.graph_descendant_of(parent.id(), base)?)
         {
-            base = parent.id;
-            parent.name.clone()
+            base = parent.id();
+            parent_name.to_string()
         } else {
             upstream.to_string()
         };

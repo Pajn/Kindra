@@ -3,7 +3,7 @@ use crate::rebase_utils::{Operation, RebaseState, begin_replay, replay_plan, run
 use anyhow::{Result, anyhow};
 use clap::Args;
 use git2::{BranchType, Commit, Oid, Repository};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Args)]
 pub struct RestackArgs {
@@ -75,7 +75,7 @@ fn restack_locked(repo: &git2::Repository, args: &RestackArgs) -> Result<()> {
             println!("No branches selected.");
             return Ok(());
         }
-        let selected_set: std::collections::HashSet<_> = selected.into_iter().collect();
+        let selected_set: HashSet<_> = selected.into_iter().collect();
         children
             .into_iter()
             .filter(|(name, _)| selected_set.contains(name))
@@ -102,7 +102,10 @@ fn restack_locked(repo: &git2::Repository, args: &RestackArgs) -> Result<()> {
     let mut ancestor_count = vec![0usize; entries.len()];
     for idx in 0..entries.len() {
         for other_idx in 0..entries.len() {
-            if idx == other_idx || entries[idx].2 == entries[other_idx].2 {
+            // A child sitting at its old base has no commits of its own to stack
+            // anything on; what descends from it descends from that base.
+            let (_, other_base, other_tip) = &entries[other_idx];
+            if idx == other_idx || entries[idx].2 == *other_tip || other_base == other_tip {
                 continue;
             }
             if !repo.graph_descendant_of(entries[idx].2, entries[other_idx].2)? {
@@ -234,21 +237,40 @@ fn find_floating_children(
         history_limit,
         &mut patch_id_cache,
     )?;
+    // Branches created on the old tip have no commits of their own, so the
+    // history walk above cannot find their base; their own tip is it.
+    let left_behind =
+        crate::stack::branches_left_on_rewritten_tip(repo, current_branch, head_commit.id())?;
+    let left_behind_names = left_behind
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<HashSet<_>>();
     for (name, old_base) in names.into_iter().zip(old_bases) {
         let Some(old_base) = old_base else {
             continue;
         };
+        if left_behind_names.contains(name.as_str()) {
+            continue;
+        }
         // If another branch still points at the detected old base, this branch is
         // part of an intact alternate stack rather than floating off the current one.
-        if has_other_local_branch_at_tip(repo, &name, old_base)? {
+        if has_other_local_branch_at_tip(repo, &name, old_base, &left_behind_names)? {
             continue;
         }
         results.push((name, old_base));
     }
+    results.extend(left_behind);
     Ok(results)
 }
 
-fn has_other_local_branch_at_tip(repo: &Repository, branch_name: &str, tip: Oid) -> Result<bool> {
+/// Whether a local branch other than `branch_name` and the `floating` ones
+/// points at `tip`.
+fn has_other_local_branch_at_tip(
+    repo: &Repository,
+    branch_name: &str,
+    tip: Oid,
+    floating: &HashSet<&str>,
+) -> Result<bool> {
     let branches = repo.branches(Some(BranchType::Local))?;
     for branch_res in branches {
         let (branch, _) = branch_res?;
@@ -256,7 +278,7 @@ fn has_other_local_branch_at_tip(repo: &Repository, branch_name: &str, tip: Oid)
             Ok(Some(name)) => name,
             _ => continue,
         };
-        if name == branch_name {
+        if name == branch_name || floating.contains(name) {
             continue;
         }
 

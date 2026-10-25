@@ -98,7 +98,8 @@ fn absorb_locked(repo: &git2::Repository, args: &AbsorbArgs) -> Result<()> {
         &current_branch_name,
         &stack_branches,
         merge_base,
-    )?;
+    )?
+    .id();
     let base_id = match &args.base {
         Some(base) => {
             let base_id = repo

@@ -214,21 +214,9 @@ fn build_tree_structure(
     let mut children_map: HashMap<Option<String>, Vec<String>> = HashMap::new();
 
     // First, find parent for each branch
-    let parent_ids = find_parents_in_stack(repo, stack_branches, upstream_id)?;
+    let parents = find_parents_in_stack(repo, stack_branches, upstream_id)?;
     for sb in stack_branches {
-        let parent_id = match parent_ids.get(&sb.name) {
-            // A branch rooted at upstream has no parent inside the tree.
-            Some(&id) if id != upstream_id => id,
-            _ => git2::Oid::zero(),
-        };
-        let parent_name = if parent_id == git2::Oid::zero() {
-            None
-        } else {
-            stack_branches
-                .iter()
-                .find(|b| b.id == parent_id)
-                .map(|b| b.name.clone())
-        };
+        let parent_name = parents[&sb.name].branch_name().map(str::to_string);
 
         tree.insert(
             sb.name.clone(),

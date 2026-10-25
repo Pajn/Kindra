@@ -343,7 +343,7 @@ kin rename <old-branch> <new-name>
 **What it does:**
 
 - Runs `git branch -m`, so the branch's tracking configuration (`branch.<name>.*`) moves with it (and Git repoints any worktree checked out on the branch).
-- Leaves stack parent/child relationships untouched, since they are computed from commit history.
+- Leaves stack parent/child relationships untouched, since they are computed from commit history. The exception is a branch with no commits of its own, sitting on another branch's tip: only the reflog entry Git wrote when it was created names its parent, and that entry names branches as they were called then. After renaming either branch, Kindra places it by commit history alone, as a sibling of the branch it shares the tip with.
 
 **Restrictions:**
 
@@ -455,6 +455,7 @@ kin restack [--history-limit <n>] [--autostash|--no-autostash] [--pick]
 - Scans all local branches for those whose history includes a commit that "matches" the current `HEAD` but is not part of the current branch's ancestry. Patch-id fallback is limited to the current branch's private lineage so unrelated branches that only share upstream-equivalent patches are ignored.
 - These branches are considered "floating" because they are pointing to a commit that has been replaced.
 - `kin restack` will automatically rebase these floating branches onto the new `HEAD`.
+- A branch created on the current branch's old tip, with no commits of its own and still sitting there, floats too and is moved to the new `HEAD`. Its reflog is what shows it was created from the current branch. The trunk has no such branches: a branch without commits on the trunk is not stacked on it.
 
 **Arguments:**
 - `--history-limit <n>`: Maximum first-parent history depth to scan while detecting floating branches. `0` disables the limit and scans the full history.

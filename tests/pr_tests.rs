@@ -9507,3 +9507,86 @@ fn after_pr_payload_uses_the_published_bases() {
     assert_eq!(entry["parent"], "feature-a");
     assert_eq!(entry["fork_point"], published_a);
 }
+
+/// A branch created on its parent's tip has no commits of its own to review:
+/// its PR base is the branch it was created from, so `kin pr` skips it rather
+/// than opening a PR that repeats the parent's commits against the trunk.
+#[test]
+fn pr_skips_a_branch_created_on_its_parent_tip() {
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    repo_init(path);
+    run_ok("git", &["commit", "--allow-empty", "-m", "root"], path);
+    run_ok("git", &["switch", "-c", "a"], path);
+    common::commit_on(path, "a", "a.txt", "a");
+    run_ok("git", &["switch", "-c", "empty-on-a"], path);
+
+    let remote = tempdir().unwrap();
+    run_ok("git", &["init", "--bare"], remote.path());
+    run_ok(
+        "git",
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        path,
+    );
+    run_ok(
+        "git",
+        &["push", "-u", "origin", "main", "a", "empty-on-a"],
+        path,
+    );
+
+    let bin = tempdir().unwrap();
+    let created = bin.path().join("created.txt");
+    common::write_gh_script(
+        bin.path().join("gh"),
+        format!(
+            r#"#!/bin/bash
+if [[ "$1" == "auth" ]]; then
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "list" ]]; then
+    echo '[]'
+    exit 0
+fi
+if [[ "$1" == "pr" ]] && [[ "$2" == "create" ]]; then
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--head" ]]; then echo "$2" >> "{}"; fi
+        shift
+    done
+    echo "https://github.com/test/repo/pull/1"
+    exit 0
+fi
+echo "mock gh: unexpected command: $@" >&2
+exit 1
+"#,
+            created.display()
+        ),
+    )
+    .unwrap();
+    run_ok(
+        "chmod",
+        &["+x", bin.path().join("gh").to_str().unwrap()],
+        path,
+    );
+
+    let output = kin_cmd()
+        .arg("pr")
+        .current_dir(path)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "kin pr failed: {output:?}");
+    assert!(
+        stdout.contains("No commits on this branch compared to 'a'. Skipping."),
+        "empty-on-a should be skipped against its parent:\n{stdout}"
+    );
+    let created = fs::read_to_string(&created).unwrap();
+    assert_eq!(created, "a\n");
+}
