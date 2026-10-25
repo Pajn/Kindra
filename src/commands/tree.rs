@@ -1,8 +1,8 @@
 use crate::commands::find_upstream;
 use crate::gh;
 use crate::stack::{
-    StackBranch, branch_creation_commit, find_parents_in_stack, get_full_stack_branches_for_head,
-    is_on_history_of,
+    StackBranch, branch_only_followed_trunk, find_parents_in_stack,
+    get_full_stack_branches_for_head, is_on_history_of,
 };
 use anyhow::{Context, Result};
 use clap::Args;
@@ -199,6 +199,7 @@ pub fn tree(args: &TreeArgs) -> Result<()> {
         &stack_branches,
         current_on_trunk.as_ref(),
         upstream_id,
+        &crate::trunk::trunk_refs(&repo, &upstream_name),
     )?;
 
     // Populate additional info based on flags
@@ -238,6 +239,7 @@ fn build_tree_structure(
     stack_branches: &[StackBranch],
     current_on_trunk: Option<&StackBranch>,
     upstream_id: git2::Oid,
+    trunk_refs: &[String],
 ) -> Result<HashMap<String, TreeBranch>> {
     let mut tree: HashMap<String, TreeBranch> = HashMap::new();
     let mut children_map: HashMap<Option<String>, Vec<String>> = HashMap::new();
@@ -261,11 +263,10 @@ fn build_tree_structure(
         let no_commits = match &parent_name {
             Some(parent) => tips[parent.as_str()] == sb.id,
             // The trunk also contains a branch whose commits it merged by a
-            // fast-forward; only one still on the commit it was created on has
-            // none of its own.
+            // fast-forward, so containment alone does not say it has none.
             None => {
                 is_on_history_of(repo, sb.id, upstream_id)?
-                    && branch_creation_commit(repo, &sb.name) == Some(sb.id)
+                    && branch_only_followed_trunk(repo, &sb.name, trunk_refs)?
             }
         };
 

@@ -1185,6 +1185,42 @@ fn test_tree_reports_a_branch_fast_forwarded_into_the_trunk_as_merged() {
     );
 }
 
+/// Following the trunk adds no commits of its own: a branch fast-forwarded to
+/// where the trunk had already moved still has none.
+#[test]
+fn test_tree_keeps_a_branch_fast_forwarded_to_the_trunk_without_commits() {
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    repo_init(path);
+    let at = |date: &str, args: &[&str]| {
+        let status = common::git_command(path)
+            .args(args)
+            .env("GIT_COMMITTER_DATE", date)
+            .env("GIT_AUTHOR_DATE", date)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    at(
+        "1700000000 +0000",
+        &["commit", "--allow-empty", "-m", "root"],
+    );
+    at("1700000000 +0000", &["switch", "-c", "x"]);
+    at("1700000001 +0000", &["switch", "main"]);
+    at(
+        "1700000001 +0000",
+        &["commit", "--allow-empty", "-m", "landed"],
+    );
+    at("1700000002 +0000", &["switch", "x"]);
+    at("1700000002 +0000", &["merge", "--ff-only", "main"]);
+
+    assert_eq!(
+        run_tree_command(path, &["-r"]),
+        "main\n\
+         └─ x (no commits) [In Sync]\n"
+    );
+}
+
 #[test]
 fn test_tree_shows_the_current_branch_on_a_trunk_without_a_stack() {
     let dir = tempdir().unwrap();
