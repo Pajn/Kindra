@@ -3451,7 +3451,10 @@ impl CreationSources {
                 let Ok(reflog) = repo.reflog("HEAD") else {
                     continue;
                 };
-                for entry in reflog.iter() {
+                // Oldest first: a later checkout of a branch can fall in the
+                // second it was created, and a tie goes to the first entry,
+                // which is then the checkout that created it.
+                for entry in reflog.iter().rev() {
                     if let Some(message) = entry.message() {
                         entries.push(HeadEntry {
                             message: message.to_string(),

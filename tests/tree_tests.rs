@@ -954,6 +954,35 @@ fn test_tree_nests_branches_created_with_switch_on_another_branch_tip() {
     );
 }
 
+/// A later checkout of the branch in the same second also matches its creation;
+/// the creating checkout is the earlier of the two.
+#[test]
+fn test_tree_nests_a_branch_checked_out_again_in_the_second_it_was_created() {
+    let dir = setup_reflogged_stack();
+    let path = dir.path();
+    for args in [
+        &["switch", "a"][..],
+        &["switch", "-c", "x"],
+        &["switch", "b"],
+        &["switch", "x"],
+    ] {
+        let status = common::git_command(path)
+            .args(args)
+            .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    assert_eq!(
+        run_tree_command(path, &[]),
+        "main\n\
+         └─ a\n    \
+             ├─ b\n    \
+             └─ x\n"
+    );
+}
+
 #[test]
 fn test_tree_nests_a_branch_created_from_a_named_start_point() {
     let dir = setup_reflogged_stack();
