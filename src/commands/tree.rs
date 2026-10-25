@@ -1,6 +1,8 @@
 use crate::commands::find_upstream;
 use crate::gh;
-use crate::stack::{StackBranch, find_parents_in_stack, get_full_stack_branches_for_head};
+use crate::stack::{
+    StackBranch, find_parents_in_stack, get_full_stack_branches_for_head, is_on_history_of,
+};
 use anyhow::{Context, Result};
 use clap::Args;
 use crossterm::style::{Color, Stylize};
@@ -115,6 +117,9 @@ pub struct TreeBranch {
     pub is_last_child: bool,
     #[allow(dead_code)]
     pub is_current: bool, // May be used for future highlighting
+    /// Whether the branch's tip is its parent's, or the trunk's when it has no
+    /// parent branch.
+    pub no_commits: bool,
     pub commits: Vec<BranchCommit>,
     pub remote_sync: Option<RemoteSyncStatus>,
     pub pr_status: Option<PrStatus>,
@@ -166,13 +171,34 @@ pub fn tree(args: &TreeArgs) -> Result<()> {
     let stack_branches =
         get_full_stack_branches_for_head(&repo, head_id, upstream_id, &upstream_name)?;
 
-    if stack_branches.is_empty() {
+    // Only the checked-out branch: worktree tools create branches on the trunk
+    // for every worktree, and listing them all would bury the stacks.
+    let current_on_trunk = match &current_branch_name {
+        Some(name)
+            if *name != upstream_name
+                && !stack_branches.iter().any(|branch| &branch.name == name)
+                && is_on_history_of(&repo, head_id, upstream_id)? =>
+        {
+            Some(StackBranch {
+                name: name.clone(),
+                id: head_id,
+            })
+        }
+        _ => None,
+    };
+
+    if stack_branches.is_empty() && current_on_trunk.is_none() {
         println!("{} (empty stack)", upstream_name);
         return Ok(());
     }
 
     // Build tree structure
-    let mut tree = build_tree_structure(&repo, &stack_branches, upstream_id)?;
+    let mut tree = build_tree_structure(
+        &repo,
+        &stack_branches,
+        current_on_trunk.as_ref(),
+        upstream_id,
+    )?;
 
     // Populate additional info based on flags
     let show_all = args.verbose;
@@ -204,19 +230,37 @@ pub fn tree(args: &TreeArgs) -> Result<()> {
     Ok(())
 }
 
-/// Build the tree structure from stack branches
+/// Build the tree structure from stack branches, with `current_on_trunk`, a
+/// branch the trunk contains, as a root of its own.
 fn build_tree_structure(
     repo: &git2::Repository,
     stack_branches: &[StackBranch],
+    current_on_trunk: Option<&StackBranch>,
     upstream_id: git2::Oid,
 ) -> Result<HashMap<String, TreeBranch>> {
     let mut tree: HashMap<String, TreeBranch> = HashMap::new();
     let mut children_map: HashMap<Option<String>, Vec<String>> = HashMap::new();
 
     // First, find parent for each branch
-    let parents = find_parents_in_stack(repo, stack_branches, upstream_id)?;
-    for sb in stack_branches {
-        let parent_name = parents[&sb.name].branch_name().map(str::to_string);
+    let mut parents = find_parents_in_stack(repo, stack_branches, upstream_id)?
+        .into_iter()
+        .map(|(name, parent)| (name, parent.branch_name().map(str::to_string)))
+        .collect::<HashMap<_, _>>();
+    let mut branches = stack_branches.to_vec();
+    if let Some(branch) = current_on_trunk {
+        parents.insert(branch.name.clone(), None);
+        branches.push(branch.clone());
+    }
+    let tips = branches
+        .iter()
+        .map(|branch| (branch.name.as_str(), branch.id))
+        .collect::<HashMap<_, _>>();
+    for sb in &branches {
+        let parent_name = parents[&sb.name].clone();
+        let no_commits = match &parent_name {
+            Some(parent) => tips[parent.as_str()] == sb.id,
+            None => is_on_history_of(repo, sb.id, upstream_id)?,
+        };
 
         tree.insert(
             sb.name.clone(),
@@ -227,6 +271,7 @@ fn build_tree_structure(
                 depth: 0,
                 is_last_child: false,
                 is_current: false,
+                no_commits,
                 commits: Vec::new(),
                 remote_sync: None,
                 pr_status: None,
@@ -405,6 +450,16 @@ fn calculate_sync_status(
     // Check if branch is merged into upstream
     let branch_id = tb.branch.id;
 
+    // A branch created on the trunk is contained in it without having merged
+    // anything; it only falls behind once the trunk moves on.
+    if tb.parent_name.is_none() && tb.no_commits {
+        return Ok(if branch_id == upstream_id {
+            SyncStatus::InSync
+        } else {
+            SyncStatus::NeedsRebase
+        });
+    }
+
     // If branch is ancestor of upstream, it's merged
     if repo.graph_descendant_of(upstream_id, branch_id)? || upstream_id == branch_id {
         return Ok(SyncStatus::Merged);
@@ -565,11 +620,15 @@ fn render_branch_recursive(
 
     // Determine branch name styling
     let is_current = current_branch_name.as_ref() == Some(&tb.branch.name);
-    let branch_display = if is_current {
+    let mut branch_display = if is_current {
         bold_if(&tb.branch.name, options.color)
     } else {
         tb.branch.name.clone()
     };
+    if tb.no_commits {
+        branch_display.push(' ');
+        branch_display.push_str(&colored_if("(no commits)", Color::DarkGrey, options.color));
+    }
 
     println!("{}{}{}{}", prefix, connector, branch_display, status_str);
 
