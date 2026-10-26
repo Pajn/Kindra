@@ -949,8 +949,8 @@ fn test_tree_nests_branches_created_with_switch_on_another_branch_tip() {
         "main\n\
          └─ a\n    \
              ├─ b\n    \
-             │   └─ empty-on-b\n    \
-             └─ empty-on-a\n"
+             │   └─ empty-on-b (no commits)\n    \
+             └─ empty-on-a (no commits)\n"
     );
 }
 
@@ -979,7 +979,7 @@ fn test_tree_nests_a_branch_checked_out_again_in_the_second_it_was_created() {
         "main\n\
          └─ a\n    \
              ├─ b\n    \
-             └─ x\n"
+             └─ x (no commits)\n"
     );
 }
 
@@ -994,7 +994,7 @@ fn test_tree_nests_a_branch_created_from_a_named_start_point() {
         "main\n\
          └─ a\n    \
              ├─ b\n    \
-             └─ x\n"
+             └─ x (no commits)\n"
     );
 }
 
@@ -1015,8 +1015,8 @@ fn test_tree_nests_branches_created_in_other_worktrees() {
     let expected = "main\n\
                     └─ a\n    \
                         ├─ b\n    \
-                        └─ v\n        \
-                            └─ w\n";
+                        └─ v (no commits)\n        \
+                            └─ w (no commits)\n";
     assert_eq!(run_tree_command(path, &[]), expected);
     assert_eq!(run_tree_command(&linked, &[]), expected);
 }
@@ -1035,8 +1035,8 @@ fn test_tree_keeps_branches_created_from_the_same_branch_as_siblings() {
         "main\n\
          └─ a\n    \
              ├─ b\n    \
-             ├─ x\n    \
-             └─ y\n"
+             ├─ x (no commits)\n    \
+             └─ y (no commits)\n"
     );
 }
 
@@ -1053,8 +1053,8 @@ fn test_tree_nests_a_chain_of_branches_created_on_the_same_tip() {
         "main\n\
          └─ a\n    \
              ├─ b\n    \
-             └─ x\n        \
-                 └─ y\n"
+             └─ x (no commits)\n        \
+                 └─ y (no commits)\n"
     );
 }
 
@@ -1085,7 +1085,7 @@ fn test_tree_places_a_branch_checked_out_in_two_worktrees_in_one_second_by_ances
         "main\n\
          ├─ a\n\
          │   ├─ b\n\
-         │   └─ c\n\
+         │   └─ c (no commits)\n\
          └─ x\n"
     );
 }
@@ -1107,5 +1107,130 @@ fn test_tree_places_a_branch_of_unknown_origin_by_ancestry() {
          ├─ a\n\
          │   └─ b\n\
          └─ empty-on-a\n"
+    );
+}
+
+/// The checked-out branch is shown even when it sits on the trunk with no
+/// commits yet; other such branches are not, since worktree tools leave many.
+#[test]
+fn test_tree_shows_the_current_branch_without_commits_on_the_trunk() {
+    let dir = setup_reflogged_stack();
+    let path = dir.path();
+    git(path, &["switch", "main"]);
+    git(path, &["branch", "not-checked-out"]);
+    kin_cmd()
+        .args(["co", "-b", "x"])
+        .current_dir(path)
+        .assert()
+        .success();
+
+    assert_eq!(
+        run_tree_command(path, &[]),
+        "main\n\
+         ├─ a\n\
+         │   └─ b\n\
+         └─ x (no commits)\n"
+    );
+    for flags in [&["-c"][..], &["-r"], &["-c", "-r"]] {
+        let output = run_tree_command(path, flags);
+        assert!(output.contains("x (no commits)"), "{flags:?}:\n{output}");
+    }
+}
+
+/// A branch the trunk contains is merged only once it had commits; one created
+/// on the trunk is in sync until the trunk moves on.
+#[test]
+fn test_tree_reports_sync_of_the_current_branch_on_the_trunk() {
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    repo_init(path);
+    git(path, &["commit", "--allow-empty", "-m", "root"]);
+    git(path, &["switch", "-c", "x"]);
+
+    assert_eq!(
+        run_tree_command(path, &["-r"]),
+        "main\n\
+         └─ x (no commits) [In Sync]\n"
+    );
+
+    git(path, &["switch", "main"]);
+    git(path, &["commit", "--allow-empty", "-m", "landed"]);
+    git(path, &["switch", "x"]);
+
+    assert_eq!(
+        run_tree_command(path, &["-r"]),
+        "main\n\
+         └─ x (no commits) [Needs Rebase]\n"
+    );
+}
+
+/// A branch whose commits reached the trunk by a fast-forward sits on the trunk
+/// just like one created there, but it had commits, and they are merged.
+#[test]
+fn test_tree_reports_a_branch_fast_forwarded_into_the_trunk_as_merged() {
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    repo_init(path);
+    git(path, &["commit", "--allow-empty", "-m", "root"]);
+    git(path, &["switch", "-c", "feature"]);
+    git(path, &["commit", "--allow-empty", "-m", "feature"]);
+    git(path, &["switch", "main"]);
+    git(path, &["merge", "--ff-only", "feature"]);
+    git(path, &["switch", "feature"]);
+
+    assert_eq!(
+        run_tree_command(path, &["-r"]),
+        "main\n\
+         └─ feature [Merged]\n"
+    );
+}
+
+/// Following the trunk adds no commits of its own: a branch fast-forwarded to
+/// where the trunk had already moved still has none.
+#[test]
+fn test_tree_keeps_a_branch_fast_forwarded_to_the_trunk_without_commits() {
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    repo_init(path);
+    let at = |date: &str, args: &[&str]| {
+        let status = common::git_command(path)
+            .args(args)
+            .env("GIT_COMMITTER_DATE", date)
+            .env("GIT_AUTHOR_DATE", date)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    at(
+        "1700000000 +0000",
+        &["commit", "--allow-empty", "-m", "root"],
+    );
+    at("1700000000 +0000", &["switch", "-c", "x"]);
+    at("1700000001 +0000", &["switch", "main"]);
+    at(
+        "1700000001 +0000",
+        &["commit", "--allow-empty", "-m", "landed"],
+    );
+    at("1700000002 +0000", &["switch", "x"]);
+    at("1700000002 +0000", &["merge", "--ff-only", "main"]);
+
+    assert_eq!(
+        run_tree_command(path, &["-r"]),
+        "main\n\
+         └─ x (no commits) [In Sync]\n"
+    );
+}
+
+#[test]
+fn test_tree_shows_the_current_branch_on_a_trunk_without_a_stack() {
+    let dir = tempdir().unwrap();
+    repo_init(dir.path());
+    git(dir.path(), &["commit", "--allow-empty", "-m", "root"]);
+    git(dir.path(), &["switch", "-c", "x"]);
+
+    assert_eq!(
+        run_tree_command(dir.path(), &[]),
+        "main\n\
+         └─ x (no commits)\n"
     );
 }

@@ -3394,21 +3394,11 @@ impl CreationSources {
         let Ok(reflog) = repo.reflog(&format!("refs/heads/{name}")) else {
             return Ok(None);
         };
-        let Some(created) = reflog
-            .len()
-            .checked_sub(1)
-            .and_then(|last| reflog.get(last))
-        else {
-            return Ok(None);
-        };
-        let Some(source) = created
-            .message()
-            .and_then(|message| message.strip_prefix("branch: Created from "))
-        else {
+        let Some((created, source)) = creation_entry(&reflog) else {
             return Ok(None);
         };
         if source != "HEAD" {
-            return Ok(Some(source.to_string()));
+            return Ok(Some(source));
         }
 
         let id = created.id_new();
@@ -3487,6 +3477,63 @@ impl CreationSources {
         }
         Ok(self.head_entries.as_deref().unwrap_or_default())
     }
+}
+
+/// The oldest entry of a branch's reflog and the start point it names, when
+/// that entry records the branch's creation (`branch: Created from <S>`).
+fn creation_entry(reflog: &git2::Reflog) -> Option<(git2::ReflogEntry<'_>, String)> {
+    let created = reflog.get(reflog.len().checked_sub(1)?)?;
+    let source = created
+        .message()?
+        .strip_prefix("branch: Created from ")?
+        .to_string();
+    Some((created, source))
+}
+
+/// Whether `name` has never had commits of its own, as the reflogs of the
+/// branch and of `trunk_refs` record it: since it was created, every commit
+/// it moved to was one the trunk had reached before. False when the branch's
+/// reflog no longer records its creation.
+///
+/// The trunk must have reached a commit in an earlier second: reflogs record
+/// whole seconds, and a commit the branch made and the trunk then took by a
+/// fast-forward can fall in the same one.
+pub fn branch_only_followed_trunk(
+    repo: &Repository,
+    name: &str,
+    trunk_refs: &[String],
+) -> Result<bool> {
+    let Ok(reflog) = repo.reflog(&format!("refs/heads/{name}")) else {
+        return Ok(false);
+    };
+    if creation_entry(&reflog).is_none() {
+        return Ok(false);
+    }
+    let mut trunk_tips = Vec::new();
+    for trunk_ref in trunk_refs {
+        if let Ok(trunk_reflog) = repo.reflog(trunk_ref) {
+            for entry in trunk_reflog.iter() {
+                trunk_tips.push((entry.committer().when().seconds(), entry.id_new()));
+            }
+        }
+    }
+    // The creation entry is the oldest; the commit a branch starts on is never
+    // its own.
+    for entry in reflog.iter().take(reflog.len() - 1) {
+        let id = entry.id_new();
+        let time = entry.committer().when().seconds();
+        let mut reached = false;
+        for &(trunk_time, trunk_tip) in &trunk_tips {
+            if trunk_time < time && is_on_history_of(repo, id, trunk_tip)? {
+                reached = true;
+                break;
+            }
+        }
+        if !reached {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Resolves which branch of a set each branch is stacked on.

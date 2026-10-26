@@ -101,3 +101,22 @@ fn resolve_branch_name(repo: &Repository, name: &str) -> Option<String> {
 
     None
 }
+
+/// The refs whose reflogs record where the trunk has been: the trunk itself
+/// and, for a local trunk, the remote-tracking branch it follows.
+pub fn trunk_refs(repo: &Repository, trunk: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    if let Ok(reference) = repo.resolve_reference_from_short_name(trunk)
+        && let Some(name) = reference.name()
+    {
+        refs.push(name.to_string());
+    }
+    if let Ok(upstream) = repo
+        .find_branch(trunk, BranchType::Local)
+        .and_then(|branch| branch.upstream())
+        && let Some(name) = upstream.get().name()
+    {
+        refs.push(name.to_string());
+    }
+    refs
+}
